@@ -438,6 +438,7 @@ fn limited_pipeline_descr() -> impl Strategy<Value = PipelineDescr> {
     .prop_map(|val| PipelineDescr {
         name: map_val_to_limited_pipeline_name(val.0),
         description: val.1,
+        metadata: "".to_string(),
         runtime_config: map_val_to_limited_runtime_config(val.2),
         program_code: val.3,
         udf_rust: val.4,
@@ -744,6 +745,7 @@ async fn pipeline_creation() {
     let new_descriptor = PipelineDescr {
         name: "test1".to_string(),
         description: "Test description".to_string(),
+        metadata: "".to_string(),
         runtime_config: json!({
             "workers": 123
         }),
@@ -843,6 +845,7 @@ async fn pipeline_retrieval() {
             PipelineDescr {
                 name: "test1".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -886,6 +889,7 @@ async fn pipeline_retrieval() {
             PipelineDescr {
                 name: "test2".to_string(),
                 description: "d2".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c2".to_string(),
                 udf_rust: "r2".to_string(),
@@ -977,6 +981,7 @@ async fn pipeline_versioning() {
             PipelineDescr {
                 name: "example".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -997,7 +1002,8 @@ async fn pipeline_versioning() {
     handle
         .db
         .update_pipeline(
-            tenant_id, "example", &None, &None, "v0", false, &None, &None, &None, &None, &None,
+            tenant_id, "example", &None, &None, &None, "v0", false, &None, &None, &None, &None,
+            &None,
         )
         .await
         .unwrap();
@@ -1012,6 +1018,7 @@ async fn pipeline_versioning() {
         .update_pipeline(
             tenant_id,
             "example",
+            &None,
             &None,
             &None,
             "v0",
@@ -1037,6 +1044,7 @@ async fn pipeline_versioning() {
             "example",
             &None,
             &Some("d1".to_string()),
+            &None,
             "v0",
             false,
             &None,
@@ -1058,6 +1066,7 @@ async fn pipeline_versioning() {
         .update_pipeline(
             tenant_id,
             "example",
+            &None,
             &None,
             &None,
             "v0",
@@ -1084,6 +1093,7 @@ async fn pipeline_versioning() {
             "example",
             &None,
             &None,
+            &None,
             "v0",
             false,
             &None,
@@ -1106,6 +1116,7 @@ async fn pipeline_versioning() {
         .update_pipeline(
             tenant_id,
             "example",
+            &None,
             &None,
             &None,
             "v0",
@@ -1132,6 +1143,7 @@ async fn pipeline_versioning() {
             "example",
             &None,
             &Some("d2".to_string()),
+            &None,
             "v0",
             false,
             &None,
@@ -1162,6 +1174,7 @@ async fn pipeline_versioning() {
             "example",
             &None,
             &None,
+            &None,
             "v0",
             false,
             &None,
@@ -1185,6 +1198,7 @@ async fn pipeline_versioning() {
             tenant_id,
             "example",
             &Some("example2".to_string()),
+            &None,
             &None,
             "v0",
             false,
@@ -1246,6 +1260,7 @@ async fn pipeline_versioning() {
             "example2",
             &None,
             &None,
+            &None,
             "v0",
             false,
             &Some(new_runtime_config.clone()),
@@ -1277,6 +1292,7 @@ async fn pipeline_duplicate() {
             PipelineDescr {
                 name: "example".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -1296,6 +1312,7 @@ async fn pipeline_duplicate() {
             PipelineDescr {
                 name: "example".to_string(),
                 description: "d2".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c2".to_string(),
                 udf_rust: "r2".to_string(),
@@ -1346,6 +1363,7 @@ async fn pipeline_program_compilation() {
             PipelineDescr {
                 name: "example1".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -1364,6 +1382,7 @@ async fn pipeline_program_compilation() {
             PipelineDescr {
                 name: "example2".to_string(),
                 description: "d2".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c2".to_string(),
                 udf_rust: "r2".to_string(),
@@ -1520,6 +1539,7 @@ async fn pipeline_transition_after_quick_stop() {
             PipelineDescr {
                 name: "example1".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -1741,6 +1761,7 @@ async fn pipeline_deployment() {
             PipelineDescr {
                 name: "example1".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -2473,6 +2494,7 @@ async fn pipeline_provision_version_guard() {
             PipelineDescr {
                 name: "example1".to_string(),
                 description: "d1".to_string(),
+                metadata: "".to_string(),
                 runtime_config: json!({}),
                 program_code: "c1".to_string(),
                 udf_rust: "r1".to_string(),
@@ -2564,6 +2586,7 @@ async fn pipeline_provision_version_guard() {
         .update_pipeline(
             tenant_id,
             &pipeline.name,
+            &None,
             &None,
             &None,
             "v0",
@@ -2707,6 +2730,212 @@ async fn pipeline_provision_version_guard() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn pipeline_metadata_update_while_running() {
+    // `metadata` is a free-form annotation with no impact on the deployed
+    // pipeline, so it can be patched at any time. Every other patchable
+    // field still requires the pipeline to be fully stopped.
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+
+    let pipeline = handle
+        .db
+        .new_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "v0",
+            PipelineDescr {
+                name: "example".to_string(),
+                description: "d1".to_string(),
+                metadata: "m1".to_string(),
+                runtime_config: json!({}),
+                program_code: "c1".to_string(),
+                udf_rust: "r1".to_string(),
+                udf_toml: "t1".to_string(),
+                program_config: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Walk the program through to `Success` so we can set the deployment
+    // desired status to `Provisioned`. Mirrors `pipeline_provision_version_guard`.
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_sql_compiled(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &SqlCompilationInfo {
+                exit_code: 0,
+                messages: vec![],
+            },
+            &serde_json::to_value(ProgramInfo {
+                schema: ProgramSchema {
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+                main_rust: "".to_string(),
+                udf_stubs: "".to_string(),
+                input_connectors: BTreeMap::new(),
+                output_connectors: BTreeMap::new(),
+                dataflow: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_rust(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_success(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &RustCompilationInfo {
+                exit_code: 0,
+                stdout: "".to_string(),
+                stderr: "".to_string(),
+            },
+            "def",
+            "123",
+            "456",
+        )
+        .await
+        .unwrap();
+
+    // Flip desired to `Provisioned` — this is the state in which most patches
+    // are rejected with `UpdateRestrictedToStopped`.
+    handle
+        .db
+        .set_deployment_resources_desired_status_provisioned(
+            tenant_id,
+            &pipeline.name,
+            RuntimeDesiredStatus::Running,
+            BootstrapPolicy::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // A description-only patch is blocked by the stopped-state gate.
+    let err = handle
+        .db
+        .update_pipeline(
+            tenant_id,
+            "example",
+            &None,
+            &Some("d2".to_string()),
+            &None,
+            "v0",
+            false,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DBError::UpdateRestrictedToStopped));
+
+    // Snapshot the pre-patch versions and monitor-event count so we can
+    // assert that the metadata patch leaves them untouched.
+    let before = handle.db.get_pipeline(tenant_id, "example").await.unwrap();
+    let event_count_before = handle
+        .db
+        .list_pipeline_monitor_events_short(tenant_id, "example".to_string())
+        .await
+        .unwrap()
+        .len();
+
+    // A metadata-only patch is allowed, writes the new value, and must NOT
+    // bump `version` / `refresh_version` nor emit a monitor event — see the
+    // metadata-only fast path in `db/operations/pipeline.rs::update_pipeline`.
+    let updated = handle
+        .db
+        .update_pipeline(
+            tenant_id,
+            "example",
+            &None,
+            &None,
+            &Some("m2".to_string()),
+            "v0",
+            false,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.metadata, "m2");
+    assert_eq!(updated.description, "d1");
+    assert_eq!(updated.version, before.version);
+    assert_eq!(updated.refresh_version, before.refresh_version);
+    let event_count_after = handle
+        .db
+        .list_pipeline_monitor_events_short(tenant_id, "example".to_string())
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(event_count_after, event_count_before);
+
+    // Combining metadata with any other field falls back to the stopped gate.
+    let err = handle
+        .db
+        .update_pipeline(
+            tenant_id,
+            "example",
+            &None,
+            &Some("d2".to_string()),
+            &Some("m3".to_string()),
+            "v0",
+            false,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DBError::UpdateRestrictedToStopped));
+
+    // No-op metadata patches (same value) are a no-op: nothing is written,
+    // and version + monitor events still don't move.
+    let unchanged = handle
+        .db
+        .update_pipeline(
+            tenant_id,
+            "example",
+            &None,
+            &None,
+            &Some("m2".to_string()),
+            "v0",
+            false,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unchanged.version, before.version);
+    assert_eq!(unchanged.refresh_version, before.refresh_version);
+}
+
 //////////////////////////////////////////////////////////////////////////////
 /////                           PROP TESTS                               /////
 
@@ -2756,6 +2985,7 @@ enum StorageAction {
         TenantId,
         #[proptest(strategy = "limited_pipeline_name()")] String,
         #[proptest(strategy = "limited_option_pipeline_name()")] Option<String>,
+        Option<String>,
         Option<String>,
         #[proptest(strategy = "limited_platform_version()")] String,
         bool,
@@ -3504,10 +3734,10 @@ fn db_impl_behaves_like_model() {
                                 let impl_response = handle.db.new_or_update_pipeline(tenant_id, new_id, &original_name, &platform_version, bump_platform_version, pipeline_descr.clone()).await;
                                 check_response_pipeline_with_created(i, model_response, impl_response);
                             }
-                            StorageAction::UpdatePipeline(tenant_id, original_name, name, description, platform_version, bump_platform_version, runtime_config, program_code, udf_rust, udf_toml, program_config) => {
+                            StorageAction::UpdatePipeline(tenant_id, original_name, name, description, metadata, platform_version, bump_platform_version, runtime_config, program_code, udf_rust, udf_toml, program_config) => {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
-                                let model_response = model.update_pipeline(tenant_id, &original_name, &name, &description, &platform_version, bump_platform_version, &runtime_config, &program_code, &udf_rust, &udf_toml, &program_config).await;
-                                let impl_response = handle.db.update_pipeline(tenant_id, &original_name, &name, &description, &platform_version, bump_platform_version, &runtime_config, &program_code, &udf_rust, &udf_toml, &program_config).await;
+                                let model_response = model.update_pipeline(tenant_id, &original_name, &name, &description, &metadata, &platform_version, bump_platform_version, &runtime_config, &program_code, &udf_rust, &udf_toml, &program_config).await;
+                                let impl_response = handle.db.update_pipeline(tenant_id, &original_name, &name, &description, &metadata, &platform_version, bump_platform_version, &runtime_config, &program_code, &udf_rust, &udf_toml, &program_config).await;
                                 check_response_pipeline(i, model_response, impl_response);
                             }
                             StorageAction::DeletePipeline(tenant_id, pipeline_name) => {
@@ -3796,6 +4026,7 @@ trait ModelHelpers {
         original_name: &str,
         name: &Option<String>,
         description: &Option<String>,
+        metadata: &Option<String>,
         platform_version: &str,
         bump_platform_version: bool,
         runtime_config: &Option<serde_json::Value>,
@@ -3846,6 +4077,7 @@ impl ModelHelpers for Mutex<DbModel> {
         original_name: &str,
         name: &Option<String>,
         description: &Option<String>,
+        metadata: &Option<String>,
         platform_version: &str,
         bump_platform_version: bool,
         runtime_config: &Option<serde_json::Value>,
@@ -3877,21 +4109,59 @@ impl ModelHelpers for Mutex<DbModel> {
         // Fetch existing pipeline
         let mut pipeline = self.get_pipeline(tenant_id, original_name).await?;
 
-        // Pipeline must be stopped
-        if !matches!(
-            (
-                pipeline.deployment_resources_status,
-                pipeline.deployment_resources_desired_status,
-                is_compiler_update
-            ),
-            (ResourcesStatus::Stopped, ResourcesDesiredStatus::Stopped, _)
-                | (
-                    ResourcesStatus::Stopped,
-                    ResourcesDesiredStatus::Provisioned,
-                    true
-                )
-        ) {
+        // `metadata` is a free-form annotation with no deployment impact, so
+        // requests that touch only it skip the stopped-state gate. Mirrors
+        // the rule in `db/operations/pipeline.rs::update_pipeline`; the same
+        // `PipelineFieldUpdates::is_metadata_only` is reused so both
+        // implementations classify patches identically.
+        let updates = crate::db::operations::pipeline::PipelineFieldUpdates {
+            name,
+            description,
+            metadata,
+            runtime_config,
+            program_code,
+            udf_rust,
+            udf_toml,
+            program_config,
+        };
+        let is_metadata_only_update =
+            !is_compiler_update && !bump_platform_version && updates.is_metadata_only();
+
+        // Pipeline must be stopped (unless this is a metadata-only update).
+        if !is_metadata_only_update
+            && !matches!(
+                (
+                    pipeline.deployment_resources_status,
+                    pipeline.deployment_resources_desired_status,
+                    is_compiler_update
+                ),
+                (ResourcesStatus::Stopped, ResourcesDesiredStatus::Stopped, _)
+                    | (
+                        ResourcesStatus::Stopped,
+                        ResourcesDesiredStatus::Provisioned,
+                        true
+                    )
+            )
+        {
             return Err(DBError::UpdateRestrictedToStopped);
+        }
+
+        // Metadata-only fast path: see `db/operations/pipeline.rs::update_pipeline`
+        // for the rationale. The mirror invariants enforced here are:
+        // - `version` and `refresh_version` are not bumped.
+        // - No `pipeline_monitor_event` is appended.
+        if is_metadata_only_update {
+            let new_metadata = metadata
+                .as_ref()
+                .expect("metadata-only update has Some(metadata)");
+            if *new_metadata != pipeline.metadata {
+                pipeline.metadata = new_metadata.clone();
+                self.lock()
+                    .await
+                    .pipelines
+                    .insert((tenant_id, pipeline.id), pipeline.clone());
+            }
+            return Ok(pipeline);
         }
 
         // While stopped, certain fields are not allowed to be updated when storage is not cleared
@@ -3987,6 +4257,12 @@ impl ModelHelpers for Mutex<DbModel> {
             }
             pipeline.description = description.clone();
         }
+        if let Some(metadata) = metadata {
+            if *metadata != pipeline.metadata {
+                version_increment = true;
+            }
+            pipeline.metadata = metadata.clone();
+        }
         if *platform_version != pipeline.platform_version && bump_platform_version {
             version_increment = true;
             program_version_increment = true;
@@ -4074,6 +4350,7 @@ fn convert_descriptor_to_monitoring(
         id: pipeline.id,
         name: pipeline.name.clone(),
         description: pipeline.description.clone(),
+        metadata: pipeline.metadata.clone(),
         created_at: pipeline.created_at,
         version: pipeline.version,
         platform_version: pipeline.platform_version.clone(),
@@ -4448,6 +4725,7 @@ impl Storage for Mutex<DbModel> {
             id: pipeline_id,
             name: pipeline.name,
             description: pipeline.description,
+            metadata: pipeline.metadata,
             created_at: now,
             version: Version(1),
             platform_version: platform_version.to_string(),
@@ -4521,6 +4799,7 @@ impl Storage for Mutex<DbModel> {
                     original_name,
                     &Some(pipeline.name),
                     &Some(pipeline.description),
+                    &Some(pipeline.metadata),
                     platform_version,
                     bump_platform_version,
                     &Some(pipeline.runtime_config),
@@ -4553,6 +4832,7 @@ impl Storage for Mutex<DbModel> {
         original_name: &str,
         name: &Option<String>,
         description: &Option<String>,
+        metadata: &Option<String>,
         platform_version: &str,
         bump_platform_version: bool,
         runtime_config: &Option<serde_json::Value>,
@@ -4567,6 +4847,7 @@ impl Storage for Mutex<DbModel> {
             original_name,
             name,
             description,
+            metadata,
             platform_version,
             bump_platform_version,
             runtime_config,
@@ -5542,6 +5823,7 @@ impl Storage for Mutex<DbModel> {
                         &pipeline.name,
                         &None,
                         &None,
+                        &None,
                         platform_version,
                         true,
                         &None,
@@ -5600,6 +5882,7 @@ impl Storage for Mutex<DbModel> {
                         true,
                         tid,
                         &pipeline.name,
+                        &None,
                         &None,
                         &None,
                         platform_version,

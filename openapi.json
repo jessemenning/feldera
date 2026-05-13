@@ -578,6 +578,7 @@
                     "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                     "name": "example1",
                     "description": "Description of the pipeline example1",
+                    "metadata": "",
                     "created_at": "1970-01-01T00:00:00Z",
                     "version": 4,
                     "platform_version": "v0",
@@ -669,6 +670,7 @@
                     "id": "67e55044-10b1-426f-9247-bb680e5fe0c9",
                     "name": "example2",
                     "description": "Description of the pipeline example2",
+                    "metadata": "",
                     "created_at": "1970-01-01T00:00:00Z",
                     "version": 1,
                     "platform_version": "v0",
@@ -793,6 +795,7 @@
               "example": {
                 "name": "example1",
                 "description": "Description of the pipeline example1",
+                "metadata": null,
                 "runtime_config": {
                   "workers": 16,
                   "max_rss_mb": null,
@@ -864,6 +867,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1048,6 +1052,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1199,6 +1204,7 @@
               "example": {
                 "name": "example1",
                 "description": "Description of the pipeline example1",
+                "metadata": null,
                 "runtime_config": {
                   "workers": 16,
                   "max_rss_mb": null,
@@ -1270,6 +1276,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1371,6 +1378,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1619,6 +1627,7 @@
               "example": {
                 "name": null,
                 "description": "This is a new description",
+                "metadata": null,
                 "runtime_config": null,
                 "program_code": "CREATE TABLE table3 ( col3 INT );",
                 "udf_rust": null,
@@ -1641,6 +1650,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -6576,6 +6586,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "metadata": "",
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -10593,6 +10604,12 @@
         "properties": {
           "description": {
             "type": "string",
+            "description": "Deprecated: use `metadata` instead.",
+            "deprecated": true,
+            "nullable": true
+          },
+          "metadata": {
+            "type": "string",
             "nullable": true
           },
           "name": {
@@ -11000,6 +11017,7 @@
           "id",
           "name",
           "description",
+          "metadata",
           "created_at",
           "version",
           "platform_version",
@@ -11110,10 +11128,15 @@
             "format": "date-time"
           },
           "description": {
-            "type": "string"
+            "type": "string",
+            "description": "Deprecated: use `metadata` instead.",
+            "deprecated": true
           },
           "id": {
             "$ref": "#/components/schemas/PipelineId"
+          },
+          "metadata": {
+            "type": "string"
           },
           "name": {
             "type": "string"
@@ -11260,6 +11283,7 @@
           "id",
           "name",
           "description",
+          "metadata",
           "created_at",
           "version",
           "platform_version",
@@ -11372,10 +11396,15 @@
             "format": "date-time"
           },
           "description": {
-            "type": "string"
+            "type": "string",
+            "description": "Deprecated: use `metadata` instead.",
+            "deprecated": true
           },
           "id": {
             "$ref": "#/components/schemas/PipelineId"
+          },
+          "metadata": {
+            "type": "string"
           },
           "name": {
             "type": "string"
@@ -11487,6 +11516,12 @@
         ],
         "properties": {
           "description": {
+            "type": "string",
+            "description": "Deprecated: use `metadata` instead.",
+            "deprecated": true,
+            "nullable": true
+          },
+          "metadata": {
             "type": "string",
             "nullable": true
           },

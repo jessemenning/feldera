@@ -871,8 +871,18 @@ export const postPipelineDismissError = <ThrowOnError extends boolean = true>(
  * Subscribe to a stream of updates from a SQL view or table.
  *
  * The pipeline responds with a continuous stream of changes to the specified
- * table or view, encoded using the format specified in the `?format=`
- * parameter. Updates are split into `Chunk`s.
+ * table or view.  The stream is configurable two ways:
+ *
+ * - Simple configuration of the format may be provided using query parameters.
+ * Use `format` to specify `csv` or `json` output and, for `json` only, `array`
+ * to specify whether to group updates into JSON arrays.  Specify
+ * `backpressure` to specify behavior when the HTTP client cannot keep up.
+ *
+ * - Comprehensive configuration may be provided by providing a connector
+ * configuration as a JSON body.  In this case, no query parameters are
+ * allowed.
+ *
+ * Updates are split into `Chunk`s.
  *
  * The pipeline continues sending updates until the client closes the
  * connection or the pipeline is stopped.
@@ -899,7 +909,7 @@ export const httpOutput = <ThrowOnError extends boolean = true>(
  * - Only the status details changed, and it has been 10s since the last event
  * - Nothing has changed for more than 10 minutes
  *
- * This endpoint returns the most recent persisted events, up to 720.
+ * This endpoint returns the most recent persisted events, up to by default approximately 720.
  */
 export const listPipelineEvents = <ThrowOnError extends boolean = true>(
   options: Options<ListPipelineEventsData, ThrowOnError>
@@ -919,10 +929,10 @@ export const listPipelineEvents = <ThrowOnError extends boolean = true>(
 /**
  * Get Pipeline Event
  *
- * Get specific pipeline monitor event.
+ * Get a specific pipeline monitor event.
  *
  * The identifiers of the events can be retrieved via `GET /v0/pipelines/<pipeline>/events`.
- * The most recent 720 events are retained.
+ * The most recent approximately 720 (default) events are retained.
  * This endpoint can return a 404 for an event that no longer exists due to a cleanup.
  */
 export const getPipelineEvent = <ThrowOnError extends boolean = true>(

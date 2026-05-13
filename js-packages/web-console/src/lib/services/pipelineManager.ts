@@ -243,6 +243,7 @@ const toPipelineThumb = (
 ) => ({
   name: pipeline.name,
   description: pipeline.description,
+  metadata: pipeline.metadata ?? '',
   storageStatus: pipeline.storage_status,
   ...consolidatePipelineStatus(
     pipeline.program_status,
@@ -273,6 +274,7 @@ const toPipeline = <
 ) => ({
   name: pipeline.name,
   description: pipeline.description ?? '',
+  metadata: pipeline.metadata ?? '',
   runtimeConfig: pipeline.runtime_config,
   programConfig: pipeline.program_config!,
   programCode: pipeline.program_code ?? '',
@@ -294,6 +296,7 @@ const toExtendedPipeline = ({
   deploymentStatusSince: pipeline.deployment_status_since,
   programStatusSince: pipeline.program_status_since,
   description: pipeline.description,
+  metadata: pipeline.metadata ?? '',
   id: pipeline.id,
   name: pipeline.name,
   programCode: pipeline.program_code ?? '',
@@ -327,6 +330,7 @@ const toExtendedPipeline = ({
 const fromPipeline = <T extends Partial<Pipeline>>(pipeline: T) => ({
   name: pipeline?.name,
   description: pipeline?.description,
+  metadata: pipeline?.metadata,
   runtime_config: pipeline?.runtimeConfig,
   program_config: pipeline?.programConfig,
   program_code: pipeline?.programCode,
@@ -529,17 +533,11 @@ export const getCheckpointStatus = (pipeline_name: string, options?: FetchOption
 }
 
 export const syncCheckpoint = (pipeline_name: string, options?: FetchOptions) => {
-  return mapResponse(
-    _syncCheckpoint({ path: { pipeline_name }, ...options }),
-    (v) => v
-  )
+  return mapResponse(_syncCheckpoint({ path: { pipeline_name }, ...options }), (v) => v)
 }
 
 export const getCheckpointSyncStatus = (pipeline_name: string, options?: FetchOptions) => {
-  return mapResponse(
-    _getCheckpointSyncStatus({ path: { pipeline_name }, ...options }),
-    (v) => v
-  )
+  return mapResponse(_getCheckpointSyncStatus({ path: { pipeline_name }, ...options }), (v) => v)
 }
 
 export const deletePipeline = async (pipeline_name: string, options?: FetchOptions) => {

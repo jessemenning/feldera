@@ -6,6 +6,9 @@ import type {
   CheckpointPipelineData,
   CheckpointPipelineErrors,
   CheckpointPipelineResponses,
+  ClockAdvanceData,
+  ClockAdvanceErrors,
+  ClockAdvanceResponses,
   CommitTransactionData,
   CommitTransactionErrors,
   CommitTransactionResponses,
@@ -142,9 +145,6 @@ import type {
   PostPipelineInputConnectorActionData,
   PostPipelineInputConnectorActionErrors,
   PostPipelineInputConnectorActionResponses,
-  PostPipelineOutputConnectorResetData,
-  PostPipelineOutputConnectorResetErrors,
-  PostPipelineOutputConnectorResetResponses,
   PostPipelinePauseData,
   PostPipelinePauseErrors,
   PostPipelinePauseResponses,
@@ -155,6 +155,9 @@ import type {
   PostPipelineResumeData,
   PostPipelineResumeErrors,
   PostPipelineResumeResponses,
+  PostPipelineStartCompactionData,
+  PostPipelineStartCompactionErrors,
+  PostPipelineStartCompactionResponses,
   PostPipelineStartData,
   PostPipelineStartErrors,
   PostPipelineStartResponses,
@@ -170,9 +173,6 @@ import type {
   PutPipelineData,
   PutPipelineErrors,
   PutPipelineResponses,
-  ResetStatusData,
-  ResetStatusErrors,
-  ResetStatusResponses,
   StartSamplyProfileData,
   StartSamplyProfileErrors,
   StartSamplyProfileResponses,
@@ -780,6 +780,39 @@ export const postPipelineClear = <ThrowOnError extends boolean = true>(
   })
 
 /**
+ * Advance Clock
+ *
+ * Moves `NOW()` forward by a specified amount. Returns the
+ * current clock time of the circuit.
+ *
+ * Requires `dev_tweaks.now_http_driven = true` on the pipeline.
+ *
+ * Forward-only: `delta_ms` is `u64`, so negative bodies are rejected at
+ * JSON parse time.  `delta_ms = null` or omitted advances by one
+ * `clock_resolution`.  Non-zero values round up to the next
+ * `clock_resolution` boundary, so a sub-resolution delta still moves
+ * the clock by one full tick.
+ *
+ * The returned `now_ms` is the value the worker will emit on its next
+ * pipeline step; queries against materialized views may observe the
+ * previous `NOW()` until that step completes.  Callers that need
+ * read-after-write semantics should poll the view.
+ */
+export const clockAdvance = <ThrowOnError extends boolean = true>(
+  options: Options<ClockAdvanceData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ClockAdvanceResponses, ClockAdvanceErrors, ThrowOnError, 'data'>({
+    responseStyle: 'data',
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v0/pipelines/{pipeline_name}/clock/advance',
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  })
+
+/**
  * Commit Transaction
  *
  * Commit the current transaction.
@@ -1123,22 +1156,6 @@ export const postPipelineRebalance = <ThrowOnError extends boolean = true>(
   })
 
 /**
- * Check Reset Status
- *
- * Check the status of a reset token returned by the output connector
- * reset endpoint.
- */
-export const resetStatus = <ThrowOnError extends boolean = true>(
-  options: Options<ResetStatusData, ThrowOnError>
-) =>
-  (options.client ?? client).get<ResetStatusResponses, ResetStatusErrors, ThrowOnError, 'data'>({
-    responseStyle: 'data',
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v0/pipelines/{pipeline_name}/reset_status',
-    ...options
-  })
-
-/**
  * Resume Pipeline
  *
  * Requests the pipeline to resume, which it will do asynchronously.
@@ -1229,6 +1246,26 @@ export const postPipelineStart = <ThrowOnError extends boolean = true>(
     responseStyle: 'data',
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v0/pipelines/{pipeline_name}/start',
+    ...options
+  })
+
+/**
+ * Initiate compaction.
+ *
+ * Initiate immediate compaction of the pipeline's state.
+ */
+export const postPipelineStartCompaction = <ThrowOnError extends boolean = true>(
+  options: Options<PostPipelineStartCompactionData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    PostPipelineStartCompactionResponses,
+    PostPipelineStartCompactionErrors,
+    ThrowOnError,
+    'data'
+  >({
+    responseStyle: 'data',
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v0/pipelines/{pipeline_name}/start_compaction',
     ...options
   })
 
@@ -1532,29 +1569,6 @@ export const postUpdateRuntime = <ThrowOnError extends boolean = true>(
     responseStyle: 'data',
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v0/pipelines/{pipeline_name}/update_runtime',
-    ...options
-  })
-
-/**
- * Reset Output Connector
- *
- * Reset an output connector configured in `snapshot_and_follow` mode.
- *
- * This clears buffered output, asks the sink to reset itself, and then replays
- * a full snapshot before resuming incremental updates.
- */
-export const postPipelineOutputConnectorReset = <ThrowOnError extends boolean = true>(
-  options: Options<PostPipelineOutputConnectorResetData, ThrowOnError>
-) =>
-  (options.client ?? client).post<
-    PostPipelineOutputConnectorResetResponses,
-    PostPipelineOutputConnectorResetErrors,
-    ThrowOnError,
-    'data'
-  >({
-    responseStyle: 'data',
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v0/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/reset',
     ...options
   })
 

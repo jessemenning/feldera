@@ -302,13 +302,85 @@ export type Chunk = {
   } | null
   sequence_number: number
   /**
+   * `true` when this chunk is part of the initial snapshot delivered in
+   * `send_snapshot` mode; `false` for incremental delta updates.
+   */
+  snapshot: boolean
+  /**
    * Text payload, e.g., CSV.
    */
   text_data?: string | null
 }
 
+/**
+ * Free-form client-side annotations stored alongside a pipeline.
+ *
+ * Persisted as a single JSON object in the `client_metadata` text column
+ * (renamed from `metadata` in V35). The schema lives in code, not the
+ * database — adding a new annotation field only requires extending this
+ * struct, never a DB migration.
+ *
+ * Deserialization is lenient: unknown keys are ignored so older readers do
+ * not break when newer writers add fields. Empty / missing values
+ * (description == "", empty tags) are normalized to `None` so that the
+ * serialized form stays minimal (`{}` for fully empty metadata, which we
+ * further collapse to `""` in storage).
+ */
+export type ClientMetadata = {
+  /**
+   * Human-readable description of the pipeline.
+   */
+  description?: string | null
+  /**
+   * Free-form tags for grouping / filtering.
+   */
+  tags?: Array<string> | null
+}
+
+/**
+ * Body of `POST /clock/advance`.
+ *
+ * `delta_ms` is unsigned; negative values fail JSON deserialization.
+ * `Some(0)` reads the current `NOW()` without moving it or rounding
+ * it; `Some(n)` advances by `n` ms; `None` (`null` or omitted)
+ * advances by one `clock_resolution`.  Non-zero values round up to
+ * the next `clock_resolution` boundary, so a sub-resolution delta
+ * still moves the clock by one full tick.
+ */
+export type ClockAdvanceRequest = {
+  delta_ms?: number | null
+}
+
+/**
+ * Response of `POST /clock/advance`: the new `NOW()` value as both
+ * milliseconds since epoch (signed; pre-1970 anchors yield negative
+ * values) and an RFC 3339 string.
+ */
+export type ClockAdvanceResponse = {
+  now: string
+  now_ms: number
+}
+
 export type ClockConfig = {
   clock_resolution_usecs: number
+  /**
+   * If `true`, the clock does not advance on wall-clock cadence.
+   * `NOW()` is held at its current value and only advances when an
+   * external caller invokes the pipeline's `POST /clock/advance`
+   * endpoint.  Populated from `DevTweaks::now_http_driven`.
+   */
+  http_driven?: boolean
+  /**
+   * Target value for `NOW()` at the worker's first emitted tick, in
+   * milliseconds since the Unix epoch.
+   *
+   * Populated verbatim from `DevTweaks::now_offset` at endpoint
+   * construction; the wall-clock delta is computed inside the
+   * connector's worker task from a single `SystemTime::now()`
+   * reading, so there is no drift between config construction and
+   * the first emitted tick.  `None` means no shift is applied.
+   */
+  now_offset_ms?: number | null
 }
 
 /**
@@ -609,9 +681,6 @@ export type ConnectOptions = {
   server_url: string
 }
 
-/**
- * A data connector's configuration
- */
 export type ConnectorConfig = OutputBufferConfig & {
   format?: FormatConfig | null
   /**
@@ -697,6 +766,21 @@ export type ConnectorConfig = OutputBufferConfig & {
    */
   paused?: boolean
   preprocessor?: Array<PreprocessorConfig> | null
+  /**
+   * Send a full snapshot of a materialized view when the connector first
+   * starts. Valid for output connectors only.
+   *
+   * When `true`, the pipeline emits the current contents of the view as the
+   * initial batch the first time the connector runs. The view must be
+   * materialized (declared with `CREATE MATERIALIZED VIEW`).
+   *
+   * The snapshot is sent exactly once per connector lifetime: it does not
+   * fire again when the pipeline resumes from a checkpoint. Modifying the
+   * connector configuration or invoking the reset API triggers a fresh
+   * snapshot when the connector supports reset (e.g., Delta Lake in
+   * `truncate` mode and Postgres).
+   */
+  send_snapshot?: boolean
   /**
    * Start the connector after all connectors with specified labels.
    *
@@ -1498,6 +1582,41 @@ export type DevTweaks = {
    */
   negative_weight_multiplier?: number | null
   /**
+   * Drive `NOW()` from an external HTTP endpoint instead of wall clock.
+   *
+   * When `true`, the clock connector emits one initial tick (using
+   * `now_offset` if set, otherwise wall clock) and then holds that
+   * value.  Subsequent calls to `POST /clock/advance` move `NOW()`
+   * forward by the requested delta.  Negative deltas are rejected;
+   * the clock is forward-only.
+   */
+  now_http_driven?: boolean | null
+  /**
+   * Override the timestamp returned by SQL `NOW()` at pipeline start.
+   *
+   * When set, the clock connector anchors `NOW()` to this RFC 3339
+   * timestamp the first time the pipeline starts and advances at
+   * wall-clock cadence from there:
+   * `NOW() = now_offset + (wall_clock - wall_clock_at_start)`.
+   *
+   * Any RFC 3339 timestamp parseable by `chrono::DateTime<Utc>` is
+   * accepted (years `0001` through `9999`), in the past or future
+   * relative to wall clock.
+   *
+   * This is a testing knob for queries that depend on `NOW()`.
+   *
+   * On resume the clock continues from the last journaled `NOW()`;
+   * `now_offset`'s value is honored only on a fresh start:
+   *
+   * | Initial run | Resume from checkpoint | Post-replay `NOW()` |
+   * |---|---|---|
+   * | no offset | no offset | wall clock (unchanged) |
+   * | offset    | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |
+   * | offset    | no offset | jumps to wall clock (explicit opt-out of the anchor) |
+   * | no offset | offset    | wall-clock pace from the last journaled value; the new offset value is ignored |
+   */
+  now_offset?: string | null
+  /**
    * Controls the maximal number of records output by splitter operators
    * (joins, distinct, aggregation, rolling window and group operators) at
    * each step.
@@ -1559,6 +1678,10 @@ export type DevTweaks = {
     | number
     | null
     | number
+    | null
+    | boolean
+    | null
+    | string
     | null
     | number
     | null
@@ -3126,14 +3249,7 @@ export type PartialProgramInfo = {
  * it is required to again pass the whole runtime configuration with the
  * change.
  */
-export type PatchPipeline = {
-  /**
-   * Deprecated: use `metadata` instead.
-   *
-   * @deprecated
-   */
-  description?: string | null
-  metadata?: string | null
+export type PatchPipeline = ClientMetadata & {
   name?: string | null
   program_code?: string | null
   program_config?: ProgramConfig | null
@@ -3396,7 +3512,7 @@ export type PipelineId = string
  * Pipeline information.
  * It both includes fields which are user-provided and system-generated.
  */
-export type PipelineInfo = {
+export type PipelineInfo = ClientMetadata & {
   created_at: string
   deployment_desired_status: CombinedDesiredStatus
   deployment_desired_status_since: string
@@ -3415,14 +3531,7 @@ export type PipelineInfo = {
   deployment_runtime_status_since?: string | null
   deployment_status: CombinedStatus
   deployment_status_since: string
-  /**
-   * Deprecated: use `metadata` instead.
-   *
-   * @deprecated
-   */
-  description: string
   id: PipelineId
-  metadata: string
   name: string
   platform_version: string
   program_code: string
@@ -3473,7 +3582,7 @@ export type PipelineMonitorEventSelectedInfo = {
  * It both includes fields which are user-provided and system-generated.
  * If an optional field is not selected (i.e., is `None`), it will not be serialized.
  */
-export type PipelineSelectedInfo = {
+export type PipelineSelectedInfo = ClientMetadata & {
   connectors?: ConnectorStats | null
   created_at: string
   deployment_desired_status: CombinedDesiredStatus
@@ -3493,14 +3602,7 @@ export type PipelineSelectedInfo = {
   deployment_runtime_status_since?: string | null
   deployment_status: CombinedStatus
   deployment_status_since: string
-  /**
-   * Deprecated: use `metadata` instead.
-   *
-   * @deprecated
-   */
-  description: string
   id: PipelineId
-  metadata: string
   name: string
   platform_version: string
   program_code?: string | null
@@ -3570,14 +3672,7 @@ export type PipelineTemplateConfig = {
  * Fields which are optional and not provided will be set to their empty type value
  * (for strings: an empty string `""`, for objects: an empty dictionary `{}`).
  */
-export type PostPutPipeline = {
-  /**
-   * Deprecated: use `metadata` instead.
-   *
-   * @deprecated
-   */
-  description?: string | null
-  metadata?: string | null
+export type PostPutPipeline = ClientMetadata & {
   name: string
   program_code: string
   program_config?: ProgramConfig | null
@@ -4177,6 +4272,7 @@ export type Rel = {
 export type Relation = SqlIdentifier & {
   fields: Array<Field>
   materialized?: boolean
+  primary_key?: Array<string> | null
   properties?: {
     [key: string]: PropertyValue
   }
@@ -6154,6 +6250,43 @@ export type PostPipelineClearResponses = {
   202: unknown
 }
 
+export type ClockAdvanceData = {
+  /**
+   * Milliseconds to add to NOW(); zero reads the current value, null/omitted: advance by one clock_resolution.
+   */
+  body: ClockAdvanceRequest
+  path: {
+    /**
+     * Unique pipeline name
+     */
+    pipeline_name: string
+  }
+  query?: never
+  url: '/v0/pipelines/{pipeline_name}/clock/advance'
+}
+
+export type ClockAdvanceErrors = {
+  /**
+   * Clock not in http-driven mode, or malformed body.
+   */
+  400: ErrorResponse
+  /**
+   * Pipeline is not running.
+   */
+  503: ErrorResponse
+}
+
+export type ClockAdvanceError = ClockAdvanceErrors[keyof ClockAdvanceErrors]
+
+export type ClockAdvanceResponses = {
+  /**
+   * Clock advanced successfully; body contains the new NOW().
+   */
+  200: ClockAdvanceResponse
+}
+
+export type ClockAdvanceResponse2 = ClockAdvanceResponses[keyof ClockAdvanceResponses]
+
 export type CommitTransactionData = {
   body?: never
   path: {
@@ -6319,6 +6452,10 @@ export type HttpOutputData = {
      * Output data format, either 'csv' or 'json'.
      */
     format: string
+    /**
+     * Set to `true` to send a full snapshot of a materialized view before streaming incremental updates. The default is `false`. Works on a paused pipeline: the snapshot is delivered from the latest cached view state without requiring the pipeline to be running.
+     */
+    send_snapshot?: boolean | null
     /**
      * Set to `true` to group updates in this stream into JSON arrays (used in conjunction with `format=json`). The default value is `false`
      */
@@ -6696,49 +6833,6 @@ export type PostPipelineRebalanceResponses = {
   200: unknown
 }
 
-export type ResetStatusData = {
-  body?: never
-  path: {
-    /**
-     * Unique pipeline name
-     */
-    pipeline_name: string
-  }
-  query: {
-    /**
-     * Reset token returned by the output connector reset endpoint.
-     */
-    token: string
-  }
-  url: '/v0/pipelines/{pipeline_name}/reset_status'
-}
-
-export type ResetStatusErrors = {
-  /**
-   * An invalid reset token was provided
-   */
-  400: ErrorResponse
-  /**
-   * Pipeline with that name does not exist
-   */
-  404: ErrorResponse
-  /**
-   * Reset token was created by a previous incarnation of the pipeline; the server cannot validate the reset across incarnations. Reissue the reset.
-   */
-  410: ErrorResponse
-  500: ErrorResponse
-  503: ErrorResponse
-}
-
-export type ResetStatusError = ResetStatusErrors[keyof ResetStatusErrors]
-
-export type ResetStatusResponses = {
-  /**
-   * Reset token status has been retrieved
-   */
-  200: unknown
-}
-
 export type PostPipelineResumeData = {
   body?: never
   path: {
@@ -6902,6 +6996,37 @@ export type PostPipelineStartResponses = {
    * Action is accepted and is being performed
    */
   202: unknown
+}
+
+export type PostPipelineStartCompactionData = {
+  body?: never
+  path: {
+    /**
+     * Unique pipeline name
+     */
+    pipeline_name: string
+  }
+  query?: never
+  url: '/v0/pipelines/{pipeline_name}/start_compaction'
+}
+
+export type PostPipelineStartCompactionErrors = {
+  /**
+   * Pipeline with that name does not exist
+   */
+  404: ErrorResponse
+  500: ErrorResponse
+  503: ErrorResponse
+}
+
+export type PostPipelineStartCompactionError =
+  PostPipelineStartCompactionErrors[keyof PostPipelineStartCompactionErrors]
+
+export type PostPipelineStartCompactionResponses = {
+  /**
+   * Compaction started successfully
+   */
+  200: unknown
 }
 
 export type StartTransactionData = {
@@ -7347,49 +7472,6 @@ export type PostUpdateRuntimeResponses = {
 }
 
 export type PostUpdateRuntimeResponse = PostUpdateRuntimeResponses[keyof PostUpdateRuntimeResponses]
-
-export type PostPipelineOutputConnectorResetData = {
-  body?: never
-  path: {
-    /**
-     * Unique pipeline name
-     */
-    pipeline_name: string
-    /**
-     * SQL view name
-     */
-    view_name: string
-    /**
-     * Output connector name
-     */
-    connector_name: string
-  }
-  query?: never
-  url: '/v0/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/reset'
-}
-
-export type PostPipelineOutputConnectorResetErrors = {
-  /**
-   * The output connector does not support reset
-   */
-  400: ErrorResponse
-  /**
-   * Pipeline, view and/or output connector with that name does not exist
-   */
-  404: ErrorResponse
-  500: ErrorResponse
-  503: ErrorResponse
-}
-
-export type PostPipelineOutputConnectorResetError =
-  PostPipelineOutputConnectorResetErrors[keyof PostPipelineOutputConnectorResetErrors]
-
-export type PostPipelineOutputConnectorResetResponses = {
-  /**
-   * Output connector reset request has been processed
-   */
-  200: unknown
-}
 
 export type GetPipelineOutputConnectorStatusData = {
   body?: never

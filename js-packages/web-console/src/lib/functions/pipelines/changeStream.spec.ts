@@ -14,10 +14,10 @@
 import { BigNumber } from 'bignumber.js'
 import { describe, expect, it } from 'vitest'
 import type { ChangeStreamData, Row } from '$lib/components/pipelines/editor/ChangeStream.svelte'
-import type { XgressEntry } from '$lib/services/pipelineManager'
 import {
   appendRowsForRelation,
   createBigNumberStreamParser,
+  newlineJsonDecoder,
   parseStream,
   type StreamingJsonParser
 } from './changeStream'
@@ -39,15 +39,16 @@ const makeMockStream = (chunks: (Uint8Array | string)[]): ReadableStream<Uint8Ar
   })
 }
 
-// Runs `parseStream` over `chunks` and resolves the returned Promise once the stream has ended and the
-// last flush has fired. Returns everything the consumer would have observed.
+// Runs `parseStream` over `chunks` with a JSON decoder and resolves once the
+// stream has ended and the last flush has fired. Returns everything the
+// consumer would have observed.
 const runParseStream = <T>(
   chunks: (Uint8Array | string)[],
   parserOpts: Parameters<typeof createBigNumberStreamParser<T>>[0] = {
     paths: ['$'],
     separator: ''
   },
-  options?: Parameters<typeof parseStream<T>>[3]
+  options?: { bufferSize?: number; flushIntervalMs?: number }
 ) =>
   new Promise<{
     values: T[]
@@ -59,17 +60,19 @@ const runParseStream = <T>(
     const parser = createBigNumberStreamParser<T>(parserOpts)
     parseStream<T>(
       { stream: makeMockStream(chunks), cancel: () => {} },
-      parser,
+      newlineJsonDecoder<T>(parser, {
+        bufferSize: options?.bufferSize,
+        onBytesSkipped: (n) => skipped.push(n)
+      }),
       {
         pushChanges: (vs) => {
           for (const v of vs) {
             values.push(v)
           }
         },
-        onBytesSkipped: (n) => skipped.push(n),
         onParseEnded: () => resolve({ values, skipped, parser })
       },
-      options
+      { flushIntervalMs: options?.flushIntervalMs }
     )
   })
 

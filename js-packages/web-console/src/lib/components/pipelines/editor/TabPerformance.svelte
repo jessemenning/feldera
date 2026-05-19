@@ -23,11 +23,8 @@
   import { formatDateTime, formatQty } from '$lib/functions/format'
   import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
-  import {
-    createBigNumberStreamParser,
-    parseStream,
-    pushAsCircularBuffer
-  } from '$lib/functions/pipelines/changeStream'
+  import { pushAsCircularBuffer } from '$lib/functions/pipelines/changeStream'
+  import { JSONParser } from '@streamparser/json-whatwg'
   import { getDeploymentStatusLabel, isMetricsAvailable } from '$lib/functions/pipelines/status'
   import type { CheckpointMetadata, CheckpointStatus } from '$lib/services/manager'
   import type { ExtendedPipeline } from '$lib/services/pipelineManager'
@@ -90,45 +87,39 @@
       cancelStream = undefined
       return undefined
     }
-    const { cancel } = parseStream(
-      result,
-      createBigNumberStreamParser<TimeSeriesEntry>({
-        paths: ['$'],
-        separator: ''
-      }),
-      {
-        pushChanges: (rows: TimeSeriesEntry[]) => {
-          pushAsCircularBuffer(
-            () => timeSeries,
-            63,
-            (v: TimeSeriesEntry) => v
-          )(rows)
-        },
-        onBytesSkipped: (skippedBytes) => {},
-        onParseEnded: () => {
-          if (metricsAvailable && cancelStream) {
-            endMetricsStream()
-            if (pipelineName !== targetPipelineName) {
-              return
-            }
-            startMetricsStream(api, targetPipelineName)
-          }
-        },
-        onNetworkError: () => {
-          if (metricsAvailable && cancelStream) {
-            endMetricsStream()
-            if (pipelineName !== targetPipelineName) {
-              return
-            }
-            startMetricsStream(api, targetPipelineName)
-          }
-        }
-      },
-      {
-        bufferSize: 8 * 1024 * 1024
-      }
+    // `JSONParser` from `@streamparser/json-whatwg` handles tokenizing and
+    // document framing. Metric values parse as JS numbers — `Number.MAX_SAFE_INTEGER`
+    // is well outside the range of realistic timestamps, record counts, and byte sizes.
+    const reader = result.stream
+      .pipeThrough(new JSONParser({ paths: ['$'], separator: '' }))
+      .getReader()
+    let cancelled = false
+    const appendRow = pushAsCircularBuffer(
+      () => timeSeries,
+      63,
+      (v: TimeSeriesEntry) => v
     )
-    cancelStream = cancel
+    cancelStream = () => {
+      cancelled = true
+      reader.cancel().catch(() => {})
+      result.cancel()
+    }
+    ;(async () => {
+      try {
+        while (!cancelled) {
+          const { value, done } = await reader.read()
+          if (done) break
+          appendRow([value.value as TimeSeriesEntry])
+        }
+      } catch {
+        /* fall through to restart logic */
+      }
+      if (cancelled || !metricsAvailable || !cancelStream) return
+      endMetricsStream()
+      if (pipelineName === targetPipelineName) {
+        startMetricsStream(api, targetPipelineName)
+      }
+    })()
   }
 
   const pipelineName = $derived(pipeline.current.name)

@@ -12,6 +12,7 @@ use apache_avro::Schema as AvroSchema;
 use apache_avro::schema::NamesRef;
 #[cfg(feature = "with-avro")]
 use apache_avro::types::Value as AvroValue;
+use aws_sdk_dynamodb::types::AttributeValue;
 use csv::{Writer as CsvWriter, WriterBuilder as CsvWriterBuilder};
 use dbsp::{
     Batch, BatchReader, OutputHandle, Trace,
@@ -43,7 +44,12 @@ use feldera_types::{
 use rand::thread_rng;
 use serde::Serialize;
 use serde_arrow::ArrayBuilder;
-use std::{any::Any, collections::HashSet, fmt::Debug, iter::once};
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    iter::once,
+};
 use std::{cell::RefCell, io, io::Write, marker::PhantomData, ops::DerefMut, sync::Arc};
 
 pub trait ErasedSerializeWithContext {
@@ -692,6 +698,14 @@ where
         .map_err(|e| anyhow!("Failed to serialize key to JSON: {}", e))
     }
 
+    fn key_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        serde_dynamo::aws_sdk_dynamodb_1::to_item(SerializeWithContextWrapper::new(
+            self.key.as_ref().unwrap(),
+            &self.serde_config,
+        ))
+        .map_err(|e| anyhow!("Failed to serialize key to DynamoDB attribute value: {}", e))
+    }
+
     fn serialize_key_fields(
         &mut self,
         fields: &HashSet<String>,
@@ -799,6 +813,19 @@ where
             &self.serde_config,
         ))
         .map_err(|e| anyhow!("Failed to serialize value to JSON: {}", e))
+    }
+
+    fn val_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        serde_dynamo::aws_sdk_dynamodb_1::to_item(SerializeWithContextWrapper::new(
+            self.val.as_ref().unwrap(),
+            &self.serde_config,
+        ))
+        .map_err(|e| {
+            anyhow!(
+                "Failed to serialize value to DynamoDB attribute value: {}",
+                e
+            )
+        })
     }
 
     #[cfg(feature = "with-avro")]

@@ -1,0 +1,37 @@
+name: Solace Connector CI
+
+on:
+  push:
+    branches: [feat/solace-connector]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: Check Solace transport
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.MSRV }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.1"
+
+      - name: Cache Cargo registry and index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-solace-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-solace-${{ runner.os }}-
+
+      # solace-rs auto-downloads the Solace C SDK for Linux x64 at build time.
+      # --no-default-features avoids pulling in native deps (rdkafka, postgres-cdc, etc.)
+      # that are not available on a stock ubuntu runner.
+      - name: Check adapters crate with Solace feature
+        run: cargo check --locked -p dbsp_adapters --no-default-features --features with-solace

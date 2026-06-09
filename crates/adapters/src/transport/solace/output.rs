@@ -252,4 +252,38 @@ mod tests {
             "{region}/results"
         );
     }
+
+    #[test]
+    fn numeric_field_value_no_quotes() {
+        let buf = br#"{"count":42}"#;
+        assert_eq!(resolve_topic("stats/{count}", buf), "stats/42");
+    }
+
+    #[test]
+    fn same_placeholder_repeated() {
+        let buf = br#"{"region":"us-east"}"#;
+        assert_eq!(
+            resolve_topic("{region}/{region}", buf),
+            "us-east/us-east"
+        );
+    }
+
+    #[test]
+    fn unclosed_brace_kept_literally() {
+        let buf = br#"{"region":"us-east"}"#;
+        // `{region` without closing `}` — kept as-is.
+        assert_eq!(resolve_topic("{region/end", buf), "{region/end");
+    }
+
+    #[test]
+    fn empty_brace_kept_literally() {
+        // `{}` has an empty field name; `record.get("")` finds nothing in an empty
+        // object, so the placeholder is preserved as `{}`.
+        assert_eq!(resolve_topic("{}/end", b"{}"), "{}/end");
+    }
+
+    #[test]
+    fn no_braces_empty_buffer() {
+        assert_eq!(resolve_topic("static/topic", b""), "static/topic");
+    }
 }

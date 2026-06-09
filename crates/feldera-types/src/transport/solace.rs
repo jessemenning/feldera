@@ -160,3 +160,110 @@ pub enum OutputDeliveryMode {
     /// Broker-acknowledged; survives broker restarts at the cost of latency.
     Persistent,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input_cfg(host: &str, port: u16) -> SolaceInputConfig {
+        SolaceInputConfig {
+            host: host.into(),
+            port,
+            vpn: "default".into(),
+            username: "u".into(),
+            password: "p".into(),
+            queue: "q".into(),
+            window_size: 255,
+            topic_pattern: None,
+        }
+    }
+
+    fn output_cfg(host: &str, port: u16) -> SolaceOutputConfig {
+        SolaceOutputConfig {
+            host: host.into(),
+            port,
+            vpn: "default".into(),
+            username: "u".into(),
+            password: "p".into(),
+            topic: "t".into(),
+            delivery_mode: OutputDeliveryMode::Direct,
+        }
+    }
+
+    // --- smf_url ---
+
+    #[test]
+    fn input_smf_url_default_port() {
+        assert_eq!(
+            input_cfg("broker.example.com", 55555).smf_url(),
+            "tcp://broker.example.com:55555"
+        );
+    }
+
+    #[test]
+    fn input_smf_url_custom_port() {
+        assert_eq!(input_cfg("localhost", 1234).smf_url(), "tcp://localhost:1234");
+    }
+
+    #[test]
+    fn output_smf_url() {
+        assert_eq!(
+            output_cfg("mq.prod.corp", 55555).smf_url(),
+            "tcp://mq.prod.corp:55555"
+        );
+    }
+
+    // --- serde defaults ---
+
+    #[test]
+    fn input_config_minimal_json_applies_defaults() {
+        let json = r#"{"host":"h","username":"u","password":"p","queue":"q"}"#;
+        let cfg: SolaceInputConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.port, 55555);
+        assert_eq!(cfg.vpn, "default");
+        assert_eq!(cfg.window_size, 255);
+        assert_eq!(cfg.topic_pattern, None);
+    }
+
+    #[test]
+    fn input_config_explicit_values_round_trip() {
+        let json = r#"{
+            "host":"broker.example.com",
+            "port":55003,
+            "vpn":"my-vpn",
+            "username":"feldera",
+            "password":"secret",
+            "queue":"feldera-q",
+            "window_size":128,
+            "topic_pattern":"demo/{region}/{type}"
+        }"#;
+        let cfg: SolaceInputConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, "broker.example.com");
+        assert_eq!(cfg.port, 55003);
+        assert_eq!(cfg.vpn, "my-vpn");
+        assert_eq!(cfg.window_size, 128);
+        assert_eq!(cfg.topic_pattern.as_deref(), Some("demo/{region}/{type}"));
+        assert_eq!(cfg.smf_url(), "tcp://broker.example.com:55003");
+    }
+
+    #[test]
+    fn output_config_minimal_json_applies_defaults() {
+        let json = r#"{"host":"h","username":"u","password":"p","topic":"t"}"#;
+        let cfg: SolaceOutputConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.port, 55555);
+        assert_eq!(cfg.vpn, "default");
+        assert_eq!(cfg.delivery_mode, OutputDeliveryMode::Direct);
+    }
+
+    #[test]
+    fn output_config_persistent_delivery_mode() {
+        let json = r#"{"host":"h","username":"u","password":"p","topic":"t","delivery_mode":"persistent"}"#;
+        let cfg: SolaceOutputConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.delivery_mode, OutputDeliveryMode::Persistent);
+    }
+
+    #[test]
+    fn delivery_mode_default_is_direct() {
+        assert_eq!(OutputDeliveryMode::default(), OutputDeliveryMode::Direct);
+    }
+}

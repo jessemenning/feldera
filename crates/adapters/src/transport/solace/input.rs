@@ -356,6 +356,56 @@ fn build_metadata(
 // Command handlers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use feldera_types::config::FtModel;
+    use feldera_types::transport::solace::SolaceInputConfig;
+
+    use super::{InputEndpoint, SolaceInputEndpoint, State};
+
+    fn make_config() -> SolaceInputConfig {
+        SolaceInputConfig {
+            host: "localhost".into(),
+            port: 55555,
+            vpn: "default".into(),
+            username: "user".into(),
+            password: "pass".into(),
+            queue: "test-q".into(),
+            window_size: 255,
+            topic_pattern: None,
+        }
+    }
+
+    #[test]
+    fn fault_tolerance_is_none_until_phase_5() {
+        // Phase 5 (checkpoint_watcher / ExactlyOnce) is not yet implemented.
+        // Ensure we don't accidentally advertise FT to the Feldera runtime.
+        let ep = SolaceInputEndpoint::new(make_config());
+        assert_eq!(ep.fault_tolerance(), None::<FtModel>);
+    }
+
+    #[test]
+    fn state_eq_and_ne() {
+        assert_eq!(State::Paused, State::Paused);
+        assert_eq!(State::Running, State::Running);
+        assert_eq!(State::Done, State::Done);
+        assert_ne!(State::Paused, State::Running);
+        assert_ne!(State::Running, State::Done);
+        assert_ne!(State::Paused, State::Done);
+    }
+
+    #[test]
+    fn state_debug() {
+        assert_eq!(format!("{:?}", State::Paused), "Paused");
+        assert_eq!(format!("{:?}", State::Running), "Running");
+        assert_eq!(format!("{:?}", State::Done), "Done");
+    }
+}
+
 /// Handles all commands except Queue (which is awaited inline in the main loop).
 fn handle_non_queue_command(
     command: InputReaderCommand,

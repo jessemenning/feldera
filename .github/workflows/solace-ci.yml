@@ -102,7 +102,12 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
           OPENSSL_NO_VENDOR: "1"
           OPENSSL_STATIC: "1"
-        run: cargo build --release --locked -p pipeline-manager
+          # Skip the bun/SvelteKit web-console build — we only need the REST API.
+          # build.rs embeds whatever is in this dir; an empty dir = no web UI.
+          WEBCONSOLE_BUILD_DIR: /tmp/webconsole-empty
+        run: |
+          mkdir -p /tmp/webconsole-empty
+          cargo build --release --locked -p pipeline-manager
 
       # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────
       - name: Stage build artifacts

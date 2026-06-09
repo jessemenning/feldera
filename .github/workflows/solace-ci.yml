@@ -85,16 +85,7 @@ jobs:
           sudo apt-get install -y \
             libssl-dev pkg-config libclang-dev \
             libsasl2-dev libzstd-dev zlib1g-dev \
-            cmake build-essential
-
-      - name: Install mold linker
-        run: |
-          ARCH=$(dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g")
-          curl -LO "https://github.com/rui314/mold/releases/download/v2.40.1/mold-2.40.1-${ARCH}-linux.tar.gz"
-          tar -xzf "mold-2.40.1-${ARCH}-linux.tar.gz"
-          sudo mv "mold-2.40.1-${ARCH}-linux/bin/mold" /usr/local/bin/mold
-          sudo mv "mold-2.40.1-${ARCH}-linux/lib/mold/mold-wrapper.so" /usr/local/lib/
-          rm -rf "mold-2.40.1-${ARCH}-linux.tar.gz" "mold-2.40.1-${ARCH}-linux"
+            cmake build-essential lld
 
       - name: Cache Cargo build
         uses: actions/cache@v4
@@ -108,7 +99,7 @@ jobs:
 
       - name: Build pipeline-manager (release)
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
           OPENSSL_NO_VENDOR: "1"
           OPENSSL_STATIC: "1"
         run: cargo build --release --locked -p pipeline-manager

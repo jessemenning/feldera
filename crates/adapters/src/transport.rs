@@ -50,6 +50,9 @@ pub(crate) mod nats;
 #[cfg(feature = "with-nexmark")]
 mod nexmark;
 
+#[cfg(feature = "with-solace")]
+pub(crate) mod solace;
+
 #[cfg(feature = "with-pubsub")]
 mod pubsub;
 

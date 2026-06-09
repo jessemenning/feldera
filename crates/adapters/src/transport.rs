@@ -75,6 +75,9 @@ use crate::transport::null::NullOutputEndpoint;
 #[cfg(feature = "with-nats")]
 use crate::transport::nats::NatsInputEndpoint;
 
+#[cfg(feature = "with-solace")]
+use crate::transport::solace::{SolaceInputEndpoint, SolaceOutputEndpoint};
+
 #[cfg(feature = "with-nexmark")]
 use crate::transport::nexmark::NexmarkEndpoint;
 use crate::transport::s3::S3InputEndpoint;
@@ -105,6 +108,10 @@ pub fn input_transport_config_to_endpoint(
         TransportConfig::NatsInput(config) => Box::new(NatsInputEndpoint::new(config)?),
         #[cfg(not(feature = "with-nats"))]
         TransportConfig::NatsInput(_) => return Ok(None),
+        #[cfg(feature = "with-solace")]
+        TransportConfig::SolaceInput(config) => Box::new(SolaceInputEndpoint::new(config)),
+        #[cfg(not(feature = "with-solace"))]
+        TransportConfig::SolaceInput(_) => return Ok(None),
         #[cfg(feature = "with-pubsub")]
         TransportConfig::PubSubInput(config) => Box::new(PubSubInputEndpoint::new(config.clone())?),
         #[cfg(not(feature = "with-pubsub"))]
@@ -131,7 +138,8 @@ pub fn input_transport_config_to_endpoint(
         | TransportConfig::HttpOutput(_)
         | TransportConfig::RedisOutput(_)
         | TransportConfig::IcebergInput(_)
-        | TransportConfig::NullOutput => return Ok(None),
+        | TransportConfig::NullOutput
+        | TransportConfig::SolaceOutput(_) => return Ok(None),
     };
     Ok(Some(endpoint))
 }
@@ -168,6 +176,10 @@ pub fn output_transport_config_to_endpoint(
             Ok(Some(Box::new(RedisOutputEndpoint::new(config)?)))
         }
         TransportConfig::NullOutput => Ok(Some(Box::new(NullOutputEndpoint))),
+        #[cfg(feature = "with-solace")]
+        TransportConfig::SolaceOutput(config) => {
+            Ok(Some(Box::new(SolaceOutputEndpoint::new(config))))
+        }
         _ => Ok(None),
     }
 }

@@ -18,6 +18,7 @@ use crate::transport::http::{HttpInputConfig, HttpOutputConfig};
 use crate::transport::iceberg::IcebergReaderConfig;
 use crate::transport::kafka::{KafkaInputConfig, KafkaOutputConfig};
 use crate::transport::nats::NatsInputConfig;
+use crate::transport::solace::{SolaceInputConfig, SolaceOutputConfig};
 use crate::transport::nexmark::NexmarkInputConfig;
 use crate::transport::postgres::{
     PostgresCdcReaderConfig, PostgresReaderConfig, PostgresWriterConfig,
@@ -1885,6 +1886,8 @@ pub enum TransportConfig {
     NullOutput,
     /// Input connector that produces no data.
     EmptyInput,
+    SolaceInput(SolaceInputConfig),
+    SolaceOutput(SolaceOutputConfig),
 }
 
 impl TransportConfig {
@@ -1914,6 +1917,8 @@ impl TransportConfig {
             TransportConfig::ClockInput(_) => "clock".to_string(),
             TransportConfig::NullOutput => "null_output".to_string(),
             TransportConfig::EmptyInput => "empty_input".to_string(),
+            TransportConfig::SolaceInput(_) => "solace_input".to_string(),
+            TransportConfig::SolaceOutput(_) => "solace_output".to_string(),
         }
     }
 

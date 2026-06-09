@@ -147,8 +147,6 @@ async fn background_task(
     let mut flow = match session.create_flow(
         &config.queue,
         AckMode::Client,
-        config.window_size,
-        None,
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -163,7 +161,7 @@ async fn background_task(
     // ack — the broker redelivers, but Feldera has restarted clean so we'd
     // process them again. Phase 5 (Enterprise FT + checkpoint) makes this
     // cross-restart durable.
-    let mut seen_rgmids: HashSet<[u8; 16]> = HashSet::new();
+    let mut seen_rgmids: HashSet<String> = HashSet::new();
 
     let mut state = State::Paused;
 
@@ -270,13 +268,13 @@ fn process_message(
     queue: &Arc<InputQueue<u64>>,
     consumer: &dyn InputConsumer,
     parser: &mut Box<dyn Parser>,
-    seen_rgmids: &mut HashSet<[u8; 16]>,
+    seen_rgmids: &mut HashSet<String>,
     config: &SolaceInputConfig,
 ) {
     // RGMID dedup: skip broker redeliveries we've already ingested this session.
-    if let Ok(Some(rgmid)) = msg.get_replication_group_message_id_raw() {
-        if !seen_rgmids.insert(rgmid) {
-            debug!("Skipping duplicate RGMID {:?}", rgmid);
+    if let Ok(Some(rgmid)) = msg.get_replication_group_message_id() {
+        if !seen_rgmids.insert(rgmid.clone()) {
+            debug!("Skipping duplicate RGMID {}", rgmid);
             return;
         }
     }

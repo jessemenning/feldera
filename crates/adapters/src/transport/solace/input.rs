@@ -17,7 +17,6 @@ use solace_rs::{Context, SolaceLogLevel};
 use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::flow::AckMode;
 use solace_rs::message::Message;
-use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -61,7 +60,24 @@ impl TransportInputEndpoint for SolaceInputEndpoint {
 
         let config = Arc::clone(&self.config);
 
-        Handle::current().spawn(background_task(config, consumer, parser, cmd_rx));
+        // connector-init threads are plain OS threads (not Tokio tasks), so
+        // Handle::current() panics.  Use try_current(): if a runtime is active
+        // (e.g. in tests) use it; otherwise spin up a dedicated single-threaded
+        // runtime on a new OS thread to host the background task.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(background_task(config, consumer, parser, cmd_rx));
+            }
+            Err(_) => {
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("solace-input: failed to build Tokio runtime")
+                        .block_on(background_task(config, consumer, parser, cmd_rx));
+                });
+            }
+        }
 
         Ok(Box::new(SolaceInputReader { cmd_tx }))
     }

@@ -190,7 +190,17 @@ async fn background_task(
                     Some(c) => c,
                     None => break,
                 };
-                handle_non_queue_command(cmd, &mut state, &flow, &*consumer);
+                match cmd {
+                    InputReaderCommand::Queue { .. } => {
+                        // Controller sends Queue during initialization (before Extend)
+                        // to complete the first empty input step.  Flush (returns 0
+                        // bytes / no aux) and signal completion so the pipeline can
+                        // advance from Initializing → Running.
+                        let (buffer_size, _hasher, _aux_vec) = queue.flush_with_aux();
+                        consumer.extended(buffer_size, None, vec![]);
+                    }
+                    other => handle_non_queue_command(other, &mut state, &flow, &*consumer),
+                }
             }
 
             State::Running => {

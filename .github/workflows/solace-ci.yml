@@ -54,6 +54,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
       # ── Java (SQL compiler) ──────────────────────────────────────────────────
       - name: Set up Java 21
         uses: actions/setup-java@v4

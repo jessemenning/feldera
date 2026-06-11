@@ -46,6 +46,7 @@ jobs:
     # Only push on direct pushes — not PRs (PRs from forks don't have GITHUB_TOKEN write access)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # Large runner recommended; Rust + Java compile takes ~25 min on a 2-core runner.
     # If you have access to larger GitHub-hosted runners, change to ubuntu-latest-16-cores.
 

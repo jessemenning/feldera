@@ -96,7 +96,8 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/rele
 #
 FROM base AS release
 
-# Run the precompile phase to speed up Rust compilations during deployment
-RUN ./feldera/build/pipeline-manager --bind-address=0.0.0.0 --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock --dbsp-override-path=$HOME/feldera --precompile
+# --precompile removed: it warms up the Rust compilation cache inside the image
+# but adds ~40 min to every CI build.  First pipeline compilation after container
+# start will be slower (~5 min), which is acceptable for dev/demo use.
 ENV BANNER_ADDR=localhost
 ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]

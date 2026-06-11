@@ -140,3 +140,7 @@ jobs:
             ghcr.io/jessemenning/feldera:${{ github.sha }}
           cache-from: type=gha,scope=feldera-docker
           cache-to:   type=gha,mode=max,scope=feldera-docker
+        env:
+          # plain progress surfaces RUST_LOG heartbeat lines from --precompile
+          # in the GHA log so we can tell "compiling" from "stuck"
+          BUILDX_PROGRESS: plain

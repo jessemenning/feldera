@@ -348,6 +348,15 @@ fn build_metadata(
     let mut meta = ConnectorMetadata::new();
     meta.insert("solace_topic", Variant::String(SqlString::from(topic.as_str())));
 
+    // Broker receive timestamp — milliseconds since Unix epoch when the broker
+    // enqueued the message.  Available as CONNECTOR_METADATA()['broker_ts']
+    // (BIGINT) in SQL table DEFAULT expressions.
+    if let Ok(Some(ts)) = msg.get_receive_timestamp() {
+        if let Ok(ms) = i64::try_from(ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()) {
+            meta.insert("broker_ts", Variant::BigInt(ms));
+        }
+    }
+
     if let Some(pattern) = &config.topic_pattern {
         for (name, value) in super::config::parse_topic_fields(pattern, &topic) {
             meta.insert(&name, Variant::String(SqlString::from(value.as_str())));

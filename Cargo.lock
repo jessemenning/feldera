@@ -1905,7 +1905,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -1923,7 +1923,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -1941,7 +1941,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2623,7 +2623,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6536,7 +6536,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -7278,7 +7278,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.5",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -11763,8 +11763,8 @@ dependencies = [
 
 [[package]]
 name = "solace-rs"
-version = "0.9.0"
-source = "git+https://github.com/jessemenning/solace-rs#724f8510849964010d34fa2b34d833d45e59b74d"
+version = "0.9.1"
+source = "git+https://github.com/jessemenning/solace-rs?rev=5d3b633e7c760493551305a3bddac9520c20f572#5d3b633e7c760493551305a3bddac9520c20f572"
 dependencies = [
  "enum_primitive",
  "futures-core",
@@ -11778,7 +11778,7 @@ dependencies = [
 [[package]]
 name = "solace-rs-sys"
 version = "1.1.0"
-source = "git+https://github.com/jessemenning/solace-rs#724f8510849964010d34fa2b34d833d45e59b74d"
+source = "git+https://github.com/jessemenning/solace-rs?rev=5d3b633e7c760493551305a3bddac9520c20f572#5d3b633e7c760493551305a3bddac9520c20f572"
 dependencies = [
  "bindgen 0.66.1",
  "cfg-if",
@@ -13907,7 +13907,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

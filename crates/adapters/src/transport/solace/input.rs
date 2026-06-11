@@ -142,6 +142,7 @@ async fn background_task(
         .username(config.username.clone())
         .password(config.password.clone())
         .reconnect_retries(3)
+        .generate_rcv_timestamps(true)
         .build()
     {
         Ok(s) => s,
@@ -162,6 +163,8 @@ async fn background_task(
     let mut flow = match session.create_flow(
         &config.queue,
         AckMode::Client,
+        config.window_size,
+        None,
     ) {
         Ok(f) => f,
         Err(e) => {

@@ -110,7 +110,7 @@ RUN bash -c ' \
       --precompile & \
     PID=$! ; \
     while kill -0 $PID 2>/dev/null; do \
-        echo "[precompile] still running at $(date -u +'%T UTC')" ; \
+        echo "[precompile] still running at $(date -u +%T) UTC" ; \
         sleep 30 ; \
     done ; \
     wait $PID'

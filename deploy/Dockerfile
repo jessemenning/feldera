@@ -97,16 +97,22 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/rele
 FROM base AS release
 
 # Pre-warm the Rust compilation cache so first user pipeline compiles fast.
-# RUST_LOG=info surfaces heartbeat lines in Docker BuildKit output so CI
-# can distinguish "compiling" from "stuck".  CARGO_BUILD_JOBS=2 caps RAM
-# to ~4 GB and prevents OOM on GitHub-hosted runners (7 GB limit).
-RUN RUST_LOG=pipeline_manager=info,feldera_types=info \
+# CARGO_BUILD_JOBS=2 caps parallel rustc workers to ~4 GB RAM.
+# The heartbeat loop prints a timestamp every 30 s so CI logs show the step
+# is still alive (cargo runs as a subprocess; its output is not forwarded).
+RUN bash -c ' \
     CARGO_BUILD_JOBS=2 \
     ./feldera/build/pipeline-manager \
       --bind-address=0.0.0.0 \
       --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar \
       --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock \
       --dbsp-override-path=$HOME/feldera \
-      --precompile
+      --precompile & \
+    PID=$! ; \
+    while kill -0 $PID 2>/dev/null; do \
+        echo "[precompile] still running at $(date -u +%T UTC)" ; \
+        sleep 30 ; \
+    done ; \
+    wait $PID'
 ENV BANNER_ADDR=localhost
 ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]

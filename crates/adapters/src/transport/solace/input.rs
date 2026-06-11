@@ -10,7 +10,6 @@ use feldera_adapterlib::transport::{
 };
 use feldera_sqllib::{SqlString, Variant};
 use feldera_types::config::FtModel;
-use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
 use serde_json::Value as JsonValue;
 use solace_rs::{Context, SolaceLogLevel};
@@ -18,7 +17,6 @@ use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::flow::AckMode;
 use solace_rs::message::Message;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use super::config::SolaceInputConfig;
@@ -125,9 +123,10 @@ async fn background_task(
     // Clone consumer for InputQueue; keep original for error()/extended() calls.
     let queue = Arc::new(InputQueue::<u64>::new(consumer.clone()));
 
-    // Grab the completion watcher now, before the consumer is moved into the queue.
-    // This always returns Some in Feldera open-core.
-    let mut completion_rx: Option<watch::Receiver<Completion>> = consumer.completion_watcher();
+    // completion_watcher() is available but not used: waiting for the circuit
+    // step before acking caused a multi-connector deadlock (all connectors
+    // waited for the same step simultaneously, circuit never fired).
+    // Ack immediately after extended() instead.
 
     let context = match Context::new(SolaceLogLevel::Warning) {
         Ok(c) => c,
@@ -210,31 +209,11 @@ async fn background_task(
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(InputReaderCommand::Queue { .. }) => {
-                                // Phase 3 deferred-ack path — inlined here so no
-                                // &OwnedAsyncFlow reference crosses the await point.
                                 let (buffer_size, _hasher, aux_vec) = queue.flush_with_aux();
-
-                                let pre_step = completion_rx
-                                    .as_ref()
-                                    .map(|w| w.borrow().total_completed_steps)
-                                    .unwrap_or(u64::MAX);
-
                                 consumer.extended(buffer_size, None, vec![]);
-
-                                // Wait until the circuit step that consumed our batch completes.
-                                if let Some(ref mut watcher) = completion_rx {
-                                    loop {
-                                        if watcher.borrow().total_completed_steps > pre_step {
-                                            break;
-                                        }
-                                        if watcher.changed().await.is_err() {
-                                            debug!("completion_watcher sender dropped");
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Ack now — no flow reference was held across the await.
+                                // Ack immediately — deferred-ack (wait for circuit step)
+                                // caused deadlock: all connectors waited on the same step,
+                                // blocking the circuit from ever firing.
                                 let n = aux_vec.len();
                                 for (_, msg_id) in aux_vec {
                                     if let Err(e) = flow.ack(msg_id) {
@@ -242,7 +221,7 @@ async fn background_task(
                                     }
                                 }
                                 if n > 0 {
-                                    debug!("Acked {n} messages after circuit step");
+                                    debug!("Acked {n} messages");
                                 }
                             }
                             Some(c) => handle_non_queue_command(c, &mut state, &flow, &*consumer),

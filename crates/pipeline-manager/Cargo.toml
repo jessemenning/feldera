@@ -106,7 +106,7 @@ utoipa-swagger-ui = { workspace = true, features = ["actix-web"] }
 #
 # - `reqwest` has an HTTPS-only mode.
 awc = { workspace = true, features = ["rustls-0_23", "rustls-0_23-native-roots"] }
-reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots", "stream"] }
 cached = { workspace = true }
 crossbeam = { workspace = true }
 rustls = { workspace = true }

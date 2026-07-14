@@ -2,7 +2,7 @@
 use crate::catalog::AvroStream;
 #[cfg(feature = "with-avro")]
 use crate::format::avro::from_avro_value;
-use crate::format::csv::deserializer::ByteRecordDeserializer;
+use crate::format::csv::{csv_reader_builder, deserializer::ByteRecordDeserializer};
 use crate::format::raw::{RawDeserializer, raw_serde_config};
 use crate::{
     ControllerError, DeCollectionHandle,
@@ -25,7 +25,7 @@ use erased_serde::Deserializer as ErasedDeserializer;
 use feldera_adapterlib::catalog::AvroSchemaRefs;
 use feldera_adapterlib::format::{BufferSize, flatten_nested};
 use feldera_sqllib::Variant;
-use feldera_types::format::csv::CsvParserConfig;
+use feldera_types::format::csv::CsvFormatConfig;
 use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde_arrow::Deserializer as ArrowDeserializer;
 use serde_json::de::SliceRead;
@@ -94,16 +94,12 @@ pub struct CsvDeserializerFromBytes {
     config: SqlSerdeConfig,
 }
 
-impl DeserializerFromBytes<(SqlSerdeConfig, CsvParserConfig)> for CsvDeserializerFromBytes {
-    fn create((serde_config, csv_config): (SqlSerdeConfig, CsvParserConfig)) -> Self {
+impl DeserializerFromBytes<(SqlSerdeConfig, CsvFormatConfig)> for CsvDeserializerFromBytes {
+    fn create((serde_config, csv_config): (SqlSerdeConfig, CsvFormatConfig)) -> Self {
         CsvDeserializerFromBytes {
-            reader: csv::ReaderBuilder::new()
-                // We skip the headers ourselves, without passing them to the
-                // reader, so we unconditionally turn off headers in the reader.
-                .has_headers(false)
-                .flexible(true)
-                .delimiter(csv_config.delimiter().0)
-                .from_reader(VecDeque::new()),
+            // `csv_reader_builder` sets `has_headers(false)` — the adapter
+            // layer handles header-row skipping itself.
+            reader: csv_reader_builder(&csv_config).from_reader(VecDeque::new()),
             record: csv::ByteRecord::new(),
             config: serde_config,
         }
@@ -297,6 +293,10 @@ where
             RecordFormat::Avro => {
                 todo!()
             }
+            #[cfg(feature = "with-dynamodb")]
+            RecordFormat::DynamoDB => {
+                unreachable!("DynamoDB is an output-only format")
+            }
         }
     }
 }
@@ -427,6 +427,10 @@ where
                         (config, column_name.clone()),
                     ),
                 ))
+            }
+            #[cfg(feature = "with-dynamodb")]
+            RecordFormat::DynamoDB => {
+                unreachable!("DynamoDB is an output-only format")
             }
         }
     }
@@ -922,6 +926,10 @@ where
                         (raw_serde_config(), column_name.clone()),
                     ),
                 ))
+            }
+            #[cfg(feature = "with-dynamodb")]
+            RecordFormat::DynamoDB => {
+                unreachable!("DynamoDB is an output-only format")
             }
         }
     }
@@ -1437,6 +1445,10 @@ where
                 self.update_key_func.clone(),
                 (raw_serde_config(), column_name.clone()),
             ))),
+            #[cfg(feature = "with-dynamodb")]
+            RecordFormat::DynamoDB => {
+                unreachable!("DynamoDB is an output-only format")
+            }
         }
     }
 

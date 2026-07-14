@@ -1,18 +1,18 @@
 <script lang="ts">
-  import { Popover } from 'common-ui'
+  import { Popover, Tooltip } from 'common-ui'
+  import { MissingValue, type PropertyValue } from 'profiler-lib'
   import { barColor, logScale01, skewTextColor } from '../colors'
-  import { type Format, formatNumber } from '../format'
 
   interface Props {
     label: string
     metricId: string
-    format: Format
-    /** Per-worker numeric values (NaN slots become zero-height bars). */
-    values: number[]
+    /** Per-worker values. Missing readings appear as `MissingValue` and are skipped by the
+     * statistics; their bar height is forced to zero. */
+    values: PropertyValue[]
     expanded: boolean
     onToggle: () => void
   }
-  const { label, metricId, format, values, expanded, onToggle }: Props = $props()
+  const { label, metricId, values, expanded, onToggle }: Props = $props()
 
   /**
    * Collapsed-view preview style:
@@ -21,28 +21,62 @@
    */
   const previewMode: 'values' | 'bars' = 'values' as 'values' | 'bars'
 
-  const stats = $derived.by(() => {
-    let min = Infinity
-    let max = -Infinity
-    let sum = 0
-    let n = 0
+  // Bar maths use the strictly-numeric subset. String-valued cells (enum metrics like balancer
+  // policy) skip this — they render flat bars but still contribute to the Avg column via
+  // `.average()` (returns the mode). Min/Max are suppressed for non-comparable kinds.
+  const numbers = $derived.by(() => {
+    const out: number[] = []
     for (const v of values) {
-      if (!Number.isFinite(v)) {
-        continue
+      const n = v.getNumericValue()
+      if (n.isSome()) {
+        out.push(n.unwrap())
       }
+    }
+    return out
+  })
+
+  const stats = $derived.by(() => {
+    if (numbers.length === 0) {
+      return { min: 0, max: 0, n: 0 }
+    }
+    let min = numbers[0]!
+    let max = numbers[0]!
+    for (const v of numbers) {
       if (v < min) {
         min = v
       }
       if (v > max) {
         max = v
       }
-      sum += v
-      n++
     }
-    if (n === 0) {
-      return { min: 0, max: 0, avg: 0, n: 0 }
+    return { min, max, n: numbers.length }
+  })
+
+  // Display rows operate on every non-missing cell (booleans, enum strings, numbers alike).
+  // Min/Max use `PropertyValue.compareTo`, which only carries magnitude information for
+  // comparable kinds (Count/Bytes/Time/Percent). For non-comparable kinds (BooleanValue,
+  // StringValue) the ordering is nominal — "min false / max true" or the lexicographic ends of
+  // an enum carry no information — so we suppress Min/Max and show only Avg (the mode).
+  const display = $derived.by(() => {
+    const real = values.filter((v) => !(v instanceof MissingValue))
+    if (real.length === 0) {
+      return { avg: MissingValue.INSTANCE, min: MissingValue.INSTANCE, max: MissingValue.INSTANCE }
     }
-    return { min, max, avg: sum / n, n }
+    const avg = real[0]!.average(real.slice(1))
+    if (!real[0]!.isComparable()) {
+      return { avg, min: MissingValue.INSTANCE, max: MissingValue.INSTANCE }
+    }
+    let min = real[0]!
+    let max = real[0]!
+    for (const v of real) {
+      if (v.compareTo(min) < 0) {
+        min = v
+      }
+      if (v.compareTo(max) > 0) {
+        max = v
+      }
+    }
+    return { avg, min, max }
   })
 
   // Skew = spread across workers (max - min) as a percentage of the largest-magnitude value.
@@ -56,12 +90,13 @@
     return ((stats.max - stats.min) / scale) * 100
   })
 
-  function bar(v: number) {
+  function bar(v: PropertyValue) {
     const collapsedHeight = previewMode === 'bars' ? 12 : 0
     if (stats.n === 0 || stats.max === stats.min) {
       return { t: 0, height: expanded ? 12 : collapsedHeight }
     }
-    const raw = Number.isFinite(v) ? (v - stats.min) / (stats.max - stats.min) : 0
+    const num = v.getNumericValue()
+    const raw = num.isSome() ? (num.unwrap() - stats.min) / (stats.max - stats.min) : 0
     const t = logScale01(raw)
     const height = expanded ? 12 + (32 - 12) * t : collapsedHeight
     return { t, height }
@@ -81,12 +116,12 @@
 </div>
 <!-- Cols 2-4: avg / min / max. Always rendered (same grid slots), opacity-driven visibility so
      collapse/expand doesn't reflow the grid mid-transition. -->
-{#each [stats.avg, stats.min, stats.max] as stat}
+{#each [display.avg, display.min, display.max] as stat}
 <div
   class="value-cell text-right text-sm tabular-nums text-surface-700-300 {showValues ? 'opacity-100' : 'opacity-0'}"
   aria-hidden={!showValues}
 >
-  {formatNumber(stat, format)}
+  {stat.toString()}
 </div>
 {/each}
 <!-- Col 5: skew toggle — always present, always pinned to the top-right -->
@@ -107,7 +142,8 @@
   </button>
 </div>
 
-<!-- Bar chart row spans full block width; container height + each bar height animate. -->
+<!-- Bar chart row spans full block width; container height + each bar height animate.
+     Each bar gets a hover tooltip showing the worker index and the formatted reading. -->
 <div
   class="bar-chart col-span-5 flex items-end gap-0.5"
   style:height="{chartHeight}px"
@@ -118,8 +154,8 @@
       class="flex-1 rounded-sm transition-[height,background-color] duration-200 ease-in-out"
       style:height="{b.height}px"
       style:background-color={barColor(b.t)}
-      title="worker {i}: {formatNumber(v, format)}"
     ></div>
+    <Tooltip class="whitespace-nowrap" placement="top">Worker {i}: {v.toString()}</Tooltip>
   {/each}
 </div>
 

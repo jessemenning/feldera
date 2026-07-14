@@ -15,7 +15,7 @@ import {
   getSessionConfigFromCache
 } from '$lib/compositions/configCache'
 import { initSystemMessages, type SystemMessage } from '$lib/compositions/initSystemMessages'
-import { newDate, setCurrentTime } from '$lib/compositions/serverTime'
+import { ServerDate } from '$lib/compositions/serverTime'
 import { displayScheduleToDismissable, getLicenseMessage } from '$lib/functions/license'
 import { resolve } from '$lib/functions/svelte'
 import {
@@ -168,7 +168,7 @@ const syncServerTimeFromConfig = (config: Configuration) => {
       ? config.license_validity.Exists
       : undefined
   if (license) {
-    setCurrentTime(license.current)
+    ServerDate.sync(license.current)
   }
 }
 
@@ -278,6 +278,7 @@ const initAuth = async (): Promise<AuthInitResult> => {
     onBeforeLogout() {
       // Session-scoped data must not survive a logout/login cycle, since a different
       // user may sign in on the same browser.
+      setSelectedTenant(undefined)
       clearConfigCaches()
       posthog.reset()
     }
@@ -350,6 +351,8 @@ export const load: LayoutLoad = async (): Promise<LayoutData> => {
       auth
     }
   }
+
+  applyTenantSelection(computeAuthorizedTenants(auth))
 
   const cachedConfig = OPTIMISTIC_CONFIG_CACHE ? getConfigFromCache() : undefined
   const cachedSessionConfig = OPTIMISTIC_CONFIG_CACHE ? getSessionConfigFromCache() : undefined
@@ -430,17 +433,14 @@ function buildLayoutData(
 /**
  * Run side effects derived from `config` that are independent of server-time
  * sync. Safe to call with cached config and safe to re-run: all pushes are
- * deduped by id, tenant selection is idempotent for a stable auth, and
- * `posthog.init` dedupes on its key.
+ * deduped by id and `posthog.init` dedupes on its key.
  * It is expected to be idempotent - calling it the second time on lazy update
  * when config hasn't changed should not break anything.
  *
- * Does NOT call `setCurrentTime` — that belongs to `syncServerTimeFromConfig`,
+ * Does NOT call `ServerDate.sync` — that belongs to `syncServerTimeFromConfig`,
  * which only runs against freshly-fetched data.
  */
 function initializeConfigDependencies(auth: AuthDetails, config: Configuration) {
-  applyTenantSelection(computeAuthorizedTenants(auth))
-
   if (typeof auth === 'object' && 'logout' in auth) {
     initPosthog(config).then(() => {
       if (auth.profile.email) {
@@ -454,7 +454,7 @@ function initializeConfigDependencies(auth: AuthDetails, config: Configuration) 
   }
 
   {
-    const message = getLicenseMessage(config, newDate())
+    const message = getLicenseMessage(config, new ServerDate())
     if (message) {
       pushSystemMessageOnce(message)
     }

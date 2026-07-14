@@ -32,8 +32,9 @@ use std::{
 
 use crate::{
     operators::{eq, gt, gte, lt, lte, neq},
-    some_existing_operator, some_function2, some_operator, some_polymorphic_function1,
-    some_polymorphic_function2, some_polymorphic_function3, some_polymorphic_null_function3,
+    some_existing_operator, some_function1, some_function2, some_nullable_function2,
+    some_nullable_function3, some_operator, some_polymorphic_function1, some_polymorphic_function2,
+    some_polymorphic_function3, some_polymorphic_null_function3,
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////
@@ -878,11 +879,7 @@ pub fn parse_timezone_(tz: SqlString) -> Zone {
     Zone::parse(tz.str())
 }
 
-#[doc(hidden)]
-pub fn parse_timezoneN(tz: Option<SqlString>) -> Option<Zone> {
-    let tz = tz?;
-    Some(parse_timezone_(tz))
-}
+some_function1!(parse_timezone, SqlString, Zone);
 
 #[doc(hidden)]
 pub fn convert_timezone___(src_tz: Zone, dst_tz: Zone, ts: Timestamp) -> Option<Timestamp> {
@@ -892,68 +889,7 @@ pub fn convert_timezone___(src_tz: Zone, dst_tz: Zone, ts: Timestamp) -> Option<
     Some(Timestamp::from_naiveDateTime(result))
 }
 
-#[doc(hidden)]
-pub fn convert_timezoneN__(source: Option<Zone>, target: Zone, ts: Timestamp) -> Option<Timestamp> {
-    let source = source?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezone_N_(source: Zone, target: Option<Zone>, ts: Timestamp) -> Option<Timestamp> {
-    let target = target?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezoneNN_(
-    source: Option<Zone>,
-    target: Option<Zone>,
-    ts: Timestamp,
-) -> Option<Timestamp> {
-    let source = source?;
-    let target = target?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezoneN_N(
-    source: Option<Zone>,
-    target: Zone,
-    ts: Option<Timestamp>,
-) -> Option<Timestamp> {
-    let source = source?;
-    let ts = ts?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezone_NN(
-    source: Zone,
-    target: Option<Zone>,
-    ts: Option<Timestamp>,
-) -> Option<Timestamp> {
-    let target = target?;
-    let ts = ts?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezone__N(source: Zone, target: Zone, ts: Option<Timestamp>) -> Option<Timestamp> {
-    let ts = ts?;
-    convert_timezone___(source, target, ts)
-}
-
-#[doc(hidden)]
-pub fn convert_timezoneNNN(
-    source: Option<Zone>,
-    target: Option<Zone>,
-    ts: Option<Timestamp>,
-) -> Option<Timestamp> {
-    let source = source?;
-    let target = target?;
-    let ts = ts?;
-    convert_timezone___(source, target, ts)
-}
+some_nullable_function3!(convert_timezone, Zone, Zone, Timestamp, Timestamp);
 
 #[doc(hidden)]
 pub fn now() -> Timestamp {
@@ -2282,21 +2218,7 @@ pub fn parse_timestamp__(format: SqlString, st: SqlString) -> Option<Timestamp> 
     }
 }
 
-pub fn parse_timestampN_(format: Option<SqlString>, st: SqlString) -> Option<Timestamp> {
-    let format = format?;
-    parse_timestamp__(format, st)
-}
-
-pub fn parse_timestamp_N(format: SqlString, st: Option<SqlString>) -> Option<Timestamp> {
-    let st = st?;
-    parse_timestamp__(format, st)
-}
-
-pub fn parse_timestampNN(format: Option<SqlString>, st: Option<SqlString>) -> Option<Timestamp> {
-    let st = st?;
-    let format = format?;
-    parse_timestamp__(format, st)
-}
+some_nullable_function2!(parse_timestamp, SqlString, SqlString, Timestamp);
 
 /////////////////////////////////////////////////////////////////////////////////////////////
 // Date
@@ -2514,52 +2436,7 @@ pub fn make_date___(year: i32, month: i32, day: i32) -> Option<Date> {
     Some(Date::from_date(naive))
 }
 
-#[doc(hidden)]
-pub fn make_dateN__(year: Option<i32>, month: i32, day: i32) -> Option<Date> {
-    let year = year?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_date_N_(year: i32, month: Option<i32>, day: i32) -> Option<Date> {
-    let month = month?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_date__N(year: i32, month: i32, day: Option<i32>) -> Option<Date> {
-    let day = day?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_dateNN_(year: Option<i32>, month: Option<i32>, day: i32) -> Option<Date> {
-    let year = year?;
-    let month = month?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_date_NN(year: i32, month: Option<i32>, day: Option<i32>) -> Option<Date> {
-    let month = month?;
-    let day = day?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_dateN_N(year: Option<i32>, month: i32, day: Option<i32>) -> Option<Date> {
-    let year = year?;
-    let day = day?;
-    make_date___(year, month, day)
-}
-
-#[doc(hidden)]
-pub fn make_dateNNN(year: Option<i32>, month: Option<i32>, day: Option<i32>) -> Option<Date> {
-    let year = year?;
-    let month = month?;
-    let day = day?;
-    make_date___(year, month, day)
-}
+some_nullable_function3!(make_date, i32, i32, i32, Date);
 
 #[doc(hidden)]
 pub fn floor_century_Date(value: Date) -> Date {
@@ -2990,11 +2867,49 @@ some_polymorphic_function1!(extract_minute, Date, Date, i64);
 some_polymorphic_function1!(extract_hour, Date, Date, i64);
 
 #[doc(hidden)]
+pub fn datediff_hour_Date_Date(left: Date, right: Date) -> i32 {
+    (right.days() - left.days()) * 24
+}
+
+some_polymorphic_function2!(datediff_hour, Date, Date, Date, Date, i32);
+
+#[doc(hidden)]
 pub fn datediff_day_Date_Date(left: Date, right: Date) -> i32 {
-    left.days() - right.days()
+    right.days() - left.days()
 }
 
 some_polymorphic_function2!(datediff_day, Date, Date, Date, Date, i32);
+
+#[doc(hidden)]
+pub fn datediff_week_Date_Date(left: Date, right: Date) -> i32 {
+    (right.days() - left.days()) / 7
+}
+
+some_polymorphic_function2!(datediff_week, Date, Date, Date, Date, i32);
+
+#[doc(hidden)]
+pub fn datediff_month_Date_Date(left: Date, right: Date) -> i32 {
+    let interval = minus_LongInterval_Date_Date__(right, left);
+    interval.months()
+}
+
+some_polymorphic_function2!(datediff_month, Date, Date, Date, Date, i32);
+
+#[doc(hidden)]
+pub fn datediff_quarter_Date_Date(left: Date, right: Date) -> i32 {
+    datediff_year_Date_Date(left, right) * 4
+        + (extract_quarter_Date(right) - extract_quarter_Date(left)) as i32
+}
+
+some_polymorphic_function2!(datediff_quarter, Date, Date, Date, Date, i32);
+
+#[doc(hidden)]
+pub fn datediff_year_Date_Date(left: Date, right: Date) -> i32 {
+    let interval = minus_LongInterval_Date_Date__(right, left);
+    interval.years()
+}
+
+some_polymorphic_function2!(datediff_year, Date, Date, Date, Date, i32);
 
 #[doc(hidden)]
 pub fn format_date__(format: SqlString, date: Date) -> SqlString {
@@ -3683,7 +3598,7 @@ pub fn make_time_i32_i32_SqlDecimal<const P: usize, const S: usize>(
     Some(Time::from_time(result))
 }
 
-some_polymorphic_null_function3!(make_time <const P: usize, const S: usize>, i32, i32, i32, i32, SqlDecimal, SqlDecimal<P, S>, Time);
+some_polymorphic_null_function3!(make_time [const P: usize, const S: usize], i32, i32, i32, i32, SqlDecimal, SqlDecimal<P, S>, Time);
 
 #[doc(hidden)]
 pub fn floor_millennium_Time(value: Time) -> Time {
@@ -4135,6 +4050,25 @@ mod test {
                 time: Time::from_nanoseconds(10800000000000),
                 timestamp: Timestamp::from_milliseconds(1529501823000),
                 timestampTz: TimestampTz::from_milliseconds(1529501823000),
+            }
+        );
+    }
+
+    /// Debezium MySQL emits `io.debezium.time.ZonedTimestamp` values with
+    /// fractional seconds when the column has sub-second precision.
+    /// The fraction must be preserved, not silently dropped.
+    #[test]
+    fn debezium_fractional_seconds() {
+        assert_eq!(
+            deserialize_with_debezium_config::<TestStruct>(
+                r#"{"date": 16816, "time": 10800000000, "timestamp": "2018-06-20T13:37:03.123456Z", "timestampTz": "2018-06-20T13:37:03.123456Z" }"#
+            )
+            .unwrap(),
+            TestStruct {
+                date: Date::from_days(16816),
+                time: Time::from_nanoseconds(10800000000000),
+                timestamp: Timestamp::from_microseconds(1529501823123456),
+                timestampTz: TimestampTz::from_microseconds(1529501823123456),
             }
         );
     }

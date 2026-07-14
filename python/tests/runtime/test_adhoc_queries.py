@@ -3,6 +3,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from feldera.rest.errors import FelderaAPIError
 from tests import TEST_CLIENT
 from tests.shared_test_pipeline import SharedTestPipeline, sql
 
@@ -216,14 +217,21 @@ class TestAdhocQueries(SharedTestPipeline):
         )
         assert "ERROR" in error_text.upper()
 
-        # Non-materialized table direct access should fail
-        res = list(self.pipeline.query("SELECT * FROM not_materialized"))
-        assert res and "error" in res[0]
+        # Non-materialized table direct access fails up front. The server
+        # reports this as an error response (HTTP 400) rather than a 200
+        # whose streamed body carries the error, so the query throws.
+        nonmat_ok = False
+        try:
+            list(self.pipeline.query("SELECT * FROM not_materialized"))
+        except FelderaAPIError as e:
+            nonmat_ok = True
+            assert "materialized" in str(e), f"unexpected error: {e}"
+        assert nonmat_ok, "Expected querying a non-materialized table to raise"
 
-        # INSERT into materialized t1 using JSON query endpoint (to retrieve count row)
-        insert_resp = list(
-            TEST_CLIENT.query_as_json(self.pipeline.name, ADHOC_SQL_INSERT)
-        )
+        # INSERT into materialized t1. `wait=True` blocks until the insert has
+        # been processed so the reads below observe it (read-your-writes). The
+        # JSON result still carries the count row.
+        insert_resp = list(self.pipeline.query(ADHOC_SQL_INSERT, wait=True))
         assert insert_resp and insert_resp[0].get("count") == 2
 
         prepared_rows = list(
@@ -238,8 +246,8 @@ class TestAdhocQueries(SharedTestPipeline):
         # Non-materialized table via its materialized view
         assert self._count("SELECT COUNT(*) AS c FROM view_of_not_materialized") == 0
         ins_nm = list(
-            TEST_CLIENT.query_as_json(
-                self.pipeline.name, "INSERT INTO not_materialized VALUES (99),(100)"
+            self.pipeline.query(
+                "INSERT INTO not_materialized VALUES (99),(100)", wait=True
             )
         )
         assert ins_nm and ins_nm[0].get("count") == 2
@@ -253,14 +261,22 @@ class TestAdhocQueries(SharedTestPipeline):
             self._count("SELECT COUNT(*) AS c FROM lateness_table3_materialized") == 3
         )
 
-        # FIXME: this should raise an exception, but it currently doesn't.
-        # https://github.com/feldera/feldera/issues/4973
-        result = list(
-            self.pipeline.query(
-                "SELECT COUNT(*) AS c FROM lateness_table1_not_materialized"
+        # This table is non-materialized because of the lateness attribute on
+        # its primary key. Querying it directly fails up front with an error
+        # response (HTTP 400), so the query throws.
+        lateness_nonmat_ok = False
+        try:
+            list(
+                self.pipeline.query(
+                    "SELECT COUNT(*) AS c FROM lateness_table1_not_materialized"
+                )
             )
+        except FelderaAPIError as e:
+            lateness_nonmat_ok = True
+            assert "materialized" in str(e), f"unexpected error: {e}"
+        assert lateness_nonmat_ok, (
+            "Expected querying a non-materialized lateness table to raise"
         )
-        assert len(result) == 1 and "Execution error" in str(result[0])
 
     @sql(
         """CREATE TABLE "TaBle1"(id bigint not null) WITH ('materialized' = 'true');"""
@@ -372,7 +388,8 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
         # Use an integer larger than 2**53 (JSON's f64 precision boundary)
         # to demonstrate a value we cannot represent in JSON.
         wide_int = 9007199254740993  # 2**53 + 1
-        # `execute` drains the generator so the INSERT actually runs.
+        # `execute` drains the generator so the INSERT actually runs; `wait`
+        # blocks until it is processed so the read below observes it.
         self.pipeline.execute(
             "INSERT INTO all_types VALUES ("
             f"1, 2, 3, {wide_int}, "
@@ -387,7 +404,8 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
             "'c32d330f-5757-4ada-bcf6-1fac2d54e37f', "
             "ARRAY[10, 20, 30], "
             "MAP {'a': 1, 'b': 2}"
-            ")"
+            ")",
+            wait=True,
         )
 
         batches = list(
@@ -446,7 +464,7 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
         self.pipeline.start()
 
         self.pipeline.execute(
-            "INSERT INTO int_keyed_map VALUES (MAP {1: 'one', 2: 'two'})"
+            "INSERT INTO int_keyed_map VALUES (MAP {1: 'one', 2: 'two'})", wait=True
         )
 
         # Arrow IPC: int keys preserved as ints.
@@ -515,7 +533,8 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
             "INSERT INTO floats VALUES "
             "('pos_inf',  1.0/0.0, CAST( 1.0/0.0 AS REAL)),"
             "('neg_inf', -1.0/0.0, CAST(-1.0/0.0 AS REAL)),"
-            "('nan',      0.0/0.0, CAST( 0.0/0.0 AS REAL))"
+            "('nan',      0.0/0.0, CAST( 0.0/0.0 AS REAL))",
+            wait=True,
         )
 
         batches = list(self.pipeline.query_arrow("SELECT * FROM floats ORDER BY tag"))

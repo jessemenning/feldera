@@ -16,6 +16,7 @@ use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use serde_json::json;
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ mod bench;
 mod cli;
 mod debug;
 mod shell;
+mod tags;
 
 pub(crate) const UPGRADE_NOTICE: &str = "Try upgrading to the latest CLI version to resolve this issue. Also make sure the pipeline is recompiled with the latest version of feldera. Report it on github.com/feldera/feldera if the issue persists.";
 
@@ -168,6 +170,7 @@ impl CacheDisabler {
             .pipeline_name(self.name.clone())
             .body(PatchPipeline {
                 description: None,
+                tags: None,
                 name: None,
                 program_code: None,
                 udf_rust: None,
@@ -676,13 +679,107 @@ async fn wait_for_checkpoint(client: &Client, name: String, seq_number: u64, wai
     }
 }
 
+/// Fetch a pipeline's current tags.
+async fn get_pipeline_tags(client: &Client, name: &str) -> Vec<String> {
+    client
+        .get_pipeline()
+        .pipeline_name(name)
+        .send()
+        .await
+        .map_err(handle_errors_fatal(
+            client.baseurl().clone(),
+            "Failed to get pipeline tags",
+            1,
+        ))
+        .unwrap()
+        .into_inner()
+        .tags
+}
+
+/// Collect the tags used across every pipeline.
+///
+/// This is the pool of "known tags": when a tag name is colored on one pipeline,
+/// setting it on another borrows that color so the name stays one consistent
+/// color everywhere.
+async fn get_known_tags(client: &Client) -> Vec<String> {
+    client
+        .list_pipelines()
+        .send()
+        .await
+        .map_err(handle_errors_fatal(
+            client.baseurl().clone(),
+            "Failed to list pipeline tags",
+            1,
+        ))
+        .unwrap()
+        .into_inner()
+        .into_iter()
+        .flat_map(|pipeline| pipeline.tags)
+        .collect()
+}
+
+/// Replace a pipeline's tags and return the stored result.
+async fn set_pipeline_tags(client: &Client, name: &str, tags: Vec<String>) -> Vec<String> {
+    client
+        .patch_pipeline()
+        .pipeline_name(name)
+        .body(PatchPipeline {
+            description: None,
+            tags: Some(tags),
+            name: None,
+            program_code: None,
+            udf_rust: None,
+            udf_toml: None,
+            program_config: None,
+            runtime_config: None,
+        })
+        .send()
+        .await
+        .map_err(handle_errors_fatal(
+            client.baseurl().clone(),
+            "Failed to update pipeline tags",
+            1,
+        ))
+        .unwrap()
+        .into_inner()
+        .tags
+}
+
+/// Print a pipeline's tags as a comma-separated list of display names, or as a
+/// JSON array of the raw stored strings.
+///
+/// Text output shows display names: the color suffix that encodes a tag's color
+/// is stripped, since it is noise to a human reader and the same comma-separated
+/// list feeds straight back into `set-tags`. JSON output keeps the raw strings,
+/// so a tag's color round-trips for machine consumers.
+fn print_pipeline_tags(format: OutputFormat, tags: &[String]) {
+    match format {
+        OutputFormat::Text => {
+            let names: Vec<&str> = tags.iter().map(|tag| tags::tag_display_name(tag)).collect();
+            println!("{}", names.join(","));
+        }
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(tags).expect("Failed to serialize tags")
+            );
+        }
+        _ => {
+            eprintln!("Unsupported output format: {}", format);
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) {
     match action {
         PipelineAction::Create {
             name,
             program_path,
             runtime_version,
+            use_platform_compiler,
             profile,
+            tags,
             udf_rs,
             udf_toml,
             stdin,
@@ -692,10 +789,19 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 read_file(udf_rs).await,
                 read_file(udf_toml).await,
             ) {
+                // Each `--tag` borrows its color from the tags already used across
+                // pipelines, keeping a name one consistent color. The lookup is
+                // skipped when no tags were given.
+                let tags = if tags.is_empty() {
+                    Vec::new()
+                } else {
+                    tags::set_tags(tags, &get_known_tags(&client).await)
+                };
                 let response = client
                     .post_pipeline()
                     .body(PostPutPipeline {
                         description: None,
+                        tags,
                         name: name.to_string(),
                         program_code: program_code.unwrap_or_default(),
                         udf_rust,
@@ -704,6 +810,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                             cache: true,
                             profile: Some(profile),
                             runtime_version,
+                            use_platform_compiler,
                         }),
                         runtime_config: None,
                     })
@@ -735,6 +842,84 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             } else {
                 // Already reported error in read_program_code or read_file.
                 std::process::exit(1);
+            }
+        }
+        PipelineAction::Copy {
+            source,
+            destination,
+        } => {
+            let source_pipeline = client
+                .get_pipeline()
+                .pipeline_name(source.clone())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get source pipeline",
+                    1,
+                ))
+                .unwrap()
+                .into_inner();
+
+            let Some(program_code) = source_pipeline.program_code else {
+                eprintln!(
+                    "Source pipeline response did not include program code. {}",
+                    UPGRADE_NOTICE
+                );
+                std::process::exit(1);
+            };
+            let Some(runtime_config) = source_pipeline.runtime_config else {
+                eprintln!(
+                    "Source pipeline response did not include runtime configuration. {}",
+                    UPGRADE_NOTICE
+                );
+                std::process::exit(1);
+            };
+            let Some(program_config) = source_pipeline.program_config else {
+                eprintln!(
+                    "Source pipeline response did not include compilation configuration. {}",
+                    UPGRADE_NOTICE
+                );
+                std::process::exit(1);
+            };
+
+            let response = client
+                .post_pipeline()
+                .body(PostPutPipeline {
+                    description: source_pipeline.description,
+                    tags: source_pipeline.tags,
+                    name: destination.clone(),
+                    program_code,
+                    udf_rust: source_pipeline.udf_rust,
+                    udf_toml: source_pipeline.udf_toml,
+                    program_config: Some(program_config),
+                    runtime_config: Some(runtime_config),
+                })
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to copy pipeline",
+                    1,
+                ))
+                .unwrap();
+
+            match format {
+                OutputFormat::Text => {
+                    println!("Pipeline copied successfully.");
+                    debug!("{:#?}", response);
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize pipeline response")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
             }
         }
         PipelineAction::Start {
@@ -797,6 +982,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     .pipeline_name(name.clone())
                     .body(PatchPipeline {
                         description: None,
+                        tags: None,
                         name: None,
                         program_code: Some(new_program),
                         udf_rust: None,
@@ -1397,6 +1583,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .pipeline_name(name)
                 .body(PatchPipeline {
                     description: None,
+                    tags: None,
                     name: None,
                     program_code: None,
                     udf_rust: None,
@@ -1431,6 +1618,22 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     std::process::exit(1);
                 }
             }
+        }
+        PipelineAction::Tags { name } => {
+            let current = get_pipeline_tags(&client, &name).await;
+            print_pipeline_tags(format, &current);
+        }
+        PipelineAction::SetTags { name, tags } => {
+            let requested = tags::split_tag_list(&tags);
+            // A tag may be named alone; its color is borrowed from the same tag
+            // used across pipelines.
+            let known = get_known_tags(&client).await;
+            let updated =
+                set_pipeline_tags(&client, &name, tags::set_tags(requested, &known)).await;
+            if matches!(format, OutputFormat::Text) {
+                println!("Tags updated successfully.");
+            }
+            print_pipeline_tags(format, &updated);
         }
         PipelineAction::UpdateRuntime { name } => {
             let response = client
@@ -2422,6 +2625,87 @@ async fn connector(
     };
 }
 
+fn format_program_errors(program_error: &ProgramError) -> String {
+    let mut output = String::new();
+    let mut has_output = false;
+
+    if let Some(sql) = &program_error.sql_compilation {
+        has_output = true;
+        output.push_str(&format!("SQL compiler exit code: {}\n", sql.exit_code));
+
+        if sql.messages.is_empty() {
+            output.push_str("No SQL compiler messages.\n");
+        } else {
+            for message in &sql.messages {
+                let severity = if message.warning { "warning" } else { "error" };
+                let error_type = &message.error_type;
+                let message_text = &message.message;
+                let start_line = message.start_line_number;
+                let start_column = message.start_column;
+
+                writeln!(
+                    &mut output,
+                    "{severity}: {error_type}: {message_text} (line {start_line}, column {start_column})",
+                )
+                .expect("writing to String should not fail");
+
+                if let Some(snippet) = &message.snippet
+                    && !snippet.is_empty()
+                {
+                    output.push_str(snippet);
+                    if !snippet.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(rust) = &program_error.rust_compilation {
+        if has_output {
+            output.push('\n');
+        }
+        has_output = true;
+        output.push_str(&format!("Rust compiler exit code: {}\n", rust.exit_code));
+
+        if !rust.stdout.is_empty() {
+            output.push_str("\nstdout:\n");
+            output.push_str(&rust.stdout);
+            if !rust.stdout.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        if !rust.stderr.is_empty() {
+            output.push_str("\nstderr:\n");
+            output.push_str(&rust.stderr);
+            if !rust.stderr.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        if rust.stdout.is_empty() && rust.stderr.is_empty() {
+            output.push_str("No Rust compiler stdout or stderr.\n");
+        }
+    }
+
+    if let Some(system_error) = &program_error.system_error {
+        if has_output {
+            output.push('\n');
+        }
+        has_output = true;
+        output.push_str("System error:\n");
+        output.push_str(system_error);
+        if !system_error.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    if !has_output {
+        output.push_str("No compilation errors or warnings.\n");
+    }
+
+    output
+}
+
 async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
     match action {
         ProgramAction::Get {
@@ -2501,9 +2785,11 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
             name,
             profile,
             runtime_version,
+            use_platform_compiler,
         } => {
             let pp = PatchPipeline {
                 description: None,
+                tags: None,
                 name: None,
                 program_code: None,
                 udf_rust: None,
@@ -2512,6 +2798,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                     profile,
                     cache: true,
                     runtime_version,
+                    use_platform_compiler,
                 }),
                 runtime_config: None,
             };
@@ -2582,6 +2869,44 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 }
             }
         }
+        ProgramAction::Errors { name } => {
+            let response = client
+                .get_pipeline()
+                .pipeline_name(name)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to get program compilation errors",
+                    1,
+                ))
+                .unwrap();
+
+            let Some(program_error) = response.into_inner().program_error else {
+                eprintln!(
+                    "Pipeline response did not include program errors. {}",
+                    UPGRADE_NOTICE
+                );
+                std::process::exit(1);
+            };
+
+            match format {
+                OutputFormat::Text => {
+                    print!("{}", format_program_errors(&program_error));
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&program_error)
+                            .expect("Failed to serialize program errors")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
         ProgramAction::Set {
             name,
             program_path,
@@ -2596,6 +2921,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
             ) {
                 let pp = PatchPipeline {
                     description: None,
+                    tags: None,
                     name: None,
                     program_code,
                     udf_rust,
@@ -2832,7 +3158,10 @@ fn init_logging(default_level: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::make_client;
+    use super::{format_program_errors, make_client};
+    use feldera_rest_api::types::{
+        ProgramError, RustCompilationInfo, SqlCompilationInfo, SqlCompilerMessage,
+    };
     use std::io::Write;
 
     // A single self-signed PEM-encoded certificate used only as test data. It
@@ -2922,5 +3251,83 @@ aC3Oy4iVrYGOq9v6uP9iblE=\n\
                 "unexpected empty-bundle error from valid PEM path: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn format_program_errors_empty() {
+        let output = format_program_errors(&ProgramError {
+            sql_compilation: None,
+            rust_compilation: None,
+            system_error: None,
+        });
+
+        assert_eq!(output, "No compilation errors or warnings.\n");
+    }
+
+    #[test]
+    fn format_program_errors_sql_messages() {
+        let output = format_program_errors(&ProgramError {
+            sql_compilation: Some(SqlCompilationInfo {
+                exit_code: 1,
+                messages: vec![SqlCompilerMessage {
+                    start_line_number: 2,
+                    start_column: 4,
+                    end_line_number: 2,
+                    end_column: 8,
+                    warning: true,
+                    error_type: "PRIMARY KEY cannot be nullable".to_string(),
+                    message: "PRIMARY KEY column 'C' has type INTEGER, which is nullable"
+                        .to_string(),
+                    snippet: Some("    2|   c INT PRIMARY KEY\n         ^^^^^\n".to_string()),
+                }],
+            }),
+            rust_compilation: None,
+            system_error: None,
+        });
+
+        assert_eq!(
+            output,
+            concat!(
+                "SQL compiler exit code: 1\n",
+                "warning: PRIMARY KEY cannot be nullable: PRIMARY KEY column 'C' has type INTEGER, which is nullable (line 2, column 4)\n",
+                "    2|   c INT PRIMARY KEY\n",
+                "         ^^^^^\n",
+            )
+        );
+    }
+
+    #[test]
+    fn format_program_errors_rust_output() {
+        let output = format_program_errors(&ProgramError {
+            sql_compilation: None,
+            rust_compilation: Some(RustCompilationInfo {
+                exit_code: 101,
+                stdout: "checking pipeline\n".to_string(),
+                stderr: "error: failed to compile".to_string(),
+            }),
+            system_error: None,
+        });
+
+        assert_eq!(
+            output,
+            "Rust compiler exit code: 101\n\
+\n\
+stdout:\n\
+checking pipeline\n\
+\n\
+stderr:\n\
+error: failed to compile\n"
+        );
+    }
+
+    #[test]
+    fn format_program_errors_system_error() {
+        let output = format_program_errors(&ProgramError {
+            sql_compilation: None,
+            rust_compilation: None,
+            system_error: Some("compiler service unavailable".to_string()),
+        });
+
+        assert_eq!(output, "System error:\ncompiler service unavailable\n");
     }
 }

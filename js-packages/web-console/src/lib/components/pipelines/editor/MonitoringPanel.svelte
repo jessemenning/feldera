@@ -33,7 +33,7 @@
     extractProgramErrors,
     numConnectorsWithProblems
   } from '$lib/compositions/health/systemErrors'
-  import { TabsPanel } from 'common-ui'
+  import { TabsPanel, advanceSearch, emptySearchState, type SearchState } from 'common-ui'
 
   let {
     pipeline,
@@ -101,7 +101,7 @@
         label: TabLogs,
         panel: PanelLogs,
         keepAlive: true,
-        tabBarEnd: TabBarEndPipelineInfo
+        tabBarEnd: TabBarEndLogs
       }
     ].filter((tab) => !hiddenTabs.includes(tab.id))
   )
@@ -140,8 +140,41 @@
 
   const connectorsWithErrorsCount = $derived(numConnectorsWithProblems(metrics.current))
 
+  const memoryPressureErrorCount = $derived.by(() => {
+    const memoryPressure = metrics.current.global?.memory_pressure
+    return memoryPressure === 'high' || memoryPressure === 'critical' ? 1 : 0
+  })
+
+  const runtimeErrorsCount = $derived(connectorsWithErrorsCount + memoryPressureErrorCount)
+
+  // Local input binding. The committed search (what the list actually runs) lives in
+  // `logSearch` and only advances on Enter — so typing doesn't search as-you-type.
+  let logSearchInput = $state('')
+  let logSearch: SearchState = $state(emptySearchState)
+  // Bound to the search <input> so Ctrl-F / Cmd-F inside the log list can focus it.
+  let logSearchInputEl: HTMLInputElement | undefined = $state()
+  const onLogSearchShortcut = () => {
+    logSearchInputEl?.focus()
+    logSearchInputEl?.select()
+  }
+
+  // Enter on the search input: empty input clears, same pattern cycles to the next match,
+  // new pattern jumps to the first match.
+  const submitLogSearch = () => {
+    logSearch = advanceSearch(
+      logSearch,
+      logSearchInput ? { kind: 'substring', query: logSearchInput } : null
+    )
+  }
+  // Escape clears the input and the highlight — submitting an empty query resets `logSearch`
+  // to `emptySearchState` (pattern null), which un-highlights the list.
+  const clearLogSearch = () => {
+    logSearchInput = ''
+    submitLogSearch()
+  }
+
   // Updating individual properties in an $effect avoids unnecessary reactive updates within tab components
-  let tabProps = $state({ metrics, pipeline, errors, deleted })
+  let tabProps = $state({ metrics, pipeline, errors, deleted, logSearch, onLogSearchShortcut })
   $effect(() => {
     tabProps.metrics = metrics
   })
@@ -154,13 +187,16 @@
   $effect(() => {
     tabProps.deleted = deleted
   })
+  $effect(() => {
+    tabProps.logSearch = logSearch
+  })
 </script>
 
 {#snippet TabControlPerformance()}
   {@render TabPerformance.Label()}
-  {#if connectorsWithErrorsCount > 0}
+  {#if runtimeErrorsCount > 0}
     <span class="ml-1 inline-block min-w-6 rounded preset-filled-error-50-950 px-1 font-medium">
-      {connectorsWithErrorsCount}
+      {runtimeErrorsCount}
     </span>
   {/if}
 {/snippet}
@@ -199,19 +235,41 @@
   <span>Logs</span>
 {/snippet}
 
+{#snippet TabBarEndLogs()}
+  <div class="ml-auto flex gap-2">
+    <input
+      bind:this={logSearchInputEl}
+      bind:value={logSearchInput}
+      type="text"
+      placeholder="Search logs"
+      title="Search within logs (Enter to jump to next match, Esc to clear, Ctrl/Cmd-F to focus from the log list)"
+      onkeydown={(e) => {
+        if (e.key === 'Enter') submitLogSearch()
+        else if (e.key === 'Escape') clearLogSearch()
+      }}
+      class="input ml-auto h-8 w-28 text-sm sm:w-32"
+    />
+    {@render PipelineInfoHeader()}
+  </div>
+{/snippet}
+
 {#snippet TabBarEndPipelineInfo()}
   <div class="ml-auto flex gap-2">
-    <ClipboardCopyButton
-      value={pipeline.current.id}
-      class="h-4! w-auto! gap-2 preset-tonal-surface px-4"
-    >
-      <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
-    </ClipboardCopyButton>
-    <Tooltip placement="top">
-      {pipeline.current.id}
-    </Tooltip>
-    <DownloadSupportBundle {pipelineName} />
+    {@render PipelineInfoHeader()}
   </div>
+{/snippet}
+
+{#snippet PipelineInfoHeader()}
+  <ClipboardCopyButton
+    value={pipeline.current.id}
+    class="h-4! w-auto! gap-2 preset-tonal-surface px-4"
+  >
+    <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
+  </ClipboardCopyButton>
+  <Tooltip placement="top">
+    {pipeline.current.id}
+  </Tooltip>
+  <DownloadSupportBundle {pipelineName} />
 {/snippet}
 
 {#snippet TabBarEndCompiler()}

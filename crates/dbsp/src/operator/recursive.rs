@@ -169,7 +169,7 @@ where
     ///         zset_set! { Tup2(4, 5) },
     ///         // Remove an edge, breaking the cycle.
     ///         zset! { Tup2(1, 2) => -1 },
-    ///      ] as [_; STEPS])
+    ///      ] as [OrdZSet<Tup2<u64, u64>>; STEPS])
     ///          .into_iter();
     ///
     ///     let edges = root_circuit
@@ -182,7 +182,7 @@ where
     ///         // Add a label to node 2.
     ///         zset_set! { Tup2(2, "l2".to_string()) },
     ///         zset! { },
-    ///     ] as [_; STEPS])
+    ///     ] as [OrdZSet<Tup2<u64, String>>; STEPS])
     ///         .into_iter();
     ///
     ///     let init_labels = root_circuit
@@ -193,7 +193,7 @@ where
     ///         zset! { Tup2(1, "l1".to_string()) => 1, Tup2(2, "l1".to_string()) => 1, Tup2(3, "l1".to_string()) => 1, Tup2(4, "l1".to_string()) => 1 },
     ///         zset! { Tup2(1, "l2".to_string()) => 1, Tup2(2, "l2".to_string()) => 1, Tup2(3, "l2".to_string()) => 1, Tup2(4, "l2".to_string()) => 1, Tup2(5, "l1".to_string()) => 1, Tup2(5, "l2".to_string()) => 1 },
     ///         zset! { Tup2(2, "l1".to_string()) => -1, Tup2(3, "l1".to_string()) => -1, Tup2(4, "l1".to_string()) => -1, Tup2(5, "l1".to_string()) => -1 },
-    ///     ] as [_; STEPS])
+    ///     ] as [OrdZSet<Tup2<u64, String>>; STEPS])
     ///         .into_iter();
     ///
     ///     let labels = root_circuit.recursive(|child_circuit, labels: Stream<_, OrdZSet<Tup2<u64, String>>>| {
@@ -235,5 +235,192 @@ where
             f(circuit, unsafe { S::typed(&streams) }).map(|streams| streams.inner())
         })
         .map(|streams| unsafe { S::typed_exports(&streams) })
+    }
+
+    /// Like [`ChildCircuit::recursive`], but for a group of mutually recursive
+    /// streams whose size is only known at runtime.
+    ///
+    /// Whereas [`recursive`](ChildCircuit::recursive) fixes the number of
+    /// recursive streams at compile time (a single stream or a tuple of
+    /// streams), this method computes a fixed point over `arity` mutually
+    /// recursive streams that all share the same key type `K`, value type `V`,
+    /// and batch type `B`.  The `arity` cannot be inferred, because the
+    /// recursive streams are the feedback Z-sets created *before* the closure
+    /// runs; it must therefore be supplied explicitly by the caller.
+    ///
+    /// The closure `f` receives a vector of `arity` recursive input streams and
+    /// must return a vector of exactly `arity` output streams, one per recursive
+    /// relation.
+    ///
+    /// Similar to [`recursive`](ChildCircuit::recursive), the underlying
+    /// circuit also applies an implicit distinct to the output of each
+    /// recursive step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the returned vector from the closure parameter has a different
+    /// length than the `arity` parameter.
+    ///
+    /// # Examples
+    ///
+    /// The circuit below computes a two-coloring (red and blue) of a graph.  If
+    /// no node is both red and blue the graph happens to be bipartite.  In the
+    /// first two computation steps the graph is bipartite but the added edge
+    /// in the third step adds an odd-length cycle which destroys the bipartite
+    /// property and all nodes are colored red and blue.
+    ///
+    /// ```
+    /// use dbsp::{
+    ///     operator::Generator,
+    ///     OrdZSet, Circuit, RootCircuit, Stream, zset, ZWeight,
+    ///     utils::Tup2, Error as DbspError, Runtime, NestedCircuit
+    /// };
+    ///
+    /// type Edge = Tup2<usize, usize>;
+    /// type Node = usize;
+    ///
+    /// const STEPS: usize = 3;
+    ///
+    /// let mut init_data = ([
+    ///     vec![Tup2(0, 1)],
+    ///     vec![],
+    ///     vec![]
+    /// ] as [Vec<Tup2<Node, ZWeight>>; STEPS]).into_iter();
+    ///
+    /// let mut edges_data = ([
+    ///     // The first step adds a graph of four nodes:
+    ///     // |0| --> |1| --> |2| --> |3| --> |4|
+    ///     vec![
+    ///         Tup2(Tup2(0, 1), 1),
+    ///         Tup2(Tup2(1, 2), 1),
+    ///         Tup2(Tup2(2, 3), 1),
+    ///         Tup2(Tup2(3, 4), 1),
+    ///     ],
+    ///     // Now, we have the following graph in total:
+    ///     // |0| --> |1| --> |2| --> |3| --> |4|
+    ///     //  ^               |
+    ///     //  |               |
+    ///     //  ------ |5| <-----
+    ///     vec![Tup2(Tup2(2, 5), 1), Tup2(Tup2(5, 0), 1)],
+    ///     // And we introduce an odd-length cycle, rendering the graph
+    ///     // non-bipartite anymore (all nodes are red _and_ blue):
+    ///     // |0| --> |1| --> |2| --> |3| --> |4|
+    ///     //  ^               |               |
+    ///     //  |               |               |
+    ///     //  ------ |5| <-----               |
+    ///     //  |                               |
+    ///     //  ---------------------------------
+    ///     vec![Tup2(Tup2(4, 0), 1)],
+    /// ] as [Vec<Tup2<Edge, ZWeight>>; STEPS]).into_iter();
+    ///
+    /// let mut expected_red_output = ([
+    ///     zset! {
+    ///         0 => 1,
+    ///         2 => 1,
+    ///         4 => 1,
+    ///     },
+    ///     zset! {},
+    ///     zset! {
+    ///         1 => 1,
+    ///         3 => 1,
+    ///         5 => 1,
+    ///     },
+    /// ] as [OrdZSet<Node>; STEPS]).into_iter();
+    ///
+    /// let mut expected_blue_output = ([
+    ///     zset! {
+    ///         1 => 1,
+    ///         3 => 1,
+    ///     },
+    ///     zset! {
+    ///         5 => 1,
+    ///     },
+    ///     zset! {
+    ///         0 => 1,
+    ///         2 => 1,
+    ///         4 => 1,
+    ///     },
+    /// ] as [OrdZSet<Node>; STEPS]).into_iter();
+    ///
+    /// let (mut circuit_handle, ((init_input, edges_input), (red_output, blue_output))) =
+    ///     Runtime::init_circuit(2, move |root_circuit| {
+    ///         let (edges, edges_input) = root_circuit.add_input_zset::<Edge>();
+    ///         let (init, init_input) = root_circuit.add_input_zset::<Node>();
+    ///
+    ///         let recursive_streams = root_circuit.recursive_dynamic(
+    ///             2,
+    ///             |child_circuit, mut recursive_streams: Vec<Stream<NestedCircuit, OrdZSet<usize>>>| {
+    ///                 // delta0 fires only at inner step 0, injecting the base case exactly once.
+    ///                 let edges = edges.delta0(child_circuit);
+    ///                 let init = init.delta0(child_circuit);
+    ///
+    ///                 let red = &recursive_streams[0];
+    ///                 let blue = &recursive_streams[1];
+    ///
+    ///                 let new_red = blue
+    ///                     .map_index(|blue_node| (*blue_node, *blue_node))
+    ///                     .join(
+    ///                         &edges.map_index(|Tup2(from, to)| (*from, *to)),
+    ///                         |_blue_node, _, new_red_node| *new_red_node,
+    ///                     )
+    ///                     .plus(&init);
+    ///
+    ///                 let new_blue = red.map_index(|red_node| (*red_node, *red_node)).join(
+    ///                     &edges.map_index(|Tup2(from, to)| (*from, *to)),
+    ///                     |_red_node, _, new_blue_node| *new_blue_node,
+    ///                 );
+    ///
+    ///                 recursive_streams[0] = new_red;
+    ///                 recursive_streams[1] = new_blue;
+    ///                 Ok(recursive_streams)
+    ///             },
+    ///         )?;
+    ///
+    ///         let red_output = recursive_streams[0].accumulate_output();
+    ///         let blue_output = recursive_streams[1].accumulate_output();
+    ///
+    ///         Ok((
+    ///             (init_input, edges_input),
+    ///             (red_output, blue_output),
+    ///         ))
+    ///     })?;
+    ///
+    /// for i in 0..STEPS {
+    ///     init_input.append(&mut init_data.next().unwrap());
+    ///     edges_input.append(&mut edges_data.next().unwrap());
+    ///     circuit_handle.transaction().unwrap();
+    ///     assert_eq!(red_output.concat().consolidate(), expected_red_output.next().unwrap());
+    ///     assert_eq!(blue_output.concat().consolidate(), expected_blue_output.next().unwrap());
+    /// }
+    ///
+    /// Ok::<(), DbspError>(())
+    /// ```
+    #[track_caller]
+    pub fn recursive_dynamic<F, K, V, B>(
+        &self,
+        arity: usize,
+        f: F,
+    ) -> Result<Vec<Stream<Self, TypedBatch<K, V, ZWeight, B>>>, SchedulerError>
+    where
+        B: Checkpoint + DynIndexedZSet + Send + Sync,
+        K: DBData + Erase<B::Key>,
+        V: DBData + Erase<B::Val>,
+        F: FnOnce(
+            &IterativeCircuit<Self>,
+            Vec<Stream<IterativeCircuit<Self>, TypedBatch<K, V, ZWeight, B>>>,
+        ) -> Result<
+            Vec<Stream<IterativeCircuit<Self>, TypedBatch<K, V, ZWeight, B>>>,
+            SchedulerError,
+        >,
+    {
+        let factories: Vec<DistinctFactories<B, _>> = (0..arity)
+            .map(|_| DistinctFactories::new::<K, V>())
+            .collect();
+
+        self.dyn_recursive(&factories, |circuit, streams: Vec<Stream<_, B>>| {
+            let typed = streams.iter().map(Stream::typed).collect();
+            f(circuit, typed).map(|streams| streams.iter().map(Stream::inner).collect())
+        })
+        .map(|exports| exports.iter().map(Stream::typed).collect())
     }
 }

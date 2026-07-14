@@ -3,28 +3,44 @@
 
   export type MetricsMode = 'overview' | 'node' | 'top-nodes'
 
-  /** The synthetic root "region" node represents the whole circuit (the overview) rather than a
-   *  single operator. Reused wherever we need to distinguish overview data from a single node. */
-  export function isOverviewAttributes(nodeAttributes: NodeAttributes): boolean {
-    return nodeAttributes.title === 'n region'
+  /** Node identity attributes shown beside the node title, in display order. */
+  const idAttributes = [
+    { key: 'parent', label: 'parent ID' },
+    { key: 'persistentId', label: 'persistent ID' }
+  ]
+
+  /** The toplevel node represents the whole circuit (the overview) rather than a single operator.
+   *  `rootNodeId` is the loaded profile's actual toplevel id; while it is `undefined` (no profile
+   *  yet) nothing counts as the overview. */
+  export function isOverviewAttributes(
+    nodeAttributes: NodeAttributes,
+    rootNodeId: string | undefined
+  ): boolean {
+    return rootNodeId !== undefined && nodeAttributes.nodeId === rootNodeId
   }
 
-  /** The node title is built as `${id} ${operation}`; the id (first token) is what `search()`
-   *  matches against, so it's the query that links back to the node in the diagram. */
+  /** The node id is what `search()` matches against, so it's the query that links back to the
+   *  node in the diagram. */
   export function nodeSearchQuery(nodeAttributes: NodeAttributes): string {
-    return nodeAttributes.title.split(' ')[0] ?? ''
+    return nodeAttributes.nodeId
   }
 </script>
 
 <script lang="ts">
   import type { TooltipData } from './ProfilerTooltip.svelte'
+  import KeyValueBlock from './metrics/blocks/KeyValueBlock.svelte'
   import MetricsDistributionBlock from './metrics/blocks/MetricsDistributionBlock.svelte'
   import { buildBlocks, type RenderableBlock } from './metrics/dispatch'
+  import { buildGlobalMetrics, type GlobalMetrics } from '../functions/globalMetrics'
   import type { LookupCoordinator } from '../functions/lookup'
 
   interface Props {
     mode: MetricsMode
     tooltipData: TooltipData | null
+    /** The loaded profile's toplevel node id, used to recognise overview data. */
+    rootNodeId: string | undefined
+    /** Cumulative pipeline-wide metrics from `stats.json`; shown as a tile atop the overview. */
+    globalMetrics?: GlobalMetrics
     /** When true, metrics flagged `advanced` in the profile metadata are included. */
     showAdvanced: boolean
     /** Lookup coordinator; the view registers an imperative handler so each Enter on the
@@ -35,13 +51,30 @@
     onSearchNode?: (query: string) => void
   }
 
-  const { mode, tooltipData, showAdvanced, lookup, onSearchNode }: Props = $props()
+  const { mode, tooltipData, rootNodeId, globalMetrics, showAdvanced, lookup, onSearchNode }: Props =
+    $props()
+
+  // Pipeline-wide totals for the overview's "Global stats" tile. Empty (so the tile is hidden) on
+  // any non-overview view or when the bundle carried no stats.
+  const globalMetricEntries = $derived(
+    mode === 'overview' ? buildGlobalMetrics(globalMetrics) : []
+  )
 
   const nodeAttributes = $derived(
     tooltipData && 'nodeAttributes' in tooltipData ? tooltipData.nodeAttributes : null
   )
   // Single-node data (a specific operator) as opposed to the whole-circuit overview.
-  const isNodeView = $derived(nodeAttributes ? !isOverviewAttributes(nodeAttributes) : false)
+  const isNodeView = $derived(
+    nodeAttributes ? !isOverviewAttributes(nodeAttributes, rootNodeId) : false
+  )
+  const identityRows = $derived(
+    nodeAttributes && isNodeView
+      ? idAttributes.flatMap((r) => {
+          const value = nodeAttributes.attributes.get(r.key)
+          return value ? [{ ...r, value }] : []
+        })
+      : []
+  )
   const blocks = $derived<RenderableBlock[]>(
     nodeAttributes ? buildBlocks(nodeAttributes, showAdvanced) : []
   )
@@ -109,7 +142,7 @@
 </script>
 
 {#snippet attributesView()}
-  {#if !nodeAttributes}
+  {#if !nodeAttributes && globalMetricEntries.length === 0}
     <div class="flex flex-1 items-center justify-center text-sm text-surface-600-400">
       {#if mode === 'node'}
         Click a node in the graph to see its metrics.
@@ -118,18 +151,34 @@
       {/if}
     </div>
   {:else}
-    {#if isNodeView}
-      <button
-        type="button"
-        title="Show this node in the diagram"
-        class="mb-3 block cursor-pointer text-left text-base font-semibold text-primary-600-400 hover:underline"
-        onclick={() => onSearchNode?.(nodeSearchQuery(nodeAttributes))}
-      >{nodeAttributes.title}</button>
+    {#if nodeAttributes && isNodeView}
+      <div class="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-base">
+        <button
+          type="button"
+          title="Show this node in the diagram"
+          class="cursor-pointer text-left font-semibold text-primary-600-400 hover:underline"
+          onclick={() => onSearchNode?.(nodeSearchQuery(nodeAttributes))}
+        >{nodeAttributes.title}</button>
+        {#each identityRows as row (row.key)}
+          <span class="text-surface-800-200">
+            <span class="font-medium">{row.label}:</span>
+            <span class="break-all font-mono">{row.value}</span>
+          </span>
+        {/each}
+      </div>
     {/if}
     <!-- Two same-width columns once the container is at least TWO_COLUMN_THRESHOLD_PX wide;
          otherwise one column. CSS multi-column flow auto-distributes blocks; the column
          count is driven by the ResizeObserver on the scroll container. -->
     <div class="gap-3" style="column-count: {useTwoColumns ? 2 : 1};">
+      <!-- Overview-only cumulative pipeline metrics from `stats.json`, tiled alongside the node
+           blocks. Driven by the bundle's global metrics, not the selected node, so it shows in the
+           overview even when the root node carries no attributes and no node tooltip is produced. -->
+      {#if globalMetricEntries.length > 0}
+        <div class="mb-3 break-inside-avoid">
+          <KeyValueBlock id="global-metrics" title="Global stats" entries={globalMetricEntries} />
+        </div>
+      {/if}
       {#each blocks as b (b.id)}
         <div class="mb-3 break-inside-avoid">
           <MetricsDistributionBlock id={b.id} title={b.title} entries={b.entries} />

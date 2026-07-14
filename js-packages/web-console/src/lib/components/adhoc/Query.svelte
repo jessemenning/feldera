@@ -39,11 +39,9 @@
   import SqlColumnHeader from '$lib/components/relationData/SQLColumnHeader.svelte'
   import { usePopoverTooltip } from '$lib/compositions/common/usePopoverTooltip.svelte'
   import List from '$lib/components/common/virtualList/HeadlessVirtualList.svelte'
-  import { useReverseScrollContainer } from '$lib/compositions/common/useReverseScrollContainer.svelte'
-  import ScrollDownFab from '$lib/components/other/ScrollDownFab.svelte'
+  import { ScrollDownFab, selectScope, useReverseScrollContainer } from 'common-ui'
   import type { Snippet } from '$lib/types/svelte'
   import type { UIEventHandler } from 'svelte/elements'
-  import { selectScope } from '$lib/compositions/common/userSelect'
   import { Progress } from '@skeletonlabs/skeleton-svelte'
   import ClipboardCopyButton from '../other/ClipboardCopyButton.svelte'
   import SQLValueTooltip from '../other/SQLValueTooltip.svelte'
@@ -178,7 +176,7 @@
                 }
               }}
               <div
-                class="relative scrollbar h-full max-h-64 w-fit max-w-full overflow-auto rounded"
+                class="relative scrollbar h-full max-h-64 w-fit max-w-full overflow-auto rounded pb-3"
                 use:reverseScroll.action
                 {onscroll}
                 bind:clientHeight={_.clientHeight}
@@ -187,6 +185,9 @@
                   {#if result.columns.length}
                     <thead>
                       <tr>
+                        <th class="bg-white-dark sticky top-0 z-10 pl-2 font-light {itemHeight}"
+                          >#</th
+                        >
                         {#each result.columns as column}
                           <SqlColumnHeader
                             {column}
@@ -206,6 +207,7 @@
               {@const row = rows[index]}
               {#if !row}{:else if 'cells' in row}
                 <tr {style} class="{itemHeight} whitespace-nowrap odd:bg-white odd:dark:bg-black">
+                  <td class="text-right font-mono select-none">{index}</td>
                   {#each row.cells as value}
                     <SQLValue
                       {value}
@@ -219,7 +221,9 @@
                 </tr>
               {:else if 'error' in row}
                 <tr {style} class={itemHeight} use:selectScope tabindex={-1}>
-                  <td colspan="99999999" class="preset-tonal-error px-2">{row.error}</td>
+                  <td colspan="99999999"
+                    ><div class="rounded bg-error-50-950/50 px-2">{row.error}</div></td
+                  >
                 </tr>
               {:else}
                 <tr {style} class={itemHeight} use:selectScope tabindex={-1}>

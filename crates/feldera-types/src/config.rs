@@ -5,17 +5,20 @@
 //! endpoint configs.  We represent these configs as opaque JSON values, so
 //! that the entire configuration tree can be deserialized from a JSON file.
 
+use crate::postprocess::PostprocessorConfig;
 use crate::preprocess::PreprocessorConfig;
 use crate::secret_resolver::default_secrets_directory;
 use crate::transport::adhoc::AdHocInputConfig;
 use crate::transport::clock::ClockConfig;
 use crate::transport::datagen::DatagenInputConfig;
 use crate::transport::delta_table::{DeltaTableReaderConfig, DeltaTableWriterConfig};
+use crate::transport::dynamodb::DynamoDBWriterConfig;
 use crate::transport::file::{FileInputConfig, FileOutputConfig};
 use crate::transport::http::{HttpInputConfig, HttpOutputConfig};
 use crate::transport::iceberg::IcebergReaderConfig;
 use crate::transport::kafka::{KafkaInputConfig, KafkaOutputConfig};
 use crate::transport::nats::NatsInputConfig;
+use crate::transport::solace::{SolaceInputConfig, SolaceOutputConfig};
 use crate::transport::nexmark::NexmarkInputConfig;
 use crate::transport::postgres::{
     PostgresCdcReaderConfig, PostgresReaderConfig, PostgresWriterConfig,
@@ -42,6 +45,9 @@ pub mod dev_tweaks;
 pub use dev_tweaks::DevTweaks;
 
 const DEFAULT_MAX_PARALLEL_CONNECTOR_INIT: u64 = 10;
+
+/// Default maximum number of updates to be kept in the output buffer.
+const DEFAULT_MAX_OUTPUT_BUFFER_SIZE_RECORDS: usize = 10_000_000;
 
 /// Default value of `ConnectorConfig::max_queued_records`.
 pub const fn default_max_queued_records() -> u64 {
@@ -523,23 +529,26 @@ pub struct SyncConfig {
     /// Default: 100M
     pub multi_thread_cutoff: Option<String>,
 
+    /// When true, checkpoint downloads use the maximum resources available on
+    /// the host: `transfers` and `checkers` are scaled to the number of CPUs,
+    /// and the download buffer is allowed to grow up to most of the available
+    /// memory. This maximizes download throughput at the cost of higher CPU and
+    /// memory usage during a pull.
+    ///
+    /// When false, downloads use the values configured via `transfers`,
+    /// `checkers`, and the rclone defaults instead.
+    ///
+    /// Default: true
+    #[schema(default = default_optimize_download_resources)]
+    #[serde(default = "default_optimize_download_resources")]
+    pub optimize_download_resources: bool,
+
     /// The number of chunks of the same file that are uploaded for multipart uploads.
     /// Default: 10
     pub upload_concurrency: Option<u8>,
 
-    /// When `true`, the pipeline starts in **standby** mode; processing doesn't
-    /// start until activation (`POST /activate`).
-    /// If this pipeline was previously activated and the storage has not been
-    /// cleared, the pipeline will auto activate, no newer checkpoints will be
-    /// fetched.
-    ///
-    /// Standby behavior depends on `start_from_checkpoint`:
-    /// - If `latest`, pipeline continuously fetches the latest available
-    ///   checkpoint until activated.
-    /// - If checkpoint UUID, pipeline fetches this checkpoint once and waits
-    ///   in standby until activated.
-    ///
-    /// Default: `false`
+    /// **Deprecated.** Use `initial=standby` when starting the pipeline instead.
+    #[deprecated(note = "Use `initial=standby` when starting the pipeline instead.")]
     #[schema(default = std::primitive::bool::default)]
     #[serde(default)]
     pub standby: bool,
@@ -612,12 +621,17 @@ fn default_retention_min_age() -> u32 {
     30
 }
 
+fn default_optimize_download_resources() -> bool {
+    true
+}
+
 impl SyncConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.standby && self.start_from_checkpoint.is_none() {
-            return Err(r#"invalid sync config: `standby` set to `true` but `start_from_checkpoint` not set.
-Standby mode requires `start_from_checkpoint` to be set.
-Consider setting `start_from_checkpoint` to `"latest"`."#.to_owned());
+        #[allow(deprecated)]
+        if self.standby {
+            return Err(
+                "The `standby` config field has been deprecated. Use `initial=standby` when starting the pipeline instead.".to_owned()
+            );
         }
 
         if let Some(ref rb) = self.read_bucket
@@ -1544,11 +1558,16 @@ pub struct ConnectorConfig {
     /// Transport endpoint configuration.
     pub transport: TransportConfig,
 
+    /// Optional preprocessor configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preprocessor: Option<Vec<PreprocessorConfig>>,
 
     /// Parser configuration.
     pub format: Option<FormatConfig>,
+
+    /// Optional postprocessor configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postprocessor: Option<Vec<PostprocessorConfig>>,
 
     /// Name of the index that the connector is attached to.
     ///
@@ -1671,6 +1690,7 @@ impl ConnectorConfig {
             transport,
             preprocessor: None,
             format,
+            postprocessor: None,
             index: None,
             output_buffer_config: Default::default(),
             max_batch_size: None,
@@ -1702,6 +1722,33 @@ impl ConnectorConfig {
         a.paused = false;
         b.paused = false;
         a == b
+    }
+
+    /// Compare two input connector configs modulo fields that only affect
+    /// runtime flow control and do not invalidate checkpointed connector state.
+    pub fn equal_for_input_checkpoint_replay(&self, other: &Self) -> bool {
+        let mut a = self.clone();
+        let mut b = other.clone();
+        a.normalize_for_input_checkpoint_replay();
+        b.normalize_for_input_checkpoint_replay();
+        a == b
+    }
+
+    fn normalize_for_input_checkpoint_replay(&mut self) {
+        self.paused = false;
+        self.max_batch_size = None;
+        self.max_worker_batch_size = None;
+        self.max_queued_records = default_max_queued_records();
+        self.max_queued_bytes = None;
+    }
+
+    /// Adopt input connector settings that are safe to change while replaying
+    /// checkpointed connector state.
+    pub fn apply_input_checkpoint_replay_config_from(&mut self, other: &Self) {
+        self.max_batch_size = other.max_batch_size;
+        self.max_worker_batch_size = other.max_worker_batch_size;
+        self.max_queued_records = other.max_queued_records;
+        self.max_queued_bytes = other.max_queued_bytes;
     }
 
     /// Returns `max_queued_records` or, if it is not set, the default.
@@ -1762,8 +1809,7 @@ pub struct OutputBufferConfig {
     /// total number of updates output by the pipeline. Updates to the
     /// same record can overwrite or cancel previous updates.
     ///
-    /// By default, the buffer can grow indefinitely until one of
-    /// the other output conditions is satisfied.
+    /// The default is 10,000,000.
     ///
     /// NOTE: this configuration option requires the `enable_output_buffer` flag
     /// to be set.
@@ -1774,25 +1820,9 @@ impl Default for OutputBufferConfig {
     fn default() -> Self {
         Self {
             enable_output_buffer: false,
-            max_output_buffer_size_records: usize::MAX,
+            max_output_buffer_size_records: DEFAULT_MAX_OUTPUT_BUFFER_SIZE_RECORDS,
             max_output_buffer_time_millis: usize::MAX,
         }
-    }
-}
-
-impl OutputBufferConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.enable_output_buffer
-            && self.max_output_buffer_size_records == Self::default().max_output_buffer_size_records
-            && self.max_output_buffer_time_millis == Self::default().max_output_buffer_time_millis
-        {
-            return Err(
-                "when the 'enable_output_buffer' flag is set, one of 'max_output_buffer_size_records' and 'max_output_buffer_time_millis' settings must be specified"
-                    .to_string(),
-            );
-        }
-
-        Ok(())
     }
 }
 
@@ -1833,6 +1863,10 @@ pub enum TransportConfig {
     S3Input(S3InputConfig),
     DeltaTableInput(DeltaTableReaderConfig),
     DeltaTableOutput(DeltaTableWriterConfig),
+    // Snake case would rename "DynamoDBOutput" to `dynamo_db_output`.
+    // However, DynamoDB is a single word, so override the tag to `dynamodb_output`.
+    #[serde(rename = "dynamodb_output")]
+    DynamoDBOutput(DynamoDBWriterConfig),
     RedisOutput(RedisOutputConfig),
     // Prevent rust from complaining about large size difference between enum variants.
     IcebergInput(Box<IcebergReaderConfig>),
@@ -1848,6 +1882,12 @@ pub enum TransportConfig {
     /// Ad hoc input: cannot be instantiated through API
     AdHocInput(AdHocInputConfig),
     ClockInput(ClockConfig),
+    /// Output connector that discards all data.
+    NullOutput,
+    /// Input connector that produces no data.
+    EmptyInput,
+    SolaceInput(SolaceInputConfig),
+    SolaceOutput(SolaceOutputConfig),
 }
 
 impl TransportConfig {
@@ -1863,6 +1903,7 @@ impl TransportConfig {
             TransportConfig::S3Input(_) => "s3_input".to_string(),
             TransportConfig::DeltaTableInput(_) => "delta_table_input".to_string(),
             TransportConfig::DeltaTableOutput(_) => "delta_table_output".to_string(),
+            TransportConfig::DynamoDBOutput(_) => "dynamodb_output".to_string(),
             TransportConfig::IcebergInput(_) => "iceberg_input".to_string(),
             TransportConfig::PostgresInput(_) => "postgres_input".to_string(),
             TransportConfig::PostgresCdcInput(_) => "postgres_cdc_input".to_string(),
@@ -1874,6 +1915,10 @@ impl TransportConfig {
             TransportConfig::AdHocInput(_) => "adhoc_input".to_string(),
             TransportConfig::RedisOutput(_) => "redis_output".to_string(),
             TransportConfig::ClockInput(_) => "clock".to_string(),
+            TransportConfig::NullOutput => "null_output".to_string(),
+            TransportConfig::EmptyInput => "empty_input".to_string(),
+            TransportConfig::SolaceInput(_) => "solace_input".to_string(),
+            TransportConfig::SolaceOutput(_) => "solace_output".to_string(),
         }
     }
 

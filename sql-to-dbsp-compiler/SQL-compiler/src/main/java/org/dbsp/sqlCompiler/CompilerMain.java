@@ -175,7 +175,7 @@ public class CompilerMain {
             return compiler.messages;
         // The following runs all compilation stages
         DBSPCircuit circuit = compiler.getFinalCircuit(false);
-        if (options.ioOptions.anonymize)
+        if (options.ioOptions.anonymize || options.ioOptions.format)
             // The front-end has already emitted the output, we are done.
             return compiler.messages;
         if (compiler.hasErrors())
@@ -220,9 +220,13 @@ public class CompilerMain {
             }
         }
 
-        String dotFormat = (this.options.ioOptions.emitJpeg ? "jpg"
-                            : this.options.ioOptions.emitPng ? "png"
-                            : null);
+        String dotFormat = null;
+        if (this.options.ioOptions.emitJpeg)
+            dotFormat = "jpg";
+        else if (this.options.ioOptions.emitPng)
+            dotFormat = "png";
+        else if (this.options.ioOptions.emitSvg)
+            dotFormat = "svg";
         if (dotFormat != null) {
             if (this.options.ioOptions.outputFile.isEmpty()) {
                 compiler.reportError(SourcePositionRange.INVALID, "Invalid output",

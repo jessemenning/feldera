@@ -1,5 +1,6 @@
 <script lang="ts" module>
   import type { TriageResults } from 'triage-types'
+  import type { GlobalMetrics } from '../../functions/globalMetrics'
   import type { LookupCoordinator } from '../../functions/lookup'
   import type { MetricsMode } from '../MetricsView.svelte'
   import type { TooltipData } from '../ProfilerTooltip.svelte'
@@ -9,6 +10,15 @@
   export type AnalysisTabProps = {
     metricsMode: MetricsMode
     tooltipData: TooltipData | null
+    /** Id of the loaded profile's toplevel node, so the Metrics view can tell the overview from a
+     *  single operator. `undefined` until a profile is loaded. */
+    rootNodeId: string | undefined
+    /** Cumulative pipeline-wide metrics from `stats.json`, shown as a tile in the overview.
+     *  `undefined` when the bundle carried no stats. */
+    globalMetrics: GlobalMetrics | undefined
+    /** Pipeline runtime configuration shown in the Config tab. `undefined` when the bundle carried
+     *  no `pipeline_config.json` */
+    runtimeConfig: unknown
     /** When true, metrics flagged `advanced` in the profile metadata are shown too. */
     showAdvancedMetrics: boolean
     lookup: LookupCoordinator
@@ -20,6 +30,8 @@
     issueCategoryFilter: string
     /** Links the metrics node title back to (searches for) the node in the diagram. */
     onSearchNode?: (query: string) => void
+    /** Called when the user presses the search shortcut inside the tab. */
+    onSearchShortcut?: () => void
   }
 </script>
 
@@ -28,6 +40,8 @@
   let {
     metricsMode,
     tooltipData,
+    rootNodeId,
+    globalMetrics,
     showAdvancedMetrics,
     lookup,
     onSearchNode
@@ -37,6 +51,8 @@
 <MetricsView
   mode={metricsMode}
   {tooltipData}
+  {rootNodeId}
+  {globalMetrics}
   showAdvanced={showAdvancedMetrics}
   {lookup}
   {onSearchNode}

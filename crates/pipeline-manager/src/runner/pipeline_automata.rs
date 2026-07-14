@@ -2052,6 +2052,7 @@ mod test {
                 PipelineDescr {
                     name: "example1".to_string(),
                     description: "Description of example1".to_string(),
+                    tags: vec![],
                     runtime_config: json!({}),
                     program_code: "CREATE TABLE example1 ( col1 INT );".to_string(),
                     udf_rust: "".to_string(),
@@ -2154,6 +2155,7 @@ mod test {
                 https_tls_key_path: None,
                 private_ca_cert_path: None,
                 pipeline_monitor_events_retention: 720,
+                disable_cluster_monitor_resources: false,
             },
             pipeline_id,
             Some("test-pipeline".to_string()),

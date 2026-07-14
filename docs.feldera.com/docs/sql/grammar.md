@@ -31,8 +31,13 @@ statement
   |   setOptionStatement
 
 columnDecl
-  :   column generalType [ INTERNED ]
+  :   column generalType
 ```
+
+<!--
+  TODO: interning is broken, restore this if it's supported
+  :   column generalType [ INTERNED ]
+-->
 
 ## Creating user-defined types
 
@@ -68,9 +73,7 @@ columnConstraint
   :   PRIMARY KEY
   |   FOREIGN KEY REFERENCES identifier '(' identifier ')'
   |   LATENESS expression
-  |   WATERMARK expression
   |   DEFAULT expression
-  |   INTERNED
 
 tableConstraint
   :   [ CONSTRAINT name ]
@@ -89,6 +92,11 @@ keyValueList
 keyValue
   : stringLiteral '=' stringLiteral
 ```
+
+<!--
+ TODO: Removed INTERNED from columnConstraint, add when supported
+    |   INTERNED
+-->
 
 Columns that are part of a `PRIMARY KEY` cannot have nullable types.
 
@@ -181,6 +189,7 @@ instructs Feldera to also maintain the complete contents of the table.
 Such materialized tables can be browsed and queried at runtime.
 See [Materialized Tables and Views](materialized.md) for more details.
 
+<!--
 #### Interned strings
 
 The `INTERNED` annotation can be added to a column with type `VARCHAR`
@@ -193,6 +202,8 @@ the string value.  This works well if strings are only used for
 equality comparisons; when interned strings participate in other
 computations, or before being emitted to the output, they are
 converted back to their original values.
+
+-->
 
 #### Append-only tables
 
@@ -260,9 +271,9 @@ latenessStatement
 
 See [Streaming SQL Extensions, LATENESS](streaming.md#lateness-expressions)
 
-### WATERMARKS
+<!-- ### WATERMARKS
 
-See [Streaming SQL Extensions, WATERMARKS](streaming.md#watermark-expressions)
+See [Streaming SQL Extensions, WATERMARKS](streaming.md#watermark-expressions) -->
 
 ## Creating user-defined functions.
 
@@ -299,7 +310,7 @@ See [Materialized Tables and Views](materialized.md) for more details.
 `DECLARE RECURSIVE VIEW` is used to declare a view that can afterwards
 be used in a recursive SQL query.  The syntax of this statement is
 reminiscent of a table declaration, without constraints.  Recursive
-queries are documented in [this section](recursion).
+queries are documented in [this section](recursion.mdx).
 
 ```
 declareRecursiveViewStatement:
@@ -326,9 +337,9 @@ query
       |   query UNION [ ALL | DISTINCT ] query
       |   query EXCEPT [ DISTINCT ] query
       |   query MINUS [ DISTINCT ] query
-      |   query INTERSECT [ DISTINCT ] query
+      |   query INTERSECT [ ALL | DISTINCT ] query
       }
-      [ ORDER BY orderItem [, orderItem ]* ]
+      [ ORDER BY { ALL [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ] | orderItem [, orderItem]* } ]
       [ LIMIT [ start, ] { count | ALL } ]
       [ OFFSET start [ { ROW | ROWS } ] ]
       [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]
@@ -340,8 +351,7 @@ withItem
       AS '(' query ')'
 ```
 
-`MINUS` is equivalent to `EXCEPT`.  Note that `EXCEPT ALL` and
-`INTERSECT ALL` are currently not implemented.
+`MINUS` is equivalent to `EXCEPT`.
 
 <a id="values"></a>
 ```
@@ -349,14 +359,24 @@ values
   :   { VALUES | VALUE } expression [, expression ]*
 
 select
-  :   SELECT [ hintComment ] [ ALL | DISTINCT ]
-          { projectItem [, projectItem ]* }
+  :   SELECT [ hintComment ] [ ALL | DISTINCT [ ON '(' expression [ ',' expression ]* ')' ] ] { projectItem [, projectItem ]* }
       FROM tableExpression
       [ WHERE booleanExpression ]
-      [ GROUP BY [ ALL | DISTINCT ] { groupItem [, groupItem ]* } ]
+      [ GROUP BY { ALL | [ ALL | DISTINCT ] { groupItem [, groupItem ]* } } ]
       [ HAVING booleanExpression ]
       [ QUALIFY booleanExpression ]
 ```
+
+`DISTINCT ON` allows you to eliminate duplicate rows based on
+specified expressions, keeping the first row in each group as
+determined by the `ORDER BY` clause. When using `DISTINCT ON`, the
+expressions in the `DISTINCT ON` clause must match a prefix of the
+`ORDER BY` clause.
+
+`GROUP BY ALL` without any groupItem specified groups by every
+expression in the `SELECT` clause that is not an aggregate function.
+For example, `SELECT deptno, SUM(sal) FROM emp GROUP BY ALL` is
+equivalent to `SELECT deptno, SUM(sal) FROM emp GROUP BY deptno`.
 
 <a id="lateral"></a>
 ```
@@ -395,12 +415,24 @@ orderItem
   :   expression [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ]
 ```
 
+`ORDER BY ALL` will order on all expressions of the `SELECT`
+statement, in the order they appear.  E.g., `SELECT x, y FROM t ORDER
+BY ALL` is equivalent to `SELECT x, y FROM t ORDER BY x, y`.  An
+optional trailing `ASC/DESC/NULLS FIRST/NULLS LAST` applies to all
+expressions.
+
 <a id="as"></a>
 ```
 projectItem
   :   expression [ [ AS ] columnAlias ]
-  |   ROW(*) [ [ AS ] columnAlias ]
-  |   tableAlias . *
+  |   ROW(rowStarItem [, projectItem ]* [ [ AS columnAlias ] ]
+  |   tableAlias . '*'
+
+rowStarItem
+  :   '*'
+  |   tableAlias . '*'
+  |   '*' { EXCLUDE | EXCEPT } '(' column [, column ]* ')'
+  |   tableAlias . '*' { EXCLUDE | EXCEPT } '(' column [, column ]* ')'
 ```
 
 The following forms of `SELECT` are supported:
@@ -409,6 +441,8 @@ The following forms of `SELECT` are supported:
 - `SELECT * EXCLUDE a, b FROM T`: select all columns of table `T` except the ones named `a` and `b`
 - `SELECT * EXCEPT a, b FROM T`: `EXCEPT` is a synonym for `EXCLUDE`; this statement is equivalent to the previous statement
 - `SELECT * REPLACE (a+b AS a) FROM T`: Select all columns of table `T` and replace column `a` with the expression `a+b`
+- `SELECT ROW(T.*) FROM T`: Create a `ROW`-typed column with all columns of table `T`
+- `SELECT ROW(T.* EXCLUDE(a, b)) FROM T: Create a `ROW`-typed column with all columns of table `T` except columns `a` and `b`
 - `SELECT` supports [lateral column aliasing](identifiers.md#lateral-column-aliasing), where
   an identifier defined in a `SELECT` statement can be immediately used in the same statement
   or in the associated `GROUP BY` and `HAVING` statements.
@@ -525,7 +559,7 @@ hintOption
 
 :::warning
 
-These hints are considered still experimental, and they may change
+These hints are considered experimental, and they may change
 
 :::
 
@@ -770,6 +804,16 @@ still considered experimental.  Possible example: `SET
 FELDERA_USE_MULTI_JOINS = OFF`.
 
 Currently the following options are available:
+
+`ENFORCE_POSITIVE_INPUTS` if set to `TRUE`, the compiler inserts a
+runtime check after every input table that has no primary key.  At
+each step, the check verifies that no record in the accumulated
+integral has a negative weight (i.e., the table has not received more
+deletions for a key than insertions).  A violation causes the pipeline
+to panic.  This option is intended for debugging pipelines that
+produce unexpected results due to invalid input data.  Note: this
+setting is expensive, and will trigger a full backfill for the
+affected tables.
 
 `FELDERA_AVOID_STAR_JOINS` if set to true the compiler will not
 generate code using the new feature of "star joins", which are a

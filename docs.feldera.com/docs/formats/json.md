@@ -196,8 +196,8 @@ data change event formats in JSON: (1) the raw format and (2) the insert/delete 
 ### The insert/delete format
 
 A data change event in this format is represented as a JSON object with a
-single key, which must be equal to `insert` or `delete`.  The associated value
-represents the table row to be inserted or deleted, encoded using the format
+single key, which must be equal to `insert`, `update`, or `delete`.  The associated value
+represents the table row to be inserted, updated, or deleted, encoded using the format
 documented above.  Example row insertion event:
 
 ```json
@@ -209,6 +209,12 @@ Example row deletion event:
 ```json
 {"delete": {"part": 1, "vendor": 2, "price": 10000}}
 ```
+
+Full or partial updates are also supported if the table has a [primary key](/sql/grammar/#creating-tables). Example update event for a vendors table:
+```json
+{"update": {"vendor_id": 2, "vendor_address": "123 Feldera Place, San Francisco, CA"}}
+```
+The `vendor_id` column must be a primary key. The vendors table may have more columns, but only the `vendor_address` column will be updated by the update event above. An `update` payload that contains all of the table columns is equivalent to an `insert`.
 
 ### The raw format
 
@@ -317,6 +323,7 @@ create table PART (
 - `update_format`: Choose data change event format for this connector. Supported values are `insert_delete` and `raw`. The default is `insert_delete`.
 - `array`: Whether to enable array encoding. The default is `false`.
 - `lines`: How many input lines may be part of a JSON value. The default, `multiple`, allows individual JSON values to span multiple lines. Specify `single` to limit support to newline-delimited JSON (NDJSON), a subset of JSON which does not allow a new-line inside a value.
+- `buffer_size_records`: Maximum number of records to batch into a single output message (output connectors only). When this threshold is reached, the encoder flushes the buffer to the transport. The default is `10000`.
 
 See also the [input/output connector tutorial](/tutorials/basics/part3.md).
 

@@ -21,22 +21,30 @@
   import type { Field } from '$lib/services/manager'
   import SqlColumnHeader from '$lib/components/relationData/SQLColumnHeader.svelte'
   import { usePopoverTooltip } from '$lib/compositions/common/usePopoverTooltip.svelte'
-  import { useReverseScrollContainer } from '$lib/compositions/common/useReverseScrollContainer.svelte'
-  import ScrollDownFab from '$lib/components/other/ScrollDownFab.svelte'
+  import { ScrollDownFab, useReverseScrollContainer } from 'common-ui'
   import SQLValueTooltip from '$lib/components/other/SQLValueTooltip.svelte'
   import type { SQLValueJS } from '$lib/types/sql'
 
   let {
-    changeStream
+    changeStream,
+    onScrollPausedChange
   }: {
     changeStream: ChangeStreamData
+    /** Fired whenever scroll-pause toggles: `true` when the user scrolls up off the
+     *  bottom, `false` when the view sticks to the bottom again. */
+    onScrollPausedChange?: (paused: boolean) => void
   } = $props()
 
   let popupRef: HTMLElement | undefined = $state()
   let tooltip = usePopoverTooltip<SQLValueJS>(() => popupRef)
 
+  // Pause the stream when the view stops sticking to the bottom (scrolled up off it) and
+  // resume when it sticks again — the same threshold that toggles `ScrollDownFab`, so
+  // pause/resume and FAB visibility stay in lockstep. Driven by the scroll container's own
+  // notification rather than a reactive read, so the host callback always fires.
   const reverseScroll = useReverseScrollContainer({
-    observeContentSize: () => changeStream.rows.length
+    observeContentSize: () => changeStream.rows.length,
+    onStickToBottomChange: (stickToBottom) => onScrollPausedChange?.(!stickToBottom)
   })
 </script>
 
@@ -90,6 +98,7 @@
       {:else}
         {@const data = 'insert' in row ? row.insert : row.delete}
         <tr
+          data-testid="box-changestream-row"
           style="{style} {padding}"
           class="h-7 whitespace-nowrap select-none even:bg-surface-50-950"
           oncopy={(e) => {

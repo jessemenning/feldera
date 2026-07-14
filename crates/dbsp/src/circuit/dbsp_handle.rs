@@ -235,6 +235,23 @@ impl Layout {
             Layout::Multihost { local_host_idx, .. } => *local_host_idx,
         }
     }
+
+    /// Returns [`HostInfo`] for this host when running in multihost mode,
+    /// or `None` for solo pipelines.
+    ///
+    /// [`HostInfo`]: feldera_types::checkpoint::HostInfo
+    pub fn host_info(&self) -> Option<feldera_types::checkpoint::HostInfo> {
+        match self {
+            Layout::Solo { .. } => None,
+            Layout::Multihost {
+                hosts,
+                local_host_idx,
+            } => Some(feldera_types::checkpoint::HostInfo {
+                host_idx: *local_host_idx,
+                n_hosts: hosts.len(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -397,11 +414,20 @@ pub fn adaptive_joins_enabled() -> bool {
     Runtime::with_dev_tweaks(|d| d.adaptive_joins())
 }
 
-pub fn max_level0_batch_size_records() -> u16 {
-    Runtime::with_dev_tweaks(|d| {
+pub fn max_level0_batch_size_records() -> usize {
+    let max_level0_batch_size_records = Runtime::with_dev_tweaks(|d| {
         d.max_level0_batch_size_records
             .unwrap_or(MAX_LEVEL0_BATCH_SIZE_RECORDS)
-    })
+    }) as usize;
+    assert!(
+        max_level0_batch_size_records > 0,
+        "max_level0_batch_size_records must be greater than 0"
+    );
+    assert!(
+        max_level0_batch_size_records <= 99_999,
+        "max_level0_batch_size_records must be less than or equal to 99_999"
+    );
+    max_level0_batch_size_records
 }
 
 pub fn negative_weight_multiplier() -> u16 {
@@ -866,6 +892,15 @@ impl Runtime {
                             return;
                         }
                     }
+                    Ok(Command::IsCompactionComplete) => {
+                        let complete = circuit.is_compaction_complete();
+                        if status_sender
+                            .send(Ok(Response::IsCompactionComplete(complete)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     // Nothing to do: do some housekeeping and relinquish the CPU if there's none
                     // left.
                     Err(TryRecvError::Empty) => {
@@ -959,6 +994,7 @@ enum Command {
     Rebalance,
     SetAutoRebalance(bool),
     StartCompaction,
+    IsCompactionComplete,
 }
 
 impl Debug for Command {
@@ -1001,6 +1037,7 @@ impl Debug for Command {
                 f.debug_tuple("SetAutoRebalance").field(enable).finish()
             }
             Command::StartCompaction => write!(f, "StartCompaction"),
+            Command::IsCompactionComplete => write!(f, "IsCompactionComplete"),
         }
     }
 }
@@ -1010,6 +1047,7 @@ enum Response {
     Unit,
     CommitComplete(bool),
     BootstrapComplete(bool),
+    IsCompactionComplete(bool),
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
@@ -1722,6 +1760,59 @@ impl DBSPHandle {
     pub fn start_compaction(&mut self) -> Result<(), DbspError> {
         self.broadcast_command(Command::StartCompaction, |_, _| {})?;
         Ok(())
+    }
+
+    /// Returns `true` when background compaction has fully converged on every
+    /// worker: all compaction requests have been processed, no merge is in
+    /// progress, and each spine has been reduced to at most one batch.
+    ///
+    /// This is a non-blocking point-in-time snapshot.  Callers that need to
+    /// wait for compaction to finish should call
+    /// [`wait_for_compaction`](Self::wait_for_compaction) or poll this method.
+    pub fn is_compaction_complete(&mut self) -> Result<bool, DbspError> {
+        let mut complete = true;
+        self.broadcast_command(Command::IsCompactionComplete, |_, response| {
+            if let Response::IsCompactionComplete(c) = response {
+                complete &= c;
+            }
+        })?;
+        Ok(complete)
+    }
+
+    /// Block until background compaction has fully converged on every worker,
+    /// or until `timeout` elapses.
+    ///
+    /// Polls [`is_compaction_complete`](Self::is_compaction_complete) with
+    /// exponential back-off, starting at 1 ms and doubling each iteration up
+    /// to a cap of 1 s.
+    ///
+    /// Returns `Ok(())` when compaction is complete, or an error if the
+    /// circuit fails or the timeout expires.
+    pub fn wait_for_compaction(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        use std::thread;
+        use std::time::Instant;
+
+        const INITIAL_SLEEP_MS: u64 = 1;
+        const MAX_SLEEP_MS: u64 = 1_000;
+
+        let deadline = Instant::now() + timeout;
+        let mut sleep_ms = INITIAL_SLEEP_MS;
+
+        loop {
+            if self.is_compaction_complete()? {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out after {timeout:?} waiting for compaction to complete");
+            }
+            let sleep = std::time::Duration::from_millis(sleep_ms).min(remaining);
+            thread::sleep(sleep);
+            sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
+        }
     }
 }
 
@@ -2633,5 +2724,75 @@ pub(crate) mod tests {
             checkpoint = Some(cpm.uuid);
             dbsp.kill().unwrap();
         }
+    }
+
+    /// `is_compaction_complete` / `wait_for_compaction` must converge after a
+    /// compaction sweep and verify actual merging occurred.
+    ///
+    /// Uses in-memory storage so the test finishes quickly.
+    #[test]
+    fn test_is_compaction_complete() {
+        use crate::circuit::GlobalNodeId;
+        use crate::circuit::metadata::{MetaItem, SPINE_BATCHES_COUNT};
+        use crate::utils::Tup2;
+        use std::time::Duration;
+
+        const BATCHES: usize = 30;
+        const RECORDS_PER_BATCH: i32 = 500;
+
+        let (mut dbsp, input_handle) =
+            Runtime::init_circuit(CircuitConfig::with_workers(2), |circuit| {
+                let (stream, handle) = circuit.add_input_indexed_zset::<i32, i32>();
+                stream.shard().integrate_trace();
+                Ok(handle)
+            })
+            .unwrap();
+
+        // Feed enough batches to give each spine more than one batch to merge.
+        for batch in 0..BATCHES as i32 {
+            let mut tuples: Vec<_> = (0..RECORDS_PER_BATCH)
+                .map(|r| Tup2(batch * RECORDS_PER_BATCH + r, Tup2(r, 1)))
+                .collect();
+            input_handle.append(&mut tuples);
+            dbsp.transaction().unwrap();
+        }
+
+        // Collect per-operator spine batch counts from the profile.
+        let batch_counts = |dbsp: &mut DBSPHandle| -> Vec<usize> {
+            let root = GlobalNodeId::root();
+            dbsp.retrieve_profile()
+                .unwrap()
+                .worker_profiles
+                .iter()
+                .flat_map(|p| p.attribute_profile(&SPINE_BATCHES_COUNT))
+                .filter_map(|(id, value)| {
+                    (id != root).then(|| match value {
+                        MetaItem::Count(n) => n,
+                        other => panic!("unexpected MetaItem: {other:?}"),
+                    })
+                })
+                .collect()
+        };
+
+        // Before compaction there must be at least one spine with more than one
+        // batch, confirming that actual merging work is needed.
+        let counts_before = batch_counts(&mut dbsp);
+        assert!(
+            counts_before.iter().any(|&n| n > 1),
+            "expected at least one spine with >1 batch before compaction, got {counts_before:?}"
+        );
+
+        // Request a full compaction and block until all spines converge.
+        dbsp.start_compaction().unwrap();
+        dbsp.wait_for_compaction(Duration::from_secs(60)).unwrap();
+
+        // After convergence every spine must have at most one batch.
+        let counts_after = batch_counts(&mut dbsp);
+        assert!(
+            counts_after.iter().all(|&n| n <= 1),
+            "expected all spines to have <=1 batch after compaction, got {counts_after:?}"
+        );
+
+        dbsp.kill().unwrap();
     }
 }

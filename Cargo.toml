@@ -1,6 +1,6 @@
 [workspace.package]
 authors = ["Feldera Team <dev@feldera.com>"]
-version = "0.307.0"
+version = "0.321.0"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/feldera/feldera"
 repository = "https://github.com/feldera/feldera"
@@ -68,6 +68,11 @@ async-trait = "0.1"
 atomic = "0.6.0"
 awc = "3.5.1"
 aws-config = "1.8.13"
+aws-sdk-dynamodb = { version = "1.110.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+  "behavior-version-latest"
+] }
 aws-sdk-s3 = { version = "1.122.0", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
@@ -103,20 +108,23 @@ csv = "1.2.2"
 csv-core = "0.1.10"
 dashmap = "6.1.0"
 datafusion = "53.1"
-dbsp = { path = "crates/dbsp", version = "0.307.0" }
+dbsp = { path = "crates/dbsp", version = "0.321.0" }
 dbsp_nexmark = { path = "crates/nexmark" }
 deadpool-postgres = "0.14.1"
-# Feldera fork of delta-rs: upstream tag `rust-v0.32.3` + 2 patches, on branch
-# `v0.32.3-feldera`. When bumping the pinned revision, preserve these patches:
+# Feldera fork of delta-rs: upstream tag `rust-v0.32.3` + 3 patches, on branch
+# `v0.32.3-feldera-fix`. When bumping the pinned revision, preserve these patches:
 #   - 7f8bb445 "Disable unsupported feature check." — relax the writer-side
 #     protocol-feature gate so we can write tables produced by newer clients.
 #   - 5b35c098 "delta-rs: round-robin pre-split unpartitioned scans into
 #     target_partitions FileGroups" — improves snapshot read parallelism for
 #     unpartitioned tables; pairs with the DataFusion knobs we tune in adapters.
+#   - 9a58fbef "delta-rs: resolve column-mapped Uniform/Iceberg columns by
+#     Parquet field-id" — fixes `col-<id> is missing from the physical schema`
+#     when reading UC-Uniform-over-Iceberg tables (columnMapping.mode=id). #6557.
 # Diff vs. upstream:
-#   https://github.com/delta-io/delta-rs/compare/rust-v0.32.3...feldera:delta-rs:v0.32.3-feldera
-deltalake = { git = "https://github.com/feldera/delta-rs.git", rev = "5b35c0988b07ab921d5eee5b8da8da55e4d65945" }
-deltalake-catalog-unity = { git = "https://github.com/feldera/delta-rs.git", rev = "5b35c0988b07ab921d5eee5b8da8da55e4d65945" }
+#   https://github.com/delta-io/delta-rs/compare/rust-v0.32.3...feldera:delta-rs:v0.32.3-feldera-fix
+deltalake = { git = "https://github.com/feldera/delta-rs.git", rev = "297f2dd146f9947795f8b77f25db8da9daff2ade" }
+deltalake-catalog-unity = { git = "https://github.com/feldera/delta-rs.git", rev = "297f2dd146f9947795f8b77f25db8da9daff2ade" }
 
 delta_kernel = { package = "buoyant_kernel", version = "0.22" }
 derive_more = { version = "1.0.0" }
@@ -128,22 +136,23 @@ erased-serde = "0.3.31"
 fake = "2.10"
 fastbloom = "0.14.0"
 fdlimit = "0.3.0"
-feldera-buffer-cache = { version = "0.307.0", path = "crates/buffer-cache" }
+feldera-buffer-cache = { version = "0.321.0", path = "crates/buffer-cache" }
 feldera-cloud1-client = "0.1.2"
 feldera-datagen = { path = "crates/datagen" }
-feldera-fxp = { version = "0.307.0", path = "crates/fxp", features = ["dbsp"] }
+feldera-fxp = { version = "0.321.0", path = "crates/fxp", features = ["dbsp"] }
 feldera-iceberg = { path = "crates/iceberg" }
-feldera-observability = { version = "0.307.0", path = "crates/feldera-observability" }
-feldera-macros = { version = "0.307.0", path = "crates/feldera-macros" }
-feldera-sqllib = { version = "0.307.0", path = "crates/sqllib" }
-feldera-storage = { version = "0.307.0", path = "crates/storage" }
-feldera-types = { version = "0.307.0", path = "crates/feldera-types" }
-feldera-rest-api = { version = "0.307.0", path = "crates/rest-api" }
-feldera-ir = { version = "0.307.0", path = "crates/ir" }
-feldera-adapterlib = { version = "0.307.0", path = "crates/adapterlib" }
-feldera-samply = { version = "0.307.0", path = "crates/samply" }
+feldera-observability = { version = "0.321.0", path = "crates/feldera-observability" }
+feldera-macros = { version = "0.321.0", path = "crates/feldera-macros" }
+feldera-sqllib = { version = "0.321.0", path = "crates/sqllib" }
+feldera-storage = { version = "0.321.0", path = "crates/storage" }
+feldera-types = { version = "0.321.0", path = "crates/feldera-types" }
+feldera-rest-api = { version = "0.321.0", path = "crates/rest-api" }
+feldera-ir = { version = "0.321.0", path = "crates/ir" }
+feldera-adapterlib = { version = "0.321.0", path = "crates/adapterlib" }
+feldera-samply = { version = "0.321.0", path = "crates/samply" }
 flate2 = "1.1.0"
 form_urlencoded = "1.2.0"
+fs_extra = "1.3.0"
 futures = "0.3.30"
 futures-timer = "3.0.2"
 futures-util = "0.3.30"
@@ -160,6 +169,7 @@ home = "=0.5.9"
 iceberg = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
 iceberg-catalog-glue = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
 iceberg-catalog-rest = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
+iceberg-catalog-s3tables = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
 iceberg-datafusion = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3" }
 iceberg-storage-opendal = { git = "https://github.com/feldera/iceberg-rust.git", rev = "28c4800f198686f306bd80d11d03f232670feec3", features = ["opendal-s3", "opendal-gcs", "opendal-fs", "opendal-memory"] }
 impl-trait-for-tuples = "0.2"
@@ -242,6 +252,7 @@ ryu = "1.0.20"
 schema_registry_converter = "4.2.0"
 semver = "1.0.27"
 serde = "1.0.213"
+serde_dynamo = { version = "4.3.0", features = ["aws-sdk-dynamodb+1"] }
 serde_arrow = { version = "0.14.1", features = ["arrow-58"] }
 serde_bytes = "0.11.15"
 serde_json = { version = "1.0.132", features = ["arbitrary_precision"] }
@@ -266,6 +277,7 @@ snap = "1.1.1"
 static-files = "0.2.3"
 static_assertions = "1.1.0"
 syn = "2.0.77"
+sysinfo = "0.38.4"
 tabled = "0.17"
 tar = "0.4.46"
 tarpc = "0.37.0"
@@ -298,9 +310,9 @@ zip = "6.0.0"
 zstd = "0.12.0"
 backtrace = "0.3.75"
 parking_lot = "0.12.4"
-etl = { git = "https://github.com/supabase/etl", rev = "05cb11ae" }
-etl-config = { git = "https://github.com/supabase/etl", rev = "05cb11ae" }
-etl-postgres = { git = "https://github.com/supabase/etl", rev = "05cb11ae" }
+etl = { git = "https://github.com/supabase/etl", rev = "b2aab62d" }
+etl-config = { git = "https://github.com/supabase/etl", rev = "b2aab62d" }
+etl-postgres = { git = "https://github.com/supabase/etl", rev = "b2aab62d" }
 
 [workspace.metadata.release]
 release = false

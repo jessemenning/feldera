@@ -19,8 +19,12 @@ import java.util.List;
 @NonCoreIR
 public final class DBSPBinaryDistinctOperator extends DBSPBinaryOperator
         implements IContainsIntegrator, IIncremental {
-    public DBSPBinaryDistinctOperator(CalciteRelNode node, OutputPort integral, OutputPort delta) {
+    /** If true this is from a {@link DBSPPositiveOperator}, else it's from a {@link DBSPDistinctOperator}. */
+    public final boolean positive;
+
+    public DBSPBinaryDistinctOperator(CalciteRelNode node, OutputPort integral, OutputPort delta, boolean positive) {
         super(node, "distinct_component", null, delta.outputType(), false, integral, delta);
+        this.positive = positive;
     }
 
     @Override
@@ -40,7 +44,7 @@ public final class DBSPBinaryDistinctOperator extends DBSPBinaryOperator
             Utilities.enforce(newInputs.size() == 2);
             if (force || this.inputsDiffer(newInputs))
                 return new DBSPBinaryDistinctOperator(
-                        this.getRelNode(), newInputs.get(0), newInputs.get(1)).copyAnnotations(this);
+                        this.getRelNode(), newInputs.get(0), newInputs.get(1), this.positive).copyAnnotations(this);
         }
         return this;
     }
@@ -48,7 +52,8 @@ public final class DBSPBinaryDistinctOperator extends DBSPBinaryOperator
     @SuppressWarnings("unused")
     public static DBSPBinaryDistinctOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = commonInfoFromJson(node, decoder);
-        return new DBSPBinaryDistinctOperator(CalciteEmptyRel.INSTANCE, info.getInput(0), info.getInput(1))
+        boolean positive = Utilities.getBooleanProperty(node, "positive");
+        return new DBSPBinaryDistinctOperator(CalciteEmptyRel.INSTANCE, info.getInput(0), info.getInput(1), positive)
                 .addAnnotations(info.annotations(), DBSPBinaryDistinctOperator.class);
     }
 }

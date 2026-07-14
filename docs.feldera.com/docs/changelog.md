@@ -12,12 +12,67 @@ import TabItem from '@theme/TabItem';
     <TabItem className="changelogItem" value="enterprise"
         label="Enterprise">
 
-        ## Unreleased
+	## Unreleased
+
+        - Cluster monitor events with information on the backing (Kubernetes) resources is
+          no longer gated behind unstable feature `cluster_monitor_resources` (deprecated).
+          It is now enabled by default. This change adds RBAC permissions to get the
+          deployments of the API server and the runner. The status of the backing Kubernetes
+          resources is shown in the Feldera Health page to every (authenticated) user.
+          The cluster monitoring of resources can still be disabled by setting in the Helm
+          chart `disableClusterMonitorResources` to `true`.
+
+	- A bug fix introduced a backward incompatible change to the replay journal format.
+          This only affects pipelines configured with exactly-once fault tolerance. Such
+          pipelines should not be upgraded to the new Feldera runtime if they are in a failed
+          state with non-empty replay journal.  Upgrade is possible once the pipeline has been
+          cleanly stopped without a failure.
+
+        ## v0.313.0
+
+        - New DynamoDB output connector. It writes a SQL view to an Amazon
+          DynamoDB table, mapping inserts and updates to upserts and deletes to
+          deletes keyed by the table's primary key. See the
+          [connector documentation](/connectors/sinks/dynamodb) for configuration
+          details.
+
+        - Pipelines now have a `tags` field: free-form labels for organizing and
+          filtering pipelines, exposed across the API, `fda` CLI, web console, and
+          Python SDK (`PipelineBuilder(tags=...)`, `pipeline.modify(tags=...)`,
+          `pipeline.tags()`).
+
+        - Editing only a pipeline's `description` or `tags` no longer bumps its
+          `version` or `refresh_version`, nor triggers recompilation. These fields can
+          therefore be edited at any state of a pipeline (e.g. while running).
+
+        ## v0.311.0
+
+        - The default value of `max_output_buffer_size_records` is now 10,000,000
+          instead of unbounded.
+
+        ## v0.309.0
+
+        - Rust compiler will clean up the `target` directory automatically
+          when its usage reaches the disk limit. This is currently behind
+          the unstable feature flag `rust_compiler_full_cleanup`.
+
+        - Pipeline name is now limited to 63 characters and must follow the Kubernetes
+          label pattern (and be non-empty and contain no dots as before). The check is only enforced
+          when the pipeline is being newly created, its `name` field is being PATCHed
+          or it is getting fully updated via PUT even if the name does not change.
+          Otherwise, existing pipelines with a now invalid name will continue to function.
+          This change is not backward compatible for scripts that create pipelines with names that are
+          no longer valid, in which case they will now receive an error instead of succeeding.
+          However, especially in the Kubernetes runner these pipelines would already not work.
+
+        ## v0.307.0
 
         - Casts of strings to Boolean and floating point values will
         produce runtime errors instead of legal values for illegal string
         values.  The set of strings that can be legally converted to
         Booleans has been changed.
+
+        ## v0.306.0
 
         - No longer allowed to edit `runtime_config.resources.storage_class` if the pipeline storage is not cleared.
 

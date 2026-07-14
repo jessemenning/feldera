@@ -36,7 +36,6 @@ import org.apache.calcite.rel.RelVisitor;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.Collect;
 import org.apache.calcite.rel.core.Filter;
-import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.TableScan;
@@ -94,6 +93,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNegateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPPositiveOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMultisetOperator;
@@ -413,12 +413,9 @@ public class CalciteToDBSPCompiler extends RelVisitor
         CalciteObject node = CalciteObject.create(correlate);
         DBSPTypeTuple type = this.convertType(
                 node.getPositionRange(), correlate.getRowType(), false).to(DBSPTypeTuple.class);
-        /*
-        The join type does not influence the results of the decorrelate!
-        A Decorrelate is a cross join, and an outer cross join is equivalent to an inner cross join.
-        if (correlate.getJoinType().isOuterJoin())
-            throw this.decorrelateError(node);
-         */
+
+        if (correlate.getJoinType() != JoinRelType.INNER)
+            throw new UnimplementedException("LEFT JOIN UNNEST");
         this.visit(correlate.getLeft(), 0, correlate);
         DBSPSimpleOperator left = this.getInputAs(correlate.getLeft(), true);
         DBSPTypeTuple leftElementType = left.getOutputZSetElementType().to(DBSPTypeTuple.class);
@@ -693,7 +690,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
             indexType = tuple.getFieldType(tuple.size() - 1);
         }
         if (inputRowType.size() > 1) {
-            throw new UnimplementedException("UNNEST with multiple vectors", node);
+            throw new UnimplementedException("UNNEST of multiple collections", node);
         }
         DBSPVariablePath data = new DBSPVariablePath(inputRowType.ref());
         DBSPType arrayType = data.deref().field(0).getType();
@@ -1168,18 +1165,27 @@ public class CalciteToDBSPCompiler extends RelVisitor
 
     private void visitMinus(LogicalMinus minus) {
         IntermediateRel node = CalciteObject.create(minus);
-        boolean first = true;
         RelDataType rowType = minus.getRowType();
-        DBSPType outputType = this.convertType(node.getPositionRange(), rowType, false);
-        List<OutputPort> inputs = new ArrayList<>();
+        DBSPTypeTuple outputType = this.convertType(node.getPositionRange(), rowType, false).to(DBSPTypeTuple.class);
         this.checkPermutation(node, minus.getInputs(), "EXCEPT");
 
+        boolean first = true;
+        List<OutputPort> inputs = new ArrayList<>(minus.getInputs().size());
         for (RelNode input : minus.getInputs()) {
-            DBSPSimpleOperator opInput = this.getInputAs(input, false);
+            DBSPSimpleOperator opInput = this.getInputAs(input, minus.all);
             if (!first) {
                 DBSPSimpleOperator neg = new DBSPNegateOperator(node, opInput.outputPort());
                 this.addOperator(neg);
-                neg = this.castOutput(node, neg, outputType);
+                DBSPTypeTuple inputRowType = neg.getOutputZSetElementType().to(DBSPTypeTuple.class);
+                List<Integer> filterIndexes = new ArrayList<>();
+                for (int i = 0; i < outputType.size(); i++) {
+                    if (inputRowType.getFieldType(i).mayBeNull && !outputType.getFieldType(i).mayBeNull)
+                        filterIndexes.add(i);
+                }
+
+                DBSPSimpleOperator filter =
+                        this.filterNonNullFields(node, CalciteObject.EMPTY, filterIndexes, neg, false);
+                neg = this.castOutput(node, filter, outputType);
                 inputs.add(neg.outputPort());
             } else {
                 opInput = this.castOutput(node, opInput, outputType);
@@ -1188,14 +1194,19 @@ public class CalciteToDBSPCompiler extends RelVisitor
             first = false;
         }
 
+        DBSPSumOperator sum = new DBSPSumOperator(node, inputs);
+        final DBSPSimpleOperator result;
+        this.addOperator(sum);
         if (minus.all) {
-            throw new UnimplementedException("EXCEPT/MINUS ALL", 5483, node);
+            DBSPDifferentiateOperator diff = new DBSPDifferentiateOperator(node, sum.outputPort());
+            this.addOperator(diff);
+            DBSPPositiveOperator pos = new DBSPPositiveOperator(node, diff.outputPort());
+            this.addOperator(pos);
+            result = new DBSPIntegrateOperator(node.getFinal(), pos.outputPort());
         } else {
-            DBSPSumOperator sum = new DBSPSumOperator(node, inputs);
-            this.addOperator(sum);
-            DBSPStreamDistinctOperator d = new DBSPStreamDistinctOperator(node.getFinal(), sum.outputPort());
-            this.assignOperator(minus, d);
+            result = new DBSPStreamDistinctOperator(node.getFinal(), sum.outputPort());
         }
+        this.assignOperator(minus, result);
     }
 
     void visitFilter(LogicalFilter filter) {
@@ -1223,15 +1234,13 @@ public class CalciteToDBSPCompiler extends RelVisitor
     }
 
     /** Apply a filter on a set of fields, keeping only rows that have non-null values in all these fields
-     * @param join    Join node that requires filtering the inputs.
      * @param fields  List of fields to filter.
-     * @param input   Join input node that is being filtered.
+     * @param input   Operator whose output is being filtered.
      * @param complement If true, revert the filter.
      * @return        An operator that performs the filtering.  If none of the fields are
      *                nullable, the original input is returned. */
-    private DBSPSimpleOperator filterNonNullFields(CalciteObject node,
-            Join join, List<Integer> fields, DBSPSimpleOperator input, boolean complement) {
-        var relNode = CalciteObject.create(join);
+    private DBSPSimpleOperator filterNonNullFields(CalciteRelNode relNode, CalciteObject node,
+            List<Integer> fields, DBSPSimpleOperator input, boolean complement) {
         DBSPTypeTuple rowType = input.getOutputZSetElementType().to(DBSPTypeTuple.class);
         boolean shouldFilter = Linq.any(fields, i -> rowType.tupFields[i].mayBeNull);
         if (!shouldFilter) {
@@ -1417,14 +1426,12 @@ public class CalciteToDBSPCompiler extends RelVisitor
                     skipped++;
                 } else {
                     DBSPExpression dataField;
+                    dataField = data.deref().field(i - skipped).applyCloneIfNeeded();
                     if (nullableData) {
-                        dataField = data.deref().field(i - skipped).applyCloneIfNeeded();
                         if (!dataField.getType().mayBeNull)
                             dataField = dataField.some();
                         dataField = new DBSPIfExpression(key.getNode(),
                                 checkNull, dataField.getType().none(), dataField);
-                    }  else {
-                        dataField = data.deref().field(i - skipped).applyCloneIfNeeded();
                     }
                     result.add(dataField);
                 }
@@ -1601,10 +1608,10 @@ public class CalciteToDBSPCompiler extends RelVisitor
 
         // If any key field that is compared with = is nullable we need to filter the inputs of the join;
         // this will make some key columns non-nullable
-        final DBSPSimpleOperator filteredLeft = this.filterNonNullFields(conditionNode, join,
+        final DBSPSimpleOperator filteredLeft = this.filterNonNullFields(node, conditionNode,
                 Linq.map(Linq.where(decomposition.comparisons, JoinConditionAnalyzer.EqualityTest::nonNull),
                         JoinConditionAnalyzer.EqualityTest::leftColumn), leftPulled, false);
-        final DBSPSimpleOperator filteredRight = this.filterNonNullFields(conditionNode, join,
+        final DBSPSimpleOperator filteredRight = this.filterNonNullFields(node, conditionNode,
                 Linq.map(Linq.where(decomposition.comparisons, JoinConditionAnalyzer.EqualityTest::nonNull),
                         JoinConditionAnalyzer.EqualityTest::rightColumn), rightPulled, false);
 
@@ -1809,7 +1816,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
                     // Since the leftNonNullIndex does not contain some elements in left,
                     // so we need add them separately to the result sumInputs.
                     // remainderLeft is the complement of leftNonNullIndex
-                    final DBSPSimpleOperator remainderLeft = this.filterNonNullFields(conditionNode, join,
+                    final DBSPSimpleOperator remainderLeft = this.filterNonNullFields(node, conditionNode,
                             Linq.map(Linq.where(decomposition.comparisons, JoinConditionAnalyzer.EqualityTest::nonNull),
                                     JoinConditionAnalyzer.EqualityTest::leftColumn), left, true);
 
@@ -1930,7 +1937,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
                     // Since the rightNonNullIndex does not contain some elements in right,
                     // so we need add them separately to the result sumInputs.
                     // remainderRight is the complement of rightNonNullIndex
-                    final DBSPSimpleOperator remainderRight = this.filterNonNullFields(conditionNode, join,
+                    final DBSPSimpleOperator remainderRight = this.filterNonNullFields(node, conditionNode,
                             Linq.map(Linq.where(decomposition.comparisons, JoinConditionAnalyzer.EqualityTest::nonNull),
                                     JoinConditionAnalyzer.EqualityTest::rightColumn), right, true);
 
@@ -2134,7 +2141,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
         List<JoinConditionAnalyzer.EqualityTest> comparisons = decomposition.comparisons;
         List<Integer> rightFilteredColumns = Linq.map(comparisons, JoinConditionAnalyzer.EqualityTest::rightColumn);
         rightFilteredColumns.add(rightTsIndex);
-        DBSPSimpleOperator filteredRight = this.filterNonNullFields(conditionNode, join, rightFilteredColumns, right, false);
+        DBSPSimpleOperator filteredRight = this.filterNonNullFields(node, conditionNode, rightFilteredColumns, right, false);
         DBSPTypeTuple rightElementType = filteredRight.getType().to(DBSPTypeZSet.class).elementType.to(DBSPTypeTuple.class);
 
         // We don't filter nulls in the left column, because this may be a left join,
@@ -2405,57 +2412,90 @@ public class CalciteToDBSPCompiler extends RelVisitor
     }
 
     /** Given an operator with output type ZSet[T], index is using
-     * (ZSet[S], Tup0). */
+     * (ZSet[S], Tup0).  If a field is nullable in the input, but not in the result, insert a filter. */
     DBSPMapIndexOperator indexEntireTuple(CalciteRelNode node, OutputPort port, DBSPTypeTuple resultType) {
-        DBSPType inputRowType = port.getOutputZSetElementType();
+        DBSPTypeTuple inputRowType = port.getOutputZSetElementType().to(DBSPTypeTuple.class);
+        List<Integer> filterIndexes = new ArrayList<>();
+        for (int i = 0; i < resultType.size(); i++) {
+            if (inputRowType.getFieldType(i).mayBeNull && !resultType.getFieldType(i).mayBeNull)
+                filterIndexes.add(i);
+        }
+
+        DBSPSimpleOperator filter =
+                this.filterNonNullFields(node, CalciteObject.EMPTY, filterIndexes, port.simpleNode(), false);
         DBSPVariablePath t = inputRowType.ref().var();
         DBSPClosureExpression entireKey =
                 new DBSPRawTupleExpression(
                         DBSPTupleExpression.flatten(t.deref()).cast(
                                 CalciteObject.EMPTY, resultType, DBSPCastExpression.CastType.SqlUnsafe),
                         new DBSPTupleExpression()).closure(t);
-        DBSPMapIndexOperator result = new DBSPMapIndexOperator(
-                node, entireKey,
-                makeIndexedZSet(resultType, DBSPTypeTuple.EMPTY),
-                port);
+        DBSPMapIndexOperator result = new DBSPMapIndexOperator(node, entireKey,
+                makeIndexedZSet(resultType, DBSPTypeTuple.EMPTY), filter.outputPort());
+        this.addOperator(result);
+        return result;
+    }
+
+    private DBSPSimpleOperator
+    except(IntermediateRel node, DBSPSimpleOperator left, DBSPSimpleOperator right, boolean all, boolean needsDistinct) {
+        List<OutputPort> inputs = new ArrayList<>(2);
+        inputs.add(left.outputPort());
+        DBSPSimpleOperator neg = new DBSPNegateOperator(node, right.outputPort());
+        this.addOperator(neg);
+        inputs.add(neg.outputPort());
+        DBSPSumOperator sum = new DBSPSumOperator(node, inputs);
+        this.addOperator(sum);
+        if (!needsDistinct)
+            return sum;
+
+        final DBSPSimpleOperator result;
+        if (all) {
+            DBSPDifferentiateOperator diff = new DBSPDifferentiateOperator(node, sum.outputPort());
+            this.addOperator(diff);
+            DBSPPositiveOperator pos = new DBSPPositiveOperator(node, diff.outputPort());
+            this.addOperator(pos);
+            result = new DBSPIntegrateOperator(node.getFinal(), pos.outputPort());
+        } else {
+            result = new DBSPStreamDistinctOperator(node.getFinal(), sum.outputPort());
+        }
         this.addOperator(result);
         return result;
     }
 
     void visitIntersect(LogicalIntersect intersect) {
-        var node = CalciteObject.create(intersect);
-        // Intersect is a special case of join.
-        List<RelNode> inputs = intersect.getInputs();
-        RelNode input = intersect.getInput(0);
-        DBSPSimpleOperator previous = this.getInputAs(input, false);
-        this.checkPermutation(node, inputs, "INTERSECT");
+        // A INTERSECT B = A EXCEPT (A EXCEPT B)
+        // A INTERSECT ALL B = A EXCEPT ALL (A EXCEPT ALL B)
+        IntermediateRel node = CalciteObject.create(intersect);
+        RelDataType rowType = intersect.getRowType();
+        DBSPTypeTuple outputType = this.convertType(node.getPositionRange(), rowType, false).to(DBSPTypeTuple.class);
+        List<RelNode> relInputs = intersect.getInputs();
+        this.checkPermutation(node, relInputs, "INTERSECT");
 
-        if (inputs.isEmpty())
+        if (relInputs.isEmpty())
             throw new UnsupportedException(node);
-        if (intersect.all)
-            throw new UnimplementedException("INTERSECT ALL", node);
-        if (inputs.size() == 1) {
-            Utilities.putNew(this.nodeOperator, intersect, previous);
-            return;
+
+        DBSPSimpleOperator current = null;
+        for (RelNode input : intersect.getInputs()) {
+            DBSPSimpleOperator opInput = this.getInputAs(input, intersect.all);
+            DBSPTypeTuple inputRowType = opInput.getOutputZSetElementType().to(DBSPTypeTuple.class);
+            List<Integer> filterIndexes = new ArrayList<>();
+            for (int i = 0; i < outputType.size(); i++) {
+                if (inputRowType.getFieldType(i).mayBeNull && !outputType.getFieldType(i).mayBeNull)
+                    filterIndexes.add(i);
+            }
+
+            DBSPSimpleOperator filter =
+                    this.filterNonNullFields(node, CalciteObject.EMPTY, filterIndexes, opInput, false);
+            DBSPSimpleOperator next = this.castOutput(node, filter, outputType);
+            if (current == null)
+                current = next;
+            else {
+                DBSPSimpleOperator crtExceptNext = this.except(node, current, next, intersect.all, true);
+                current = this.except(node, current, crtExceptNext, intersect.all, false);
+            }
         }
 
-        DBSPTypeTuple resultType = this.convertType(node.getPositionRange(), intersect.getRowType(), false)
-                .to(DBSPTypeTuple.class);
-        DBSPMapIndexOperator previousIndex = this.indexEntireTuple(node, previous.outputPort(), resultType);
-
-        for (int i = 1; i < inputs.size(); i++) {
-            DBSPSimpleOperator inputI = this.getInputAs(intersect.getInput(i), false);
-            DBSPMapIndexOperator index = this.indexEntireTuple(node, inputI.outputPort(), resultType);
-            // Join with the current result
-            DBSPVariablePath l = DBSPTypeTuple.EMPTY.ref().var();
-            DBSPVariablePath r = DBSPTypeTuple.EMPTY.ref().var();
-            DBSPVariablePath k = resultType.ref().var();
-            DBSPClosureExpression closure = DBSPTupleExpression.flatten(k.deref()).closure(k, l, r);
-            previous = new DBSPStreamJoinOperator(node, TypeCompiler.makeZSet(resultType),
-                    closure, false, previousIndex.outputPort(), index.outputPort(), false);
-            this.addOperator(previous);
-        }
-        Utilities.putNew(this.nodeOperator, intersect, previous);
+        Utilities.enforce(current != null);
+        Utilities.putNew(this.nodeOperator, intersect, current);
     }
 
     /** If this is not null, the parent LogicalFilter should use this implementation

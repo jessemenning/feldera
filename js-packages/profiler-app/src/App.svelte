@@ -2,6 +2,7 @@
   import {
     createLoadGuard,
     getSuitableProfiles,
+    type GlobalMetrics,
     processProfileFiles,
     SupportBundleViewerLayout,
     type ZipItem
@@ -19,10 +20,12 @@
   let sqlPanelFullHeight = $state(false)
 
   let profileData: {
-    profile: JsonProfiles
+    profile: JsonProfiles | undefined
     dataflow: Dataflow | undefined
     sources: string[] | undefined
     logText: string | undefined
+    globalMetrics: GlobalMetrics | undefined
+    runtimeConfig: unknown
   } | null = $state(null)
 
   let fileInput: HTMLInputElement | null = $state(null)
@@ -44,7 +47,9 @@
       profile: data.profile,
       dataflow: data.dataflow,
       sources: data.sources,
-      logText: data.logText
+      logText: data.logText,
+      globalMetrics: data.globalMetrics,
+      runtimeConfig: data.runtimeConfig
     }
   }
 
@@ -60,7 +65,7 @@
         const suitableProfiles = getSuitableProfiles(zipData)
         if (suitableProfiles.length === 0) {
           throw new Error(
-            'No suitable profiles found in the uploaded support bundle. Check if it contains the circuit profile and dataflow graph (optional).'
+            'No readable data found in the uploaded support bundle. Check that it contains a circuit profile, config, logs or stats.'
           )
         }
         profileFiles = suitableProfiles
@@ -111,6 +116,8 @@
       dataflowData={profileData.dataflow}
       programCode={profileData.sources}
       logText={profileData.logText}
+      globalMetrics={profileData.globalMetrics}
+      runtimeConfig={profileData.runtimeConfig}
       triageResults={new TriageResults()}
       {profileFiles}
       {selectedTimestamp}
@@ -140,8 +147,8 @@
 
       <div class="bg-surface-50 max-w-md rounded-container p-6 shadow-lg">
         <p class="mb-6 text-sm text-surface-700">
-          Load a Feldera support bundle (.zip file) containing circuit profile data to begin
-          visualization.
+          Load a Feldera support bundle (.zip file) to explore the circuit profile,
+          program code, logs and the pipeline config.
         </p>
 
         {#if isLoading}

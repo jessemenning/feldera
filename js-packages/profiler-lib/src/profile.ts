@@ -202,7 +202,12 @@ function formatValue(val: number, base: number, prefixes: Array<string>): string
         val = val / base;
         index++;
     }
-    return val.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + prefixes[index];
+    // For sub-unit values, `maximumFractionDigits: 2` rounds non-zero numbers down to "0".
+    // Switch to `maximumSignificantDigits: 2` in that range so e.g. 0.004 -> "0.004" instead of "0".
+    const opts: Intl.NumberFormatOptions = (val !== 0 && Math.abs(val) < 1)
+        ? { maximumSignificantDigits: 2 }
+        : { minimumFractionDigits: 0, maximumFractionDigits: 2 };
+    return val.toLocaleString('en-US', opts) + prefixes[index];
 }
 
 /** Base class for (numeric) property values; representation which abstracts away from the
@@ -247,12 +252,30 @@ export abstract class PropertyValue implements Comparable<PropertyValue> {
         }
     }
 
+    /** True iff `compareTo` carries magnitude information for this kind, i.e. ordering pairs is
+     * meaningful beyond mere distinction. Numeric kinds (count/bytes/time/percent) are
+     * comparable; nominal kinds (booleans, enum strings) are not, so callers should suppress the
+     * Min/Max columns for them. The `Avg` column still makes sense — it reports the mode. */
+    isComparable(): boolean {
+        return true;
+    }
+
     /** Combine values from multiple operators; the semantics depends on the value kind. */
     abstract combine(other: PropertyValue): PropertyValue;
+
+    /** Average this value and `others` across workers. Distinct from `combine` because the
+     * per-kind semantics differ:
+     *   - counts/bytes/seconds: arithmetic mean of the underlying numbers.
+     *   - percents: arithmetic mean of per-worker percents (not weighted — see PercentValue).
+     *   - booleans / enum strings: the most common value across workers (the mode), so the
+     *     "Avg" column shows the prevailing reading instead of N/A.
+     *   - missing: delegate to the first non-missing neighbour so the result inherits the
+     *     right kind. */
+    abstract average(others: PropertyValue[]): PropertyValue;
 }
 
 /** A property value represented as a numerator and denominator, which are supposed to represent a percentage. */
-class PercentValue extends PropertyValue {
+export class PercentValue extends PropertyValue {
     readonly numerator: number;
     readonly denominator: number;
 
@@ -279,11 +302,16 @@ class PercentValue extends PropertyValue {
 
     override toString(): string {
         let v = this.getNumericValue();
-        if (v.isSome()) {
-            return v.unwrap().toFixed(1) + "%";
-        } else {
+        if (v.isNone()) {
             return "N/A";
         }
+        const value = v.unwrap();
+        // Below 0.1% the 1-decimal form rounds to "0.0%"; fall back to 2 significant figures
+        // there so e.g. 0.034 -> "0.034%" instead of "0.0%".
+        if (value !== 0 && Math.abs(value) < 0.1) {
+            return value.toLocaleString('en-US', { maximumSignificantDigits: 2 }) + "%";
+        }
+        return value.toFixed(1) + "%";
     }
 
     override combine(other: PropertyValue): PropertyValue {
@@ -299,10 +327,31 @@ class PercentValue extends PropertyValue {
         }
         throw new Error("Cannot add PercentValue to " + other);
     }
+
+    // Weighted mean across workers: sum(numerator) / sum(denominator). A worker that observed
+    // 5 of 10 events contributes 5 hits and 10 trials to the pooled ratio, so workers with more
+    // observations move the average more — the right semantics for population-level percents
+    // like hit rates or utilization.
+    override average(others: PropertyValue[]): PropertyValue {
+        let numSum = 0;
+        let denSum = 0;
+        let any = false;
+        for (const v of [this, ...others]) {
+            if (v instanceof PercentValue) {
+                numSum += v.numerator;
+                denSum += v.denominator;
+                any = true;
+            }
+        }
+        if (!any) {
+            return MissingValue.INSTANCE;
+        }
+        return new PercentValue(numSum, denSum);
+    }
 }
 
 /** A property value that is a simple count. */
-class CountValue extends PropertyValue {
+export class CountValue extends PropertyValue {
     readonly value: number;
 
     constructor(value: any) {
@@ -331,9 +380,22 @@ class CountValue extends PropertyValue {
         }
         throw new Error("Cannot add CountValue to " + other);
     }
+
+    override average(others: PropertyValue[]): PropertyValue {
+        const values: number[] = [];
+        for (const v of [this, ...others]) {
+            if (v instanceof CountValue) {
+                values.push(v.value);
+            }
+        }
+        if (values.length === 0) {
+            return MissingValue.INSTANCE;
+        }
+        return new CountValue(values.reduce((a, b) => a + b, 0) / values.length);
+    }
 }
 
-class BytesValue extends PropertyValue {
+export class BytesValue extends PropertyValue {
     readonly value: number;
 
     constructor(value: any) {
@@ -363,6 +425,19 @@ class BytesValue extends PropertyValue {
         throw new Error("Cannot add BytesValue to " + other);
     }
 
+    override average(others: PropertyValue[]): PropertyValue {
+        const values: number[] = [];
+        for (const v of [this, ...others]) {
+            if (v instanceof BytesValue) {
+                values.push(v.value);
+            }
+        }
+        if (values.length === 0) {
+            return MissingValue.INSTANCE;
+        }
+        return new BytesValue(values.reduce((a, b) => a + b, 0) / values.length);
+    }
+
     override toString(): string {
         let prefixes = ["B", "KiB", "MiB", "GiB", "TiB"];
         return formatValue(this.value, 1024, prefixes);
@@ -370,7 +445,7 @@ class BytesValue extends PropertyValue {
 }
 
 /** A property value that is a Boolean. */
-class BooleanValue extends PropertyValue {
+export class BooleanValue extends PropertyValue {
     readonly value: boolean;
 
     constructor(id: any) {
@@ -385,19 +460,14 @@ class BooleanValue extends PropertyValue {
         return new BooleanValue(value.value);
     }
 
-    getNumericValue(): Option<number> {
-        return this.value ? Option.some(0) : Option.some(1);
+    override isComparable(): boolean {
+        return false;
     }
 
-    override compareTo(other: PropertyValue): number {
-        let v1 = this.value;
-        if (other instanceof BooleanValue) {
-            let v2 = other.value;
-            if (v1 < v2) return -1;
-            if (v1 > v2) return 1;
-            return 0;
-        }
-        return super.compareTo(other);
+    // `true` maps to the high end of the bar-chart range and `false` to the low end, so a worker
+    // reporting `true` shows the tallest bar.
+    getNumericValue(): Option<number> {
+        return this.value ? Option.some(1) : Option.some(0);
     }
 
     override combine(other: PropertyValue): PropertyValue {
@@ -410,6 +480,30 @@ class BooleanValue extends PropertyValue {
         throw new Error("Cannot add BooleanValue to " + other);
     }
 
+    // The "average" of a set of booleans is the most common value (the mode), so the Avg
+    // column shows the prevailing reading across workers instead of N/A. On a tie we keep the
+    // first reading, which is deterministic from the caller's perspective.
+    override average(others: PropertyValue[]): PropertyValue {
+        let trueCount = 0;
+        let falseCount = 0;
+        let first: BooleanValue | undefined;
+        for (const v of [this, ...others]) {
+            if (v instanceof BooleanValue) {
+                if (!first) {
+                    first = v;
+                }
+                v.value ? trueCount++ : falseCount++;
+            }
+        }
+        if (!first) {
+            return MissingValue.INSTANCE;
+        }
+        if (trueCount === falseCount) {
+            return first;
+        }
+        return new BooleanValue(trueCount > falseCount);
+    }
+
     override getStringValue(): string {
         return this.value.toString();
     }
@@ -420,7 +514,7 @@ class BooleanValue extends PropertyValue {
 }
 
 /** A property value that is a string, with no numeric value. */
-class StringValue extends PropertyValue {
+export class StringValue extends PropertyValue {
     readonly value: string;
 
     constructor(id: any) {
@@ -435,19 +529,12 @@ class StringValue extends PropertyValue {
         return new StringValue(value);
     }
 
-    getNumericValue(): Option<number> {
-        return Option.none();
+    override isComparable(): boolean {
+        return false;
     }
 
-    override compareTo(other: PropertyValue): number {
-        let v1 = this.value;
-        if (other instanceof StringValue) {
-            let v2 = other.value;
-            if (v1 < v2) return -1;
-            if (v1 > v2) return 1;
-            return 0;
-        }
-        return super.compareTo(other);
+    getNumericValue(): Option<number> {
+        return Option.none();
     }
 
     override combine(other: PropertyValue): PropertyValue {
@@ -461,6 +548,39 @@ class StringValue extends PropertyValue {
             return new StringValue("<multiple values>");
         }
         throw new Error("Cannot add StringValue to " + other);
+    }
+
+    // The "average" of a set of enum-like strings is the most common value (the mode), so the
+    // Avg column shows the prevailing reading across workers instead of N/A. First-seen wins
+    // on ties.
+    override average(others: PropertyValue[]): PropertyValue {
+        const counts = new Map<string, number>();
+        let firstByValue: Map<string, StringValue> | undefined;
+        let firstOverall: StringValue | undefined;
+        for (const v of [this, ...others]) {
+            if (v instanceof StringValue) {
+                if (!firstOverall) {
+                    firstOverall = v;
+                    firstByValue = new Map();
+                }
+                if (!firstByValue!.has(v.value)) {
+                    firstByValue!.set(v.value, v);
+                }
+                counts.set(v.value, (counts.get(v.value) ?? 0) + 1);
+            }
+        }
+        if (!firstOverall) {
+            return MissingValue.INSTANCE;
+        }
+        let best = firstOverall;
+        let bestCount = counts.get(firstOverall.value)!;
+        for (const [value, count] of counts) {
+            if (count > bestCount) {
+                best = firstByValue!.get(value)!;
+                bestCount = count;
+            }
+        }
+        return best;
     }
 
     override getStringValue(): string {
@@ -487,10 +607,23 @@ export class MissingValue extends PropertyValue {
     override combine(other: PropertyValue): PropertyValue {
         return other;
     }
+
+    // If any neighbour is non-missing, delegate to it so the result inherits the right kind;
+    // otherwise the whole collection is missing.
+    override average(others: PropertyValue[]): PropertyValue {
+        for (let i = 0; i < others.length; i++) {
+            const o = others[i]!;
+            if (!(o instanceof MissingValue)) {
+                const rest = others.slice(0, i).concat(others.slice(i + 1));
+                return o.average(rest);
+            }
+        }
+        return MissingValue.INSTANCE;
+    }
 }
 
 /** A property value that represents a time with seconds and nanoseconds. */
-class TimeValue extends PropertyValue {
+export class TimeValue extends PropertyValue {
     constructor(readonly seconds: number) {
         super();
     }
@@ -517,38 +650,54 @@ class TimeValue extends PropertyValue {
         throw new Error("Cannot add TimeValue to " + other);
     }
 
+    override average(others: PropertyValue[]): PropertyValue {
+        const values: number[] = [];
+        for (const v of [this, ...others]) {
+            if (v instanceof TimeValue) {
+                values.push(v.seconds);
+            }
+        }
+        if (values.length === 0) {
+            return MissingValue.INSTANCE;
+        }
+        return new TimeValue(values.reduce((a, b) => a + b, 0) / values.length);
+    }
+
     override toString(): string {
         let v = this.getNumericValue();
-        if (v.isSome()) {
-            let value = v.unwrap();
-            if (value === 0) {
-                return "0s";
-            } else if (value < 0.001) {
-                value = value * 1000_000;
-                return value.toLocaleString('en-US', { maximumFractionDigits: 2 }) + "us";
-            } else if (value < 1) {
-                value = value * 1000;
-                return value.toLocaleString('en-US', { maximumFractionDigits: 2 }) + "ms";
-            } else if (value >= 3600) {
-                // Discard sub-second part
-                let seconds = Math.floor(value);
-                let days = Math.floor(seconds / 86400);
-                let inDay = seconds - days * 86400;
-                let hours = Math.floor(inDay / 3600);
-                let minutes = Math.floor((seconds % 3600) / 60);
-                let secs = seconds % 60;
-                let result = "";
-                if (days > 0) {
-                    result += days + "days ";
-                }
-                result += String(hours).padStart(2, "0") + ":" +
-                    String(minutes).padStart(2, "0") + ":" +
-                    String(secs).padStart(2, "0");
-            }
-            return value.toLocaleString('en-US', { maximumFractionDigits: 2 }) + "s";
-        } else {
+        if (v.isNone()) {
             return "N/A";
         }
+        let value = v.unwrap();
+        if (value === 0) {
+            return "0s";
+        }
+        if (value < 0.001) {
+            // Use significant digits below 1us so e.g. 4ns -> "0.004us" instead of "0us".
+            const us = value * 1_000_000;
+            const opts: Intl.NumberFormatOptions = Math.abs(us) < 1
+                ? { maximumSignificantDigits: 2 }
+                : { maximumFractionDigits: 2 };
+            return us.toLocaleString('en-US', opts) + "us";
+        }
+        if (value < 1) {
+            return (value * 1000).toLocaleString('en-US', { maximumFractionDigits: 2 }) + "ms";
+        }
+        if (value >= 3600) {
+            // Hours-or-longer: render as [Nday[s] ]HH:MM:SS, discarding the sub-second part.
+            const seconds = Math.floor(value);
+            const days = Math.floor(seconds / 86400);
+            const inDay = seconds - days * 86400;
+            const hours = Math.floor(inDay / 3600);
+            const minutes = Math.floor((inDay % 3600) / 60);
+            const secs = inDay % 60;
+            const dayPart = days > 0 ? days + (days === 1 ? "day " : "days ") : "";
+            return dayPart +
+                String(hours).padStart(2, "0") + ":" +
+                String(minutes).padStart(2, "0") + ":" +
+                String(secs).padStart(2, "0");
+        }
+        return value.toLocaleString('en-US', { maximumFractionDigits: 2 }) + "s";
     }
 }
 
@@ -792,6 +941,9 @@ export class Measurement {
                 return [new Measurement(metric_id, Option.some(perc))];
             }
             case "seconds": {
+                if (metric.value === undefined) {
+                    return []
+                }
                 let s = metric.value as DurationMetricValue;
                 let duration = TimeValue.fromDurationMetric(s);
                 return [new Measurement(metric_id, Option.some(duration))];
@@ -849,16 +1001,21 @@ export class Measurement {
             }
             case "merges": {
                 let s = metric.value as MergesMetricValue;
-                let avg_step_time = TimeValue.fromDurationMetric(s.avg_step_time);
+                let avg_step_time = undefined;
+                let result = [];
+                if (s.avg_step_time !== undefined) {
+                    avg_step_time = TimeValue.fromDurationMetric(s.avg_step_time);
+                    result.push(new Measurement(metric_id + ".avg_step_time", Option.some(avg_step_time)));
+                }
                 let batches = CountValue.fromCountMetric(s.batches);
                 let merges = CountValue.fromCountMetric(s.merges);
                 let steps = CountValue.fromCountMetric(s.steps);
-                return [
-                    new Measurement(metric_id + ".avg_step_time", Option.some(avg_step_time)),
+                result.push(
                     new Measurement(metric_id + ".batches", Option.some(batches)),
                     new Measurement(metric_id + ".merges", Option.some(merges)),
                     new Measurement(metric_id + ".steps", Option.some(steps)),
-                ];
+                );
+                return result;
             }
             case "policy": {
                 let s = metric.value as StringMetricValue;
@@ -1182,7 +1339,7 @@ export class CircuitProfile {
      * Profile graphs are always a single node containing everything else inside.
      * That node is pretty much ignored everywhere else in this code after parsing. */
     isTop(node: NodeId): boolean {
-        return node === "n";
+        return node === this.rootNodeId;
     }
 
     addNode(n: JsonSimpleNodeWrapper | JsonClusterWrapper, parent: Option<NodeId>) {
@@ -1380,7 +1537,8 @@ export class CircuitProfile {
         return Option.some(ranges[0]!);
     }
 
-    constructor(readonly worker_count: number) { }
+    /** @param rootNodeId Id of the toplevel graph node, taken from the parsed profile. */
+    constructor(readonly worker_count: number, readonly rootNodeId: NodeId) { }
 
     // Scan the nodes and compute the range of each property
     computePropertyRanges() {
@@ -1453,7 +1611,7 @@ export class CircuitProfile {
         // Decode the graph structure and create the nodes.
         // The graph itself is always a complex node.
         let rootNodeId = json.graph.nodes.id;
-        let result = new CircuitProfile(worker_count);
+        let result = new CircuitProfile(worker_count, rootNodeId);
         result.complexNodes.set(rootNodeId,
             new ComplexNode(rootNodeId, json.graph.nodes.label, worker_count));
         for (const nodeWrapper of json.graph.nodes.nodes) {

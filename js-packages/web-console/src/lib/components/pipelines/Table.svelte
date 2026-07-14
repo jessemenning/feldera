@@ -6,6 +6,8 @@
   import PipelineStatus from '$lib/components/pipelines/list/PipelineStatus.svelte'
   import ThSort from '$lib/components/pipelines/table/ThSort.svelte'
   import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
+  import { useLayoutSettings } from '$lib/compositions/layout/useLayoutSettings.svelte'
+  import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { dateMax } from '$lib/functions/common/date'
   import { matchesSubstring } from '$lib/functions/common/string'
   import { type NamesInUnion, unionName } from '$lib/functions/common/union'
@@ -16,6 +18,7 @@
   } from '$lib/services/pipelineManager'
   import type { Snippet } from '$lib/types/svelte'
   import PipelineVersion from './table/PipelineVersion.svelte'
+  import Tags from './table/Tags.svelte'
 
   let {
     pipelines,
@@ -82,8 +85,31 @@
     pipelinesWithLastChange.filter((p) => matchesSubstring(p.name, nameSearch))
   )
 
+  // `knownTags` is the union of tags over every pipeline — the pool the per-row
+  // tag picker chooses from.
+  const knownTags = $derived.by(() => {
+    const tags = new Set<string>()
+    for (const pipeline of pipelines) {
+      for (const tag of pipeline.tags) {
+        tags.add(tag)
+      }
+    }
+    return tags
+  })
+
+  const api = usePipelineManager()
+
   const { formatElapsedTime } = useElapsedTime()
   const td = 'py-1 text-base border-t-[0.5px]'
+
+  // Persist the active sort and restore it on the matching column. Each ThSort
+  // owns the upstream `direction`/`onSort` API; the column identity lives here.
+  const { pipelinesTableSort } = useLayoutSettings()
+  const sortColumn = (column: string) => ({
+    direction:
+      pipelinesTableSort.value.column === column ? pipelinesTableSort.value.direction : undefined,
+    onSort: (direction: 'asc' | 'desc') => (pipelinesTableSort.value = { column, direction })
+  })
 </script>
 
 <div class="pipeline-table-wrapper bg-white-dark w-fit min-w-full">
@@ -134,37 +160,54 @@
               onclick={() => table.selectAll()}
             /></th
           >
-          <ThSort class="px-1 py-1" {table} field="name"
+          <ThSort class="px-1 py-1" {table} field="name" {...sortColumn('name')}
             ><span class="text-base font-normal text-surface-950-50">Pipeline name</span></ThSort
           >
           <th class="px-1 py-1 text-left"
             ><span class="text-base font-normal text-surface-950-50">Storage</span></th
           >
-          <ThSort {table} class="px-1 py-1" field="status"
+          <ThSort {table} class="px-1 py-1" field="status" {...sortColumn('status')}
             ><span class="ml-8 text-base font-normal text-surface-950-50">Status</span></ThSort
           >
           <th class="px-1 py-1 text-left"
             ><span class="text-base font-normal text-surface-950-50">Message</span></th
           >
+          <th class="px-1 py-1 text-left"
+            ><span class="text-base font-normal text-surface-950-50">Tags</span></th
+          >
+          <ThSort
+            {table}
+            class="w-20 px-1 py-1 xl:w-32"
+            field="platformVersion"
+            {...sortColumn('platformVersion')}
+          >
+            <span class="text-base font-normal text-surface-950-50">
+              Runtime <span class="hidden xl:!inline">version</span>
+            </span>
+          </ThSort>
           <ThSort
             {table}
             class="w-20 py-1 pr-4 text-right xl:w-32"
             field={(p) => p.connectors?.numErrors}
+            {...sortColumn('numErrors')}
           >
             <span class="text-base font-normal text-surface-950-50">
               <span class="inline xl:hidden">Errors</span>
               <span class="hidden xl:!inline">Runtime errors</span>
             </span>
           </ThSort>
-          <ThSort {table} class="w-20 px-1 py-1 xl:w-32" field="platformVersion">
-            <span class="text-base font-normal text-surface-950-50">
-              Runtime <span class="hidden xl:!inline">version</span>
-            </span>
-          </ThSort>
-          <ThSort {table} class="px-1 py-1" field="lastStatusSince"
+          <ThSort
+            {table}
+            class="px-1 py-1"
+            field="lastStatusSince"
+            {...sortColumn('lastStatusSince')}
             ><span class="text-base font-normal text-surface-950-50">Status changed</span></ThSort
           >
-          <ThSort {table} class="px-1 py-1" field="deploymentResourcesStatusSince"
+          <ThSort
+            {table}
+            class="px-1 py-1"
+            field="deploymentResourcesStatusSince"
+            {...sortColumn('deploymentResourcesStatusSince')}
             ><span class="text-base font-normal text-surface-950-50">Deployed on</span></ThSort
           >
         </tr>
@@ -223,11 +266,9 @@
                 {/if}
               </span>
             </td>
-            <td class="{td} border-surface-100-900 pr-4 group-hover:bg-surface-50-950">
-              <div class="text-right text-nowrap">
-                {pipeline.connectors?.numErrors ?? '-'}
-              </div>
-            </td>
+            <td class="pr-2 {td} w-36 border-surface-100-900 group-hover:bg-surface-50-950"
+              ><Tags pipelineName={pipeline.name} tags={pipeline.tags} {knownTags} {api}></Tags></td
+            >
             <td class="{td} relative border-surface-100-900 group-hover:bg-surface-50-950">
               <div class="flex w-full flex-nowrap items-center gap-2 text-nowrap">
                 <PipelineVersion
@@ -236,6 +277,11 @@
                   baseRuntimeVersion={page.data.feldera!.version}
                   configuredRuntimeVersion={pipeline.programConfig.runtime_version}
                 ></PipelineVersion>
+              </div>
+            </td>
+            <td class="{td} border-surface-100-900 pr-4 group-hover:bg-surface-50-950">
+              <div class="text-right text-nowrap">
+                {pipeline.connectors?.numErrors ?? '-'}
               </div>
             </td>
             <td class="{td} relative w-28 border-surface-100-900 group-hover:bg-surface-50-950">

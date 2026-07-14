@@ -3,7 +3,7 @@
 import cytoscape, { type EdgeCollection, type EdgeDefinition, type ElementsDefinition, type EventObject, type NodeDefinition, type NodeSingular, type StylesheetJson } from 'cytoscape';
 import dblclick from 'cytoscape-dblclick';
 import { assert, Graph, OMap, Option, type EncodableAsString, NumericRange, Edge } from './util.js';
-import { CircuitProfile, NodeAndMetric, PropertyValue, MissingValue, type NodeId } from './profile.js';
+import { CircuitProfile, NodeAndMetric, PropertyValue, type NodeId } from './profile.js';
 import { CircuitSelection } from './selection.js';
 import elk from 'cytoscape-elk';
 import { Sources } from './dataflow.js';
@@ -13,12 +13,14 @@ import { ZSet } from "./zset.js";
 import { MetadataSelection } from './metadataSelection.js';
 import { type NodeAttributes, type TooltipCell, type ProfilerCallbacks } from './profiler.js';
 
-/** A measurement represented as a string, but also with a normalized value between 0 and 100. */
+/** A measurement together with a normalized [0, 100] percentile for color scaling. The original
+ * `PropertyValue` is preserved so consumers can format on demand (via `.toString()`) or compute
+ * over the raw number (via `.getNumericValue()`). */
 class SerializedMeasurement {
-    constructor(readonly value: string, readonly percentile: number) { }
+    constructor(readonly value: PropertyValue, readonly percentile: number) { }
 
     toString(): string {
-        return this.value;
+        return this.value.toString();
     }
 }
 
@@ -423,6 +425,10 @@ export class CytographRendering {
     lastNode: Option<NodeId>;
     // Current node that has tooltip displayed (for refreshing on metadata changes)
     private currentTooltipNode: NodeId | null = null;
+    // True between `initiateLayout` and its matching `layoutComplete`. Used so `dispose()`
+    // can fire a final `onRenderingChange(false)` if the layout was still in flight when the
+    // visualizer is torn down — otherwise a consumer's progress bar would stick on screen.
+    private renderingInFlight = false;
 
     readonly graph_style: StylesheetJson = [
         {
@@ -665,15 +671,15 @@ export class CytographRendering {
             percentile = 0;
         }
 
-        return new SerializedMeasurement(m.toString(), percentile);
+        return new SerializedMeasurement(m, percentile);
     }
 
     /** Compute the attributes for all cytograph nodes based on the circuit profile and current selection. */
     computeAttributes(profile: CircuitProfile, selection: MetadataSelection) {
         let workers = selection.workersVisible.getSelectedElements(profile.getWorkerNames());
-        let columnNames = [...workers.map(w => w.toString())];
-        columnNames.push("Min");
-        columnNames.push("Max");
+        // One column per visible worker. Aggregates such as min/max are not produced here:
+        // consumers that want them compute them from the per-worker values themselves.
+        let columnNames = workers.map(w => w.toString());
         for (const node of this.currentGraph!.nodes) {
             let profileNode = profile.getNode(node.getId()).unwrap();
             let data = new Map<string, Array<SerializedMeasurement>>();
@@ -684,25 +690,9 @@ export class CytographRendering {
                 let metrics = profileNode.getMeasurements(metric);
                 let selected = selection.workersVisible.getSelectedElements(metrics);
                 let measurements: Array<SerializedMeasurement> = [];
-                let min: PropertyValue = MissingValue.INSTANCE;
-                let max: PropertyValue = MissingValue.INSTANCE;
                 for (const m of selected) {
                     measurements.push(CytographRendering.toMeasurement(m, range));
                 }
-                // Compute min and max over all metrics, including the ones not selected
-                for (const m of metrics) {
-                    if (min instanceof MissingValue ||
-                        (m.getNumericValue().isSome() && min.getNumericValue().unwrap() > m.getNumericValue().unwrap())) {
-                        min = m;
-                    }
-                    if (max instanceof MissingValue ||
-                        (m.getNumericValue().isSome() && max.getNumericValue().unwrap() < m.getNumericValue().unwrap())) {
-                        max = m;
-                    }
-                }
-
-                measurements.push(CytographRendering.toMeasurement(min, range));
-                measurements.push(CytographRendering.toMeasurement(max, range));
                 data.set(metric, measurements);
             }
             // additional key-value per node attributes
@@ -775,11 +765,23 @@ export class CytographRendering {
         if (this.cy === null) {
             return;
         }
-        // This runs asynchronously
+        // The layout runs asynchronously; the `true` dispatched here is paired with the
+        // `false` dispatched from `layoutComplete()` on the `layoutstop` event. If `.run()`
+        // throws synchronously (bad options, cytoscape internal error), we'd never reach
+        // `layoutstop` and the consumer's progress bar would stick forever — so reset on the
+        // throw before rethrowing.
+        this.renderingInFlight = true;
+        this.callbacks.onRenderingChange?.(true);
         this.message("Computing layout...");
-        this.cy
-            .layout(options)
-            .run();
+        try {
+            this.cy
+                .layout(options)
+                .run();
+        } catch (e) {
+            this.renderingInFlight = false;
+            this.callbacks.onRenderingChange?.(false);
+            throw e;
+        }
     }
 
     /** Modify the rendered graph incrementally by applying a diff. */
@@ -866,6 +868,9 @@ export class CytographRendering {
             .on('click', 'node', (e) => {
                 // Hide previous node information if any
                 this.hideNodeInformation();
+                // Fires before the attrs payload so consumers can switch view state without
+                // inferring it from data (distinguishes a click from a programmatic refresh).
+                this.callbacks.onNodeClick?.(e.target.id());
                 // Display current node
                 this.displayEventTargetAttributes(e, true);
             })
@@ -888,8 +893,9 @@ export class CytographRendering {
     }
 
     layoutComplete() {
-        // console.log("layout complete");
         this.clearMessage();
+        this.renderingInFlight = false;
+        this.callbacks.onRenderingChange?.(false);
         this.cy.container()!.style.visibility = "visible";
         this.updateNavigator(this.navigator);
         if (this.lastNode.isSome()) {
@@ -1006,6 +1012,7 @@ export class CytographRendering {
         let visible = false;
 
         const tooltipData: NodeAttributes = {
+            nodeId,
             title: "",
             columns: [],
             rows: [],
@@ -1097,6 +1104,14 @@ export class CytographRendering {
      * Clean up resources when the rendering is no longer needed
      */
     dispose(): void {
+        // Destroying cytoscape mid-layout cancels the pending `layoutstop` event, so a
+        // consumer driving a progress bar from `onRenderingChange` would never see the
+        // matching `false`. Emit it explicitly here for the in-flight case.
+        if (this.renderingInFlight) {
+            this.renderingInFlight = false;
+            this.callbacks.onRenderingChange?.(false);
+        }
+
         // Destroy the Cytoscape instance
         if (this.cy) {
             this.cy.destroy();

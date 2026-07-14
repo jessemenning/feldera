@@ -73,18 +73,27 @@ subqueries. In these cases, we recommend users refactor the query.
 
 See [#2555](https://github.com/feldera/feldera/issues/2555).
 
+## `LEFT JOIN UNNEST`
+
+`LEFT JOIN UNNEST(...)` and `OUTER APPLY (...)`, are not yet supported:
+
+```sql
+-- NOT supported: LEFT JOIN UNNEST
+SELECT s.id, mention_id
+FROM spreadsheet s
+LEFT JOIN UNNEST(s.mentions) AS m(mention_id) ON TRUE;
+```
+
 ## Map functions
 
 Several `MAP` functions are not yet implemented:
 
 | Function | Status |
 |----------|--------|
-| `MAP_CONCAT` | Not supported |
 | `MAP_ENTRIES` | Not supported |
 | `MAP_FROM_ARRAYS` | Not supported |
 | `MAP_FROM_ENTRIES` | Not supported |
 | `STR_TO_MAP` | Not supported |
-| Building a `MAP` from a subquery returning a pair of columns | Not supported |
 
 A list of supported MAP operations is available [here](./map.md).
 See [#1907](https://github.com/feldera/feldera/issues/1907).
@@ -99,9 +108,6 @@ supported.
 `PIVOT` is supported if the user provides a fixed set of
 columns. Refer to [PIVOT documentation](./aggregates.md#pivots) for
 example usage.  Dynamic `PIVOT` is not yet supported.
-
-## `INTERSECT ALL` and `EXCEPT ALL`
-`INTERSECT ALL` and `EXCEPT ALL` operations are not yet supported.
 
 ## `MULTISET` Data Type
 The `MULTISET` data type is not currently supported.

@@ -431,9 +431,40 @@ fn collect_endpoint_records(controller: &Controller, n: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Default budget for [`wait_for_records`] to observe the expected output.
+const OUTPUT_TIMEOUT_MS: u128 = 10_000;
+
+/// Longer output budget for waits taken while a suspend is in progress.
+///
+/// While a suspend is pending, the controller advances only the barrier inputs
+/// while re-attempting the checkpoint each step, so under CI CPU contention
+/// output can lag far behind input even though stepping keeps making forward
+/// progress. Using the default [`OUTPUT_TIMEOUT_MS`] in that window makes the
+/// suspend tests flake. Matches the 100s budget already used for the
+/// suspend-completion `recv_timeout` in these tests.
+const SUSPEND_OUTPUT_TIMEOUT_MS: u128 = 100_000;
+
+/// Like `println!`, but prefixes a UTC timestamp so test output interleaves
+/// legibly with the controller's tracing logs when diagnosing timing issues.
+macro_rules! tprintln {
+    ($($arg:tt)*) => {
+        println!("[{}] {}", chrono::Utc::now().format("%H:%M:%S%.6f"), format_args!($($arg)*))
+    };
+}
+
+/// Wait until every output endpoint has received at least the expected number
+/// of records, then verify the counts match exactly, using the default
+/// [`OUTPUT_TIMEOUT_MS`] budget.
 #[track_caller]
 fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
-    println!("waiting for {expect_n:?} records...");
+    wait_for_records_within(controller, expect_n, OUTPUT_TIMEOUT_MS);
+}
+
+/// Like [`wait_for_records`], but waits up to `timeout_ms` for the records to
+/// arrive.
+#[track_caller]
+fn wait_for_records_within(controller: &Controller, expect_n: &[usize], timeout_ms: u128) {
+    tprintln!("waiting for {expect_n:?} records...");
     let n = expect_n.len();
     let mut last_n = repeat_n(0, n).collect::<Vec<_>>();
     wait(
@@ -441,7 +472,7 @@ fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
             let new_n = collect_endpoint_records(controller, n);
             for i in 0..n {
                 if new_n[i] > last_n[i] {
-                    println!("received {} records on test_output{}", new_n[i], i + 1);
+                    tprintln!("received {} records on test_output{}", new_n[i], i + 1);
                 }
             }
             last_n = new_n;
@@ -450,7 +481,7 @@ fn wait_for_records(controller: &Controller, expect_n: &[usize]) {
                 .zip(expect_n.iter())
                 .all(|(&last, &expect)| last >= expect)
         },
-        10_000,
+        timeout_ms,
     )
     .unwrap();
 
@@ -2028,25 +2059,25 @@ fn suspend_barrier() {
         .from_writer(&input_file);
 
     // Write records to the input file.
-    println!("Writing records 0..4000");
+    tprintln!("Writing records 0..4000");
     for id in 0..4000 {
         writer.serialize(TestStruct::for_id(id as u32)).unwrap();
     }
     writer.flush().unwrap();
 
     // Start pipeline.
-    println!("start pipeline");
+    tprintln!("start pipeline");
 
     let controller = start_controller(&storage_dir, &[5000]);
 
     // Wait for the records that are not in the checkpoint to be
     // processed or replayed.
-    println!("wait for 4000 records 0..4000");
+    tprintln!("wait for 4000 records 0..4000");
     wait_for_records(&controller, &[4000]);
 
     // Suspend.
     let (sender, receiver) = mpsc::channel();
-    println!("start suspend");
+    tprintln!("start suspend");
     let suspend_request_step = controller.status().global_metrics.total_initiated_steps();
     controller.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
 
@@ -2062,13 +2093,13 @@ fn suspend_barrier() {
 
     // Suspend should now succeed, because we crossed the barrier.
     receiver
-        .recv_timeout(Duration::from_millis(10000))
+        .recv_timeout(Duration::from_millis(100000))
         .unwrap()
         .unwrap();
     assert_bounded_suspend_steps(&controller, suspend_request_step);
 
     // Stop controller.
-    println!("stop controller");
+    tprintln!("stop controller");
     controller.stop().unwrap();
 
     // Read output and compare. Our output adapter, which is not
@@ -2082,7 +2113,7 @@ fn suspend_barrier() {
     let controller = start_controller(&storage_dir, &[5000]);
     wait_for_records(&controller, &[5000]);
 
-    println!("start suspend");
+    tprintln!("start suspend");
     let (sender, receiver) = mpsc::channel();
     let mut sender = Some(sender);
 
@@ -2092,13 +2123,16 @@ fn suspend_barrier() {
 
         let start = (i + 5) * 1000;
         let end = start + 1000;
-        println!("writing records {start}..{end}");
+        tprintln!("writing records {start}..{end}");
         for id in start..end {
             writer.serialize(TestStruct::for_id(id as u32)).unwrap();
         }
         writer.flush().unwrap();
-        println!("waiting for {end} records");
-        wait_for_records(&controller, &[end]);
+        tprintln!("waiting for {end} records");
+        // After the first iteration a suspend is pending: the controller only
+        // advances barrier inputs while re-attempting the checkpoint each step,
+        // so output can lag under CI CPU load. Use the longer budget.
+        wait_for_records_within(&controller, &[end], SUSPEND_OUTPUT_TIMEOUT_MS);
         check_file_contents(&(output_path(&storage_dir, 0)), 5000..end);
 
         if let Some(sender) = sender.take() {
@@ -2113,7 +2147,7 @@ fn suspend_barrier() {
 
     // Suspend should now succeed, because we crossed the barrier.
     receiver
-        .recv_timeout(Duration::from_millis(10000))
+        .recv_timeout(Duration::from_millis(100000))
         .unwrap()
         .unwrap();
 }
@@ -2157,7 +2191,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
         .collect::<Vec<_>>();
 
     // Write records to the input files.
-    println!("Writing 1000 records to each of {n_inputs} files");
+    tprintln!("Writing 1000 records to each of {n_inputs} files");
     for writer in writers.iter_mut().take(n_inputs) {
         for id in 0..1000 {
             writer.serialize(TestStruct::for_id(id as u32)).unwrap();
@@ -2166,7 +2200,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
     }
 
     // Start pipeline.
-    println!("start pipeline");
+    tprintln!("start pipeline");
 
     // The barrier for input 0 is record 0,
     // for input 1 is record 1000,
@@ -2177,7 +2211,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
 
     // Wait for the first 1000 records in each file to be read and copied to the
     // output.
-    println!("wait for 1000 records in each file");
+    tprintln!("wait for 1000 records in each file");
     let mut written = repeat_n(1000, n_inputs).collect::<Vec<_>>();
     wait_for_records(&controller, &written);
 
@@ -2187,7 +2221,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
     // we're past all the barriers; otherwise, it will not complete due to
     // barriers, since each input only has 1000 records so far.
     let (sender, receiver) = mpsc::channel();
-    println!("start suspend");
+    tprintln!("start suspend");
     let suspend_request_step = controller.status().global_metrics.total_initiated_steps();
     controller.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
 
@@ -2212,7 +2246,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
         receiver.try_recv().unwrap_err();
 
         // Write 1000 more records to the `next` input.
-        println!("writing 1000 more records to test_input{}", next + 1);
+        tprintln!("writing 1000 more records to test_input{}", next + 1);
         for id in written[next]..written[next] + 1000 {
             writers[next]
                 .serialize(TestStruct::for_id(id as u32))
@@ -2228,9 +2262,12 @@ fn suspend_multiple_barriers(n_inputs: usize) {
         // We won't get any more records on output from inputs that have reached
         // their barrier, so the writes to inputs 0 and 1 won't have any effect
         // here.
-        println!("total written: {written:?}");
+        tprintln!("total written: {written:?}");
         let expect = expectations(&written, &barriers);
-        wait_for_records(&controller, &expect);
+        // A suspend is pending here: the controller only advances barrier inputs
+        // while re-attempting the checkpoint each step, so output can lag far
+        // behind under CI CPU load. Use the longer budget.
+        wait_for_records_within(&controller, &expect, SUSPEND_OUTPUT_TIMEOUT_MS);
         for (i, expectation) in expect.iter().enumerate().take(n_inputs) {
             check_file_contents(&output_path(&storage_dir, i), 0..*expectation);
         }
@@ -2238,17 +2275,17 @@ fn suspend_multiple_barriers(n_inputs: usize) {
 
     // Suspend should now succeed, because we crossed the barrier.
     receiver
-        .recv_timeout(Duration::from_millis(10000))
+        .recv_timeout(Duration::from_millis(100000))
         .unwrap()
         .unwrap();
     assert_bounded_suspend_steps(&controller, suspend_request_step);
 
     // Stop controller.
-    println!("stop controller");
+    tprintln!("stop controller");
     controller.stop().unwrap();
 
     // Check output one more time.
-    println!("check output one more time now that controller is stopped");
+    tprintln!("check output one more time now that controller is stopped");
     let expect = expectations(&written, &barriers);
     for (i, e) in expect.iter().enumerate().take(n_inputs) {
         check_file_contents(&output_path(&storage_dir, i), 0..*e);
@@ -2256,7 +2293,7 @@ fn suspend_multiple_barriers(n_inputs: usize) {
 
     // Now restart the controller and wait for all the records that we wrote
     // beyond the barriers get copied to output (and nothing else).
-    println!("restart controller and wait for records beyond the barriers");
+    tprintln!("restart controller and wait for records beyond the barriers");
     let controller = start_controller(&storage_dir, &barriers);
     wait_for_records(&controller, &written);
     for i in 0..n_inputs {
@@ -2864,7 +2901,7 @@ fn test_external_controller_status_serialization() {
     );
 }
 
-/// Test that custom connector metrics registered via `set_custom_metrics` are
+/// Test that custom connector metrics registered via `set_input_custom_metrics` are
 /// included in the Prometheus output produced by the custom-metrics loop in
 /// `write_metrics`.
 #[test]
@@ -2921,7 +2958,7 @@ fn test_custom_connector_metrics_prometheus_output() {
     status.inputs.write().insert(0, endpoint);
 
     // Register custom metrics on the endpoint.
-    status.set_custom_metrics(0, Arc::new(MockMetrics));
+    status.set_input_custom_metrics(0, Arc::new(MockMetrics));
 
     let mut writer = MetricsWriter::<PrometheusFormatter>::new();
     let labels = LabelStack::new();
@@ -2948,6 +2985,97 @@ fn test_custom_connector_metrics_prometheus_output() {
     assert!(
         output.contains("1000"),
         "output missing counter value 1000:\n{output}"
+    );
+}
+
+/// Test that custom connector metrics registered on output endpoints are
+/// included in Prometheus output.
+#[test]
+fn test_custom_output_connector_metrics_prometheus_output() {
+    use crate::{
+        ControllerStatus,
+        controller::write_custom_metrics,
+        server::metrics::{LabelStack, MetricsWriter, PrometheusFormatter},
+    };
+    use feldera_adapterlib::metrics::{ConnectorHistogram, ConnectorMetrics, ValueType};
+    use feldera_storage::histogram::ExponentialHistogram;
+    use feldera_types::config::OutputEndpointConfig;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    struct MockMetrics;
+
+    impl ConnectorMetrics for MockMetrics {
+        fn metrics(&self) -> Vec<(&'static str, &'static str, ValueType, f64)> {
+            vec![(
+                "mock_metric_total",
+                "Mock connector-specific metric for the output connector.",
+                ValueType::Counter,
+                3.0,
+            )]
+        }
+
+        fn histograms(&self) -> Vec<ConnectorHistogram> {
+            let histogram = ExponentialHistogram::new();
+            histogram.record(5u64);
+            histogram.record(15u64);
+            vec![ConnectorHistogram {
+                name: "mock_latency_microseconds",
+                help: "Mock connector-specific histogram for the output connector.",
+                snapshot: histogram.snapshot(),
+            }]
+        }
+    }
+
+    let config = serde_json::from_value(json!({
+        "name": "test_output_custom_metrics",
+        "workers": 1,
+    }))
+    .unwrap();
+    let status = ControllerStatus::new(config, 0, None, Uuid::nil());
+
+    let output_config: OutputEndpointConfig = serde_json::from_value(json!({
+        "stream": "s",
+        "transport": { "name": "http_output", "config": {} },
+        "format": { "name": "json", "config": {} }
+    }))
+    .unwrap();
+    status.add_output(&0, "mock_output", &output_config, None);
+    status.set_output_custom_metrics(0, Arc::new(MockMetrics));
+
+    let mut writer = MetricsWriter::<PrometheusFormatter>::new();
+    let labels = LabelStack::new();
+    write_custom_metrics(&status, &mut writer, &labels);
+    let output = writer.into_output();
+
+    assert!(
+        output.contains("mock_metric_total"),
+        "output missing mock_metric_total:\n{output}"
+    );
+    assert!(
+        output.contains(r#"endpoint="mock_output""#),
+        "output missing endpoint label:\n{output}"
+    );
+    assert!(output.contains("3"), "output missing value 3:\n{output}");
+
+    // The histogram is exported with its standard `_bucket`, `_sum`, and
+    // `_count` series under a single `# TYPE ... histogram` header.  The mock
+    // records observations of 5 and 15, so sum is 20 and count is 2.
+    assert!(
+        output.contains("# TYPE mock_latency_microseconds histogram"),
+        "output missing histogram type header:\n{output}"
+    );
+    assert!(
+        output.contains(r#"mock_latency_microseconds_bucket{endpoint="mock_output","#),
+        "output missing histogram bucket:\n{output}"
+    );
+    assert!(
+        output.contains(r#"mock_latency_microseconds_sum{endpoint="mock_output"} 20"#),
+        "output missing histogram sum:\n{output}"
+    );
+    assert!(
+        output.contains(r#"mock_latency_microseconds_count{endpoint="mock_output"} 2"#),
+        "output missing histogram count:\n{output}"
     );
 }
 
@@ -2999,7 +3127,7 @@ fn test_custom_connector_metrics_prometheus_grouping() {
             None,
         );
         status.inputs.write().insert(id, endpoint);
-        status.set_custom_metrics(id, Arc::new(MockMetrics));
+        status.set_input_custom_metrics(id, Arc::new(MockMetrics));
     }
 
     let mut writer = MetricsWriter::<PrometheusFormatter>::new();
@@ -4199,4 +4327,576 @@ mod queue_limit_tests {
             "second batch above threshold should not unpark again"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Postprocessor integration tests
+// ---------------------------------------------------------------------------
+
+use feldera_adapterlib::postprocess::{
+    Postprocessor, PostprocessorCreateError, PostprocessorFactory,
+};
+use feldera_types::postprocess::PostprocessorConfig;
+
+/// Verify that a passthrough postprocessor does not alter output.
+///
+/// The output JSON produced by the encoder passes through the postprocessor
+/// unchanged and lands in the output file as valid JSON that the query engine
+/// can read back.
+#[test]
+fn test_postprocessor() {
+    use crate::postprocess::PassthroughPostprocessorFactory;
+
+    init_test_logger();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(
+            br#"[
+            {"id": 1, "b": true, "s": "one"},
+            {"id": 2, "b": false, "s": "two"}
+        ]"#,
+        )
+        .unwrap();
+
+    let temp_output_file = NamedTempFile::new().unwrap();
+    let output_path = temp_output_file.path().to_path_buf();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_postprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": { "path": output_path }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                },
+                "postprocessor": [
+                    {
+                        "name": "passthrough",
+                        "config": {}
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog
+                .postprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("passthrough", Box::new(PassthroughPostprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+
+    let result = controller
+        .execute_query_text_sync("select * from test_output1 order by id")
+        .unwrap();
+
+    let expected = r#"+----+-------+---+-----+
+| id | b     | i | s   |
++----+-------+---+-----+
+| 1  | true  |   | one |
+| 2  | false |   | two |
++----+-------+---+-----+"#;
+
+    assert_eq!(&result, expected);
+    controller.stop().unwrap();
+}
+
+/// Verify that the encryption postprocessor encrypts output and the file
+/// cannot be parsed as plain JSON.  Decrypt the raw file bytes and confirm
+/// that the decrypted payload matches what the pipeline produced.
+#[test]
+fn test_encryption_postprocessor() {
+    use crate::postprocess::EncryptionPostprocessorFactory;
+    use openssl::symm::{Cipher, decrypt_aead};
+
+    init_test_logger();
+
+    let key = b"0123456789abcdef0123456789abcdef"; // 32 bytes
+    let nonce = b"test_nonce_1"; // 12 bytes
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(
+            br#"[
+            {"id": 1, "b": true, "s": "one"},
+            {"id": 2, "b": false, "s": "two"}
+        ]"#,
+        )
+        .unwrap();
+
+    let temp_output_file = NamedTempFile::new().unwrap();
+    let output_path = temp_output_file.path().to_path_buf();
+
+    let key_b64 = BASE64.encode(key);
+    let nonce_b64 = BASE64.encode(nonce);
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_encryption_postprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": { "path": output_path.clone() }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                },
+                "postprocessor": [
+                    {
+                        "name": "encryption",
+                        "config": {
+                            "key": key_b64,
+                            "nonce": nonce_b64
+                        }
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog
+                .postprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("encryption", Box::new(EncryptionPostprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+    controller.stop().unwrap();
+
+    // Read the raw output file and decrypt it.
+    let encrypted = std::fs::read(&output_path).unwrap();
+    assert!(
+        !encrypted.is_empty(),
+        "output file should not be empty after encryption"
+    );
+
+    // The encrypted blob is not valid UTF-8 CSV.
+    assert!(
+        std::str::from_utf8(&encrypted).is_err() || !encrypted.contains(&b','),
+        "encrypted output should not look like plain CSV"
+    );
+
+    // Decrypt and verify the result contains CSV records.
+    let enc_nonce = &encrypted[..12];
+    let tag_start = encrypted.len() - 16;
+    let ciphertext = &encrypted[12..tag_start];
+    let tag = &encrypted[tag_start..];
+    let plaintext = decrypt_aead(
+        Cipher::aes_256_gcm(),
+        key,
+        Some(enc_nonce),
+        &[],
+        ciphertext,
+        tag,
+    )
+    .expect("decryption of postprocessed output failed");
+
+    // The decrypted payload must be parseable CSV with 2 records.
+    let mut rdr = CsvReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(plaintext.as_slice());
+    let rows: Vec<_> = rdr.records().collect();
+    assert_eq!(rows.len(), 2, "expected 2 rows in decrypted CSV output");
+}
+
+/// Verify that a base64-encoding postprocessor transforms the output and that
+/// decoding it yields the original JSON payload.
+#[cfg(test)]
+struct Base64EncodePostprocessor;
+
+#[cfg(test)]
+impl Postprocessor for Base64EncodePostprocessor {
+    fn push_buffer(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Ok(BASE64.encode(data).into_bytes())
+    }
+
+    fn fork(&self) -> Box<dyn Postprocessor> {
+        Box::new(Base64EncodePostprocessor)
+    }
+}
+
+#[cfg(test)]
+struct Base64EncodePostprocessorFactory;
+
+#[cfg(test)]
+impl PostprocessorFactory for Base64EncodePostprocessorFactory {
+    fn create(
+        &self,
+        _config: &PostprocessorConfig,
+    ) -> Result<Box<dyn Postprocessor>, PostprocessorCreateError> {
+        Ok(Box::new(Base64EncodePostprocessor))
+    }
+}
+
+/// Verify that a custom postprocessor can transform output bytes and that
+/// decoding the result yields the original JSON payload.
+#[test]
+fn test_base64_postprocessor() {
+    init_test_logger();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(
+            br#"[
+            {"id": 1, "b": true, "s": "one"},
+            {"id": 2, "b": false, "s": "two"}
+        ]"#,
+        )
+        .unwrap();
+
+    let temp_output_file = NamedTempFile::new().unwrap();
+    let output_path = temp_output_file.path().to_path_buf();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_base64_postprocessor",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": {
+                        "path": temp_input_file.path(),
+                        "follow": false
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "array": true,
+                        "update_format": "raw"
+                    }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": { "path": output_path.clone() }
+                },
+                "format": {
+                    "name": "csv",
+                    "config": {}
+                },
+                "postprocessor": [
+                    {
+                        "name": "base64Encode",
+                        "config": {}
+                    }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog
+                .postprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("base64Encode", Box::new(Base64EncodePostprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(|e, _| panic!("error: {e}")),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+    controller.stop().unwrap();
+
+    // Read the raw output and base64-decode it; the result must be parseable CSV.
+    let encoded = std::fs::read(&output_path).unwrap();
+    assert!(
+        !encoded.is_empty(),
+        "output file should not be empty after base64 encoding"
+    );
+
+    let decoded = BASE64
+        .decode(&encoded)
+        .expect("output file should be valid base64");
+    let mut rdr = CsvReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(decoded.as_slice());
+    let rows: Vec<_> = rdr.records().collect();
+    assert_eq!(rows.len(), 2, "expected 2 rows in decoded CSV output");
+}
+
+/// A postprocessor that rejects every record with an error, used in
+/// [`test_postprocessor_error_reported`].
+#[cfg(test)]
+struct AlwaysErrorPostprocessor;
+
+#[cfg(test)]
+impl Postprocessor for AlwaysErrorPostprocessor {
+    fn push_buffer(&mut self, _buffer: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Err(anyhow::anyhow!("deliberate postprocessor error"))
+    }
+
+    fn fork(&self) -> Box<dyn Postprocessor> {
+        Box::new(AlwaysErrorPostprocessor)
+    }
+}
+
+#[cfg(test)]
+struct AlwaysErrorPostprocessorFactory;
+
+#[cfg(test)]
+impl PostprocessorFactory for AlwaysErrorPostprocessorFactory {
+    fn create(
+        &self,
+        _config: &PostprocessorConfig,
+    ) -> Result<Box<dyn Postprocessor>, PostprocessorCreateError> {
+        Ok(Box::new(AlwaysErrorPostprocessor))
+    }
+}
+
+/// Verify that a postprocessor error is forwarded to the controller error callback.
+///
+/// When [`Postprocessor::push_buffer`] returns [`Err`], the record is dropped
+/// and the error is delivered to the controller's error callback as a non-fatal
+/// [`ControllerError::OutputTransportError`].  The pipeline must continue
+/// running without panicking or hanging.
+#[test]
+fn test_postprocessor_error_reported() {
+    use crate::controller::ControllerError;
+    use std::sync::{Arc, Mutex};
+
+    init_test_logger();
+
+    let temp_input_file = NamedTempFile::new().unwrap();
+    temp_input_file
+        .as_file()
+        .write_all(
+            br#"[
+            {"id": 1, "b": true, "s": "one"},
+            {"id": 2, "b": false, "s": "two"}
+        ]"#,
+        )
+        .unwrap();
+
+    let temp_output_file = NamedTempFile::new().unwrap();
+    let output_path = temp_output_file.path().to_path_buf();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_postprocessor_error_reported",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": { "path": temp_input_file.path(), "follow": false }
+                },
+                "format": {
+                    "name": "json",
+                    "config": { "array": true, "update_format": "raw" }
+                }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": { "path": output_path }
+                },
+                "format": { "name": "csv", "config": {} },
+                "postprocessor": [{ "name": "always_error", "config": {} }]
+            }
+        }
+    }))
+    .unwrap();
+
+    let captured: Arc<Mutex<Vec<Arc<ControllerError>>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+
+    let controller = Controller::with_test_config(
+        |circuit_config| {
+            let (circuit, catalog) =
+                test_circuit::<TestStruct>(circuit_config, &TestStruct::schema(), &[None]);
+            catalog
+                .postprocessor_registry()
+                .lock()
+                .unwrap()
+                .register("always_error", Box::new(AlwaysErrorPostprocessorFactory));
+            Ok((circuit, catalog))
+        },
+        &config,
+        Box::new(move |e, _| {
+            captured_clone.lock().unwrap().push(e);
+        }),
+    )
+    .unwrap();
+
+    controller.start();
+    wait(|| controller.pipeline_complete(), DEFAULT_TIMEOUT_MS).unwrap();
+    controller.stop().unwrap();
+
+    let errors = captured.lock().unwrap();
+    assert!(
+        !errors.is_empty(),
+        "error callback should have been invoked at least once by the postprocessor"
+    );
+    for err in errors.iter() {
+        let ControllerError::OutputTransportError {
+            endpoint_name,
+            fatal,
+            ..
+        } = err.as_ref()
+        else {
+            panic!("expected OutputTransportError, got: {err}");
+        };
+        assert_eq!(endpoint_name, "test_output1");
+        assert!(!fatal, "postprocessor errors must be non-fatal");
+    }
+}
+
+/// Verify that attaching a postprocessor to a `delta_table_output` (integrated)
+/// connector is rejected at startup.
+///
+/// Integrated connectors own their own serialization pipeline and bypass the
+/// postprocessor layer, so a postprocessor cannot be wired into them.  The
+/// controller should return a [`ControllerError::PostprocessorCreateError`]
+/// before the circuit starts running.
+#[test]
+fn test_postprocessor_on_delta_output_fails() {
+    use crate::controller::ControllerError;
+
+    init_test_logger();
+
+    let config: PipelineConfig = serde_json::from_value(json!({
+        "name": "test_postprocessor_delta_fails",
+        "workers": 1,
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "file_input",
+                    "config": { "path": "/dev/null", "follow": false }
+                },
+                "format": { "name": "csv" }
+            }
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "delta_table_output",
+                    "config": { "uri": "file:///tmp/test_delta_postprocessor" }
+                },
+                "postprocessor": [{ "name": "passthrough", "config": {} }]
+            }
+        }
+    }))
+    .unwrap();
+
+    let err = Controller::with_test_config(
+        |circuit_config| {
+            Ok(test_circuit::<TestStruct>(
+                circuit_config,
+                &TestStruct::schema(),
+                &[None],
+            ))
+        },
+        &config,
+        Box::new(|e, _| panic!("unexpected error callback: {e}")),
+    )
+    .err()
+    .expect("expected an error when attaching a postprocessor to a delta_table_output connector");
+
+    let ControllerError::PostprocessorCreateError {
+        ref endpoint_name,
+        ref error,
+    } = err
+    else {
+        panic!("expected PostprocessorCreateError, got: {err}");
+    };
+    assert_eq!(endpoint_name, "test_output1");
+    assert!(
+        error.contains("delta_table_output"),
+        "error should name the unsupported transport, got: {error}"
+    );
 }

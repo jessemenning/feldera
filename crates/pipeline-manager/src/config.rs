@@ -253,8 +253,8 @@ pub struct CommonConfig {
     /// Currently supported features:
     /// - `runtime_version`: Allows to override the runtime version of a pipeline on the platform.
     /// - `testing`
-    /// - `cluster_monitor_resources`: Cluster monitoring also monitors the resources backing the
-    ///   instance (i.e., the Kubernetes objects).
+    /// - `rust_compiler_full_cleanup`: the Rust compiler fully cleans up the target directory if the
+    ///   disk space usage is approaching its limit.
     #[arg(verbatim_doc_comment, long, env = "FELDERA_UNSTABLE_FEATURES")]
     pub unstable_features: Option<String>,
 
@@ -314,6 +314,14 @@ pub struct CommonConfig {
     /// Number of monitor events that are retained for each pipeline.
     #[arg(long, default_value_t = default_pipeline_monitor_events_retention(), env = "FELDERA_PIPELINE_MONITOR_EVENTS_RETENTION")]
     pub pipeline_monitor_events_retention: u32,
+
+    /// Whether to disable cluster monitoring of its own (Kubernetes) resources.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "FELDERA_DISABLE_CLUSTER_MONITOR_RESOURCES"
+    )]
+    pub disable_cluster_monitor_resources: bool,
 }
 
 impl CommonConfig {
@@ -586,6 +594,7 @@ impl CommonConfig {
             https_tls_key_path: None,
             private_ca_cert_path: None,
             pipeline_monitor_events_retention: 720,
+            disable_cluster_monitor_resources: false,
         }
     }
 }
@@ -1064,6 +1073,17 @@ pub struct LocalRunnerConfig {
     #[serde(default = "default_local_runner_working_directory")]
     #[arg(long, default_value_t = default_local_runner_working_directory())]
     pub runner_working_directory: String,
+
+    /// Path to the `feldera-coordinator` executable.
+    ///
+    /// Required only to provision multihost pipelines (`runtime_config.hosts >
+    /// 1`).  The coordinator binary ships with the enterprise distribution; for
+    /// local development build it with `cargo build -p feldera-coordinator` and
+    /// point this at the resulting executable.  When unset, the local runner
+    /// can only provision single-host pipelines.
+    #[serde(default)]
+    #[arg(long, env = "FELDERA_COORDINATOR_BINARY")]
+    pub coordinator_binary: Option<String>,
 }
 
 impl LocalRunnerConfig {
@@ -1101,6 +1121,29 @@ impl LocalRunnerConfig {
     pub(crate) fn port_file_path(&self, pipeline_id: PipelineId) -> PathBuf {
         self.pipeline_dir(pipeline_id)
             .join(feldera_types::transport::http::SERVER_PORT_FILE)
+    }
+
+    /// Per-process working directory for one host of a multihost pipeline.
+    ///
+    /// Each host runs in its own subdirectory so that its storage, config, and
+    /// port file do not collide with the other hosts sharing this container.
+    /// This mirrors how each Kubernetes pod has its own volume.
+    pub(crate) fn host_dir(&self, pipeline_id: PipelineId, ordinal: usize) -> PathBuf {
+        self.pipeline_dir(pipeline_id)
+            .join(format!("host-{ordinal}"))
+    }
+
+    /// Working directory for the coordinator process of a multihost pipeline.
+    pub(crate) fn coordinator_dir(&self, pipeline_id: PipelineId) -> PathBuf {
+        self.pipeline_dir(pipeline_id).join("coordinator")
+    }
+
+    /// Location of a config file within a multihost process's working directory.
+    ///
+    /// `subdir` is the process's working directory (see [`Self::host_dir`] and
+    /// [`Self::coordinator_dir`]).
+    pub(crate) fn member_config_file_path(&self, subdir: &Path, extension: &str) -> PathBuf {
+        subdir.join("config").with_extension(extension)
     }
 }
 

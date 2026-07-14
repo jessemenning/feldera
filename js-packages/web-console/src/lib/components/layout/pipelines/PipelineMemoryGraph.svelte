@@ -11,10 +11,12 @@
   import { CanvasRenderer } from 'echarts/renderers'
   import type { ECMouseEvent } from 'svelte-echarts'
   import { Chart } from 'svelte-echarts'
+  import { ServerDate } from '$lib/compositions/serverTime'
   import { getThemeColor } from '$lib/functions/common/color'
   import { humanSize } from '$lib/functions/common/string'
   import { tuple } from '$lib/functions/common/tuple'
-  import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
+  import { multihostMemoryLimitMb, timeSeriesAxisMax } from '$lib/functions/pipelineMetrics'
+  import type { MemoryPressure } from '$lib/services/manager'
   import type { Pipeline } from '$lib/services/pipelineManager'
   import type { TimeSeriesEntry } from '$lib/types/pipelineManager'
 
@@ -22,13 +24,23 @@
     pipeline,
     metrics,
     refetchMs,
-    keepMs
+    keepMs,
+    memoryPressure
   }: {
     pipeline: { current: Pipeline }
     metrics: TimeSeriesEntry[]
     refetchMs: number
     keepMs: number
+    memoryPressure?: MemoryPressure
   } = $props()
+
+  const pressureChips: Record<MemoryPressure, { label: string; class: string }> = {
+    low: { label: '', class: 'hidden' },
+    moderate: { label: 'Moderate pressure', class: 'bg-warning-100-900' },
+    high: { label: 'High pressure', class: 'bg-error-50-950' },
+    critical: { label: 'Critical pressure', class: 'bg-error-50-950' }
+  }
+  const pressureChip = $derived(memoryPressure ? pressureChips[memoryPressure] : undefined)
   use([
     LineChart,
     GridComponent,
@@ -40,12 +52,22 @@
 
   const pipelineName = $derived(pipeline.current.name)
 
-  const valueMax = $derived(metrics.length ? Math.max(...metrics.map((v) => v.m.toNumber())) : 0)
+  // Anchor the time axis to the newest sample's timestamp rather than to the
+  // client clock.
+  const xAxisMax = $derived(timeSeriesAxisMax(metrics))
+
+  const valueMax = $derived(metrics.length ? Math.max(...metrics.map((v) => v.m)) : 0)
   const yMaxStep = $derived(2 ** Math.ceil(Math.log2(valueMax * 1.25)))
   const yMax = $derived(valueMax !== 0 ? yMaxStep : 1024 * 2048)
   const yMin = 0
+  // The reported memory metric (`m`) is the sum across all hosts in a multihost
+  // deployment, while `memory_mb_max` is the per-host limit. Scale the limit by
+  // the number of hosts.
   const maxMemoryMb = $derived(
-    pipeline.current.runtimeConfig?.resources?.memory_mb_max ?? undefined
+    multihostMemoryLimitMb(
+      pipeline.current.runtimeConfig?.resources?.memory_mb_max,
+      pipeline.current.runtimeConfig?.hosts
+    )
   )
 
   const primaryColor = getThemeColor('--color-primary-500').format('hex')
@@ -61,14 +83,14 @@
       series: [
         {
           data: metrics.map((m) => ({
-            name: m.t.toString(),
-            value: tuple(m.t.toNumber(), m.m.toNumber() ?? 0)
+            id: m.t,
+            value: tuple(m.t, m.m ?? 0)
           }))
         }
       ],
       xAxis: {
-        min: Date.now() - keepMs,
-        max: Date.now()
+        min: xAxisMax - keepMs,
+        max: xAxisMax
       },
       yAxis: {
         interval: (yMax - yMin) / 2,
@@ -87,9 +109,7 @@
         {
           markline: {
             data: maxMemoryMb
-              ? [
-                  { yAxis: maxMemoryMb * 1000 * 1000, lineStyle: { color: 'red', cap: 'square' } } // example 1
-                ]
+              ? [{ yAxis: maxMemoryMb * 1000 * 1000, lineStyle: { color: 'red', cap: 'square' } }]
               : []
           }
         }
@@ -111,8 +131,10 @@
       animationDuration: 0,
       animationDurationUpdate: refetchMs,
       type: 'time' as const,
-      min: Date.now() - keepMs - refetchMs,
-      max: Date.now() - refetchMs,
+      // svelte-ignore state_referenced_locally
+      min: ServerDate.now() - keepMs - refetchMs,
+      // svelte-ignore state_referenced_locally
+      max: ServerDate.now() - refetchMs,
       minInterval: 25000,
       maxInterval: 25000,
       axisLabel: {
@@ -159,8 +181,8 @@
           opacity: 0
         },
         data: metrics.map((m) => ({
-          name: m.t.toString(),
-          value: tuple(m.t.toNumber(), m.m.toNumber() ?? 0)
+          id: m.t,
+          value: tuple(m.t, m.m ?? 0)
         })),
         markLine: {
           animation: false,
@@ -175,9 +197,7 @@
           symbol: ['none', 'none'],
           // svelte-ignore state_referenced_locally
           data: maxMemoryMb
-            ? [
-                { yAxis: maxMemoryMb * 1000 * 1000, lineStyle: { color: 'red', cap: 'square' } } // example 1
-              ]
+            ? [{ yAxis: maxMemoryMb * 1000 * 1000, lineStyle: { color: 'red', cap: 'square' } }]
             : []
         },
         triggerLineEvent: true
@@ -200,8 +220,13 @@
 </script>
 
 <div class="absolute h-full w-full py-4">
-  <div class="px-4 pb-2">
-    Used memory: {humanSize(metrics.at(-1)?.m.toNumber() ?? 0)}
+  <div class="flex items-center justify-between gap-2 px-4 pb-2">
+    <span>Used memory: {humanSize(metrics.at(-1)?.m ?? 0)}</span>
+    {#if pressureChip}
+      <div class="pointer-events-none flex h-5 rounded px-2 text-sm {pressureChip.class}">
+        {pressureChip.label}
+      </div>
+    {/if}
   </div>
   {#key pipelineName}
     <Chart init={(dom, theme, opts) => (ref = init(dom, theme, opts))} {options} />

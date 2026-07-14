@@ -324,12 +324,14 @@ async fn unbundle_support_bundle(
                     .as_str()
                     .map(|s| s.to_string())
                     .or(runtime_version.clone()),
+                use_platform_compiler: false,
             })
         } else {
             Some(ProgramConfig {
                 cache: true,
                 profile: Some(CompilationProfile::Optimized),
                 runtime_version: runtime_version.clone(),
+                use_platform_compiler: false,
             })
         };
 
@@ -389,6 +391,7 @@ async fn unbundle_support_bundle(
                 .post_pipeline()
                 .body(PostPutPipeline {
                     description,
+                    tags: Vec::new(),
                     name: pipeline_name.clone(),
                     program_code: program_code.to_string(),
                     udf_rust,

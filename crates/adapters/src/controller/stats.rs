@@ -752,7 +752,11 @@ impl ControllerStatus {
     }
 
     /// Register connector-specific metrics for an input endpoint.
-    pub fn set_custom_metrics(&self, endpoint_id: EndpointId, metrics: Arc<dyn ConnectorMetrics>) {
+    pub fn set_input_custom_metrics(
+        &self,
+        endpoint_id: EndpointId,
+        metrics: Arc<dyn ConnectorMetrics>,
+    ) {
         if let Some(status) = self.inputs.write().get_mut(&endpoint_id) {
             status.custom_metrics = Some(metrics);
         }
@@ -761,6 +765,17 @@ impl ControllerStatus {
     /// Output endpoint stats.
     pub fn output_status(&self) -> RwLockReadGuard<'_, BTreeMap<EndpointId, OutputEndpointStatus>> {
         self.outputs.read_recursive()
+    }
+
+    /// Register connector-specific metrics for an output endpoint.
+    pub fn set_output_custom_metrics(
+        &self,
+        endpoint_id: EndpointId,
+        metrics: Arc<dyn ConnectorMetrics>,
+    ) {
+        if let Some(status) = self.outputs.write().get_mut(&endpoint_id) {
+            status.custom_metrics = Some(metrics);
+        }
     }
 
     /// Register a batch-progress counter for an output endpoint.
@@ -1257,13 +1272,20 @@ impl ControllerStatus {
     /// True if the pipeline has processed all inputs to completion.
     pub fn pipeline_complete(&self) -> bool {
         // All input endpoints (if any) are at end of input.
-        if !self
-            .input_status()
-            .values()
-            .filter(|endpoint_stats| !endpoint_stats.endpoint_name.contains(".api-ingress-"))
-            .all(|endpoint_stats| endpoint_stats.is_eoi())
-        {
-            return false;
+        for ep in self.input_status().values().filter(|ep| !ep.is_eoi()) {
+            let name = &ep.endpoint_name;
+
+            // We don't require HTTP ingress connectors to be at end of input,
+            // because the user is in charge of whether more data comes in.
+            //
+            // We also don't require the clock connector to be at end of input
+            // if it's configured to advance only when the user sends a request.
+            let ignore = name.contains(".api-ingress-")
+                || (name == "now" && self.pipeline_config.global.dev_tweaks.now_http_driven());
+
+            if !ignore {
+                return false;
+            }
         }
 
         // All received records have been processed by the circuit.
@@ -1526,18 +1548,6 @@ impl TryFrom<StepResults> for InputLog {
                 },
             }),
             _ => Err(MissingReplay),
-        }
-    }
-}
-
-impl StepResults {
-    pub(super) fn checksums(&self) -> Option<InputChecksums> {
-        match self.resume {
-            Some(Resume::Replay { hash, .. }) => Some(InputChecksums {
-                hash,
-                num_records: self.amt.records as u64,
-            }),
-            _ => None,
         }
     }
 }
@@ -2582,6 +2592,9 @@ pub struct OutputEndpointStatus {
     pub transport_errors: Mutex<ConnectorErrorList>,
 
     pub health: Mutex<Option<ConnectorHealth>>,
+
+    /// Connector-specific metrics for Prometheus export.
+    pub custom_metrics: Option<Arc<dyn ConnectorMetrics>>,
 }
 
 impl OutputEndpointStatus {
@@ -2661,6 +2674,7 @@ impl OutputEndpointStatus {
             encode_errors: Mutex::new(encode_errors),
             transport_errors: Mutex::new(transport_errors),
             health: Mutex::new(None),
+            custom_metrics: None,
         }
     }
 

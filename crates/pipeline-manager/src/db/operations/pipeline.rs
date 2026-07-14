@@ -12,7 +12,7 @@ use crate::db::operations::utils::{
 use crate::db::types::pipeline::{
     bootstrap_config_to_string, runtime_desired_status_to_string, runtime_status_to_string,
     ExtendedPipelineDescr, ExtendedPipelineDescrEventInfo, ExtendedPipelineDescrMonitoring,
-    PipelineDescr, PipelineId,
+    PatchClientMetadata, PipelineDescr, PipelineId,
 };
 use crate::db::types::program::{
     validate_program_status_transition, ProgramError, ProgramStatus, RustCompilationInfo,
@@ -25,8 +25,8 @@ use crate::db::types::resources_status::{
 use crate::db::types::storage::{validate_storage_status_transition, StorageStatus};
 use crate::db::types::tenant::TenantId;
 use crate::db::types::utils::{
-    validate_deployment_config, validate_name, validate_program_config, validate_program_info,
-    validate_runtime_config, validate_storage_status_details,
+    validate_deployment_config, validate_pipeline_name, validate_program_config,
+    validate_program_info, validate_runtime_config, validate_storage_status_details,
 };
 use crate::db::types::version::Version;
 use deadpool_postgres::Transaction;
@@ -37,6 +37,12 @@ use serde_json::json;
 use tokio_postgres::Row;
 use tracing::warn;
 use uuid::Uuid;
+
+/// This expression converts the first 8 bytes of the pipeline UUID to a BIGINT,
+/// and takes its absolute value. It is used to determine which compiler server
+/// worker the pipeline is assigned to.
+const PIPELINE_ID_SQL_HASH_FUNCTION_CALL: &str =
+    "abs(('x' || substr(replace(p.id::text, '-', ''), 1, 16))::bit(64)::bigint)";
 
 pub(crate) async fn list_pipelines(
     txn: &Transaction<'_>,
@@ -78,17 +84,25 @@ pub(crate) async fn list_pipelines_for_monitoring(
     Ok(result)
 }
 
+/// Retrieve pipeline complete descriptor by its name.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 pub(crate) async fn get_pipeline(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     name: &str,
+    row_lock: bool,
 ) -> Result<ExtendedPipelineDescr, DBError> {
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT {PIPELINE_COLUMNS_ALL}
              FROM pipeline AS p
              WHERE p.tenant_id = $1 AND p.name = $2
-            "
+             {}
+            ",
+            if row_lock { "FOR UPDATE" } else { "" }
         ))
         .await?;
     let row = txn.query_opt(&stmt, &[&tenant_id.0, &name]).await?.ok_or(
@@ -99,17 +113,25 @@ pub(crate) async fn get_pipeline(
     parse_pipeline_row_all(&row)
 }
 
+/// Retrieve pipeline monitoring descriptor (only contains status-related fields) by its name.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 pub(crate) async fn get_pipeline_for_monitoring(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     name: &str,
+    row_lock: bool,
 ) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT {PIPELINE_COLUMNS_MONITORING}
              FROM pipeline AS p
              WHERE p.tenant_id = $1 AND p.name = $2
-            "
+             {}
+            ",
+            if row_lock { "FOR UPDATE" } else { "" }
         ))
         .await?;
     let row = txn.query_opt(&stmt, &[&tenant_id.0, &name]).await?.ok_or(
@@ -120,18 +142,27 @@ pub(crate) async fn get_pipeline_for_monitoring(
     parse_pipeline_row_monitoring(&row)
 }
 
+/// Retrieve pipeline by its identifier; internal helper that allows specifying which `fields`
+/// to retrieve.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 async fn internal_get_pipeline_by_id(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     pipeline_id: PipelineId,
     fields: &'static str,
+    row_lock: bool,
 ) -> Result<Row, DBError> {
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT {fields}
              FROM pipeline AS p
              WHERE p.tenant_id = $1 AND p.id = $2
-            "
+             {}
+            ",
+            if row_lock { "FOR UPDATE" } else { "" }
         ))
         .await?;
     txn.query_opt(&stmt, &[&tenant_id.0, &pipeline_id.0])
@@ -139,33 +170,65 @@ async fn internal_get_pipeline_by_id(
         .ok_or(DBError::UnknownPipeline { pipeline_id })
 }
 
+/// Retrieve pipeline complete descriptor by its identifier.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 pub async fn get_pipeline_by_id(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     pipeline_id: PipelineId,
+    row_lock: bool,
 ) -> Result<ExtendedPipelineDescr, DBError> {
     let row =
-        internal_get_pipeline_by_id(txn, tenant_id, pipeline_id, PIPELINE_COLUMNS_ALL).await?;
+        internal_get_pipeline_by_id(txn, tenant_id, pipeline_id, PIPELINE_COLUMNS_ALL, row_lock)
+            .await?;
     parse_pipeline_row_all(&row)
 }
 
+/// Retrieve pipeline monitoring descriptor (only contains status-related fields) by its identifier.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 pub async fn get_pipeline_by_id_for_monitoring(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     pipeline_id: PipelineId,
+    row_lock: bool,
 ) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
-    let row = internal_get_pipeline_by_id(txn, tenant_id, pipeline_id, PIPELINE_COLUMNS_MONITORING)
-        .await?;
+    let row = internal_get_pipeline_by_id(
+        txn,
+        tenant_id,
+        pipeline_id,
+        PIPELINE_COLUMNS_MONITORING,
+        row_lock,
+    )
+    .await?;
     parse_pipeline_row_monitoring(&row)
 }
 
+/// Retrieve pipeline descriptor by its identifier, getting only the fields needed to construct
+/// an event.
+///
+/// Set `row_lock` to `true` when using the retrieved row in the decision logic in the
+/// rest of the transaction (for example, whether/how to update its fields). It will
+/// acquire a FOR UPDATE lock on the retrieved row in that case.
 pub async fn get_pipeline_by_id_for_event_info(
     txn: &Transaction<'_>,
     tenant_id: TenantId,
     pipeline_id: PipelineId,
+    row_lock: bool,
 ) -> Result<ExtendedPipelineDescrEventInfo, DBError> {
-    let row = internal_get_pipeline_by_id(txn, tenant_id, pipeline_id, PIPELINE_COLUMNS_EVENT_INFO)
-        .await?;
+    let row = internal_get_pipeline_by_id(
+        txn,
+        tenant_id,
+        pipeline_id,
+        PIPELINE_COLUMNS_EVENT_INFO,
+        row_lock,
+    )
+    .await?;
     parse_pipeline_row_event_info(&row)
 }
 
@@ -176,7 +239,9 @@ pub(crate) async fn new_pipeline(
     platform_version: &str,
     pipeline: PipelineDescr,
 ) -> Result<(PipelineId, Version), DBError> {
-    validate_name(&pipeline.name)?;
+    validate_pipeline_name(&pipeline.name)?;
+    let client_metadata = pipeline.client_metadata();
+    client_metadata.validate()?;
     // Validate runtime configuration JSON when deserializing it
     // and reserialize it to have it contain current default values
     let runtime_config =
@@ -210,7 +275,7 @@ pub(crate) async fn new_pipeline(
     let stmt = txn
 
         .prepare_cached(
-            "INSERT INTO pipeline (id, tenant_id, name, description, created_at, version, platform_version, runtime_config,
+            "INSERT INTO pipeline (id, tenant_id, name, client_metadata, created_at, version, platform_version, runtime_config,
                                    program_code, udf_rust, udf_toml, program_config, program_version, program_status,
                                    program_status_since, program_error, program_info,
                                    program_binary_source_checksum, program_binary_integrity_checksum,
@@ -239,7 +304,7 @@ pub(crate) async fn new_pipeline(
             &new_id,                             // $1: id
             &tenant_id.0,                        // $2: tenant_id
             &pipeline.name,                      // $3: name
-            &pipeline.description,               // $4: description
+            &client_metadata.to_db_string(),     // $4: client_metadata
             &Version(1).0,                       // $5: version
             &platform_version.to_string(),       // $6: platform_version
             &runtime_config.to_string(),         // $7: runtime_config
@@ -268,6 +333,25 @@ pub(crate) async fn new_pipeline(
     Ok((PipelineId(new_id), Version(1)))
 }
 
+/// Bundle of patchable pipeline fields, i.e. the contents of a `PATCH` request
+/// body. `update_pipeline` destructures this struct exhaustively so adding a
+/// new patchable field forces the call sites and the classifier
+/// (`core_changed` etc.) to be revisited or fail to compile.
+pub(crate) struct PipelineFieldUpdates<'a> {
+    pub name: &'a Option<String>,
+    /// Client-metadata patch to merge into the stored value: each `Some` field
+    /// overwrites it; each `None` field leaves it unchanged. A `POST`/`PUT`
+    /// replace is expressed as a patch in which every field is `Some` (built
+    /// from the complete descriptor), so an empty string or empty list is
+    /// always a value in its own right, never a request to unset.
+    pub client_metadata: &'a PatchClientMetadata,
+    pub runtime_config: &'a Option<serde_json::Value>,
+    pub program_code: &'a Option<String>,
+    pub udf_rust: &'a Option<String>,
+    pub udf_toml: &'a Option<String>,
+    pub program_config: &'a Option<serde_json::Value>,
+}
+
 /// Modify pipeline.
 ///
 /// # Arguments
@@ -278,26 +362,30 @@ pub(crate) async fn new_pipeline(
 /// * `bump_platform_version` - if true, the platform_version of the pipeline will be updated to the
 ///   provided `platform_version`. In addition, the platform_version will be updated unconditionally
 ///   if the program code or program settings are getting updated by this request.
-/// * Other arguments correspond to fields that can be updated. If an argument is `None`, the corresponding
-///   field is not updated.
-#[allow(clippy::too_many_arguments)]
+/// * `updates` - patchable fields. Each `Some` value is applied; `None` leaves the corresponding
+///   field unchanged.
 pub(crate) async fn update_pipeline(
     txn: &Transaction<'_>,
     is_compiler_update: bool,
     tenant_id: TenantId,
     original_name: &str,
-    name: &Option<String>,
-    description: &Option<String>,
+    updates: &PipelineFieldUpdates<'_>,
     platform_version: &str,
     mut bump_platform_version: bool,
-    runtime_config: &Option<serde_json::Value>,
-    program_code: &Option<String>,
-    udf_rust: &Option<String>,
-    udf_toml: &Option<String>,
-    program_config: &Option<serde_json::Value>,
 ) -> Result<Version, DBError> {
+    // Dereference in the pattern so each binding has the original reference
+    // type (e.g. `name: &Option<String>`) rather than `&&Option<String>`.
+    let &PipelineFieldUpdates {
+        name,
+        client_metadata,
+        runtime_config,
+        program_code,
+        udf_rust,
+        udf_toml,
+        program_config,
+    } = updates;
     if let Some(name) = name {
-        validate_name(name)?;
+        validate_pipeline_name(name)?;
     }
 
     // Validate runtime configuration JSON when deserializing it
@@ -342,25 +430,61 @@ pub(crate) async fn update_pipeline(
 
     // Fetch current pipeline to decide how to update.
     // This will also return an error if the pipeline does not exist.
-    let current = get_pipeline(txn, tenant_id, original_name).await?;
+    let current = get_pipeline(txn, tenant_id, original_name, true).await?;
+
+    // Build the current client metadata and merge the patch into it to get the
+    // new value. `current.client_metadata()` uses an exhaustive `ClientMetadata`
+    // literal, so adding a client-metadata field cannot be omitted from this
+    // change detection: it is automatically covered by the struct comparison
+    // below. Client metadata never appears in `core_changed`, so such a field
+    // also can never wrongly bump the version.
+    let current_client_metadata = current.client_metadata();
+    let mut new_client_metadata = current_client_metadata.clone();
+    new_client_metadata.apply_patch(client_metadata);
+    let client_metadata_changed = new_client_metadata != current_client_metadata;
+    // Validate only the fields the client is actually changing, so values
+    // stored before a constraint existed (e.g. a long migrated description)
+    // stay readable and patchable until they are themselves modified.
+    new_client_metadata.validate_changes(&current_client_metadata)?;
+
+    // Determine whether any "core" (version-bumping) field will actually
+    // change. A `Some(v)` value with `v == current` is *not* a change.
+    let core_changed = name.as_ref().is_some_and(|v| *v != current.name)
+        || (bump_platform_version && platform_version != current.platform_version.as_str())
+        || runtime_config
+            .as_ref()
+            .is_some_and(|v| *v != current.runtime_config)
+        || program_code
+            .as_ref()
+            .is_some_and(|v| *v != current.program_code)
+        || udf_rust.as_ref().is_some_and(|v| *v != current.udf_rust)
+        || udf_toml.as_ref().is_some_and(|v| *v != current.udf_toml)
+        || program_config
+            .as_ref()
+            .is_some_and(|v| *v != current.program_config);
 
     // Pipeline update is allowed if either:
     // - Current status is `Stopped` AND desired status is `Stopped`
     // - Current status is `Stopped` AND desired status is `Provisioned` AND it is the
     //   compiler doing the update to bump platform version (the early start mechanism)
-    if !matches!(
-        (
-            is_compiler_update,
-            current.deployment_resources_status,
-            current.deployment_resources_desired_status
-        ),
-        (_, ResourcesStatus::Stopped, ResourcesDesiredStatus::Stopped)
-            | (
-                true,
-                ResourcesStatus::Stopped,
-                ResourcesDesiredStatus::Provisioned
+    // - The update touches only `client_metadata`. Client metadata
+    //   (description, tags, ...) is client-generated data
+    //   with no deployment semantics, so it can be patched at any time.
+    if core_changed
+        && !matches!(
+            (
+                is_compiler_update,
+                current.deployment_resources_status,
+                current.deployment_resources_desired_status
             ),
-    ) {
+            (_, ResourcesStatus::Stopped, ResourcesDesiredStatus::Stopped)
+                | (
+                    true,
+                    ResourcesStatus::Stopped,
+                    ResourcesDesiredStatus::Provisioned
+                ),
+        )
+    {
         return Err(DBError::UpdateRestrictedToStopped);
     }
 
@@ -369,7 +493,7 @@ pub(crate) async fn update_pipeline(
         !is_compiler_update
             || (bump_platform_version
                 && name.is_none()
-                && description.is_none()
+                && client_metadata.contains_only_nones()
                 && runtime_config.is_none()
                 && program_code.is_none()
                 && udf_rust.is_none()
@@ -377,28 +501,56 @@ pub(crate) async fn update_pipeline(
                 && program_config.is_none())
     );
 
-    // If nothing changes in any of the core fields, return the current version
-    if (name.is_none() || name.as_ref().is_some_and(|v| *v == current.name))
-        && (description.is_none()
-            || description
-                .as_ref()
-                .is_some_and(|v| *v == current.description))
-        && (!bump_platform_version || platform_version == current.platform_version.as_str())
-        && (runtime_config.is_none()
-            || runtime_config
-                .as_ref()
-                .is_some_and(|v| *v == current.runtime_config))
-        && (program_code.is_none()
-            || program_code
-                .as_ref()
-                .is_some_and(|v| *v == current.program_code))
-        && (udf_rust.is_none() || udf_rust.as_ref().is_some_and(|v| *v == current.udf_rust))
-        && (udf_toml.is_none() || udf_toml.as_ref().is_some_and(|v| *v == current.udf_toml))
-        && (program_config.is_none()
-            || program_config
-                .as_ref()
-                .is_some_and(|v| *v == current.program_config))
-    {
+    // No-op patch: nothing changed anywhere.
+    if !core_changed && !client_metadata_changed {
+        return Ok(current.version);
+    }
+
+    // Client-metadata-only fast path. Client metadata (description, tags, ...)
+    // is client-generated data with no deployment semantics, so patching it
+    // must not disturb anything watching the pipeline's state:
+    //
+    // - `version` is *not* incremented. The runner automaton uses it as a guard
+    //   on every resources-status transition (see `pipeline_automata.rs`); only
+    //   `TransitionToProvisioning` retries on `OutdatedPipelineVersion`, every
+    //   other transition surfaces it as a hard error. Bumping `version` here
+    //   would crash mid-flight transitions whenever a metadata patch landed
+    //   concurrently.
+    // - `refresh_version` is *not* incremented. It is the client-visible
+    //   "material change happened" counter; client-metadata edits are not
+    //   material.
+    //
+    // Note that this UPDATE still fires the row-level `pipeline_notify` trigger,
+    // which issues a Postgres `NOTIFY` on the `pipeline` channel
+    // just like any other write to the row. We do not try to suppress
+    // it: the woken runner simply re-reads the pipeline, sees that neither
+    // `version` nor `refresh_version` changed, and goes back to sleep.
+    // (The `pipeline_monitor_event` table is a separate audit log
+    // and plays no part in this wake-up.)
+    //
+    // Consequently this branch issues a narrow `UPDATE pipeline SET
+    // client_metadata` (no version columns touched) and returns
+    // `current.version` unchanged.
+    if !core_changed {
+        let stmt = txn
+            .prepare_cached(
+                "UPDATE pipeline
+                     SET client_metadata = $1
+                     WHERE tenant_id = $2 AND name = $3",
+            )
+            .await?;
+        let rows_affected = txn
+            .execute(
+                &stmt,
+                &[
+                    &new_client_metadata.to_db_string(),
+                    &tenant_id.0,
+                    &original_name,
+                ],
+            )
+            .await
+            .map_err(maybe_unique_violation)?;
+        assert_eq!(rows_affected, 1); // The row must exist as it has been retrieved above
         return Ok(current.version);
     }
 
@@ -408,13 +560,9 @@ pub(crate) async fn update_pipeline(
         if name.as_ref().is_some_and(|v| *v != current.name) {
             not_allowed.push("`name`")
         }
-        if description
-            .as_ref()
-            .is_some_and(|v| *v != current.description)
-        {
-            not_allowed.push("`description`")
-        }
-        // `platform_version` can be updated
+        // `platform_version` can be updated.
+        // `client_metadata` (description, tags, ...) is client-generated
+        // and strongly-typed at the API level; it is written below alongside any core changes.
         // Some fields of `runtime_config` are not allowed to be updated
         if let Some(runtime_config) = &runtime_config {
             if runtime_config.get("workers") != current.runtime_config.get("workers") {
@@ -493,7 +641,7 @@ pub(crate) async fn update_pipeline(
         .prepare_cached(
             "UPDATE pipeline
                  SET name = COALESCE($1, name),
-                     description = COALESCE($2, description),
+                     client_metadata = $2,
                      platform_version = COALESCE($3, platform_version),
                      runtime_config = COALESCE($4, runtime_config),
                      program_code = COALESCE($5, program_code),
@@ -510,7 +658,7 @@ pub(crate) async fn update_pipeline(
             &stmt,
             &[
                 &name,
-                &description,
+                &new_client_metadata.to_db_string(),
                 &if bump_platform_version {
                     Some(platform_version.to_string())
                 } else {
@@ -570,7 +718,7 @@ pub(crate) async fn delete_pipeline(
     tenant_id: TenantId,
     name: &str,
 ) -> Result<PipelineId, DBError> {
-    let current = get_pipeline(txn, tenant_id, name).await?;
+    let current = get_pipeline(txn, tenant_id, name, true).await?;
 
     // Pipeline deletion is only possible if it is fully stopped
     if current.deployment_resources_status != ResourcesStatus::Stopped
@@ -611,7 +759,7 @@ pub(crate) async fn set_program_status(
     new_program_binary_integrity_checksum: &Option<String>,
     new_program_info_integrity_checksum: &Option<String>,
 ) -> Result<(), DBError> {
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     // Only if the program whose status is being transitioned is the same one can it be updated
     if current.program_version != program_version_guard {
@@ -874,7 +1022,7 @@ pub(crate) async fn dismiss_deployment_error(
     tenant_id: TenantId,
     pipeline_name: &str,
 ) -> Result<(), DBError> {
-    let current = get_pipeline(txn, tenant_id, pipeline_name).await?;
+    let current = get_pipeline(txn, tenant_id, pipeline_name, true).await?;
 
     // If an error has to be cleared, then it is only possible if it is fully stopped
     if (current.deployment_resources_status != ResourcesStatus::Stopped
@@ -912,7 +1060,7 @@ pub(crate) async fn set_deployment_resources_desired_status(
     bootstrap_config: Option<BootstrapConfig>,
     dismiss_error: bool,
 ) -> Result<PipelineId, DBError> {
-    let current = get_pipeline(txn, tenant_id, pipeline_name).await?;
+    let current = get_pipeline(txn, tenant_id, pipeline_name, true).await?;
 
     // Deployment error will be automatically dismissed if this is wanted
     let final_deployment_error = if dismiss_error {
@@ -1054,7 +1202,7 @@ async fn check_version_guard_and_transition_deployment_resources_status(
     new_deployment_resources_status: ResourcesStatus,
     remain: bool,
 ) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
-    let current = get_pipeline_by_id_for_monitoring(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id_for_monitoring(txn, tenant_id, pipeline_id, true).await?;
 
     // Use the version guard to check that the deployment is the intended one
     if current.version != version_guard {
@@ -1124,7 +1272,7 @@ pub(crate) async fn set_deployment_resources_status_stopped(
         false,
     )
     .await?;
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
         txn,
@@ -1200,7 +1348,7 @@ pub(crate) async fn set_deployment_resources_status_provisioning(
         false,
     )
     .await?;
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
         txn,
@@ -1273,7 +1421,7 @@ pub(crate) async fn set_deployment_resources_status_provisioned(
         false,
     )
     .await?;
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
         txn,
@@ -1347,7 +1495,7 @@ pub(crate) async fn set_deployment_resources_status_stopping(
         false,
     )
     .await?;
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
         txn,
@@ -1570,7 +1718,7 @@ pub(crate) async fn set_storage_status(
     pipeline_id: PipelineId,
     new_storage_status: StorageStatus,
 ) -> Result<(), DBError> {
-    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id).await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     // Check that the transition is permitted
     validate_storage_status_transition(
@@ -1686,6 +1834,104 @@ pub(crate) async fn list_pipelines_across_all_tenants_for_monitoring(
     Ok(result)
 }
 
+/// Retrieves a list of pipelines across all tenants that belong to the worker ID which are
+/// `Stopped` and are either:
+/// - of the same platform version and are `CompilingSql`
+/// - of a different platform version and are either `Pending` or `CompilingSql`
+///
+/// The SQL compiler worker will use the result of this to reset the compilation of those
+/// pipelines in the database, before picking up its next job.
+pub(crate) async fn list_pipelines_across_all_tenants_needing_sql_compilation_clear(
+    txn: &Transaction<'_>,
+    platform_version: &str,
+    worker_id: usize,
+    total_workers: usize,
+) -> Result<Vec<(TenantId, ExtendedPipelineDescrMonitoring)>, DBError> {
+    let stmt = txn
+        .prepare_cached(&format!(
+            "SELECT p.tenant_id, {PIPELINE_COLUMNS_MONITORING}
+             FROM pipeline AS p
+             WHERE p.deployment_resources_status = 'stopped'
+                   AND (
+                      (p.platform_version = $1 AND p.program_status = 'compiling_sql')
+                      OR
+                      (p.platform_version != $1 AND (p.program_status = 'pending' OR p.program_status = 'compiling_sql'))
+                   )
+                   AND ({PIPELINE_ID_SQL_HASH_FUNCTION_CALL} % $2) = $3
+             ORDER BY p.id ASC
+             FOR UPDATE
+            "
+        ))
+        .await?;
+    let rows: Vec<Row> = txn
+        .query(
+            &stmt,
+            &[
+                &platform_version.to_string(),
+                &(total_workers as i64),
+                &(worker_id as i64),
+            ],
+        )
+        .await?;
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        result.push((
+            TenantId(row.get("tenant_id")),
+            parse_pipeline_row_monitoring(&row)?,
+        ));
+    }
+    Ok(result)
+}
+
+/// Retrieves a list of pipelines across all tenants that belong to the worker ID which are
+/// `Stopped` and are either:
+/// - of the same platform version and are `CompilingRust`
+/// - of a different platform version and are either `SqlCompiled` or `CompilingRust`
+///
+/// The Rust compiler worker will use the result of this to reset the compilation of those
+/// pipelines in the database, before picking up its next job.
+pub(crate) async fn list_pipelines_across_all_tenants_needing_rust_compilation_clear(
+    txn: &Transaction<'_>,
+    platform_version: &str,
+    worker_id: usize,
+    total_workers: usize,
+) -> Result<Vec<(TenantId, ExtendedPipelineDescrMonitoring)>, DBError> {
+    let stmt = txn
+        .prepare_cached(&format!(
+            "SELECT p.tenant_id, {PIPELINE_COLUMNS_MONITORING}
+             FROM pipeline AS p
+             WHERE p.deployment_resources_status = 'stopped'
+                   AND (
+                      (p.platform_version = $1 AND p.program_status = 'compiling_rust')
+                      OR
+                      (p.platform_version != $1 AND (p.program_status = 'sql_compiled' OR p.program_status = 'compiling_rust'))
+                   )
+                   AND ({PIPELINE_ID_SQL_HASH_FUNCTION_CALL} % $2) = $3
+             ORDER BY p.id ASC
+             FOR UPDATE
+            "
+        ))
+        .await?;
+    let rows: Vec<Row> = txn
+        .query(
+            &stmt,
+            &[
+                &platform_version.to_string(),
+                &(total_workers as i64),
+                &(worker_id as i64),
+            ],
+        )
+        .await?;
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        result.push((
+            TenantId(row.get("tenant_id")),
+            parse_pipeline_row_monitoring(&row)?,
+        ));
+    }
+    Ok(result)
+}
+
 /// Retrieves the pipeline which is stopped, whose program status has been Pending
 /// for the longest, and is of the current platform version. Returns `None` if none is found.
 pub(crate) async fn get_next_sql_compilation(
@@ -1694,9 +1940,6 @@ pub(crate) async fn get_next_sql_compilation(
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
-    // The expression `abs(('x' || substr(replace(p.id::text, '-', ''), 1, 16))::bit(64)::bigint) % $2) = $3`
-    // converts the first 8 bytes of the UUID to a bigint, takes its absolute value,
-    // and computes the modulo with the total number of workers.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_ALL}
@@ -1704,7 +1947,7 @@ pub(crate) async fn get_next_sql_compilation(
              WHERE p.deployment_resources_status = 'stopped'
                    AND p.program_status = 'pending'
                    AND p.platform_version = $1
-                   AND (abs(('x' || substr(replace(p.id::text, '-', ''), 1, 16))::bit(64)::bigint) % $2) = $3
+                   AND ({PIPELINE_ID_SQL_HASH_FUNCTION_CALL} % $2) = $3
              ORDER BY p.program_status_since ASC, p.id ASC
              LIMIT 1
             "
@@ -1737,9 +1980,6 @@ pub(crate) async fn get_next_rust_compilation(
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
-    // The expression `abs(('x' || substr(replace(p.id::text, '-', ''), 1, 16))::bit(64)::bigint) % $2) = $3`
-    // converts the first 8 bytes of the UUID to a bigint, takes its absolute value,
-    // and computes the modulo with the total number of workers.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_ALL}
@@ -1747,7 +1987,7 @@ pub(crate) async fn get_next_rust_compilation(
              WHERE p.deployment_resources_status = 'stopped'
                    AND p.program_status = 'sql_compiled'
                    AND p.platform_version = $1
-                   AND (abs(('x' || substr(replace(p.id::text, '-', ''), 1, 16))::bit(64)::bigint) % $2) = $3
+                   AND ({PIPELINE_ID_SQL_HASH_FUNCTION_CALL} % $2) = $3
              ORDER BY p.program_status_since ASC, p.id ASC
              LIMIT 1
             "

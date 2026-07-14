@@ -32,6 +32,7 @@ import org.dbsp.sqlCompiler.compiler.backend.rust.StubsWriter;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCrates;
 import org.dbsp.sqlCompiler.compiler.backend.rust.multi.MultiCratesWriter;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.optimizer.CalciteOptimizer;
 import org.dbsp.sqlCompiler.compiler.sql.MultiCrateTests;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.LowerCircuitVisitor;
@@ -62,7 +63,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.function.Predicate;
@@ -124,6 +124,11 @@ public class BaseSQLTests {
     @SuppressWarnings("unused")
     public static void showPlan() {
         Logger.INSTANCE.setLoggingLevel(SqlToRelCompiler.class, 2);
+    }
+
+    @SuppressWarnings("unused")
+    public static void showCalciteOptimizer() {
+        Logger.INSTANCE.setLoggingLevel(CalciteOptimizer.class, 2);
     }
 
     @SuppressWarnings("unused")
@@ -445,6 +450,17 @@ public class BaseSQLTests {
         DBSPCompiler compiler = this.testCompiler();
         compiler.submitStatementForCompilation(query);
         new CompilerCircuitStream(compiler, data, this, message);
+    }
+
+    /** Run a test that fails at runtime with a panic matching {@code message}.
+     *
+     * @param compiler compiler
+     * @param script   DML statements (INSERT/REMOVE) that trigger the panic
+     * @param message  expected substring of the panic message */
+    protected void runtimeFail(DBSPCompiler compiler, String script, String message) {
+        CompilerCircuitStream ccs = new CompilerCircuitStream(compiler, this, message);
+        Change input = ccs.toChange(script);
+        ccs.addPair(input, new Change());
     }
 
     /** Run a test that fails at runtime without needing any inputs */

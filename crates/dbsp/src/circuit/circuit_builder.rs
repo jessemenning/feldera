@@ -59,8 +59,13 @@ use feldera_ir::{LirCircuit, LirNodeId};
 use feldera_samply::Span;
 use feldera_storage::{FileCommitter, StoragePath};
 use itertools::Itertools;
+use nix::{
+    sys::time::TimeValLike,
+    time::{ClockId, clock_gettime},
+};
 use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned};
+use size_of::SizeOf;
 use std::{
     any::{Any, TypeId, type_name_of_val},
     borrow::Cow,
@@ -71,7 +76,7 @@ use std::{
     io::ErrorKind,
     marker::PhantomData,
     mem::{take, transmute},
-    ops::Deref,
+    ops::{AddAssign, Deref},
     panic::Location,
     pin::Pin,
     rc::Rc,
@@ -538,6 +543,10 @@ dyn_clone::clone_trait_object!(StreamMetadata);
 ///   * Use [`Stream::stream_distinct`] to non-incrementally process a stream of
 ///     data.  It sets each record's weight to 1 if it is positive and drops the
 ///     others.
+///
+/// The "positive" operator on a Z-set keeps positive weights unchanged and
+/// maps all other weights to 0.  It differs from "distinct" only in that it
+/// does not clamp positive weights to 1.
 ///
 /// ## Join on equal keys
 ///
@@ -1101,6 +1110,9 @@ pub trait Node: Any {
 
     /// Call [`Operator::start_compaction`](super::operator_traits::Operator::start_compaction) on the operator this node encapsulates.
     fn start_compaction(&mut self);
+
+    /// Call [`Operator::is_compaction_complete`](super::operator_traits::Operator::is_compaction_complete) on the operator this node encapsulates.
+    fn is_compaction_complete(&self) -> bool;
 
     /// Place operator in the replay mode.
     ///
@@ -1885,6 +1897,10 @@ pub trait CircuitBase: 'static {
     fn rebalance(&self);
 
     fn start_compaction(&self);
+
+    /// Returns `true` when all operators' background compaction has fully
+    /// converged.
+    fn is_compaction_complete(&self) -> bool;
 }
 
 /// The circuit interface.  All DBSP computation takes place within a circuit.
@@ -3595,6 +3611,15 @@ where
             Ok(())
         });
     }
+
+    fn is_compaction_complete(&self) -> bool {
+        let mut complete = true;
+        let _ = self.map_local_nodes(&mut |node| {
+            complete &= node.is_compaction_complete();
+            Ok(())
+        });
+        complete
+    }
 }
 
 impl<P, T> Circuit for ChildCircuit<P, T>
@@ -3783,20 +3808,26 @@ where
             circuit.nodes.borrow()[id.0].borrow().as_ref(),
         ));
 
-        let span = Span::new("eval")
-            .with_category("Operator")
-            .with_tooltip(|| {
-                let nodes = circuit.nodes.borrow();
-                let node = nodes[id.0].borrow();
-                format!("{} {}", node.name(), node.global_id().node_identifier())
-            });
-        let (result, duration) = Timed::new(circuit.nodes.borrow()[id.0].borrow_mut().eval()).await;
+        let span = Span::new("eval").with_category("Operator");
+        let (result, elapsed_time) =
+            Timed::new(circuit.nodes.borrow()[id.0].borrow_mut().eval()).await;
         let progress = result?;
-        span.record();
+        span.with_tooltip(|| {
+            let nodes = circuit.nodes.borrow();
+            let node = nodes[id.0].borrow();
+            format!(
+                "{} {} used {}μs real time, {}μs CPU time",
+                node.name(),
+                node.global_id().node_identifier(),
+                elapsed_time.real.as_micros(),
+                elapsed_time.cpu.as_micros(),
+            )
+        })
+        .record();
 
         circuit.log_scheduler_event(&SchedulerEvent::eval_end(
             circuit.nodes.borrow()[id.0].borrow().as_ref(),
-            duration,
+            elapsed_time,
         ));
 
         Ok(progress)
@@ -4536,7 +4567,7 @@ where
             let res = constructor(child)?;
             let child_clone = child.clone();
 
-            let consensus = Consensus::new();
+            let consensus = Consensus::new("fixed point");
 
             let termination_check = async move || {
                 // Send local fixed point status to all peers.
@@ -4775,6 +4806,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -4924,6 +4959,10 @@ where
 
     fn start_compaction(&mut self) {
         self.operator.start_compaction()
+    }
+
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5091,6 +5130,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5247,6 +5290,10 @@ where
 
     fn start_compaction(&mut self) {
         self.operator.start_compaction()
+    }
+
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5464,6 +5511,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -5653,6 +5704,10 @@ where
 
     fn start_compaction(&mut self) {
         self.operator.start_compaction()
+    }
+
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -5870,6 +5925,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6057,6 +6116,10 @@ where
 
     fn start_compaction(&mut self) {
         self.operator.start_compaction()
+    }
+
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -6269,6 +6332,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6464,6 +6531,10 @@ where
         self.operator.start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.clear_state()
     }
@@ -6649,6 +6720,10 @@ where
         self.operator.borrow_mut().start_compaction()
     }
 
+    fn is_compaction_complete(&self) -> bool {
+        self.operator.borrow().is_compaction_complete()
+    }
+
     fn clear_state(&mut self) -> Result<(), DbspError> {
         self.operator.borrow_mut().clear_state()
     }
@@ -6815,6 +6890,10 @@ where
     }
 
     fn start_compaction(&mut self) {}
+
+    fn is_compaction_complete(&self) -> bool {
+        true
+    }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
         Ok(())
@@ -7046,6 +7125,10 @@ where
 
     fn start_compaction(&mut self) {
         self.circuit.start_compaction();
+    }
+
+    fn is_compaction_complete(&self) -> bool {
+        self.circuit.is_compaction_complete()
     }
 
     fn clear_state(&mut self) -> Result<(), DbspError> {
@@ -7839,6 +7922,31 @@ impl CircuitHandle {
     pub fn start_compaction(&self) {
         self.circuit.start_compaction()
     }
+
+    pub fn is_compaction_complete(&self) -> bool {
+        self.circuit.is_compaction_complete()
+    }
+}
+
+/// Real time and CPU time.
+#[derive(Copy, Clone, Debug, Default, SizeOf)]
+pub struct ElapsedTime {
+    /// Real time running a task.
+    pub real: Duration,
+
+    /// CPU time running a task.
+    ///
+    /// In the ordinary course, if `cpu` is much less than `real`, then it
+    /// indicates that the task blocked its thread, e.g. for synchronous I/O,
+    /// without yielding to the tokio scheduler.
+    pub cpu: Duration,
+}
+
+impl AddAssign for ElapsedTime {
+    fn add_assign(&mut self, rhs: Self) {
+        self.real += rhs.real;
+        self.cpu += rhs.cpu;
+    }
 }
 
 pin_project! {
@@ -7846,9 +7954,9 @@ pin_project! {
     ///
     /// This uses the same wrapper technique as [tokio_metrics::Instrumented] or
     /// [tracing::Instrument]: by implementing [Future] manually, it wraps each
-    /// poll with elapsed time measurement.  When the future eventually
-    /// completes, it outputs the wrapped future's output value plus the total
-    /// elapsed time.
+    /// poll with elapsed real and CPU time measurement.  When the future
+    /// eventually completes, it outputs the wrapped future's output value plus
+    /// the [ElapsedTime].
     ///
     /// [tokio_metrics::Instrumented]: https://docs.rs/tokio-metrics/latest/tokio_metrics/struct.Instrumented.html
     /// [tracing::Instrument]: https://docs.rs/tracing/latest/tracing/trait.Instrument.html
@@ -7858,8 +7966,8 @@ pin_project! {
         #[pin]
         task: T,
 
-        // Time spent running this task.
-        elapsed: Duration,
+        // Elapsed time running this task.
+        elapsed: ElapsedTime,
     }
 }
 
@@ -7867,8 +7975,32 @@ impl<T> Timed<T> {
     fn new(task: T) -> Self {
         Self {
             task,
-            elapsed: Duration::ZERO,
+            elapsed: ElapsedTime::default(),
         }
+    }
+}
+
+/// Amount of time elapsed running a thread.
+pub struct ThreadCpuTime(pub Duration);
+
+impl ThreadCpuTime {
+    /// Returns the current time elapsed running the current thread.
+    pub fn now() -> Self {
+        let nanos = clock_gettime(ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .unwrap()
+            .num_nanoseconds();
+        Self(Duration::from_nanos(nanos.max(0).cast_unsigned()))
+    }
+
+    /// Returns the time elapsed running the current thread since this
+    /// `ThreadCpuTime`.
+    ///
+    /// This only makes sense if this `ThreadCpuTime` was for the currently
+    /// running thread.
+    ///
+    /// Returns zero if the current time is earlier than self.
+    pub fn elapsed(&self) -> Duration {
+        Self::now().0.saturating_sub(self.0)
     }
 }
 
@@ -7876,13 +8008,15 @@ impl<T> Future for Timed<T>
 where
     T: Future,
 {
-    type Output = (T::Output, Duration);
+    type Output = (T::Output, ElapsedTime);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let start = Instant::now();
+        let start_cputime = ThreadCpuTime::now();
         let ret = this.task.poll(cx);
-        *this.elapsed += start.elapsed();
+        this.elapsed.real += start.elapsed();
+        this.elapsed.cpu += start_cputime.elapsed();
         ret.map(|value| (value, take(&mut *this.elapsed)))
     }
 }

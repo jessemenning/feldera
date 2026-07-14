@@ -11,37 +11,168 @@ use tracing::error;
 // Utility functions related to types which are stored in the database.
 // The functions center around serialization, deserialization and validation.
 
-/// Pattern that every name must adhere to.
-pub const PATTERN_VALID_NAME: &str = r"^[a-zA-Z0-9_-]+$";
+/// Pattern for non-empty string containing lowercase (a-z), uppercase (A-Z),
+/// number (0-9), underscore (_) or hyphen (-) characters.
+const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN: &str = r"^[a-zA-Z0-9_-]+$";
 
-/// Maximum name length.
-pub const MAXIMUM_NAME_LENGTH: usize = 100;
+/// Description of the non-empty alphanumeric-underscore-hyphen pattern.
+const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION: &str = "be non-empty and only \
+contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters";
+
+/// The pattern is almost the same as for Kubernetes label values but slightly stricter.
+/// Pattern for non-empty string containing lowercase (a-z), uppercase (A-Z),
+/// number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end
+/// with hyphen or underscore. In addition to Kubernetes label constraints, we do not
+/// allow dot characters or empty strings.
+pub const PATTERN_KUBERNETES_LABEL_VALUE: &str = r"^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$";
+
+/// Description of the Kubernetes label value pattern.
+pub const PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION: &str = "be non-empty and only contain \
+lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but \
+cannot start or end with hyphen or underscore";
+
+/// Maximum API key name length.
+pub(crate) const MAXIMUM_API_KEY_NAME_LENGTH: usize = 100;
+
+/// Maximum pipeline name length.
+/// It is limited to 63 to make it fit in a Kubernetes label value.
+pub(crate) const MAXIMUM_PIPELINE_NAME_LENGTH: usize = 63;
+
+/// Maximum connector name length.
+pub(crate) const MAXIMUM_CONNECTOR_NAME_LENGTH: usize = 100;
+
+/// Checks the provided API key name is valid.
+pub fn validate_api_key_name(name: &str) -> Result<(), DBError> {
+    validate_name(
+        name,
+        MAXIMUM_API_KEY_NAME_LENGTH,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION,
+    )
+}
+
+/// Checks the provided pipeline name is valid.
+pub fn validate_pipeline_name(name: &str) -> Result<(), DBError> {
+    validate_name(
+        name,
+        MAXIMUM_PIPELINE_NAME_LENGTH,
+        PATTERN_KUBERNETES_LABEL_VALUE,
+        PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION,
+    )
+}
+
+/// Checks the provided connector name is valid.
+pub fn validate_connector_name(name: &str) -> Result<(), DBError> {
+    validate_name(
+        name,
+        MAXIMUM_CONNECTOR_NAME_LENGTH,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION,
+    )
+}
+
+/// Pattern that every tag must adhere to: one or more ASCII letters (a-z,
+/// A-Z), digits (0-9), or one of space, `.`, `_`, `/`, `|`, `\`, `:`, `=` and
+/// `-`.
+pub const PATTERN_VALID_TAG: &str = r"^[a-zA-Z0-9 ._/|\\:=-]+$";
+
+/// Maximum length of a single tag, in characters.
+pub const MAXIMUM_TAG_LENGTH: usize = 50;
+
+/// Maximum number of tags a single pipeline may carry.
+pub const MAXIMUM_TAGS_PER_PIPELINE: usize = 50;
+
+/// Maximum length of a pipeline description, in characters.
+pub const MAXIMUM_DESCRIPTION_LENGTH: usize = 300;
 
 /// Checks whether the provided name is valid.
 /// The constraints are as follows:
 /// - It cannot be empty
-/// - It must be at most 100 characters long
-/// - It must contain only characters which are lowercase (a-z), uppercase (A-Z),
-//    numbers (0-9), underscores (_) or hyphens (-)
-pub fn validate_name(name: &str) -> Result<(), DBError> {
+/// - It must be at most `length_limit` characters long
+/// - It must contain characters that follow the `pattern`
+fn validate_name(
+    name: &str,
+    length_limit: usize,
+    pattern: &str,
+    pattern_description: &str,
+) -> Result<(), DBError> {
     if name.is_empty() {
         Err(DBError::EmptyName)
-    } else if name.len() > MAXIMUM_NAME_LENGTH {
+    } else if name.len() > length_limit {
         Err(DBError::TooLongName {
             name: name.to_string(),
             length: name.len(),
-            maximum: MAXIMUM_NAME_LENGTH,
+            maximum: length_limit,
         })
     } else {
-        let re = Regex::new(PATTERN_VALID_NAME).expect("Pattern for name must be valid");
+        let re = Regex::new(pattern).expect("Pattern for name must be valid");
         if re.is_match(name) {
             Ok(())
         } else {
             Err(DBError::NameDoesNotMatchPattern {
                 name: name.to_string(),
+                pattern: pattern.to_string(),
+                pattern_description: pattern_description.to_string(),
             })
         }
     }
+}
+
+/// Checks whether the provided description is valid: it must be at most
+/// [`MAXIMUM_DESCRIPTION_LENGTH`] characters long. The content is otherwise
+/// free-form.
+pub fn validate_description(description: &str) -> Result<(), DBError> {
+    let length = description.chars().count();
+    if length > MAXIMUM_DESCRIPTION_LENGTH {
+        Err(DBError::TooLongDescription {
+            length,
+            maximum: MAXIMUM_DESCRIPTION_LENGTH,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks whether the provided tags are valid. There may be at most
+/// [`MAXIMUM_TAGS_PER_PIPELINE`] tags, and each tag:
+/// - cannot be empty;
+/// - must be at most [`MAXIMUM_TAG_LENGTH`] characters long;
+/// - must contain only ASCII letters (a-z, A-Z), digits (0-9), or one of
+///   space, `.`, `_`, `/`, `|`, `\`, `:`, `=` and `-`.
+pub fn validate_tags(tags: &[String]) -> Result<(), DBError> {
+    if tags.len() > MAXIMUM_TAGS_PER_PIPELINE {
+        return Err(DBError::TooManyTags {
+            count: tags.len(),
+            maximum: MAXIMUM_TAGS_PER_PIPELINE,
+        });
+    }
+    let re = Regex::new(PATTERN_VALID_TAG).expect("Pattern for tag must be valid");
+    for tag in tags {
+        // Check each rule in turn; the first violated rule names the error.
+        let length = tag.chars().count();
+        let violated_rule = if tag.is_empty() {
+            Some("it cannot be empty".to_string())
+        } else if length > MAXIMUM_TAG_LENGTH {
+            Some(format!(
+                "it is {length} characters long, but the maximum is {MAXIMUM_TAG_LENGTH}"
+            ))
+        } else if !re.is_match(tag) {
+            Some(
+                "it may contain only ASCII letters (a-z, A-Z), numbers (0-9), or one of space, \
+                 '.', '_', '/', '|', '\\', ':', '=' and '-'"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = violated_rule {
+            return Err(DBError::InvalidTag {
+                tag: tag.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Errors that can happen when deserializing a generic JSON value
@@ -158,8 +289,14 @@ pub(crate) fn validate_storage_status_details(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_deployment_config, validate_name, validate_program_config, validate_program_info,
-        validate_runtime_config, ValidationError,
+        validate_api_key_name, validate_connector_name, validate_deployment_config,
+        validate_description, validate_pipeline_name, validate_program_config,
+        validate_program_info, validate_runtime_config, validate_tags, ValidationError,
+        MAXIMUM_API_KEY_NAME_LENGTH, MAXIMUM_CONNECTOR_NAME_LENGTH, MAXIMUM_DESCRIPTION_LENGTH,
+        MAXIMUM_PIPELINE_NAME_LENGTH, MAXIMUM_TAGS_PER_PIPELINE, MAXIMUM_TAG_LENGTH,
+        PATTERN_KUBERNETES_LABEL_VALUE, PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION,
     };
     use crate::db::error::DBError;
     use crate::db::types::program::{CompilationProfile, ProgramConfig, ProgramInfo};
@@ -169,6 +306,7 @@ mod tests {
 
     #[test]
     fn test_valid_names() {
+        // API key name
         let valid = vec![
             "a",
             "z",
@@ -176,8 +314,12 @@ mod tests {
             "Z",
             "0",
             "9",
+            "A-a",
+            "A_a",
             "-",
             "_",
+            "_-",
+            "_a-",
             "exampleExample",
             "example-1",
             "example-of-this",
@@ -187,26 +329,239 @@ mod tests {
             "EXAMPLE_example-example1234",
         ];
         for name in valid {
-            assert!(validate_name(name).is_ok());
+            assert!(validate_api_key_name(name).is_ok());
         }
+        assert!(validate_api_key_name(&"a".repeat(MAXIMUM_API_KEY_NAME_LENGTH)).is_ok());
+        assert!(validate_api_key_name(&"a".repeat(MAXIMUM_API_KEY_NAME_LENGTH - 1)).is_ok());
+
+        // Pipeline name
+        let valid = vec![
+            "a",
+            "z",
+            "A",
+            "Z",
+            "0",
+            "9",
+            "A-a",
+            "A_a",
+            "exampleExample",
+            "example-1",
+            "example-of-this",
+            "Aa0",
+            "example_2",
+            "Example",
+            "EXAMPLE_example-example1234",
+        ];
+        for name in valid {
+            assert!(validate_pipeline_name(name).is_ok());
+        }
+        assert!(validate_pipeline_name(&"a".repeat(MAXIMUM_PIPELINE_NAME_LENGTH)).is_ok());
+        assert!(validate_pipeline_name(&"a".repeat(MAXIMUM_PIPELINE_NAME_LENGTH - 1)).is_ok());
+
+        // Connector name
+        let valid = vec![
+            "a",
+            "z",
+            "A",
+            "Z",
+            "0",
+            "9",
+            "A-a",
+            "A_a",
+            "-",
+            "_",
+            "_-",
+            "_a-",
+            "exampleExample",
+            "example-1",
+            "example-of-this",
+            "Aa0_-",
+            "example_2",
+            "Example",
+            "EXAMPLE_example-example1234",
+        ];
+        for name in valid {
+            assert!(validate_connector_name(name).is_ok());
+        }
+        assert!(validate_connector_name(&"a".repeat(MAXIMUM_CONNECTOR_NAME_LENGTH)).is_ok());
+        assert!(validate_connector_name(&"a".repeat(MAXIMUM_CONNECTOR_NAME_LENGTH - 1)).is_ok());
     }
 
     #[test]
     fn test_invalid_names() {
-        assert!(matches!(validate_name(""), Err(DBError::EmptyName)));
+        // API key name
+        assert!(matches!(validate_api_key_name(""), Err(DBError::EmptyName)));
+        let just_exceeds_max_string = "a".repeat(MAXIMUM_API_KEY_NAME_LENGTH + 1);
         assert!(
-            matches!(validate_name("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), Err(DBError::TooLongName {
+            matches!(validate_api_key_name(&just_exceeds_max_string), Err(DBError::TooLongName {
             name, length, maximum
-        }) if name == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" && length == 101 && maximum == 100)
+        }) if name == just_exceeds_max_string && length == MAXIMUM_API_KEY_NAME_LENGTH + 1 && maximum == MAXIMUM_API_KEY_NAME_LENGTH)
         );
-        let invalid_due_to_pattern = vec!["%", "$", "abc@", "example example", " ", "%20"];
+        let invalid_due_to_pattern =
+            vec!["%", "$", "abc@", "example example", "a.b", ".", " ", "%20"];
         for invalid_name in invalid_due_to_pattern {
             assert!(
-                matches!(validate_name(invalid_name), Err(DBError::NameDoesNotMatchPattern {
-                name
-            }) if name == invalid_name)
+                matches!(validate_api_key_name(invalid_name), Err(DBError::NameDoesNotMatchPattern {
+                    name,
+                    pattern,
+                    pattern_description,
+                }) if name == invalid_name && pattern == PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN && pattern_description == PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION)
             );
         }
+
+        // Pipeline name
+        assert!(matches!(
+            validate_pipeline_name(""),
+            Err(DBError::EmptyName)
+        ));
+        let just_exceeds_max_string = "a".repeat(MAXIMUM_PIPELINE_NAME_LENGTH + 1);
+        assert!(
+            matches!(validate_pipeline_name(&just_exceeds_max_string), Err(DBError::TooLongName {
+            name, length, maximum
+        }) if name == just_exceeds_max_string && length == MAXIMUM_PIPELINE_NAME_LENGTH + 1 && maximum == MAXIMUM_PIPELINE_NAME_LENGTH)
+        );
+        let invalid_due_to_pattern = vec![
+            "%",
+            "$",
+            "abc@",
+            "example example",
+            " ",
+            "%20",
+            "-",
+            "_",
+            "_-",
+            "_a-",
+            "Aa0_-",
+            "_Aa0-",
+            "a.b",
+            ".",
+        ];
+        for invalid_name in invalid_due_to_pattern {
+            assert!(
+                matches!(validate_pipeline_name(invalid_name), Err(DBError::NameDoesNotMatchPattern {
+                    name,
+                    pattern,
+                    pattern_description,
+                }) if name == invalid_name && pattern == PATTERN_KUBERNETES_LABEL_VALUE && pattern_description == PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION)
+            );
+        }
+
+        // Connector name
+        assert!(matches!(
+            validate_connector_name(""),
+            Err(DBError::EmptyName)
+        ));
+        let just_exceeds_max_string = "a".repeat(MAXIMUM_CONNECTOR_NAME_LENGTH + 1);
+        assert!(
+            matches!(validate_connector_name(&just_exceeds_max_string), Err(DBError::TooLongName {
+            name, length, maximum
+        }) if name == just_exceeds_max_string && length == MAXIMUM_CONNECTOR_NAME_LENGTH + 1 && maximum == MAXIMUM_CONNECTOR_NAME_LENGTH)
+        );
+        let invalid_due_to_pattern =
+            vec!["%", "$", "abc@", "example example", "a.b", ".", " ", "%20"];
+        for invalid_name in invalid_due_to_pattern {
+            assert!(
+                matches!(validate_connector_name(invalid_name), Err(DBError::NameDoesNotMatchPattern {
+                    name,
+                    pattern,
+                    pattern_description,
+                }) if name == invalid_name && pattern == PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN && pattern_description == PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION)
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_tags() {
+        let max_length = "a".repeat(MAXIMUM_TAG_LENGTH);
+        let valid = vec![
+            "a",
+            "Z",
+            "0",
+            "prod",
+            "team-billing",
+            "env/staging",
+            "a.b.c",
+            "with space",
+            "pipe|sep",
+            "back\\slash",
+            "key:value",
+            "key=value",
+            "Mixed-1_2/3|4.5:6=7 8",
+            max_length.as_str(),
+        ];
+        for tag in valid {
+            assert!(
+                validate_tags(&[tag.to_string()]).is_ok(),
+                "expected '{tag}' to be valid"
+            );
+        }
+        // An empty list (no tags) is valid.
+        assert!(validate_tags(&[]).is_ok());
+        // Several valid tags together.
+        assert!(validate_tags(&["a".to_string(), "b/c".to_string()]).is_ok());
+        // Up to the maximum number of tags is valid.
+        let max_tags: Vec<String> = (0..MAXIMUM_TAGS_PER_PIPELINE)
+            .map(|i| format!("tag{i}"))
+            .collect();
+        assert!(validate_tags(&max_tags).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_tags() {
+        // Empty tag.
+        assert!(matches!(
+            validate_tags(&["".to_string()]),
+            Err(DBError::InvalidTag { tag, .. }) if tag.is_empty()
+        ));
+        // Too long.
+        let too_long = "a".repeat(MAXIMUM_TAG_LENGTH + 1);
+        assert!(matches!(
+            validate_tags(&[too_long.clone()]),
+            Err(DBError::InvalidTag { tag, .. }) if tag == too_long
+        ));
+        // Disallowed characters.
+        for invalid in ["%", "café", "a,b", "tab\tchar", "emoji😀", "a;b", "a@b"] {
+            assert!(
+                matches!(
+                    validate_tags(&[invalid.to_string()]),
+                    Err(DBError::InvalidTag { tag, .. }) if tag == invalid
+                ),
+                "expected '{invalid}' to be rejected"
+            );
+        }
+        // A single bad tag among good ones is rejected.
+        assert!(matches!(
+            validate_tags(&["ok".to_string(), "bad,tag".to_string()]),
+            Err(DBError::InvalidTag { tag, .. }) if tag == "bad,tag"
+        ));
+        // More than the maximum number of tags is rejected, even when every
+        // individual tag is valid.
+        let too_many: Vec<String> = (0..MAXIMUM_TAGS_PER_PIPELINE + 1)
+            .map(|i| format!("tag{i}"))
+            .collect();
+        assert!(matches!(
+            validate_tags(&too_many),
+            Err(DBError::TooManyTags { count, maximum })
+                if count == MAXIMUM_TAGS_PER_PIPELINE + 1 && maximum == MAXIMUM_TAGS_PER_PIPELINE
+        ));
+    }
+
+    #[test]
+    fn test_description_length() {
+        // Empty and up-to-the-limit descriptions are accepted.
+        assert!(validate_description("").is_ok());
+        assert!(validate_description("a short description").is_ok());
+        assert!(validate_description(&"a".repeat(MAXIMUM_DESCRIPTION_LENGTH)).is_ok());
+        // Length is counted in characters, not bytes: a multi-byte string of
+        // MAXIMUM_DESCRIPTION_LENGTH characters is still accepted.
+        assert!(validate_description(&"é".repeat(MAXIMUM_DESCRIPTION_LENGTH)).is_ok());
+        // One character over the limit is rejected.
+        let too_long = "a".repeat(MAXIMUM_DESCRIPTION_LENGTH + 1);
+        assert!(matches!(
+            validate_description(&too_long),
+            Err(DBError::TooLongDescription { length, maximum })
+                if length == MAXIMUM_DESCRIPTION_LENGTH + 1 && maximum == MAXIMUM_DESCRIPTION_LENGTH
+        ));
     }
 
     #[test]
@@ -253,6 +608,7 @@ mod tests {
             profile: Some(CompilationProfile::Unoptimized),
             cache: false,
             runtime_version: None,
+            use_platform_compiler: false,
         };
         let value = serde_json::to_value(program_config.clone()).unwrap();
         assert_eq!(

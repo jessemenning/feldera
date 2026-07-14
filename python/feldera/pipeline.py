@@ -488,6 +488,53 @@ metrics"""
                 raise RuntimeError(f"waiting for idle reached timeout ({timeout_s}s)")
             time.sleep(poll_interval_s)
 
+    def _wait_for_adhoc_write(
+        self, poll_interval_s: float = 0.1, timeout_s: float | None = None
+    ):
+        """
+        Block until every record currently in the circuit has been processed
+        to completion.
+
+        This backs the ``wait`` option of :meth:`.query` and :meth:`.execute`.
+        An ad-hoc ``INSERT`` returns once its records have been
+        pushed to the circuit, but not necessarily once the circuit has
+        processed them, so a subsequent ad-hoc ``SELECT`` is not guaranteed to
+        observe the write. To close that gap, this method snapshots the number
+        of records that have entered the circuit
+        (``total_input_records - buffered_input_records``) and polls until the
+        pipeline reports at least that many records completed. The write's
+        records are part of that count, because the ``/query`` endpoint pushes
+        them to the circuit before returning.
+
+        The metric polled is ``total_completed_records``, so "completed" means
+        more than just visible to ad-hoc queries: a record is counted only once
+        the DBSP engine has processed it *and* every output connector has
+        processed the outputs derived from it. Therefore, when this method
+        returns, both of the following hold for the write:
+
+        - ad-hoc queries reflect the updates, and
+        - all output connectors have processed (sent out) the outputs the
+          updates produced.
+
+        :param poll_interval_s: Interval between ``/stats`` polls.
+        :param timeout_s: Maximum time to wait, or ``None`` to wait
+            indefinitely.
+        :raises TimeoutError: If ``timeout_s`` elapses before the records are
+            processed.
+        """
+
+        metrics = self.stats().global_metrics
+        target = metrics.total_input_records - metrics.buffered_input_records
+
+        start_s = time.monotonic()
+        while self.stats().global_metrics.total_completed_records < target:
+            if timeout_s is not None and time.monotonic() - start_s >= timeout_s:
+                raise TimeoutError(
+                    f"timeout ({timeout_s}s) reached while waiting for an ad-hoc"
+                    f" write on pipeline '{self.name}' to be processed"
+                )
+            time.sleep(poll_interval_s)
+
     def activate(
         self, wait: bool = True, timeout_s: Optional[float] = None
     ) -> Optional[PipelineStatus]:
@@ -939,6 +986,18 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         return uuid
 
+    def remote_checkpoints(self) -> list[dict]:
+        """
+        Lists checkpoints available in the configured remote object storage.
+
+        :return: A list of remote checkpoint descriptors, each containing at
+            minimum a ``uuid`` field.
+
+        :raises FelderaAPIError: If sync storage is not configured or
+            enterprise features are not enabled.
+        """
+        return self.client.get_remote_checkpoints(self.name)
+
     def sync_checkpoint_status(self, uuid: str) -> CheckpointStatus:
         """
         Checks the status of the given checkpoint sync operation.
@@ -992,11 +1051,13 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         else:
             return max(UUID(success), UUID(periodic))
 
-    def query(self, query: str) -> Generator[Mapping[str, Any], None, None]:
+    def query(
+        self, query: str, wait: bool = False
+    ) -> Generator[Mapping[str, Any], None, None]:
         """
         Executes an ad-hoc SQL query on this pipeline and returns a generator
         that yields the rows of the result as Python dictionaries. For
-        ``INSERT`` and ``DELETE`` queries, consider using :meth:`.execute`
+        ``INSERT`` queries, consider using :meth:`.execute`
         instead. All floating-point numbers are deserialized as ``Decimal``
         to avoid precision loss.
 
@@ -1009,10 +1070,19 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             You can only ``SELECT`` from materialized tables and views.
 
         Important:
-            This method is lazy. It returns a generator and is not evaluated
-            until you consume the result.
+            With the default ``wait=False`` this method is lazy: it returns a
+            generator and is not evaluated until you consume the result.
 
         :param query: The SQL query to be executed.
+        :param wait: When ``True``, block until the query's writes have been
+            fully processed by the pipeline. Once the call returns, a
+            subsequent ad-hoc query observes the writes (read-your-writes)
+            *and* every output connector has processed the outputs the writes
+            produced. This is useful for ``INSERT`` queries; it
+            has no effect on a pure ``SELECT`` other than waiting for
+            already-in-flight records to be processed. Setting ``wait=True``
+            consumes the result eagerly. ``False`` by default for backward
+            compatibility.
         :return: A generator that yields the rows of the result as Python
             dictionaries.
 
@@ -1024,7 +1094,15 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         # Delegate to the non-deprecated internal helper so calls through
         # `query()` don't surface a DeprecationWarning to user code.
-        return self.client._query_json_stream(self.name, query)
+        gen = self.client._query_json_stream(self.name, query)
+        if not wait:
+            return gen
+
+        # Eagerly consume the result so the query's writes reach the circuit,
+        # block until they are processed, then replay the collected rows.
+        rows = list(gen)
+        self._wait_for_adhoc_write()
+        return (row for row in rows)
 
     def query_parquet(self, query: str, path: str):
         """
@@ -1130,15 +1208,15 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         """
         return self.client.query_as_hash(self.name, query)
 
-    def execute(self, query: str):
+    def execute(self, query: str, wait: bool = False):
         """
         Executes an ad-hoc SQL query on the current pipeline, discarding its
         result. Unlike the :meth:`.query` method which returns a generator for
         retrieving query results lazily, this method processes the query
         eagerly and fully before returning.
 
-        This method is suitable for SQL operations like ``INSERT`` and
-        ``DELETE``, where the user needs confirmation of successful query
+        This method is suitable for SQL operations like ``INSERT``
+        where the user needs confirmation of successful query
         execution, but does not require the query result. If the query fails,
         an exception will be raised.
 
@@ -1147,6 +1225,11 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             pipeline is paused, it will block until the pipeline is resumed.
 
         :param query: The SQL query to be executed.
+        :param wait: When ``True``, block until the query's writes have been
+            fully processed by the pipeline. Once the call returns, a
+            subsequent ad-hoc query observes the writes (read-your-writes)
+            *and* every output connector has processed the outputs the writes
+            produced. ``False`` by default for backward compatibility.
 
         :raises FelderaAPIError: If the pipeline is not in a RUNNING state.
         :raises FelderaAPIError: If the query is invalid.
@@ -1154,6 +1237,8 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         gen = self.query_tabular(query)
         deque(gen, maxlen=0)
+        if wait:
+            self._wait_for_adhoc_write()
 
     def clear_storage(
         self,
@@ -1201,18 +1286,22 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         program_config: Optional[Mapping[str, Any]] = None,
         runtime_config: Optional[Mapping[str, Any]] = None,
         description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ):
         """
         Modify the pipeline.
 
         Modify the values of pipeline attributes: SQL code, UDF Rust code,
-        UDF Rust dependencies (TOML), program config, runtime config, and
-        description. Only the provided attributes will be modified. Other
-        attributes will remain unchanged.
+        UDF Rust dependencies (TOML), program config, runtime config,
+        description, and tags. Only the provided attributes will be modified.
+        Other attributes will remain unchanged.
 
-        The pipeline must be in the STOPPED state to be modified.
+        Most attributes require the pipeline to be in the STOPPED state to be
+        modified. The ``description`` and ``tags`` are an exception: they can be
+        modified at any time, as they have no effect on the deployed pipeline.
 
-        :raises FelderaAPIError: If the pipeline is not in a STOPPED state.
+        :raises FelderaAPIError: If a non-metadata attribute is modified while
+            the pipeline is not in a STOPPED state.
         """
 
         self.client.patch_pipeline(
@@ -1223,6 +1312,7 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             program_config=program_config,
             runtime_config=runtime_config,
             description=description,
+            tags=tags,
         )
 
     def update_runtime(self):
@@ -1374,6 +1464,18 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
         self.refresh(PipelineFieldSelector.STATUS)
         return self._inner.description
+
+    def tags(self) -> List[str]:
+        """
+        Return the tags of the pipeline.
+
+        Tags are returned verbatim, including the ``|rrggbb`` color suffix the web
+        console uses to encode a tag's color. Use :func:`feldera.tags.tag_display_name`
+        to obtain the tag's text label.
+        """
+
+        self.refresh(PipelineFieldSelector.STATUS)
+        return getattr(self._inner, "tags", [])
 
     def tables(self) -> List[SQLTable]:
         """

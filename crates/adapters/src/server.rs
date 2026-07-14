@@ -56,12 +56,13 @@ use feldera_types::adapter_stats::{
     PipelineStatsErrorsResponse,
 };
 use feldera_types::checkpoint::{
-    CheckpointFailure, CheckpointResponse, CheckpointStatus, CheckpointSyncFailure,
-    CheckpointSyncResponse, CheckpointSyncStatus,
+    CheckpointFailure, CheckpointPullStatus, CheckpointResponse, CheckpointStatus,
+    CheckpointSyncFailure, CheckpointSyncResponse, CheckpointSyncStatus, HostInfo,
 };
 use feldera_types::completion_token::{
     CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
 };
+use feldera_types::config::SyncConfig;
 use feldera_types::constants::STATUS_FILE;
 use feldera_types::coordination::{
     AdHocScan, CoordinationActivate, CoordinationStatus, Labels, RestartArgs, Step, StepRequest,
@@ -293,6 +294,20 @@ pub(crate) struct ServerState {
 
     storage: Option<Arc<dyn StorageBackend>>,
 
+    /// Sync configuration, extracted from the storage backend at startup.
+    ///
+    /// Used by the `/coordination/checkpoint/pull` endpoint to pull checkpoints
+    /// from object storage on behalf of the multihost coordinator.
+    sync_config: Option<SyncConfig>,
+
+    /// Host identity of this pod within a multihost pipeline, derived from
+    /// `--host-id` and `config.global.hosts` at startup.  `None` for solo
+    /// pipelines.
+    host_info: Option<HostInfo>,
+
+    /// Status of the most recent background checkpoint pull.
+    pull_state: Mutex<CheckpointPullStatus>,
+
     // rate limiter based on tags
     // NOTE: we assume that there are a finite small number
     // of tags, so using String is fine.
@@ -317,6 +332,7 @@ struct Lease {
 }
 
 impl ServerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         phase: PipelinePhase,
         md: String,
@@ -324,6 +340,8 @@ impl ServerState {
         bootstrap_config: BootstrapConfig,
         deployment_id: Uuid,
         storage: Option<Arc<dyn StorageBackend>>,
+        sync_config: Option<SyncConfig>,
+        host_info: Option<HostInfo>,
     ) -> Self {
         // Max 10 errors per minute
         let rate_limiter = TokenBucketRateLimiter::new(10, Duration::from_secs(60));
@@ -338,6 +356,9 @@ impl ServerState {
             bootstrap_config: Mutex::new(bootstrap_config),
             deployment_id,
             storage,
+            sync_config,
+            host_info,
+            pull_state: Default::default(),
             rate_limiter,
             samply_state: Default::default(),
             coordination_activate: Default::default(),
@@ -353,6 +374,8 @@ impl ServerState {
             RuntimeDesiredStatus::Paused,
             BootstrapConfig::default(),
             deployment_id,
+            None,
+            None,
             None,
         )
     }
@@ -754,6 +777,10 @@ pub fn run_server(
             return Err(ControllerError::InvalidInitialStatus(initial_status));
         }
 
+        let host_info = args.host_id.map(|host_idx| HostInfo {
+            host_idx,
+            n_hosts: config.global.hosts,
+        });
         let state = WebData::new(ServerState::new(
             PipelinePhase::Initializing(InitializationState::Starting),
             md,
@@ -761,6 +788,8 @@ pub fn run_server(
             bootstrap_config,
             args.deployment_id,
             builder.storage().clone(),
+            builder.sync_config(),
+            host_info,
         ));
 
         // Initialize the pipeline in a separate thread.  On success, this thread
@@ -1248,6 +1277,7 @@ where
         .service(checkpoint)
         .service(checkpoint_status)
         .service(checkpoints)
+        .service(remote_checkpoints)
         .service(checkpoint_sync)
         .service(sync_checkpoint_status)
         .service(suspend)
@@ -1267,6 +1297,9 @@ where
         .service(coordination_checkpoint_status)
         .service(coordination_checkpoint_prepare)
         .service(coordination_checkpoint_release)
+        .service(coordination_checkpoint_pull)
+        .service(coordination_checkpoint_pull_status)
+        .service(coordination_checkpoint_push)
         .service(coordination_transaction_status)
         .service(coordination_completion_status)
         .service(coordination_adhoc_catalog)
@@ -1387,6 +1420,47 @@ async fn status_handler(
 }
 
 #[allow(clippy::result_large_err)]
+/// Reports the runtime status of a controller whose circuit has reached
+/// [`PipelineState::Terminated`].
+///
+/// A successful suspend terminates the circuit before the server installs
+/// [`PipelinePhase::Suspended`] and deallocates the controller (see `/suspend`),
+/// so a status poll landing in that window observes the still-registered
+/// controller in `Terminated`. When a suspend was requested the pipeline is
+/// converging to `Suspended`, so report that clean status rather than a
+/// spurious `PipelineTerminated` error that the pipeline manager would record
+/// as a failed execution.
+///
+/// This branch is reached only for a *successful* suspend: a failed suspend
+/// deliberately leaves the circuit running (see the `SuspendCommand` handler in
+/// `controller.rs`) so that it never masquerades here as a clean `Suspended`;
+/// the `/suspend` handler reports it as [`PipelinePhase::Failed`] instead. Any
+/// termination without a suspend request is an unexpected, fatal termination
+/// and stays an error.
+fn terminated_status(
+    runtime_desired_status: RuntimeDesiredStatus,
+    storage_status_details: Option<StorageStatusDetails>,
+) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
+    if matches!(runtime_desired_status, RuntimeDesiredStatus::Suspended) {
+        Ok(ExtendedRuntimeStatus {
+            runtime_status: RuntimeStatus::Suspended,
+            runtime_status_details: json!(""),
+            runtime_desired_status,
+            storage_status_details,
+        })
+    } else {
+        Err(ExtendedRuntimeStatusError {
+            status_code: StatusCode::INTERNAL_SERVER_ERROR,
+            error: feldera_types::error::ErrorResponse {
+                message: "Pipeline has been terminated.".to_string(),
+                error_code: Cow::from("PipelineTerminated"),
+                details: json!({}),
+            },
+        })
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
     // Runtime desired status
     let runtime_desired_status = state.desired_status();
@@ -1443,14 +1517,9 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
                     RuntimeStatus::Running,
                     storage_status_details,
                 )),
-                PipelineState::Terminated => Err(ExtendedRuntimeStatusError {
-                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
-                    error: feldera_types::error::ErrorResponse {
-                        message: "Pipeline has been terminated.".to_string(),
-                        error_code: Cow::from("PipelineTerminated"),
-                        details: json!({}),
-                    },
-                }),
+                PipelineState::Terminated => {
+                    terminated_status(runtime_desired_status, storage_status_details)
+                }
             };
         }
         Err(_) => {
@@ -1758,7 +1827,7 @@ async fn metadata(state: WebData<ServerState>) -> impl Responder {
 
 #[get("/heap_profile")]
 async fn heap_profile() -> impl Responder {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "with-heap-profiling"))]
     {
         let mut prof_ctl = jemalloc_pprof::PROF_CTL.as_ref().unwrap().lock().await;
         if !prof_ctl.activated() {
@@ -1776,10 +1845,10 @@ async fn heap_profile() -> impl Responder {
             }),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", feature = "with-heap-profiling")))]
     {
         Err::<HttpResponse, PipelineError>(PipelineError::HeapProfilerError {
-            error: "heap profiling is only supported on Linux".to_string(),
+            error: "heap profiling is not available in this build".to_string(),
         })
     }
 }
@@ -1945,12 +2014,23 @@ fn get_checkpoints(state: &ServerState) -> Result<VecDeque<CheckpointMetadata>, 
 async fn checkpoint_sync(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
     let controller = state.controller()?;
 
+    if controller.layout().is_multihost() {
+        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
+            message: "checkpoint sync is not supported directly on multihost pipelines; \
+                      sync requests must go through the coordinator via \
+                      `/coordination/checkpoint/push`"
+                .to_string(),
+            error_code: "400".into(),
+            details: serde_json::Value::Null,
+        }));
+    }
+
     let Some(last_checkpoint) = get_checkpoints(&state)?.back().map(|c| c.uuid) else {
         return Ok(HttpResponse::BadRequest().json(ErrorResponse {
-                    message: "no checkpoints found; make a POST request to `/checkpoint` to make a new checkpoint".to_string(),
-                    error_code: "400".into(),
-                    details: serde_json::Value::Null,
-                }));
+            message: "no checkpoints found; make a POST request to `/checkpoint` to make a new checkpoint".to_string(),
+            error_code: "400".into(),
+            details: serde_json::Value::Null,
+        }));
     };
 
     spawn(async move {
@@ -1963,6 +2043,47 @@ async fn checkpoint_sync(state: WebData<ServerState>) -> Result<HttpResponse, Pi
     });
 
     Ok(HttpResponse::Accepted().json(CheckpointSyncResponse::new(last_checkpoint)))
+}
+
+/// Request body for `POST /coordination/checkpoint/push`.
+#[derive(Deserialize)]
+struct CoordinationPushBody {
+    /// UUID of the local checkpoint to push to object storage.
+    uuid: Uuid,
+}
+
+/// Triggers a push of a specific checkpoint to object storage.
+///
+/// Called by the multihost coordinator to direct each pod to sync a particular
+/// checkpoint UUID.  The coordinator selects the same logical step for all pods
+/// before calling this endpoint, ensuring all pods' remote catalogs converge
+/// on a consistent snapshot.
+#[post("/coordination/checkpoint/push")]
+async fn coordination_checkpoint_push(
+    state: WebData<ServerState>,
+    body: web::Json<CoordinationPushBody>,
+) -> Result<HttpResponse, PipelineError> {
+    let uuid = body.into_inner().uuid;
+    let controller = state.controller()?;
+
+    if get_checkpoints(&state)?.iter().all(|c| c.uuid != uuid) {
+        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
+            message: format!("checkpoint '{uuid}' not found in local storage"),
+            error_code: "400".into(),
+            details: serde_json::Value::Null,
+        }));
+    }
+
+    spawn(async move {
+        let result = controller.async_sync_checkpoint(uuid).await;
+        state
+            .sync_checkpoint_state
+            .lock()
+            .unwrap()
+            .completed(uuid, result);
+    });
+
+    Ok(HttpResponse::Accepted().json(CheckpointSyncResponse::new(uuid)))
 }
 
 /// Initiates a checkpoint and returns its sequence number.  The caller may poll
@@ -1991,6 +2112,28 @@ async fn checkpoint_status(state: WebData<ServerState>) -> impl Responder {
 #[get("/checkpoints")]
 async fn checkpoints(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
     Ok(HttpResponse::Ok().json(get_checkpoints(&state)?))
+}
+
+/// List checkpoints available in the configured remote object storage.
+#[get("/checkpoints/remote")]
+async fn remote_checkpoints(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
+    let sync = state
+        .sync_config
+        .clone()
+        .ok_or_else(|| PipelineError::ControllerError {
+            error: Arc::new(ControllerError::checkpoint_fetch_error(
+                "listing remote checkpoints requires sync to be configured".to_string(),
+            )),
+        })?;
+
+    let result = spawn_blocking(move || crate::controller::sync::list_remote_checkpoints(&sync))
+        .await
+        .map_err(|e| PipelineError::ControllerError {
+            error: Arc::new(ControllerError::checkpoint_fetch_error(format!("{e}"))),
+        })?
+        .map_err(|e| PipelineError::ControllerError { error: Arc::new(e) })?;
+
+    Ok(HttpResponse::Ok().json(result))
 }
 
 #[get("/checkpoint/sync_status")]
@@ -2028,10 +2171,12 @@ async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, Pipeline
             drop(desired_status);
 
             async fn suspend(state: WebData<ServerState>) {
+                let mut suspend_error = None;
                 loop {
                     if let Ok(controller) = state.controller() {
                         if let Err(error) = controller.async_suspend().await {
                             error!("controller suspend failed ({error})");
+                            suspend_error = Some(error);
                         }
                         break;
                     }
@@ -2044,7 +2189,17 @@ async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, Pipeline
                     };
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                state.set_phase(PipelinePhase::Suspended);
+                // A failed suspend leaves the pipeline unsuspended: report it as
+                // a fatal error so the pipeline manager records the failure
+                // rather than a clean suspend. The circuit is deliberately left
+                // running on failure (see the `SuspendCommand` handler in
+                // `controller.rs`), so `/status` never observed a `Terminated`
+                // circuit to mask as `Suspended`; this phase is what the poll
+                // sees once the controller is deallocated below.
+                state.set_phase(match suspend_error {
+                    Some(error) => PipelinePhase::Failed(error),
+                    None => PipelinePhase::Suspended,
+                });
                 if let Ok(controller) = state.take_controller()
                     && let Err(error) = controller.async_stop().await
                 {
@@ -2618,6 +2773,99 @@ async fn coordination_checkpoint_release(
     Ok(HttpResponse::Ok().finish())
 }
 
+/// Request body for `POST /coordination/checkpoint/pull`.
+#[derive(Deserialize)]
+struct CoordinationPullBody {
+    #[serde(default)]
+    standby: bool,
+}
+
+/// Pulls the latest checkpoint from object storage into local storage.
+///
+/// Returns 202 Accepted and starts a background pull.  If a pull is already in
+/// progress, returns 200 OK without starting a new one.  Poll
+/// `GET /coordination/checkpoint/pull_status` for the result.  Fails
+/// synchronously only if the pipeline is already running or storage/sync config
+/// is absent.
+#[post("/coordination/checkpoint/pull")]
+async fn coordination_checkpoint_pull(
+    state: WebData<ServerState>,
+    body: web::Json<CoordinationPullBody>,
+) -> Result<HttpResponse, PipelineError> {
+    if matches!(state.phase(), PipelinePhase::InitializationComplete) {
+        return Err(PipelineError::ControllerError {
+            error: Arc::new(ControllerError::checkpoint_fetch_error(
+                "checkpoint pull is not allowed while the pipeline is already running".to_string(),
+            )),
+        });
+    }
+
+    let storage = state
+        .storage
+        .clone()
+        .ok_or_else(|| PipelineError::ControllerError {
+            error: Arc::new(ControllerError::checkpoint_fetch_error(
+                "checkpoint pull requires storage to be configured".to_string(),
+            )),
+        })?;
+    let sync = state
+        .sync_config
+        .clone()
+        .ok_or_else(|| PipelineError::ControllerError {
+            error: Arc::new(ControllerError::checkpoint_fetch_error(
+                "checkpoint pull requires sync to be configured".to_string(),
+            )),
+        })?;
+
+    let host_info = state.host_info;
+    let standby = body.into_inner().standby;
+
+    {
+        let mut pull_state = state.pull_state.lock().unwrap();
+        if matches!(*pull_state, CheckpointPullStatus::InProgress) {
+            return Ok(HttpResponse::Ok().finish());
+        }
+        *pull_state = CheckpointPullStatus::InProgress;
+    }
+    info!("coordination checkpoint pull: host_info={host_info:?} standby={standby}");
+
+    spawn(async move {
+        let result = spawn_blocking(move || {
+            crate::controller::sync::pull_once_with_backend(storage, &sync, host_info, standby)
+        })
+        .await
+        .unwrap();
+
+        let new_status = match result {
+            Ok(()) => {
+                info!("coordination checkpoint pull: done");
+                CheckpointPullStatus::Ok
+            }
+            Err(e) => {
+                error!("coordination checkpoint pull failed: {e:?}");
+                CheckpointPullStatus::Error {
+                    error: e.to_string(),
+                }
+            }
+        };
+        *state.pull_state.lock().unwrap() = new_status;
+    });
+
+    Ok(HttpResponse::Accepted().finish())
+}
+
+/// Returns the status of the most recent `POST /coordination/checkpoint/pull`.
+///
+/// Returns one of:
+/// - `{"status": "not_requested"}` — no pull has been requested yet.
+/// - `{"status": "in_progress"}` — a pull is currently running.
+/// - `{"status": "ok"}` — the pull completed successfully.
+/// - `{"status": "error", "error": "..."}` — the pull failed.
+#[get("/coordination/checkpoint/pull_status")]
+async fn coordination_checkpoint_pull_status(state: WebData<ServerState>) -> HttpResponse {
+    HttpResponse::Ok().json(state.pull_state.lock().unwrap().clone())
+}
+
 #[get("/coordination/transaction/status")]
 async fn coordination_transaction_status(
     state: WebData<ServerState>,
@@ -2656,12 +2904,27 @@ async fn coordination_adhoc_lease(
 
     // Grab the snapshot for the step.
     let controller = state.controller()?;
-    let snapshot = controller.consistent_snapshot(step).await.ok_or_else(|| {
-        PipelineError::AdHocQueryError {
-            error: format!("snapshot for step {step} is not available"),
-            df: None,
+    let snapshot = match controller.consistent_snapshot(step).await {
+        Some(snapshot) => snapshot,
+        None => {
+            // INSTRUMENTATION: the coordinator leased `step` (its `current_step`),
+            // but our snapshot for it has already been evicted. Log which steps we
+            // still retain so we can see how far `current_step` lagged this host.
+            let retained = controller.available_snapshot_steps().await;
+            error!(
+                "adhoc lease: snapshot for step {step} is not available; \
+                 retained snapshot steps = {retained:?} (this host is at step \
+                 {:?})",
+                retained.last()
+            );
+            return Err(PipelineError::AdHocQueryError {
+                error: format!(
+                    "snapshot for step {step} is not available (retained steps: {retained:?})"
+                ),
+                df: None,
+            });
         }
-    })?;
+    };
 
     // Add the snapshot to the table of leases.
     state
@@ -2763,21 +3026,73 @@ async fn coordination_adhoc_scan(
     // one.  After the first batch, there is no way to properly report an error,
     // so this at least allows us to report errors at the point they are most
     // likely.
+    //
+    // Crucially, an error that occurs *after* the first batch can no longer
+    // change the HTTP status (200 OK and the initial bytes are already on the
+    // wire). All we can do is stop writing, which truncates the Arrow stream;
+    // the coordinator then observes a generic "Unexpected End of Stream" with no
+    // hint as to the real cause. To keep that cause from being lost, we log it
+    // here -- with table/step/worker context -- before the stream terminates.
     let first_batch = match stream.next().await {
         Some(Err(error)) => return Err(error.into()),
         other => other.into_iter(),
     };
 
     let schema = stream.schema();
-    let response_stream = async_stream::try_stream! {
-        let mut writer = StreamWriter::try_new(Vec::new(), &schema)?;
+
+    // Diagnostic context, captured so it can be logged from inside the stream.
+    let table = scan.table.clone();
+    let step = scan.step;
+    let worker = scan.worker;
+
+    let response_stream = async_stream::stream! {
+        let mut writer = match StreamWriter::try_new(Vec::new(), &schema) {
+            Ok(writer) => writer,
+            Err(error) => {
+                error!(
+                    "ad-hoc scan of {table} (step {step}, worker {worker}): failed to \
+                     create the Arrow stream writer: {error}"
+                );
+                yield Err(error.into());
+                return;
+            }
+        };
         let mut stream = futures_util::stream::iter(first_batch).chain(stream);
         while let Some(batch) = stream.next().await {
-            writer.write(&batch?)?;
-            yield Bytes::copy_from_slice(writer.get_ref().as_slice());
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    error!(
+                        "ad-hoc scan of {table} (step {step}, worker {worker}): error \
+                         producing a record batch after streaming had already begun; the \
+                         response will be truncated and the coordinator will report an \
+                         incomplete Arrow stream: {error}"
+                    );
+                    yield Err(error.into());
+                    return;
+                }
+            };
+            if let Err(error) = writer.write(&batch) {
+                error!(
+                    "ad-hoc scan of {table} (step {step}, worker {worker}): error encoding \
+                     a record batch into the Arrow stream: {error}"
+                );
+                yield Err(error.into());
+                return;
+            }
+            yield Ok(Bytes::copy_from_slice(writer.get_ref().as_slice()));
             writer.get_mut().clear();
         }
-        yield writer.into_inner()?.into();
+        match writer.into_inner() {
+            Ok(buffer) => yield Ok(Bytes::from(buffer)),
+            Err(error) => {
+                error!(
+                    "ad-hoc scan of {table} (step {step}, worker {worker}): error \
+                     finalizing the Arrow stream: {error}"
+                );
+                yield Err(error.into());
+            }
+        }
     };
     Ok(HttpResponseBuilder::new(StatusCode::OK).streaming::<_, PipelineError>(response_stream))
 }
@@ -2879,7 +3194,7 @@ impl StoredStatus {
 /// off.
 #[cfg(test)]
 mod test_http_helpers {
-    use super::{ServerArgs, ServerState, bootstrap, build_app, parse_config};
+    use super::{ServerArgs, ServerState, bootstrap, build_app, parse_config, terminated_status};
     use crate::{
         controller::ControllerBuilder,
         server::{InitializationState, PipelinePhase},
@@ -2913,6 +3228,26 @@ mod test_http_helpers {
     };
     use tempfile::NamedTempFile;
     use uuid::Uuid;
+
+    /// A successful suspend terminates the circuit before the server reports
+    /// `PipelinePhase::Suspended`, so `terminated_status` must report a clean
+    /// `Suspended` while a suspend is in progress instead of the spurious
+    /// `PipelineTerminated` error that flaked `suspend_and_resume_demos`.
+    ///
+    /// A *failed* suspend never reaches `terminated_status`: the `SuspendCommand`
+    /// handler leaves the circuit running instead of terminating it, and the
+    /// `/suspend` handler reports the failure as `PipelinePhase::Failed`.
+    #[test]
+    fn terminated_status_reports_suspended_while_suspending() {
+        let status = terminated_status(RuntimeDesiredStatus::Suspended, None)
+            .expect("a suspending pipeline must not surface PipelineTerminated");
+        assert!(matches!(status.runtime_status, RuntimeStatus::Suspended));
+
+        // An unexpected termination (no suspend requested) stays a fatal error.
+        let error = terminated_status(RuntimeDesiredStatus::Running, None)
+            .expect_err("an unexpected termination must remain PipelineTerminated");
+        assert_eq!(error.error.error_code.as_ref(), "PipelineTerminated");
+    }
 
     pub(super) async fn get_stats(server: &TestServer) -> ExternalControllerStatus {
         server
@@ -2972,6 +3307,8 @@ mod test_http_helpers {
             RuntimeDesiredStatus::Paused,
             bootstrap_config,
             deployment_id,
+            None,
+            None,
             None,
         ));
         let state_clone = state.clone();

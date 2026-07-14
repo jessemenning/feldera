@@ -189,7 +189,6 @@ It contains the following fields:
         endpoints::pipeline_management::post_pipeline,
         endpoints::pipeline_management::put_pipeline,
         endpoints::pipeline_management::patch_pipeline,
-        endpoints::pipeline_management::post_pipeline_testing,
         endpoints::pipeline_management::post_update_runtime,
         endpoints::pipeline_management::delete_pipeline,
         endpoints::pipeline_management::post_pipeline_start,
@@ -219,6 +218,7 @@ It contains the following fields:
         endpoints::pipeline_interaction::sync_checkpoint,
         endpoints::pipeline_interaction::get_checkpoint_sync_status,
         endpoints::pipeline_interaction::get_checkpoints,
+        endpoints::pipeline_interaction::get_remote_checkpoints,
         endpoints::pipeline_interaction::post_pipeline_pause,
         endpoints::pipeline_interaction::post_pipeline_resume,
         endpoints::pipeline_interaction::post_pipeline_activate,
@@ -272,6 +272,8 @@ It contains the following fields:
 
         // Pipeline
         crate::db::types::pipeline::PipelineId,
+        crate::db::types::pipeline::ClientMetadata,
+        crate::db::types::pipeline::PatchClientMetadata,
         crate::db::types::combined_status::CombinedStatus,
         crate::db::types::combined_status::CombinedDesiredStatus,
         crate::db::types::resources_status::ResourcesStatus,
@@ -382,6 +384,8 @@ It contains the following fields:
         feldera_types::transport::kafka::KafkaOutputConfig,
         feldera_types::transport::kafka::KafkaOutputFtConfig,
         feldera_types::transport::kafka::KafkaStartFromConfig,
+        feldera_types::transport::kafka::HeaderFilter,
+        feldera_types::transport::kafka::HeaderMatch,
         feldera_types::transport::nats::Auth,
         feldera_types::transport::nats::ConnectOptions,
         feldera_types::transport::nats::ConsumerConfig,
@@ -404,11 +408,14 @@ It contains the following fields:
         feldera_types::transport::delta_table::DeltaTableWriteMode,
         feldera_types::transport::delta_table::DeltaTableReaderConfig,
         feldera_types::transport::delta_table::DeltaTableWriterConfig,
+        feldera_types::transport::dynamodb::DynamoDBWriteMode,
+        feldera_types::transport::dynamodb::DynamoDBWriterConfig,
         feldera_types::transport::iceberg::IcebergReaderConfig,
         feldera_types::transport::iceberg::IcebergIngestMode,
         feldera_types::transport::iceberg::IcebergCatalogType,
         feldera_types::transport::iceberg::RestCatalogConfig,
         feldera_types::transport::iceberg::GlueCatalogConfig,
+        feldera_types::transport::iceberg::S3TablesCatalogConfig,
         feldera_types::transport::postgres::PostgresReaderConfig,
         feldera_types::transport::postgres::PostgresCdcReaderConfig,
         feldera_types::transport::postgres::PostgresWriterConfig,
@@ -441,11 +448,13 @@ It contains the following fields:
         feldera_types::checkpoint::CheckpointStatus,
         feldera_types::checkpoint::CheckpointSyncStatus,
         feldera_types::checkpoint::CheckpointResponse,
+        feldera_types::checkpoint::CheckpointSyncResponse,
         feldera_types::checkpoint::CheckpointActivity,
         feldera_types::checkpoint::CheckpointFailure,
         feldera_types::checkpoint::CheckpointSyncFailure,
         feldera_types::checkpoint::CheckpointMetadata,
-        feldera_types::preprocess::PreprocessorConfig,
+        feldera_types::checkpoint::RemoteCheckpoint,
+        feldera_types::postprocess::PostprocessorConfig,
         feldera_types::transaction::StartTransactionResponse,
         feldera_types::transaction::CommitProgressSummary,
         feldera_types::transport::clock::ClockAdvanceRequest,
@@ -578,8 +587,18 @@ fn build_app(
     let app = match auth_configuration {
         Some(auth_configuration) => {
             let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
-            app.app_data(auth_configuration.clone())
-                .service(api_scope().wrap(auth_middleware).wrap(cors))
+            app.app_data(auth_configuration.clone()).service(
+                api_scope()
+                    .wrap(auth_middleware)
+                    // Runs ahead of `auth_middleware` (last wrap = outermost):
+                    // browsers can't set the `Authorization` header on a
+                    // WebSocket handshake, so promote a token carried in a
+                    // `feldera-bearer.*` subprotocol to that header first.
+                    .wrap(middleware::from_fn(
+                        crate::auth::promote_websocket_subprotocol_auth,
+                    ))
+                    .wrap(cors),
+            )
         }
         None => app.service(
             api_scope()
@@ -619,6 +638,7 @@ fn public_scope(api_config: &ApiServerConfig) -> Scope {
         )
         .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
         .service(healthz)
+        .service(robots_txt)
         .service(
             web::scope("")
                 .wrap(middleware::from_fn(add_cache_headers))
@@ -654,6 +674,7 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_interaction::get_checkpoint_status)
         .service(endpoints::pipeline_interaction::get_checkpoint_sync_status)
         .service(endpoints::pipeline_interaction::get_checkpoints)
+        .service(endpoints::pipeline_interaction::get_remote_checkpoints)
         .service(endpoints::pipeline_interaction::post_pipeline_pause)
         .service(endpoints::pipeline_interaction::post_pipeline_resume)
         .service(endpoints::pipeline_interaction::post_pipeline_activate)
@@ -1015,6 +1036,16 @@ async fn healthz(state: WebData<ServerState>) -> Result<HttpResponse, ManagerErr
     Ok(probe.as_http_response())
 }
 
+/// Disallow all crawlers instance-wide. The web-console is a client-side SPA, so per-page robots
+/// hints never reach crawlers; a root disallow is the only reliable way to keep app URLs (e.g.
+/// the sandbox's `/create?...` deep-links) out of search indexes.
+#[get("/robots.txt")]
+async fn robots_txt() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/plain; charset=utf-8")
+        .body("User-agent: *\nDisallow: /\n")
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests covering the static-asset caching middleware and the CORS surface
@@ -1079,6 +1110,28 @@ mod tests {
             .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
             .is_none());
         assert!(res.headers().get(header::EXPIRES).is_none());
+    }
+
+    /// `/robots.txt` must be answered by the backend with a blanket crawler
+    /// disallow, not fall through to the SPA catch-all. Drives the production
+    /// App from `build_app`. Without the explicit `robots_txt` route this path
+    /// resolves to the web-console bundle (index.html in production, a 404 in
+    /// the bundle-less test build) and crawlers get no valid robots rules — so
+    /// they index the sandbox's generated `/create?...` deep-links. Removing
+    /// the `.service(robots_txt)` wiring flips the status to 404 and fails here.
+    #[actix_web::test]
+    async fn robots_txt_disallows_all_crawlers() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+        let req = test::TestRequest::get().uri("/robots.txt").to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8",
+        );
+        let body = test::read_body(res).await;
+        assert_eq!(&body[..], b"User-agent: *\nDisallow: /\n");
     }
 
     // -------- CORS surface integration tests --------

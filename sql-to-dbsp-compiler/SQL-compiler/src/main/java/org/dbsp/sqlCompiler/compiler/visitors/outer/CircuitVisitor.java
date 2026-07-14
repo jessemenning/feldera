@@ -302,6 +302,10 @@ public abstract class CircuitVisitor
         return this.preorder((DBSPUnaryOperator) node);
     }
 
+    public VisitDecision preorder(DBSPWeightValidatorOperator node) {
+        return this.preorder((DBSPUnaryOperator) node);
+    }
+
     public VisitDecision preorder(DBSPUpsertFeedbackOperator node) {
         return this.preorder((DBSPUnaryOperator) node);
     }
@@ -339,6 +343,10 @@ public abstract class CircuitVisitor
     }
 
     public VisitDecision preorder(DBSPDistinctOperator node) {
+        return this.preorder((DBSPUnaryOperator) node);
+    }
+
+    public VisitDecision preorder(DBSPPositiveOperator node) {
         return this.preorder((DBSPUnaryOperator) node);
     }
 
@@ -677,6 +685,10 @@ public abstract class CircuitVisitor
         this.postorder((DBSPUnaryOperator) node);
     }
 
+    public void postorder(DBSPWeightValidatorOperator node) {
+        this.postorder((DBSPUnaryOperator) node);
+    }
+
     public void postorder(DBSPUpsertFeedbackOperator node) {
         this.postorder((DBSPUnaryOperator) node);
     }
@@ -714,6 +726,10 @@ public abstract class CircuitVisitor
     }
 
     public void postorder(DBSPDistinctOperator node) {
+        this.postorder((DBSPUnaryOperator) node);
+    }
+
+    public void postorder(DBSPPositiveOperator node) {
         this.postorder((DBSPUnaryOperator) node);
     }
 

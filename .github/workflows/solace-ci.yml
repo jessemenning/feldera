@@ -1,0 +1,157 @@
+name: Solace Connector CI
+
+on:
+  push:
+    branches: [feat/solace-connector]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  check:
+    name: Check Solace transport
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.MSRV }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Cache Cargo registry and index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-solace-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-solace-${{ runner.os }}-
+
+      # solace-rs auto-downloads the Solace C SDK for Linux x64 at build time.
+      # --no-default-features avoids pulling in native deps (rdkafka, postgres-cdc, etc.)
+      # that are not available on a stock ubuntu runner.
+      - name: Check adapters crate with Solace feature
+        run: cargo check --locked -p dbsp_adapters --no-default-features --features with-solace
+
+  build-image:
+    name: Build and Push Docker Image
+    # Only push on direct pushes — not PRs (PRs from forks don't have GITHUB_TOKEN write access)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Large runner recommended; Rust + Java compile takes ~25 min on a 2-core runner.
+    # If you have access to larger GitHub-hosted runners, change to ubuntu-latest-16-cores.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      # ── Java (SQL compiler) ──────────────────────────────────────────────────
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Maven
+        run: sudo apt-get update -qq && sudo apt-get install -y maven
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-solace-${{ runner.os }}-${{ hashFiles('sql-to-dbsp-compiler/**/pom.xml') }}
+          restore-keys: maven-solace-${{ runner.os }}-
+
+      - name: Build SQL compiler jar
+        working-directory: ./sql-to-dbsp-compiler
+        run: bash build.sh -pl SQL-compiler
+
+      # ── Rust (pipeline-manager) ──────────────────────────────────────────────
+      - name: Install Rust 1.94.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get install -y \
+            libssl-dev pkg-config libclang-dev \
+            libsasl2-dev libzstd-dev zlib1g-dev \
+            cmake build-essential lld
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+
+      - name: Build pipeline-manager (release)
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "1"
+          # Skip the bun/SvelteKit web-console build — we only need the REST API.
+          # build.rs embeds whatever is in this dir; an empty dir = no web UI.
+          WEBCONSOLE_BUILD_DIR: /tmp/webconsole-empty
+        run: |
+          mkdir -p /tmp/webconsole-empty
+          cargo build --release --locked -p pipeline-manager
+
+      # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────
+      - name: Stage build artifacts
+        run: |
+          mkdir -p build
+          cp target/release/pipeline-manager build/
+          cp sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar build/
+          ls -lh build/
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/jessemenning/feldera:feat-solace-connector
+            ghcr.io/jessemenning/feldera:${{ github.sha }}
+          cache-from: type=gha,scope=feldera-docker
+          cache-to:   type=gha,mode=max,scope=feldera-docker
+        env:
+          # plain progress surfaces RUST_LOG heartbeat lines from --precompile
+          # in the GHA log so we can tell "compiling" from "stuck"
+          BUILDX_PROGRESS: plain

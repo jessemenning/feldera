@@ -1,7 +1,8 @@
 use std::any::Any;
+#[cfg(any(feature = "with-avro", feature = "with-dynamodb"))]
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result as AnyResult;
@@ -12,21 +13,23 @@ use apache_avro::{
     types::Value as AvroValue,
 };
 use arrow::record_batch::RecordBatch;
+#[cfg(feature = "with-dynamodb")]
+use aws_sdk_dynamodb::types::AttributeValue;
 use dbsp::circuit::NodeId;
 use dbsp::dynamic::{ClonableTrait, DynData, DynVec, Erase, Factory};
 use dbsp::operator::StagedBuffers;
+use dbsp::operator::dynamic::accumulator::EnableCount;
 use dyn_clone::DynClone;
 use feldera_sqllib::Variant;
-use feldera_types::format::csv::CsvParserConfig;
+use feldera_types::format::csv::CsvFormatConfig;
 use feldera_types::format::json::JsonFlavor;
 use feldera_types::program_schema::{Relation, SqlIdentifier};
 use feldera_types::serde_with_context::SqlSerdeConfig;
 use serde_arrow::ArrayBuilder;
-#[cfg(feature = "with-avro")]
-use std::collections::HashMap;
 
 use crate::errors::controller::ControllerError;
 use crate::format::InputBuffer;
+use crate::postprocess::PostprocessorRegistry;
 use crate::preprocess::PreprocessorRegistry;
 
 /// Descriptor that specifies the format in which records are received
@@ -40,11 +43,14 @@ pub enum RecordFormat {
     // raw encoding of this column only.  This is particularly useful for
     // tables that store raw JSON or binary data to be parsed using SQL.
     Json(JsonFlavor),
-    Csv(CsvParserConfig),
+    Csv(CsvFormatConfig),
     Parquet(SqlSerdeConfig),
     #[cfg(feature = "with-avro")]
     Avro,
     Raw(String),
+    /// Output-only format for the DynamoDB connector.
+    #[cfg(feature = "with-dynamodb")]
+    DynamoDB,
 }
 
 /// An input handle that deserializes and buffers records.
@@ -359,6 +365,10 @@ pub trait SerTrace: SerBatchReader {
     /// Insert a batch into the trace.
     fn insert(&mut self, batch: Arc<dyn SerBatch>);
 
+    fn insert_without_blocking(&mut self, batch: Arc<dyn SerBatch>) -> bool;
+
+    fn backpressure_wait(&self);
+
     fn as_batch_reader(&self) -> &dyn SerBatchReader;
 }
 
@@ -502,6 +512,11 @@ impl SerCursor for SplitCursor<'_> {
         self.cursor.key_to_json()
     }
 
+    #[cfg(feature = "with-dynamodb")]
+    fn key_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        self.cursor.key_to_dynamodb_item()
+    }
+
     fn serialize_key_fields(
         &mut self,
         fields: &HashSet<String>,
@@ -563,6 +578,11 @@ impl SerCursor for SplitCursor<'_> {
 
     fn val_to_json(&mut self) -> AnyResult<serde_json::Value> {
         self.cursor.val_to_json()
+    }
+
+    #[cfg(feature = "with-dynamodb")]
+    fn val_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        self.cursor.val_to_dynamodb_item()
     }
 
     #[cfg(feature = "with-avro")]
@@ -663,6 +683,11 @@ impl<'a> SerCursor for SerCursorFlattened<'a> {
         self.cursor.val_to_json()
     }
 
+    #[cfg(feature = "with-dynamodb")]
+    fn key_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        self.cursor.val_to_dynamodb_item()
+    }
+
     fn serialize_key_fields(
         &mut self,
         fields: &HashSet<String>,
@@ -723,6 +748,11 @@ impl<'a> SerCursor for SerCursorFlattened<'a> {
 
     fn val_to_json(&mut self) -> AnyResult<serde_json::Value> {
         panic!("val_to_json is not supported for flattened cursors");
+    }
+
+    #[cfg(feature = "with-dynamodb")]
+    fn val_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        panic!("val_to_dynamodb_item is not supported for flattened cursors");
     }
 
     #[cfg(feature = "with-avro")]
@@ -796,6 +826,10 @@ pub trait SerCursor: Send {
     /// representation of the key.
     fn key_to_json(&mut self) -> AnyResult<serde_json::Value>;
 
+    /// Serialize current key to a DynamoDB item.
+    #[cfg(feature = "with-dynamodb")]
+    fn key_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>>;
+
     /// Like `serialize_key`, but only serializes the specified fields of the key.
     fn serialize_key_fields(
         &mut self,
@@ -849,6 +883,10 @@ pub trait SerCursor: Send {
     /// Convert value to JSON. Used for error reporting to generate a human-readable
     /// representation of the value.
     fn val_to_json(&mut self) -> AnyResult<serde_json::Value>;
+
+    /// Serialize current value to a DynamoDB item.
+    #[cfg(feature = "with-dynamodb")]
+    fn val_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>>;
 
     #[cfg(feature = "with-avro")]
     /// Convert current value to Avro.
@@ -980,6 +1018,11 @@ impl SerCursor for CursorWithPolarity<'_> {
         self.cursor.key_to_json()
     }
 
+    #[cfg(feature = "with-dynamodb")]
+    fn key_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        self.cursor.key_to_dynamodb_item()
+    }
+
     fn serialize_key_fields(
         &mut self,
         fields: &HashSet<String>,
@@ -1041,6 +1084,11 @@ impl SerCursor for CursorWithPolarity<'_> {
 
     fn val_to_json(&mut self) -> AnyResult<serde_json::Value> {
         self.cursor.val_to_json()
+    }
+
+    #[cfg(feature = "with-dynamodb")]
+    fn val_to_dynamodb_item(&mut self) -> AnyResult<HashMap<String, AttributeValue>> {
+        self.cursor.val_to_dynamodb_item()
     }
 
     #[cfg(feature = "with-avro")]
@@ -1115,6 +1163,9 @@ pub trait CircuitCatalog: Send + Sync {
 
     /// The registry used to insert new user-defined preprocessors
     fn preprocessor_registry(&self) -> Arc<Mutex<PreprocessorRegistry>>;
+
+    /// The registry used to insert new user-defined postprocessors
+    fn postprocessor_registry(&self) -> Arc<Mutex<PostprocessorRegistry>>;
 }
 
 #[doc(hidden)]
@@ -1173,7 +1224,7 @@ pub struct OutputCollectionHandles {
     /// Reference to the enable count of the accumulator used to collect updates to this stream.
     /// Incremented every time an output connector is attached to this stream; decremented when
     /// the output connector is detached.
-    pub enable_count: Arc<AtomicUsize>,
+    pub enable_count: EnableCount,
 }
 
 impl OutputCollectionHandles {

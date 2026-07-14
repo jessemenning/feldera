@@ -27,7 +27,7 @@ pub fn platform_enable_unstable(requested_features: &str) {
     let all_features: HashSet<&'static str> = HashSet::from_iter(vec![
         "runtime_version",
         "testing",
-        "cluster_monitor_resources",
+        "rust_compiler_full_cleanup",
     ]);
     let mut enabled = HashSet::new();
     for requested_feature in requested_features.split(',') {

@@ -1,7 +1,7 @@
 use crate::config::CompilerConfig;
 use crate::db::error::DBError;
 use crate::db::types::pipeline::PipelineId;
-use crate::db::types::utils::validate_name;
+use crate::db::types::utils::validate_connector_name;
 use crate::has_unstable_feature;
 use clap::Parser;
 use feldera_ir::Dataflow;
@@ -465,6 +465,23 @@ pub struct ProgramConfig {
     /// If not set (null), the runtime version will be the same as the platform version.
     #[schema(value_type = Option<String>)]
     pub runtime_version: Option<RuntimeSelector>,
+
+    /// Use the platform SQL compiler when a non-platform `runtime_version` is specified.
+    ///
+    /// Warning: This setting is experimental and may change in the future.
+    /// Requires the platform to run with the unstable feature `runtime_version` enabled.
+    ///
+    /// When `false` (default), the SQL compiler matching the `runtime_version` is
+    /// downloaded and used. When `true`, the platform's SQL compiler is used instead.
+    ///
+    /// Setting this to `true` avoids downloading the runtime-version-specific SQL
+    /// compiler JAR (e.g., when network access is unavailable or slow), at the cost
+    /// of potentially using a mismatched SQL compiler. The Rust runtime sources are
+    /// still checked out and compiled from the requested `runtime_version`.
+    ///
+    /// Has no effect when `runtime_version` is not set or the platform does not have
+    /// the unstable feature `runtime_version` enabled.
+    pub use_platform_compiler: bool,
 }
 
 impl ProgramConfig {
@@ -489,6 +506,7 @@ impl Default for ProgramConfig {
             profile: None,
             cache: true,
             runtime_version: None,
+            use_platform_compiler: false,
         }
     }
 }
@@ -572,7 +590,7 @@ fn parse_named_connectors(
                 })?;
             for connector in &connectors {
                 if let Some(name) = &connector.name {
-                    validate_name(name).map_err(|e| {
+                    validate_connector_name(name).map_err(|e| {
                         ConnectorGenerationError::InvalidPropertyValue {
                             position: value.value_position,
                             relation: relation.sql_name(),
@@ -712,7 +730,9 @@ pub fn generate_program_info(
                 | TransportConfig::PostgresInput(_)
                 | TransportConfig::IcebergInput(_)
                 | TransportConfig::Datagen(_)
-                | TransportConfig::Nexmark(_) => {}
+                | TransportConfig::Nexmark(_)
+                | TransportConfig::EmptyInput
+                | TransportConfig::SolaceInput(_) => {}
                 _ => {
                     return Err(ConnectorGenerationError::ExpectedInputConnector {
                         position: origin_value.value_position,
@@ -759,7 +779,10 @@ pub fn generate_program_info(
                 | TransportConfig::PostgresOutput(_)
                 | TransportConfig::KafkaOutput(_)
                 | TransportConfig::DeltaTableOutput(_)
-                | TransportConfig::RedisOutput(_) => {}
+                | TransportConfig::DynamoDBOutput(_)
+                | TransportConfig::RedisOutput(_)
+                | TransportConfig::NullOutput
+                | TransportConfig::SolaceOutput(_) => {}
                 _ => {
                     return Err(ConnectorGenerationError::ExpectedOutputConnector {
                         position: origin_value.value_position,
@@ -877,6 +900,7 @@ mod tests {
             transport: TransportConfig::Datagen(DatagenInputConfig::default()),
             format: None,
             preprocessor: None,
+            postprocessor: None,
             index: None,
             output_buffer_config: Default::default(),
             max_batch_size: Some(0),

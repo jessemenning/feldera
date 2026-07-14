@@ -1,7 +1,7 @@
 // Core profiler visualization library
 // This module provides the main API for rendering circuit profiles
 
-import { CircuitProfile, NodeAndMetric } from "./profile.js";
+import { CircuitProfile, NodeAndMetric, PropertyValue } from "./profile.js";
 import { Cytograph, CytographRendering } from "./cytograph.js";
 import { CircuitSelector } from "./selection.js";
 import { MetadataSelector } from './metadataSelection.js';
@@ -22,9 +22,12 @@ export interface WorkerOption {
     checked: boolean;
 }
 
-/** Represents a cell in the tooltip heatmap */
+/** Represents a cell in the tooltip heatmap. Carries the live `PropertyValue` so consumers can
+ * call `.toString()` for display and `.getNumericValue()` for math without going through a
+ * string round-trip. Not meant to cross serialization boundaries (postMessage, JSON.stringify)
+ * — class instances would lose their prototypes. */
 export interface TooltipCell {
-    value: string;
+    value: PropertyValue;
     percentile: number;
 }
 
@@ -37,6 +40,9 @@ export interface TooltipRow {
 
 /** Tooltip data structure */
 export interface NodeAttributes {
+    /** The operator's graph node id, carried as a first-class field so consumers need not
+     *  parse it back out of `title`. */
+    nodeId: string;
     title: string;
     /** Column headers */
     columns: string[];
@@ -68,6 +74,16 @@ export interface ProfilerCallbacks {
 
     /** Called when a node is double-clicked. */
     onNodeDoubleClick?: (nodeId: string, type: 'group' | 'leaf') => void;
+
+    /** Called when the graph rendering enters or leaves its asynchronous layout phase.
+     *  `rendering = true` is dispatched immediately before the ELK layout starts (the cytoscape
+     *  container is hidden during this window); `rendering = false` follows the `layoutstop`
+     *  event when the graph is on screen and interactive. */
+    onRenderingChange?: (rendering: boolean) => void;
+
+    /** User-initiated single-click on a node (not fired by `showGlobalMetrics` / `showTopNodes`).
+     *  Fires before the matching `displayNodeAttributes` so consumers can switch view state. */
+    onNodeClick?: (nodeId: string) => void;
 }
 
 export interface VisualizerConfig {

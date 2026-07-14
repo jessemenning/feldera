@@ -10,7 +10,7 @@
     "license": {
       "name": "MIT OR Apache-2.0"
     },
-    "version": "0.307.0"
+    "version": "0.321.0"
   },
   "paths": {
     "/config/authentication": {
@@ -161,7 +161,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiKeyDescr"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiKeyDescr"
+                  }
                 }
               }
             }
@@ -578,6 +581,7 @@
                     "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                     "name": "example1",
                     "description": "Description of the pipeline example1",
+                    "tags": [],
                     "created_at": "1970-01-01T00:00:00Z",
                     "version": 4,
                     "platform_version": "v0",
@@ -633,7 +637,8 @@
                     "program_config": {
                       "profile": "optimized",
                       "cache": true,
-                      "runtime_version": null
+                      "runtime_version": null,
+                      "use_platform_compiler": false
                     },
                     "program_version": 2,
                     "program_status": "Pending",
@@ -669,6 +674,7 @@
                     "id": "67e55044-10b1-426f-9247-bb680e5fe0c9",
                     "name": "example2",
                     "description": "Description of the pipeline example2",
+                    "tags": [],
                     "created_at": "1970-01-01T00:00:00Z",
                     "version": 1,
                     "platform_version": "v0",
@@ -724,7 +730,8 @@
                     "program_config": {
                       "profile": "unoptimized",
                       "cache": true,
-                      "runtime_version": null
+                      "runtime_version": null,
+                      "use_platform_compiler": false
                     },
                     "program_version": 1,
                     "program_status": "Pending",
@@ -793,6 +800,7 @@
               "example": {
                 "name": "example1",
                 "description": "Description of the pipeline example1",
+                "tags": [],
                 "runtime_config": {
                   "workers": 16,
                   "max_rss_mb": null,
@@ -845,7 +853,8 @@
                 "program_config": {
                   "profile": "optimized",
                   "cache": true,
-                  "runtime_version": null
+                  "runtime_version": null,
+                  "use_platform_compiler": false
                 }
               }
             }
@@ -864,6 +873,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -919,7 +929,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -964,10 +975,12 @@
                 "examples": {
                   "Name does not match pattern": {
                     "value": {
-                      "message": "Name 'name-with-invalid-char-#' contains characters which are not lowercase (a-z), uppercase (A-Z), numbers (0-9), underscores (_) or hyphens (-)",
+                      "message": "Name 'name-with-invalid-char-#' should be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore (pattern: '^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$')",
                       "error_code": "NameDoesNotMatchPattern",
                       "details": {
-                        "name": "name-with-invalid-char-#"
+                        "name": "name-with-invalid-char-#",
+                        "pattern": "^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$",
+                        "pattern_description": "be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore"
                       }
                     }
                   }
@@ -1048,6 +1061,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1103,7 +1117,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -1199,6 +1214,7 @@
               "example": {
                 "name": "example1",
                 "description": "Description of the pipeline example1",
+                "tags": [],
                 "runtime_config": {
                   "workers": 16,
                   "max_rss_mb": null,
@@ -1251,7 +1267,8 @@
                 "program_config": {
                   "profile": "optimized",
                   "cache": true,
-                  "runtime_version": null
+                  "runtime_version": null,
+                  "use_platform_compiler": false
                 }
               }
             }
@@ -1270,6 +1287,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1325,7 +1343,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -1371,6 +1390,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1426,7 +1446,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -1478,10 +1499,12 @@
                   },
                   "Name does not match pattern": {
                     "value": {
-                      "message": "Name 'name-with-invalid-char-#' contains characters which are not lowercase (a-z), uppercase (A-Z), numbers (0-9), underscores (_) or hyphens (-)",
+                      "message": "Name 'name-with-invalid-char-#' should be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore (pattern: '^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$')",
                       "error_code": "NameDoesNotMatchPattern",
                       "details": {
-                        "name": "name-with-invalid-char-#"
+                        "name": "name-with-invalid-char-#",
+                        "pattern": "^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$",
+                        "pattern_description": "be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore"
                       }
                     }
                   }
@@ -1641,6 +1664,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -1696,7 +1720,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -1748,10 +1773,12 @@
                   },
                   "Name does not match pattern": {
                     "value": {
-                      "message": "Name 'name-with-invalid-char-#' contains characters which are not lowercase (a-z), uppercase (A-Z), numbers (0-9), underscores (_) or hyphens (-)",
+                      "message": "Name 'name-with-invalid-char-#' should be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore (pattern: '^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$')",
                       "error_code": "NameDoesNotMatchPattern",
                       "details": {
-                        "name": "name-with-invalid-char-#"
+                        "name": "name-with-invalid-char-#",
+                        "pattern": "^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$",
+                        "pattern_description": "be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore"
                       }
                     }
                   }
@@ -1842,7 +1869,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CheckpointResponse"
+                  "type": "string"
                 }
               }
             }
@@ -1967,12 +1994,12 @@
           }
         ],
         "responses": {
-          "202": {
-            "description": "Pipeline activation initiated",
+          "200": {
+            "description": "Bootstrap approved",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CheckpointResponse"
+                  "type": "string"
                 }
               }
             }
@@ -2209,12 +2236,12 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "Checkpoint synced to object store",
+          "202": {
+            "description": "Checkpoint sync to object store initiated",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CheckpointResponse"
+                  "$ref": "#/components/schemas/CheckpointSyncResponse"
                 }
               }
             }
@@ -2558,7 +2585,7 @@
           "Pipeline Lifecycle"
         ],
         "summary": "Get the checkpoints for a pipeline",
-        "description": "Retrieve the current checkpoints made by a pipeline.",
+        "description": "Retrieve the current checkpoints made by a pipeline.\n\n**Stability note**: for multihost pipelines, this endpoint returns the\ncombined checkpoint list from all hosts.  The shape of this response may\nchange in a future release.",
         "operationId": "get_checkpoints",
         "parameters": [
           {
@@ -2573,11 +2600,138 @@
         ],
         "responses": {
           "200": {
-            "description": "Checkpoints retrieved successfully",
+            "description": "Checkpoints retrieved successfully. For multihost pipelines the list contains entries from all hosts; the shape of this response may change in a future release.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CheckpointMetadata"
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CheckpointMetadata"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pipeline with that name does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "message": "Unknown pipeline name 'non-existent-pipeline'",
+                  "error_code": "UnknownPipelineName",
+                  "details": {
+                    "pipeline_name": "non-existent-pipeline"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "examples": {
+                  "Disconnected during response": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs. Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "the pipeline disconnected while it was processing this HTTP request. This could be because the pipeline either (a) encountered a fatal error or panic, (b) was stopped, or (c) experienced network issues -- retrying might help in the last case. Alternatively, check the pipeline logs."
+                      }
+                    }
+                  },
+                  "Pipeline is currently unavailable": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "deployment status is currently 'unavailable' -- wait for it to become 'running' or 'paused' again"
+                      }
+                    }
+                  },
+                  "Pipeline is not deployed": {
+                    "value": {
+                      "message": "Unable to interact with pipeline because the deployment status (stopped) indicates it is not (yet) fully provisioned pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionNotDeployed",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "status": "Stopped",
+                        "desired_status": "Provisioned"
+                      }
+                    }
+                  },
+                  "Response timeout": {
+                    "value": {
+                      "message": "Error sending HTTP request to pipeline: timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response) Failed request: /pause pipeline-id=N/A pipeline-name=\"my_pipeline\"",
+                      "error_code": "PipelineInteractionUnreachable",
+                      "details": {
+                        "pipeline_name": "my_pipeline",
+                        "request": "/pause",
+                        "error": "timeout (10s) was reached: this means the pipeline took too long to respond -- this can simply be because the request was too difficult to process in time, or other reasons (e.g., deadlock): the pipeline logs might contain additional information (original send request error: Timeout while waiting for response)"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/pipelines/{pipeline_name}/checkpoints/remote": {
+      "get": {
+        "tags": [
+          "Pipeline Lifecycle"
+        ],
+        "summary": "List checkpoints in remote object storage",
+        "description": "Retrieve the list of checkpoints available in the configured remote object\nstorage (e.g., S3).  Requires the pipeline to be running with a sync\nstorage configuration.",
+        "operationId": "get_remote_checkpoints",
+        "parameters": [
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Remote checkpoints retrieved successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RemoteCheckpoint"
+                  }
                 }
               }
             }
@@ -6236,73 +6390,6 @@
         ]
       }
     },
-    "/v0/pipelines/{pipeline_name}/testing": {
-      "post": {
-        "tags": [
-          "Metrics & Debugging"
-        ],
-        "summary": "Test Endpoint",
-        "description": "This endpoint is used as part of the test harness. Only available if the `testing`\nunstable feature is enabled. Do not use in production.",
-        "operationId": "post_pipeline_testing",
-        "parameters": [
-          {
-            "name": "pipeline_name",
-            "in": "path",
-            "description": "Unique pipeline name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "set_platform_version",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Request successfully processed"
-          },
-          "404": {
-            "description": "Pipeline with that name does not exist",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                },
-                "example": {
-                  "message": "Unknown pipeline name 'non-existent-pipeline'",
-                  "error_code": "UnknownPipelineName",
-                  "details": {
-                    "pipeline_name": "non-existent-pipeline"
-                  }
-                }
-              }
-            }
-          },
-          "405": {
-            "description": "Endpoint is disabled. Set FELDERA_UNSTABLE_FEATURES=\"testing\" to enable.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "JSON web token (JWT) or API key": []
-          }
-        ]
-      }
-    },
     "/v0/pipelines/{pipeline_name}/time_series": {
       "get": {
         "tags": [
@@ -6576,6 +6663,7 @@
                   "id": "67e55044-10b1-426f-9247-bb680e5fe0c8",
                   "name": "example1",
                   "description": "Description of the pipeline example1",
+                  "tags": [],
                   "created_at": "1970-01-01T00:00:00Z",
                   "version": 4,
                   "platform_version": "v0",
@@ -6631,7 +6719,8 @@
                   "program_config": {
                     "profile": "optimized",
                     "cache": true,
-                    "runtime_version": null
+                    "runtime_version": null,
+                    "use_platform_compiler": false
                   },
                   "program_version": 2,
                   "program_status": "Pending",
@@ -6683,10 +6772,12 @@
                   },
                   "Name does not match pattern": {
                     "value": {
-                      "message": "Name 'name-with-invalid-char-#' contains characters which are not lowercase (a-z), uppercase (A-Z), numbers (0-9), underscores (_) or hyphens (-)",
+                      "message": "Name 'name-with-invalid-char-#' should be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore (pattern: '^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$')",
                       "error_code": "NameDoesNotMatchPattern",
                       "details": {
-                        "name": "name-with-invalid-char-#"
+                        "name": "name-with-invalid-char-#",
+                        "pattern": "^([A-Za-z0-9][-A-Za-z0-9_]*)?[A-Za-z0-9]$",
+                        "pattern_description": "be non-empty and only contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters, but cannot start or end with hyphen or underscore"
                       }
                     }
                   }
@@ -7360,6 +7451,19 @@
           }
         }
       },
+      "CheckpointSyncResponse": {
+        "type": "object",
+        "description": "Response to a sync checkpoint request.",
+        "required": [
+          "checkpoint_uuid"
+        ],
+        "properties": {
+          "checkpoint_uuid": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "CheckpointSyncStatus": {
         "type": "object",
         "description": "Checkpoint status returned by the `/checkpoint/sync_status` endpoint.",
@@ -7418,6 +7522,23 @@
             "type": "string",
             "description": "Text payload, e.g., CSV.",
             "nullable": true
+          }
+        }
+      },
+      "ClientMetadata": {
+        "type": "object",
+        "description": "Client-generated data stored alongside a pipeline.\n\nThe fields are stored together as a single JSON object in the\n`client_metadata` text column, so adding a field needs no migration.\nDeserialization is lenient: missing keys take their default and unknown\nkeys are ignored. [`PatchClientMetadata`] is the optional, per-field form\nused by `PATCH` request bodies.",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of the pipeline. Default is an empty string."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Free-form labels used to organize, group, and filter pipelines.\nDefault is no tags (empty vector)."
           }
         }
       },
@@ -7979,11 +8100,20 @@
                 "type": "boolean",
                 "description": "Create connector in paused state.\n\nThe default is `false`."
               },
+              "postprocessor": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PostprocessorConfig"
+                },
+                "description": "Optional postprocessor configuration",
+                "nullable": true
+              },
               "preprocessor": {
                 "type": "array",
                 "items": {
                   "$ref": "#/components/schemas/PreprocessorConfig"
                 },
+                "description": "Optional preprocessor configuration",
                 "nullable": true
               },
               "send_snapshot": {
@@ -8885,6 +9015,87 @@
           }
         ]
       },
+      "DynamoDBWriteMode": {
+        "type": "string",
+        "description": "DynamoDB write API used by the output connector.",
+        "enum": [
+          "batch",
+          "transactional"
+        ]
+      },
+      "DynamoDBWriterConfig": {
+        "type": "object",
+        "description": "DynamoDB output connector configuration.",
+        "required": [
+          "table",
+          "region"
+        ],
+        "properties": {
+          "aws_access_key_id": {
+            "type": "string",
+            "description": "AWS access key ID.\n\nIf both `aws_access_key_id` and `aws_secret_access_key` are specified,\nthe connector uses these static credentials. Otherwise it uses the\ndefault AWS credential provider chain, including IAM Roles for Service\nAccounts (IRSA) in EKS.\n\nStatic credentials are treated as long-lived IAM keys: no session token\nis sent, so STS-issued temporary credentials are not supported via these\nfields. To use temporary credentials, rely on the default provider chain\ninstead (leave these unset).",
+            "nullable": true
+          },
+          "aws_secret_access_key": {
+            "type": "string",
+            "description": "AWS secret access key.",
+            "nullable": true
+          },
+          "batch_size": {
+            "type": "integer",
+            "description": "Maximum number of write requests in one DynamoDB write call.\n\nDynamoDB supports at most 100 for `TransactWriteItems` and at most 25\nfor `BatchWriteItem`. If omitted, the connector uses the maximum for\nthe selected `write_mode`.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "endpoint_url": {
+            "type": "string",
+            "description": "Optional endpoint URL, for example when using a local\nDynamoDB-compatible service.",
+            "nullable": true
+          },
+          "max_buffer_size_bytes": {
+            "type": "integer",
+            "description": "Maximum number of bytes buffered by each worker before flushing writes.\n\nThis is an approximate size based on encoded DynamoDB attributes.",
+            "default": 1048576,
+            "minimum": 0
+          },
+          "max_concurrent_requests": {
+            "type": "integer",
+            "description": "Maximum number of DynamoDB write requests in flight per worker thread.\n\nThe total in-flight request count across the connector is\n`threads × max_concurrent_requests`. Size this accordingly when\ntuning against a provisioned-throughput table to avoid excessive\nthrottling.",
+            "default": 64,
+            "minimum": 0
+          },
+          "max_retries": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of retries for a failed or partially-applied DynamoDB write chunk.\n\nFor `batch` writes, `BatchWriteItem` may return some items as \"unprocessed\" in a\nsuccessful 200 response; those are re-submitted and counted as retries. For\n`transactional` writes, a failed `TransactWriteItems` call is retried in full.\n\nTransient errors (throttling, network failures) are first handled transparently by the\nAWS SDK. Only attempts that reach this connector's retry loop count against this limit.\nEach retry waits longer than the previous one (exponential backoff), up to a ceiling\nof roughly 13 seconds.\n\nSet to `null` to retry indefinitely. After the backoff ceiling is reached the connector\nkeeps retrying at that interval, providing backpressure until DynamoDB recovers.\nDefaults to `10`.",
+            "default": 10,
+            "nullable": true,
+            "minimum": 0
+          },
+          "region": {
+            "type": "string",
+            "description": "AWS region."
+          },
+          "table": {
+            "type": "string",
+            "description": "Name of the DynamoDB table to write to."
+          },
+          "threads": {
+            "type": "integer",
+            "description": "Number of worker threads used to encode and write disjoint key ranges.",
+            "default": 1,
+            "minimum": 0
+          },
+          "write_mode": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/DynamoDBWriteMode"
+              }
+            ],
+            "default": "batch"
+          }
+        }
+      },
       "ErrorResponse": {
         "type": "object",
         "description": "Information returned by REST API endpoints on error.",
@@ -9431,6 +9642,81 @@
           }
         }
       },
+      "HeaderFilter": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "header"
+            ],
+            "properties": {
+              "header": {
+                "$ref": "#/components/schemas/HeaderMatch"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "and"
+            ],
+            "properties": {
+              "and": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HeaderFilter"
+                },
+                "description": "Conjunction: matches when every nested filter matches.  Must have at\nleast one operand."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "or"
+            ],
+            "properties": {
+              "or": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HeaderFilter"
+                },
+                "description": "Disjunction: matches when at least one nested filter matches.  Must have\nat least one operand."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "not"
+            ],
+            "properties": {
+              "not": {
+                "$ref": "#/components/schemas/HeaderFilter"
+              }
+            }
+          }
+        ],
+        "description": "A boolean filter over the headers of a Kafka message.\n\nThe Kafka input connector uses this to drop messages whose headers do not\nsatisfy a predicate.  It is a tree of boolean operators (`and`, `or`, `not`)\nwhose leaves are regular expression tests on individual header values.  It\nserializes as an externally tagged JSON object, for example:\n\n```json\n{\n\"and\": [\n{ \"header\": { \"name\": \"event-type\", \"pattern\": \"created|updated\" } },\n{ \"not\": { \"header\": { \"name\": \"source\", \"pattern\": \"test-.*\" } } }\n]\n}\n```\n\nThis admits a message only if it has an `event-type` header valued exactly\n`created` or `updated` and does not have a `source` header whose value\nstarts with `test-`."
+      },
+      "HeaderMatch": {
+        "type": "object",
+        "description": "A leaf of a [`HeaderFilter`]: a regular expression tested against the value\nof a named Kafka header.",
+        "required": [
+          "name",
+          "pattern"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the header to test, matched exactly against the header key."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regular expression ([Rust `regex` crate\nsyntax](https://docs.rs/regex/latest/regex/#syntax)) tested against the\nheader value.\n\nThe value is matched as raw bytes, so non-UTF-8 values and byte patterns\nwork.  The pattern must match the *entire* value: it is anchored\nautomatically, so `^`/`$` are unnecessary (though harmless).  A header\npresent with a null value is matched as an empty byte sequence; a header\nthat appears more than once matches if any of its values match."
+          }
+        }
+      },
       "HealthStatus": {
         "type": "object",
         "required": [
@@ -9482,7 +9768,8 @@
         "type": "string",
         "enum": [
           "rest",
-          "glue"
+          "glue",
+          "s3tables"
         ]
       },
       "IcebergIngestMode": {
@@ -9501,6 +9788,9 @@
           },
           {
             "$ref": "#/components/schemas/RestCatalogConfig"
+          },
+          {
+            "$ref": "#/components/schemas/S3TablesCatalogConfig"
           },
           {
             "type": "object",
@@ -9779,6 +10069,14 @@
             "format": "int32",
             "description": "Maximum timeout in seconds to wait for the endpoint to join the Kafka\nconsumer group during initialization.",
             "minimum": 0
+          },
+          "header_filter": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HeaderFilter"
+              }
+            ],
+            "nullable": true
           },
           "include_headers": {
             "type": "boolean",
@@ -10387,8 +10685,8 @@
           },
           "max_output_buffer_size_records": {
             "type": "integer",
-            "description": "Maximum number of updates to be kept in the output buffer.\n\nThis parameter bounds the maximal size of the buffer.\nNote that the size of the buffer is not always equal to the\ntotal number of updates output by the pipeline. Updates to the\nsame record can overwrite or cancel previous updates.\n\nBy default, the buffer can grow indefinitely until one of\nthe other output conditions is satisfied.\n\nNOTE: this configuration option requires the `enable_output_buffer` flag\nto be set.",
-            "default": 18446744073709551615,
+            "description": "Maximum number of updates to be kept in the output buffer.\n\nThis parameter bounds the maximal size of the buffer.\nNote that the size of the buffer is not always equal to the\ntotal number of updates output by the pipeline. Updates to the\nsame record can overwrite or cancel previous updates.\n\nThe default is 10,000,000.\n\nNOTE: this configuration option requires the `enable_output_buffer` flag\nto be set.",
+            "default": 10000000,
             "minimum": 0
           },
           "max_output_buffer_time_millis": {
@@ -10586,7 +10884,7 @@
             }
           },
           "schema": {
-            "description": "Schema of the compiled SQL."
+            "$ref": "#/components/schemas/ProgramSchema"
           },
           "udf_stubs": {
             "type": "string",
@@ -10594,47 +10892,69 @@
           }
         }
       },
-      "PatchPipeline": {
+      "PatchClientMetadata": {
         "type": "object",
-        "description": "Partially update the pipeline (PATCH).\n\nNote that the patching only applies to the main fields, not subfields.\nFor instance, it is not possible to update only the number of workers;\nit is required to again pass the whole runtime configuration with the\nchange.",
+        "description": "Client-generated metadata as supplied in a `PATCH` request body: the\nfield-by-field patch form of [`ClientMetadata`].\n\nEach field is optional. A `Some` value overwrites the stored field; a\n`None` (absent) field leaves it unchanged. An empty string or empty list is\na value in its own right, not a request to unset the field.",
         "properties": {
           "description": {
             "type": "string",
+            "description": "Human-readable description of the pipeline.",
             "nullable": true
           },
-          "name": {
-            "type": "string",
-            "nullable": true
-          },
-          "program_code": {
-            "type": "string",
-            "nullable": true
-          },
-          "program_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ProgramConfig"
-              }
-            ],
-            "nullable": true
-          },
-          "runtime_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeConfig"
-              }
-            ],
-            "nullable": true
-          },
-          "udf_rust": {
-            "type": "string",
-            "nullable": true
-          },
-          "udf_toml": {
-            "type": "string",
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Free-form labels used to organize, group, and filter pipelines.",
             "nullable": true
           }
         }
+      },
+      "PatchPipeline": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/PatchClientMetadata"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "nullable": true
+              },
+              "program_code": {
+                "type": "string",
+                "nullable": true
+              },
+              "program_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ProgramConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "runtime_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "udf_rust": {
+                "type": "string",
+                "nullable": true
+              },
+              "udf_toml": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          }
+        ],
+        "description": "Partially update the pipeline (PATCH).\n\nNote that the patching only applies to the main fields, not subfields.\nFor instance, it is not possible to update only the number of workers;\nit is required to again pass the whole runtime configuration with the\nchange."
       },
       "PermanentSuspendError": {
         "oneOf": [
@@ -11001,182 +11321,185 @@
         "description": "Pipeline identifier."
       },
       "PipelineInfo": {
-        "type": "object",
-        "description": "Pipeline information.\nIt both includes fields which are user-provided and system-generated.",
-        "required": [
-          "id",
-          "name",
-          "description",
-          "created_at",
-          "version",
-          "platform_version",
-          "runtime_config",
-          "program_code",
-          "udf_rust",
-          "udf_toml",
-          "program_config",
-          "program_version",
-          "program_status",
-          "program_status_since",
-          "program_error",
-          "refresh_version",
-          "storage_status",
-          "deployment_status",
-          "deployment_status_since",
-          "deployment_desired_status",
-          "deployment_desired_status_since",
-          "deployment_resources_status",
-          "deployment_resources_status_since",
-          "deployment_resources_desired_status",
-          "deployment_resources_desired_status_since"
-        ],
-        "properties": {
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClientMetadata"
           },
-          "deployment_desired_status": {
-            "$ref": "#/components/schemas/CombinedDesiredStatus"
-          },
-          "deployment_desired_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_error": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ErrorResponse"
-              }
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "created_at",
+              "version",
+              "platform_version",
+              "runtime_config",
+              "program_code",
+              "udf_rust",
+              "udf_toml",
+              "program_config",
+              "program_version",
+              "program_status",
+              "program_status_since",
+              "program_error",
+              "refresh_version",
+              "storage_status",
+              "deployment_status",
+              "deployment_status_since",
+              "deployment_desired_status",
+              "deployment_desired_status_since",
+              "deployment_resources_status",
+              "deployment_resources_status_since",
+              "deployment_resources_desired_status",
+              "deployment_resources_desired_status_since"
             ],
-            "nullable": true
-          },
-          "deployment_id": {
-            "type": "string",
-            "format": "uuid",
-            "nullable": true
-          },
-          "deployment_initial": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeDesiredStatus"
+            "properties": {
+              "created_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_desired_status": {
+                "$ref": "#/components/schemas/CombinedDesiredStatus"
+              },
+              "deployment_desired_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_error": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_id": {
+                "type": "string",
+                "format": "uuid",
+                "nullable": true
+              },
+              "deployment_initial": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeDesiredStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_resources_desired_status": {
+                "$ref": "#/components/schemas/ResourcesDesiredStatus"
+              },
+              "deployment_resources_desired_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_resources_status": {
+                "$ref": "#/components/schemas/ResourcesStatus"
+              },
+              "deployment_resources_status_details": {
+                "nullable": true
+              },
+              "deployment_resources_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_runtime_desired_status": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeDesiredStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_runtime_desired_status_since": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "deployment_runtime_status": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_runtime_status_details": {
+                "nullable": true
+              },
+              "deployment_runtime_status_since": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "deployment_status": {
+                "$ref": "#/components/schemas/CombinedStatus"
+              },
+              "deployment_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "id": {
+                "$ref": "#/components/schemas/PipelineId"
+              },
+              "name": {
+                "type": "string"
+              },
+              "platform_version": {
+                "type": "string"
+              },
+              "program_code": {
+                "type": "string"
+              },
+              "program_config": {
+                "$ref": "#/components/schemas/ProgramConfig"
+              },
+              "program_error": {
+                "$ref": "#/components/schemas/ProgramError"
+              },
+              "program_info": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/PartialProgramInfo"
+                  }
+                ],
+                "nullable": true
+              },
+              "program_status": {
+                "$ref": "#/components/schemas/ProgramStatus"
+              },
+              "program_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "program_version": {
+                "$ref": "#/components/schemas/Version"
+              },
+              "refresh_version": {
+                "$ref": "#/components/schemas/Version"
+              },
+              "runtime_config": {
+                "$ref": "#/components/schemas/RuntimeConfig"
+              },
+              "storage_status": {
+                "$ref": "#/components/schemas/StorageStatus"
+              },
+              "storage_status_details": {
+                "nullable": true
+              },
+              "udf_rust": {
+                "type": "string"
+              },
+              "udf_toml": {
+                "type": "string"
+              },
+              "version": {
+                "$ref": "#/components/schemas/Version"
               }
-            ],
-            "nullable": true
-          },
-          "deployment_resources_desired_status": {
-            "$ref": "#/components/schemas/ResourcesDesiredStatus"
-          },
-          "deployment_resources_desired_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_resources_status": {
-            "$ref": "#/components/schemas/ResourcesStatus"
-          },
-          "deployment_resources_status_details": {
-            "nullable": true
-          },
-          "deployment_resources_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_runtime_desired_status": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeDesiredStatus"
-              }
-            ],
-            "nullable": true
-          },
-          "deployment_runtime_desired_status_since": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "deployment_runtime_status": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeStatus"
-              }
-            ],
-            "nullable": true
-          },
-          "deployment_runtime_status_details": {
-            "nullable": true
-          },
-          "deployment_runtime_status_since": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "deployment_status": {
-            "$ref": "#/components/schemas/CombinedStatus"
-          },
-          "deployment_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "description": {
-            "type": "string"
-          },
-          "id": {
-            "$ref": "#/components/schemas/PipelineId"
-          },
-          "name": {
-            "type": "string"
-          },
-          "platform_version": {
-            "type": "string"
-          },
-          "program_code": {
-            "type": "string"
-          },
-          "program_config": {
-            "$ref": "#/components/schemas/ProgramConfig"
-          },
-          "program_error": {
-            "$ref": "#/components/schemas/ProgramError"
-          },
-          "program_info": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/PartialProgramInfo"
-              }
-            ],
-            "nullable": true
-          },
-          "program_status": {
-            "$ref": "#/components/schemas/ProgramStatus"
-          },
-          "program_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "program_version": {
-            "$ref": "#/components/schemas/Version"
-          },
-          "refresh_version": {
-            "$ref": "#/components/schemas/Version"
-          },
-          "runtime_config": {
-            "$ref": "#/components/schemas/RuntimeConfig"
-          },
-          "storage_status": {
-            "$ref": "#/components/schemas/StorageStatus"
-          },
-          "storage_status_details": {
-            "nullable": true
-          },
-          "udf_rust": {
-            "type": "string"
-          },
-          "udf_toml": {
-            "type": "string"
-          },
-          "version": {
-            "$ref": "#/components/schemas/Version"
+            }
           }
-        }
+        ],
+        "description": "Pipeline information.\nIt both includes fields which are user-provided and system-generated."
       },
       "PipelineMonitorEventFieldSelector": {
         "type": "string",
@@ -11261,202 +11584,205 @@
         }
       },
       "PipelineSelectedInfo": {
-        "type": "object",
-        "description": "Pipeline information which has a selected subset of optional fields.\nIt both includes fields which are user-provided and system-generated.\nIf an optional field is not selected (i.e., is `None`), it will not be serialized.",
-        "required": [
-          "id",
-          "name",
-          "description",
-          "created_at",
-          "version",
-          "platform_version",
-          "program_version",
-          "program_status",
-          "program_status_since",
-          "refresh_version",
-          "storage_status",
-          "deployment_status",
-          "deployment_status_since",
-          "deployment_desired_status",
-          "deployment_desired_status_since",
-          "deployment_resources_status",
-          "deployment_resources_status_since",
-          "deployment_resources_desired_status",
-          "deployment_resources_desired_status_since"
-        ],
-        "properties": {
-          "connectors": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ConnectorStats"
-              }
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClientMetadata"
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "created_at",
+              "version",
+              "platform_version",
+              "program_version",
+              "program_status",
+              "program_status_since",
+              "refresh_version",
+              "storage_status",
+              "deployment_status",
+              "deployment_status_since",
+              "deployment_desired_status",
+              "deployment_desired_status_since",
+              "deployment_resources_status",
+              "deployment_resources_status_since",
+              "deployment_resources_desired_status",
+              "deployment_resources_desired_status_since"
             ],
-            "nullable": true
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_desired_status": {
-            "$ref": "#/components/schemas/CombinedDesiredStatus"
-          },
-          "deployment_desired_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_error": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ErrorResponse"
+            "properties": {
+              "connectors": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ConnectorStats"
+                  }
+                ],
+                "nullable": true
+              },
+              "created_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_desired_status": {
+                "$ref": "#/components/schemas/CombinedDesiredStatus"
+              },
+              "deployment_desired_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_error": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ErrorResponse"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_id": {
+                "type": "string",
+                "format": "uuid",
+                "nullable": true
+              },
+              "deployment_initial": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeDesiredStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_resources_desired_status": {
+                "$ref": "#/components/schemas/ResourcesDesiredStatus"
+              },
+              "deployment_resources_desired_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_resources_status": {
+                "$ref": "#/components/schemas/ResourcesStatus"
+              },
+              "deployment_resources_status_details": {
+                "nullable": true
+              },
+              "deployment_resources_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "deployment_runtime_desired_status": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeDesiredStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_runtime_desired_status_since": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "deployment_runtime_status": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeStatus"
+                  }
+                ],
+                "nullable": true
+              },
+              "deployment_runtime_status_details": {
+                "nullable": true
+              },
+              "deployment_runtime_status_since": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": true
+              },
+              "deployment_status": {
+                "$ref": "#/components/schemas/CombinedStatus"
+              },
+              "deployment_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "id": {
+                "$ref": "#/components/schemas/PipelineId"
+              },
+              "name": {
+                "type": "string"
+              },
+              "platform_version": {
+                "type": "string"
+              },
+              "program_code": {
+                "type": "string",
+                "nullable": true
+              },
+              "program_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ProgramConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "program_error": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ProgramError"
+                  }
+                ],
+                "nullable": true
+              },
+              "program_info": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/PartialProgramInfo"
+                  }
+                ],
+                "nullable": true
+              },
+              "program_status": {
+                "$ref": "#/components/schemas/ProgramStatus"
+              },
+              "program_status_since": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "program_version": {
+                "$ref": "#/components/schemas/Version"
+              },
+              "refresh_version": {
+                "$ref": "#/components/schemas/Version"
+              },
+              "runtime_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "storage_status": {
+                "$ref": "#/components/schemas/StorageStatus"
+              },
+              "storage_status_details": {
+                "nullable": true
+              },
+              "udf_rust": {
+                "type": "string",
+                "nullable": true
+              },
+              "udf_toml": {
+                "type": "string",
+                "nullable": true
+              },
+              "version": {
+                "$ref": "#/components/schemas/Version"
               }
-            ],
-            "nullable": true
-          },
-          "deployment_id": {
-            "type": "string",
-            "format": "uuid",
-            "nullable": true
-          },
-          "deployment_initial": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeDesiredStatus"
-              }
-            ],
-            "nullable": true
-          },
-          "deployment_resources_desired_status": {
-            "$ref": "#/components/schemas/ResourcesDesiredStatus"
-          },
-          "deployment_resources_desired_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_resources_status": {
-            "$ref": "#/components/schemas/ResourcesStatus"
-          },
-          "deployment_resources_status_details": {
-            "nullable": true
-          },
-          "deployment_resources_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deployment_runtime_desired_status": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeDesiredStatus"
-              }
-            ],
-            "nullable": true
-          },
-          "deployment_runtime_desired_status_since": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "deployment_runtime_status": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeStatus"
-              }
-            ],
-            "nullable": true
-          },
-          "deployment_runtime_status_details": {
-            "nullable": true
-          },
-          "deployment_runtime_status_since": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "deployment_status": {
-            "$ref": "#/components/schemas/CombinedStatus"
-          },
-          "deployment_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "description": {
-            "type": "string"
-          },
-          "id": {
-            "$ref": "#/components/schemas/PipelineId"
-          },
-          "name": {
-            "type": "string"
-          },
-          "platform_version": {
-            "type": "string"
-          },
-          "program_code": {
-            "type": "string",
-            "nullable": true
-          },
-          "program_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ProgramConfig"
-              }
-            ],
-            "nullable": true
-          },
-          "program_error": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ProgramError"
-              }
-            ],
-            "nullable": true
-          },
-          "program_info": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/PartialProgramInfo"
-              }
-            ],
-            "nullable": true
-          },
-          "program_status": {
-            "$ref": "#/components/schemas/ProgramStatus"
-          },
-          "program_status_since": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "program_version": {
-            "$ref": "#/components/schemas/Version"
-          },
-          "refresh_version": {
-            "$ref": "#/components/schemas/Version"
-          },
-          "runtime_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeConfig"
-              }
-            ],
-            "nullable": true
-          },
-          "storage_status": {
-            "$ref": "#/components/schemas/StorageStatus"
-          },
-          "storage_status_details": {
-            "nullable": true
-          },
-          "udf_rust": {
-            "type": "string",
-            "nullable": true
-          },
-          "udf_toml": {
-            "type": "string",
-            "nullable": true
-          },
-          "version": {
-            "$ref": "#/components/schemas/Version"
+            }
           }
-        }
+        ],
+        "description": "Pipeline information which has a selected subset of optional fields.\nIt both includes fields which are user-provided and system-generated.\nIf an optional field is not selected (i.e., is `None`), it will not be serialized."
       },
       "PipelineState": {
         "type": "string",
@@ -11486,48 +11812,51 @@
         }
       },
       "PostPutPipeline": {
-        "type": "object",
-        "description": "Create a new pipeline (POST), or fully update an existing pipeline (PUT).\nFields which are optional and not provided will be set to their empty type value\n(for strings: an empty string `\"\"`, for objects: an empty dictionary `{}`).",
-        "required": [
-          "name",
-          "program_code"
-        ],
-        "properties": {
-          "description": {
-            "type": "string",
-            "nullable": true
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClientMetadata"
           },
-          "name": {
-            "type": "string"
-          },
-          "program_code": {
-            "type": "string"
-          },
-          "program_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/ProgramConfig"
-              }
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "program_code"
             ],
-            "nullable": true
-          },
-          "runtime_config": {
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/RuntimeConfig"
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "program_code": {
+                "type": "string"
+              },
+              "program_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ProgramConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "runtime_config": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeConfig"
+                  }
+                ],
+                "nullable": true
+              },
+              "udf_rust": {
+                "type": "string",
+                "nullable": true
+              },
+              "udf_toml": {
+                "type": "string",
+                "nullable": true
               }
-            ],
-            "nullable": true
-          },
-          "udf_rust": {
-            "type": "string",
-            "nullable": true
-          },
-          "udf_toml": {
-            "type": "string",
-            "nullable": true
+            }
           }
-        }
+        ],
+        "description": "Create a new pipeline (POST), or fully update an existing pipeline (PUT).\nFields which are optional and not provided will be set to their empty type value\n(for strings: an empty string `\"\"`, for objects: an empty dictionary `{}`)."
       },
       "PostStopPipelineParameters": {
         "type": "object",
@@ -11849,6 +12178,23 @@
         ],
         "description": "Postgres output connector configuration."
       },
+      "PostprocessorConfig": {
+        "type": "object",
+        "description": "Configuration for describing a postprocessor",
+        "required": [
+          "name",
+          "config"
+        ],
+        "properties": {
+          "config": {
+            "description": "Arbitrary additional configuration expected by the postprocessor\nencoded as a JSON Value."
+          },
+          "name": {
+            "type": "string",
+            "description": "Name of the postprocessor.\nAll postprocessors with the same name will perform the same task."
+          }
+        }
+      },
       "PreprocessorConfig": {
         "type": "object",
         "description": "Configuration for describing a preprocessor",
@@ -11894,6 +12240,11 @@
             "description": "Override runtime version of the pipeline being executed.\n\nWarning: This setting is experimental and may change in the future.\nRequires the platform to run with the unstable feature `runtime_version`\nenabled. Should only be used for testing purposes, and requires\nnetwork access.\n\nA runtime version can be specified in the form of a version\nor SHA taken from the `feldera/feldera` repository main branch.\n\nExamples: `v0.96.0` or `f4dcac0989ca0fda7d2eb93602a49d007cb3b0ae`\n\nA platform of version `0.x.y` may be capable of running future and past\nruntimes with versions `>=0.x.y` and `<=0.x.y` until breaking API changes happen,\nthe exact bounds for each platform version are unspecified until we reach a\nstable version. Compatibility is only guaranteed if platform and runtime version\nare exact matches.\n\nNote that any enterprise features are currently considered to be part of\nthe platform.\n\nIf not set (null), the runtime version will be the same as the platform version.",
             "default": null,
             "nullable": true
+          },
+          "use_platform_compiler": {
+            "type": "boolean",
+            "description": "Use the platform SQL compiler when a non-platform `runtime_version` is specified.\n\nWarning: This setting is experimental and may change in the future.\nRequires the platform to run with the unstable feature `runtime_version` enabled.\n\nWhen `false` (default), the SQL compiler matching the `runtime_version` is\ndownloaded and used. When `true`, the platform's SQL compiler is used instead.\n\nSetting this to `true` avoids downloading the runtime-version-specific SQL\ncompiler JAR (e.g., when network access is unavailable or slow), at the cost\nof potentially using a mismatched SQL compiler. The Rust runtime sources are\nstill checked out and compiled from the requested `runtime_version`.\n\nHas no effect when `runtime_version` is not set or the platform does not have\nthe unstable feature `runtime_version` enabled.",
+            "default": false
           }
         }
       },
@@ -12327,6 +12678,20 @@
           }
         ],
         "description": "A SQL table or view. It has a name and a list of fields.\n\nMatches the Calcite JSON format."
+      },
+      "RemoteCheckpoint": {
+        "type": "object",
+        "description": "A checkpoint that exists in remote object storage.",
+        "required": [
+          "uuid"
+        ],
+        "properties": {
+          "uuid": {
+            "type": "string",
+            "format": "uuid",
+            "description": "UUID of the checkpoint."
+          }
+        }
       },
       "ReplayPolicy": {
         "type": "string",
@@ -12863,6 +13228,47 @@
           }
         }
       },
+      "S3TablesCatalogConfig": {
+        "type": "object",
+        "description": "Amazon S3 Tables catalog config.",
+        "properties": {
+          "s3tables.access-key-id": {
+            "type": "string",
+            "description": "Access key id used to access the S3 Tables catalog.",
+            "nullable": true
+          },
+          "s3tables.endpoint": {
+            "type": "string",
+            "description": "Custom endpoint URL for the S3 Tables service.\n\nPrimarily used to target a local or mock S3 Tables implementation for testing.\nWhen omitted, the default regional endpoint is used.",
+            "nullable": true
+          },
+          "s3tables.profile-name": {
+            "type": "string",
+            "description": "Profile used to access the S3 Tables catalog.",
+            "nullable": true
+          },
+          "s3tables.region": {
+            "type": "string",
+            "description": "Region of the S3 Tables catalog.",
+            "nullable": true
+          },
+          "s3tables.secret-access-key": {
+            "type": "string",
+            "description": "Secret access key used to access the S3 Tables catalog.",
+            "nullable": true
+          },
+          "s3tables.session-token": {
+            "type": "string",
+            "description": "Static session token used to access the S3 Tables catalog.",
+            "nullable": true
+          },
+          "s3tables.table-bucket-arn": {
+            "type": "string",
+            "description": "ARN of the S3 table bucket that contains the table.\n\nNote that this is the ARN of the table *bucket*, not of an individual table,\ne.g., `\"arn:aws:s3tables:us-east-2:123456789012:bucket/my-bucket\"`.",
+            "nullable": true
+          }
+        }
+      },
       "SampleStatistics": {
         "type": "object",
         "description": "One sample of time-series data.",
@@ -13062,202 +13468,49 @@
         }
       },
       "SqlType": {
-        "oneOf": [
-          {
-            "type": "string",
-            "description": "SQL `BOOLEAN` type.",
-            "enum": [
-              "Boolean"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `TINYINT` type.",
-            "enum": [
-              "TinyInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `SMALLINT` or `INT2` type.",
-            "enum": [
-              "SmallInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `INTEGER`, `INT`, `SIGNED`, `INT4` type.",
-            "enum": [
-              "Int"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `BIGINT` or `INT64` type.",
-            "enum": [
-              "BigInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `TINYINT UNSIGNED` type.",
-            "enum": [
-              "UTinyInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `SMALLINT UNSIGNED` type.",
-            "enum": [
-              "USmallInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `UNSIGNED`, `INTEGER UNSIGNED`, `INT UNSIGNED` type.",
-            "enum": [
-              "UInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `BIGINT UNSIGNED` type.",
-            "enum": [
-              "UBigInt"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `REAL` or `FLOAT4` or `FLOAT32` type.",
-            "enum": [
-              "Real"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `DOUBLE` or `FLOAT8` or `FLOAT64` type.",
-            "enum": [
-              "Double"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `DECIMAL` or `DEC` or `NUMERIC` type.",
-            "enum": [
-              "Decimal"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `CHAR(n)` or `CHARACTER(n)` type.",
-            "enum": [
-              "Char"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `VARCHAR`, `CHARACTER VARYING`, `TEXT`, or `STRING` type.",
-            "enum": [
-              "Varchar"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `BINARY(n)` type.",
-            "enum": [
-              "Binary"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `VARBINARY` or `BYTEA` type.",
-            "enum": [
-              "Varbinary"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `TIME` type.",
-            "enum": [
-              "Time"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `DATE` type.",
-            "enum": [
-              "Date"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `TIMESTAMP` type.",
-            "enum": [
-              "Timestamp"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `TIMESTAMP WITH TIME ZONE` type.",
-            "enum": [
-              "TimestampTz"
-            ]
-          },
-          {
-            "type": "object",
-            "required": [
-              "Interval"
-            ],
-            "properties": {
-              "Interval": {
-                "$ref": "#/components/schemas/IntervalUnit"
-              }
-            }
-          },
-          {
-            "type": "string",
-            "description": "SQL `ARRAY` type.",
-            "enum": [
-              "Array"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "A complex SQL struct type (`CREATE TYPE x ...`).",
-            "enum": [
-              "Struct"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `MAP` type.",
-            "enum": [
-              "Map"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `NULL` type.",
-            "enum": [
-              "Null"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `UUID` type.",
-            "enum": [
-              "Uuid"
-            ]
-          },
-          {
-            "type": "string",
-            "description": "SQL `VARIANT` type.",
-            "enum": [
-              "Variant"
-            ]
-          }
-        ],
-        "description": "The available SQL types as specified in `CREATE` statements."
+        "type": "string",
+        "description": "The available SQL column type names. Each value is the platform's wire encoding of the type (e.g. `BIGINT`, `INTEGER`, `INTERVAL_DAY`), not valid SQL type syntax.",
+        "enum": [
+          "BOOLEAN",
+          "TINYINT",
+          "SMALLINT",
+          "INTEGER",
+          "BIGINT",
+          "UTINYINT",
+          "USMALLINT",
+          "UINTEGER",
+          "UBIGINT",
+          "REAL",
+          "DOUBLE",
+          "DECIMAL",
+          "CHAR",
+          "VARCHAR",
+          "BINARY",
+          "VARBINARY",
+          "TIME",
+          "DATE",
+          "TIMESTAMP",
+          "TIMESTAMP_TZ",
+          "INTERVAL_DAY",
+          "INTERVAL_DAY_HOUR",
+          "INTERVAL_DAY_MINUTE",
+          "INTERVAL_DAY_SECOND",
+          "INTERVAL_HOUR",
+          "INTERVAL_HOUR_MINUTE",
+          "INTERVAL_HOUR_SECOND",
+          "INTERVAL_MINUTE",
+          "INTERVAL_MINUTE_SECOND",
+          "INTERVAL_MONTH",
+          "INTERVAL_SECOND",
+          "INTERVAL_YEAR",
+          "INTERVAL_YEAR_MONTH",
+          "ARRAY",
+          "STRUCT",
+          "MAP",
+          "NULL",
+          "UUID",
+          "VARIANT"
+        ]
       },
       "StartFromCheckpoint": {
         "oneOf": [
@@ -13524,6 +13777,11 @@
             "nullable": true,
             "minimum": 0
           },
+          "optimize_download_resources": {
+            "type": "boolean",
+            "description": "When true, checkpoint downloads use the maximum resources available on\nthe host: `transfers` and `checkers` are scaled to the number of CPUs,\nand the download buffer is allowed to grow up to most of the available\nmemory. This maximizes download throughput at the cost of higher CPU and\nmemory usage during a pull.\n\nWhen false, downloads use the values configured via `transfers`,\n`checkers`, and the rclone defaults instead.\n\nDefault: true",
+            "default": true
+          },
           "provider": {
             "type": "string",
             "description": "The name of the cloud storage provider (e.g., `\"AWS\"`, `\"Minio\"`).\n\nUsed for provider-specific behavior in rclone.\nIf omitted, defaults to `\"Other\"`.\n\nSee [rclone S3 provider documentation](https://rclone.org/s3/#s3-provider)",
@@ -13574,8 +13832,9 @@
           },
           "standby": {
             "type": "boolean",
-            "description": "When `true`, the pipeline starts in **standby** mode; processing doesn't\nstart until activation (`POST /activate`).\nIf this pipeline was previously activated and the storage has not been\ncleared, the pipeline will auto activate, no newer checkpoints will be\nfetched.\n\nStandby behavior depends on `start_from_checkpoint`:\n- If `latest`, pipeline continuously fetches the latest available\ncheckpoint until activated.\n- If checkpoint UUID, pipeline fetches this checkpoint once and waits\nin standby until activated.\n\nDefault: `false`",
-            "default": false
+            "description": "**Deprecated.** Use `initial=standby` when starting the pipeline instead.",
+            "default": false,
+            "deprecated": true
           },
           "start_from_checkpoint": {
             "allOf": [
@@ -13904,6 +14163,24 @@
             ],
             "properties": {
               "config": {
+                "$ref": "#/components/schemas/DynamoDBWriterConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "dynamodb_output"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
                 "$ref": "#/components/schemas/RedisOutputConfig"
               },
               "name": {
@@ -14090,6 +14367,34 @@
                 "type": "string",
                 "enum": [
                   "clock_input"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": [
+                  "null_output"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": [
+                  "empty_input"
                 ]
               }
             }

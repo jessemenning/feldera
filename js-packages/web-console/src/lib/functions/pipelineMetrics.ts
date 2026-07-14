@@ -1,3 +1,4 @@
+import { ServerDate } from '$lib/compositions/serverTime'
 import { groupBy } from '$lib/functions/common/array'
 import { nonNull } from '$lib/functions/common/function'
 import { discreteDerivative } from '$lib/functions/common/math'
@@ -200,15 +201,42 @@ export const accumulatePipelineMetrics =
   }
 
 /**
+ * Right edge (newest time) of a performance graph's time axis.
+ *
+ * Samples carry server-side timestamps, so the axis must be anchored to the
+ * newest sample rather than to the client clock: any client/server clock skew
+ * would otherwise shift the plotted line relative to the axis and leave the
+ * graph under-filling its width. Before any sample has arrived, fall back to
+ * the server-time estimate so the empty window is still in the right time base.
+ *
+ * @param now - Source of the fallback time; injectable for testing.
+ */
+export const timeSeriesAxisMax = (metrics: TimeSeriesEntry[], now: () => number = ServerDate.now) =>
+  metrics.at(-1)?.t ?? now()
+
+/**
+ * Memory limit on a multi-host deployment, in MB.
+ *
+ * `memory_mb_max` is the individual host's limit, but the reported memory metric
+ * is the sum of resident memory across all hosts in a multihost deployment.
+ * To keep the limit line meaningful, multiply the per-host limit by the number of hosts.
+ *
+ * @param perHostMemoryMb - Per-host limit `runtimeConfig.resources.memory_mb_max`, in MB.
+ * @param hosts - Number of hosts `runtimeConfig.hosts`; treated as at least 1.
+ * @returns The aggregate limit in MB, or undefined when no limit is configured.
+ */
+export const multihostMemoryLimitMb = (
+  perHostMemoryMb: number | null | undefined,
+  hosts: number | null | undefined
+): number | undefined => (perHostMemoryMb ? perHostMemoryMb * Math.max(hosts ?? 1, 1) : undefined)
+
+/**
  * @returns Time series of throughput with smoothing window over 3 data intervals
  */
 export const calcPipelineThroughput = (metrics: TimeSeriesEntry[]) => {
-  const series = discreteDerivative(metrics, (n1, n0) => {
-    return {
-      name: n1.t.toFixed(),
-      value: tuple(n1.t.toNumber(), n1.r.minus(n0.r).toNumber())
-    }
-  })
+  const series = discreteDerivative(metrics, (n1, n0) => ({
+    value: tuple(n1.t, n1.r - n0.r)
+  }))
 
   const avgN = Math.min(Math.ceil(series.length / 5), 4)
   const valueMax = series.length

@@ -3,6 +3,7 @@
   import { Progress } from '@skeletonlabs/skeleton-svelte'
   import {
     createLoadGuard,
+    type GlobalMetrics,
     getSuitableProfiles,
     processProfileFiles,
     SupportBundleViewerLayout,
@@ -44,13 +45,18 @@
   let selectedProfile: Date | null = $state(null)
   let getProfileData:
     | (() => {
-        profile: JsonProfiles
+        profile: JsonProfiles | undefined
         dataflow: Dataflow | undefined
         sources: string[] | undefined
         logText: string | undefined
+        globalMetrics: GlobalMetrics | undefined
+        runtimeConfig: unknown
       })
     | null = $state(null)
   let triageResults: TriageResults = $state(new TriageResults())
+  // `true` while ELK is running the layout pass on the current profile. The flag flips back
+  // to `false` once `layoutstop` fires inside profiler-lib.
+  let isRendering = $state(false)
 
   let collectNewData = $state(collect)
   let fileInput: HTMLInputElement | null = $state(null)
@@ -98,7 +104,9 @@
       profile: processed.profile,
       dataflow: processed.dataflow,
       sources: processed.sources,
-      logText: processed.logText
+      logText: processed.logText,
+      globalMetrics: processed.globalMetrics,
+      runtimeConfig: processed.runtimeConfig
     })
   }
 
@@ -118,7 +126,7 @@
         const buffer = await receiveUploadedBundle(channel)
         await processZipBundle(
           new Uint8Array(buffer),
-          'No suitable profiles found in the uploaded bundle.'
+          'No readable data found in the uploaded bundle.'
         )
       } else {
         downloadProgress.onProgress(0, 1)
@@ -136,7 +144,7 @@
         const supportBundle = await dataPromise
         await processZipBundle(
           new Uint8Array(await supportBundle.data.arrayBuffer()),
-          'No suitable profiles found. Try enabling "Collect new data".'
+          'No readable data found. Try enabling "Collect new data".'
         )
       }
     }, onLoadError('Failed to load the profile bundle.'))
@@ -161,7 +169,7 @@
       const bundle = await dataPromise
       await processZipBundle(
         new Uint8Array(await bundle.data.arrayBuffer()),
-        'No suitable profiles found. Try enabling "Collect new data".'
+        'No readable data found. Try enabling "Collect new data".'
       )
     }, onLoadError('Failed to download the profile bundle.'))
   }
@@ -235,14 +243,28 @@
     {/snippet}
   </AppHeader>
 
-  <!-- Download progress bar -->
-  <div class="{nonNull(downloadProgress.percent) ? '' : 'h-0 opacity-0'} transition-opacity">
-    <Progress class="h-1" value={downloadProgress.percent ?? null} max={100}>
-      <Progress.Track>
-        <Progress.Range class="bg-primary-500" />
-      </Progress.Track>
-    </Progress>
-  </div>
+  <!-- Thin progress bar shown above the layout while a profile is loading or being drawn.
+       `percent === null` keeps it indeterminate (the layout engine has no progress signal,
+       so the "rendering" pass cannot report a fraction). `visible === false` collapses the
+       row to zero height instead of unmounting, so successive uses (download → render) flow
+       without layout jumps. -->
+  {#snippet progressBar(visible: boolean, percent: number | null)}
+    <div class=" px-4 {visible ? '' : 'h-0 opacity-0'} transition-opacity">
+      <Progress class="-mt-1 h-1" value={percent} max={100}>
+        <Progress.Track>
+          <Progress.Range class="bg-primary-500" />
+        </Progress.Track>
+      </Progress>
+    </div>
+  {/snippet}
+  <!-- Download takes precedence: while the bundle is still arriving there is nothing to
+       render yet, and once it has, `downloadProgress.percent` is reset to null and we display
+       the indeterminate rendering bar while the diagram layout is computed. -->
+  {#if nonNull(downloadProgress.percent)}
+    {@render progressBar(true, downloadProgress.percent ?? null)}
+  {:else}
+    {@render progressBar(isRendering, null)}
+  {/if}
 
   {#if isLoading && !getProfileData}
     <div class="flex flex-1 flex-col items-center justify-center gap-4">
@@ -263,18 +285,22 @@
       {/if}
     </div>
   {:else if getProfileData}
-    {@const { profile, dataflow, sources, logText } = getProfileData()}
-    <div class="min-h-0 flex-1 px-2 pb-4 md:pr-8 md:pl-8 xl:pl-4">
+    {@const { profile, dataflow, sources, logText, globalMetrics, runtimeConfig } =
+      getProfileData()}
+    <div class="min-h-0 flex-1 px-4 pb-4">
       <SupportBundleViewerLayout
         profileData={profile}
         dataflowData={dataflow}
         programCode={sources}
         {logText}
+        {globalMetrics}
+        {runtimeConfig}
         {triageResults}
         profileFiles={getProfileFiles()}
         selectedTimestamp={selectedProfile}
         onSelectTimestamp={handleSelectTimestamp}
         bind:sqlPanelFullHeight={layoutSettings.sqlPanelFullHeight.value}
+        onRenderingChange={(rendering) => (isRendering = rendering)}
       >
         {#snippet loadProfileControl()}
           <Popup>

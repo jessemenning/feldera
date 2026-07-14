@@ -8,8 +8,8 @@ notably at most 1000 and with a time limit of 72 hours (whichever comes first).
 With this, it is possible to access both the latest health check of the cluster
 and its health in the recent past. The events are accessible through the API.
 
-The resources monitoring feature is not yet stabilized, but can already be activated by adding
-`cluster_monitor_resources` to the Helm chart `unstableFeatures` array value.
+The resources monitoring feature can be deactivated by setting
+in the Helm chart `disableClusterMonitorResources` to `true`.
 
 ## API usage
 
@@ -32,7 +32,7 @@ The cluster monitor events can be retrieved via two endpoints:
 
 **Request**
 ```
-curl -X GET http://127.0.0.1:8080/v0/cluster/events | jq
+curl -X GET 'http://127.0.0.1:8080/v0/cluster/events' | jq
 ```
 
 **Response**
@@ -62,7 +62,7 @@ curl -X GET http://127.0.0.1:8080/v0/cluster/events | jq
 
 **Request**
 ```
-curl -X GET http://127.0.0.1:8080/v0/cluster/events/latest | jq
+curl -X GET 'http://127.0.0.1:8080/v0/cluster/events/latest' | jq
 ```
 
 **Response**
@@ -81,7 +81,7 @@ curl -X GET http://127.0.0.1:8080/v0/cluster/events/latest | jq
 
 **Request**
 ```
-curl -X GET http://127.0.0.1:8080/v0/cluster/events/019afe45-ec1f-7de0-9cd1-3a6a4350b5e9?selector=all | jq
+curl -X GET 'http://127.0.0.1:8080/v0/cluster/events/019afe45-ec1f-7de0-9cd1-3a6a4350b5e9?selector=all' | jq
 ```
 
 **Response**

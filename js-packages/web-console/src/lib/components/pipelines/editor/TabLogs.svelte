@@ -25,11 +25,12 @@
 
 <script lang="ts">
   import LogsStreamList from '$lib/components/pipelines/editor/LogsStreamList.svelte'
+  import { emptySearchState, type SearchState } from 'common-ui'
 
   import {
-    parseCancellable,
-    pushAsCircularBuffer,
-    SplitNewlineTransformStream
+    newlineTextDecoder,
+    parseStream,
+    pushAsCircularBuffer
   } from '$lib/functions/pipelines/changeStream'
   import { type ExtendedPipeline, type PipelineStatus } from '$lib/services/pipelineManager'
   import { usePipelineActionCallbacks } from '$lib/compositions/pipelines/usePipelineActionCallbacks.svelte'
@@ -44,10 +45,16 @@
 
   let {
     pipeline,
-    deleted = false
+    deleted = false,
+    logSearch = emptySearchState,
+    onLogSearchShortcut
   }: {
     pipeline: { current: ExtendedPipeline }
     deleted?: boolean
+    logSearch?: SearchState
+    /** Invoked when the user presses Ctrl-F / Cmd-F inside the log list — the monitoring
+     *  panel uses this to focus its search input. */
+    onLogSearchShortcut?: () => void
   } = $props()
   let pipelineName = $derived(pipeline.current.name)
 
@@ -76,20 +83,7 @@
     // Close log stream when leaving log tab, switching to another pipeline, or when readonly
     let oldPipelineName = pipelineName
     return () => {
-      if (streams[oldPipelineName]) {
-        if ('open' in streams[oldPipelineName].stream) {
-          streams[oldPipelineName].stream.stop()
-          return
-        }
-        if ('cancelRetry' in streams[oldPipelineName].stream) {
-          streams[oldPipelineName].stream.cancelRetry()
-          return
-        }
-        if ('cancelFetch' in streams[oldPipelineName].stream) {
-          streams[oldPipelineName].stream.cancelFetch()
-          return
-        }
-      }
+      stopLogStream(oldPipelineName)
     }
   })
   const bufferSize = 10000
@@ -152,10 +146,27 @@
         tryRestartStream(pipelineName, isServerOverloaded ? attempts + 1 : 0)
         return
       }
-      const { cancel } = parseCancellable(
+      // Replace the previous connection's buffer only once fresh data is actually in hand,
+      // not the moment the fetch resolves. Otherwise a reconnect (scroll-resume, retry) blanks
+      // the view between connecting and the first byte. Until then the prior rows stay visible.
+      let freshConnection = true
+      const { cancel } = parseStream<string>(
         result,
+        newlineTextDecoder({
+          bufferSize: 16 * 1024 * 1024,
+          onBytesSkipped: (bytes) => {
+            streams[pipelineName].totalSkippedBytes += bytes
+          }
+        }),
         {
           pushChanges: (changes: string[]) => {
+            if (freshConnection) {
+              freshConnection = false
+              streams[pipelineName].rows = []
+              streams[pipelineName].firstRowIndex = 0
+              streams[pipelineName].rowBoundaries = []
+              streams[pipelineName].totalSkippedBytes = 0
+            }
             const droppedNum = pushAsCircularBuffer(
               () => streams[pipelineName].rows,
               bufferSize,
@@ -164,7 +175,12 @@
             streams[pipelineName].firstRowIndex += droppedNum
           },
           onParseEnded: (reason) => {
-            if (!streams[pipelineName]) {
+            const current = streams[pipelineName]?.stream
+            // Ignore a callback from a stream we've already replaced: scroll-pause can stop
+            // this stream and scroll-resume can open a new one before this 'cancelled' callback
+            // lands. Acting on it would clobber the live stream's handle. Identify "still mine"
+            // by the open ReadableStream reference.
+            if (!current || !('open' in current) || current.open !== result.stream) {
               return
             }
             streams[pipelineName].stream = { closed: {} }
@@ -172,23 +188,12 @@
               return
             }
             tryRestartStream(pipelineName, 0)
-          },
-          onBytesSkipped(bytes) {
-            streams[pipelineName].totalSkippedBytes += bytes
           }
-        },
-        new SplitNewlineTransformStream(),
-        {
-          bufferSize: 16 * 1024 * 1024
         }
       )
-      streams[pipelineName] = {
-        firstRowIndex: 0,
-        stream: { open: result.stream, stop: cancel },
-        rows: [],
-        rowBoundaries: [],
-        totalSkippedBytes: 0
-      }
+      // Keep the existing rows in place — only swap in the live stream handle. The buffer is
+      // cleared on the first `pushChanges` above, so the view stays populated until then.
+      streams[pipelineName].stream = { open: result.stream, stop: cancel }
       getStreams.current = streams
     })
   }
@@ -209,6 +214,53 @@
         streams[pipelineName].stream = { closed: {} }
       },
       retryAtTimestamp: Date.now() + delayMs
+    }
+  }
+
+  // Stop the log feed whatever state it's in — an open stream, an in-flight connect, or a
+  // pending retry — and mark it closed. A clean stop reports 'cancelled' to `onParseEnded`,
+  // which deliberately does not auto-restart. Used by scroll-pause (so the user can read back
+  // through history with no "connection lost" banner) and by teardown when leaving the tab or
+  // switching pipelines.
+  const stopLogStream = (pipelineName: string) => {
+    const stream = streams[pipelineName]?.stream
+    if (!stream) {
+      return
+    }
+    if ('open' in stream) {
+      stream.stop()
+      // Mark closed now rather than waiting for the (delayed) onParseEnded tick, so a
+      // scroll-resume that arrives within the flush window sees a closed stream and reconnects.
+      streams[pipelineName].stream = { closed: {} }
+    } else if ('cancelFetch' in stream) {
+      stream.cancelFetch()
+    } else if ('cancelRetry' in stream) {
+      stream.cancelRetry()
+    }
+  }
+  // Scroll-resume: when the view sticks to the bottom again, reconnect the feed. Drop any
+  // pending retry first so we connect immediately rather than waiting out the backoff.
+  const resumeLogStream = (pipelineName: string) => {
+    const s = streams[pipelineName]?.stream
+    if (!s) {
+      return
+    }
+    if ('cancelRetry' in s) {
+      s.cancelRetry()
+    }
+    if ('open' in s || 'cancelFetch' in s) {
+      return
+    }
+    startStream(pipelineName, 0)
+  }
+  const onStickToBottomChange = (stickToBottom: boolean) => {
+    if (deleted) {
+      return
+    }
+    if (stickToBottom) {
+      resumeLogStream(pipelineName)
+    } else {
+      stopLogStream(pipelineName)
     }
   }
 
@@ -268,6 +320,11 @@
     <WarningBanner>Connecting to logs stream...</WarningBanner>
   {/if}
   {#key pipelineName}
-    <LogsStreamList logs={pipelineLogs}></LogsStreamList>
+    <LogsStreamList
+      logs={pipelineLogs}
+      search={logSearch}
+      onSearchShortcut={onLogSearchShortcut}
+      {onStickToBottomChange}
+    ></LogsStreamList>
   {/key}
 </div>

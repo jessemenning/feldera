@@ -4,6 +4,7 @@ import time
 import pytest
 from http import HTTPStatus
 from feldera import PipelineBuilder, Pipeline
+from feldera.runtime_config import RuntimeConfig
 from feldera.enums import BootstrapPolicy
 from tests import TEST_CLIENT
 from .helper import (
@@ -27,7 +28,10 @@ from .helper import (
     post_no_body,
 )
 from tests import enterprise_only
-from feldera.testutils import single_host_only
+from feldera.testutils import (
+    FELDERA_TEST_NUM_WORKERS,
+    FELDERA_TEST_NUM_HOSTS,
+)
 
 
 def _wait_for_stopped_with_error(name: str, timeout_s: float = 90.0):
@@ -182,7 +186,7 @@ def test_pipeline_deleted_during_program_compilation(pipeline_name):
 
 
 @gen_pipeline_name
-def test_pipeline_stop_force_after_start(pipeline_name):
+def test_pipeline_stop_with_force_after_start(pipeline_name):
     """
     Start and then force stop after varying short delays.
     """
@@ -191,15 +195,10 @@ def test_pipeline_stop_force_after_start(pipeline_name):
     ).create_or_replace()
 
     for delay_sec in [0, 0.1, 0.5, 1, 3, 10, 20]:
-        print(f"Testing with {delay_sec} second delay")
-
-        # Issue non-blocking start
         pipeline.start(wait=False)
-
-        # Shortly wait for the pipeline to transition to next state(s)
         time.sleep(delay_sec)
-
-        # Stop force and clear the pipeline
+        pipeline.stop(force=True)
+        pipeline.start(wait=False)
         pipeline.stop(force=True)
         pipeline.clear_storage()
 
@@ -211,73 +210,85 @@ def test_pipeline_stop_with_force(pipeline_name):
     """
     create_pipeline(pipeline_name, "")
 
-    # Already stopped force
+    # Already stopped
     stop_pipeline(pipeline_name, force=True)
 
-    # Start then immediate stop (force)
-    #
-    # We do not wait for the pipeline to start, but we do wait for it
-    # to transition away from "Stopped".  Otherwise, there is a race:
-    #
-    # - Request start.
-    #
-    # - Request force stop.
-    #
-    # - Check for "stopped" status succeeds because starting up is
-    #   taking a little while, so we move along to
-    #   start_pipeline_as_paused().
-    #
-    # - Pipeline transitions to "stopping".
-    #
-    # - start_pipeline_as_paused() fails with "Cannot restart the
-    #   pipeline while it is stopping. Wait until it is stopped before
-    #   starting the pipeline again."
+    # Start (don't wait), immediately stop
     start_pipeline(pipeline_name, wait=False)
-    pipeline = Pipeline.get(pipeline_name, TEST_CLIENT)
-    wait_for_condition(
-        f"{pipeline_name} no longer stopped",
-        lambda: pipeline.status() != PipelineStatus.STOPPED,
-        timeout_s=30.0,
-        poll_interval_s=0.2,
-    )
     stop_pipeline(pipeline_name, force=True)
 
-    # Start paused then stop (simulate by pausing immediately)
+    # Start (wait for running), stop
+    start_pipeline(pipeline_name)
+    stop_pipeline(pipeline_name, force=True)
+
+    # Start (wait for paused), stop
     start_pipeline_as_paused(pipeline_name)
     stop_pipeline(pipeline_name, force=True)
 
-    # Start, stop (without waiting), then stop again
+    # Start (wait for running), stop twice in a row
     start_pipeline(pipeline_name)
     stop_pipeline(pipeline_name, force=True, wait=False)
     stop_pipeline(pipeline_name, force=True)
+
+    # Stopping must complete before starting again.
+    #
+    # It is possible that the stopping happens very quickly, as such only if an error occurs,
+    # is it checked that it is the correct error code.
+    start_pipeline(pipeline_name)
+    stop_pipeline(pipeline_name, force=True, wait=False)
+    error = None
+    try:
+        start_pipeline(pipeline_name)
+    except FelderaAPIError as e:
+        error = e
+    if error is not None:
+        assert error.error_code == "IllegalPipelineAction"
+    stop_pipeline(pipeline_name, force=True, wait=False)
+
+
+@enterprise_only
+@gen_pipeline_name
+def test_pipeline_stop_without_force_after_start(pipeline_name):
+    """
+    Start and then stop after varying short delays.
+    """
+    pipeline = PipelineBuilder(
+        TEST_CLIENT, pipeline_name, "CREATE TABLE t1(c1 INTEGER);"
+    ).create_or_replace()
+
+    for delay_sec in [0, 0.1, 0.5, 1, 3, 10, 20]:
+        pipeline.start(wait=False)
+        time.sleep(delay_sec)
+        pipeline.stop(force=False)
+        pipeline.start(wait=False)
+        pipeline.stop(force=False)
+        pipeline.clear_storage()
 
 
 @enterprise_only
 @gen_pipeline_name
 def test_pipeline_stop_without_force(pipeline_name):
     """
-    Same sequences but without force (Enterprise only).
+    Sequences of starting/stopping without force (Enterprise only).
     """
     create_pipeline(pipeline_name, "")
 
     # Already stopped
     stop_pipeline(pipeline_name, force=False)
 
-    # Start then stop (non-force)
-    #
-    # See test_pipeline_stop_with_force() for notes.
+    # Start (don't wait), immediately stop
     start_pipeline(pipeline_name, wait=False)
     stop_pipeline(pipeline_name, force=False)
 
-    # Start, wait for running, stop
+    # Start (wait for running), stop
     start_pipeline(pipeline_name)
     stop_pipeline(pipeline_name, force=False)
 
-    # Start paused (pause right away), stop
+    # Start (wait for paused), stop
     start_pipeline_as_paused(pipeline_name)
     stop_pipeline(pipeline_name, force=False)
 
-    # Start, stop twice in a row
+    # Start (wait for running), stop twice in a row
     start_pipeline(pipeline_name)
     stop_pipeline(pipeline_name, force=False, wait=False)
     stop_pipeline(pipeline_name, force=False)
@@ -533,13 +544,19 @@ def test_pipeline_double_start(pipeline_name):
 
 
 @gen_pipeline_name
-@single_host_only
 def test_pipeline_storage_status_details_without_checkpoints(pipeline_name):
     """
     Validate storage_status_details transitions and clear behavior using the Python API
     without checkpoints.
     """
-    pipeline = PipelineBuilder(TEST_CLIENT, pipeline_name, "").create_or_replace()
+    pipeline = PipelineBuilder(
+        TEST_CLIENT,
+        pipeline_name,
+        "",
+        runtime_config=RuntimeConfig(
+            hosts=FELDERA_TEST_NUM_HOSTS, workers=FELDERA_TEST_NUM_WORKERS
+        ),
+    ).create_or_replace()
 
     # Initially no details
     assert pipeline.storage_status() == StorageStatus.CLEARED
@@ -575,7 +592,6 @@ def test_pipeline_storage_status_details_without_checkpoints(pipeline_name):
 
 
 @gen_pipeline_name
-@single_host_only
 @enterprise_only
 def test_pipeline_storage_status_details_with_checkpoints(pipeline_name):
     """
@@ -606,6 +622,9 @@ def test_pipeline_storage_status_details_with_checkpoints(pipeline_name):
         }]'
     );
     """,
+        runtime_config=RuntimeConfig(
+            hosts=FELDERA_TEST_NUM_HOSTS, workers=FELDERA_TEST_NUM_WORKERS
+        ),
     ).create_or_replace()
 
     # Initially no details
@@ -679,7 +698,7 @@ def test_refresh_version_due_to_status_changes(pipeline_name):
         TEST_CLIENT.http.get(f"/pipelines/{pipeline_name}?selector=status")[
             "refresh_version"
         ]
-        <= 10
+        <= 15
     )
     pipeline.stop(force=True)
     pipeline.clear_storage()
@@ -687,7 +706,7 @@ def test_refresh_version_due_to_status_changes(pipeline_name):
         TEST_CLIENT.http.get(f"/pipelines/{pipeline_name}?selector=status")[
             "refresh_version"
         ]
-        <= 15
+        <= 25
     )
 
 

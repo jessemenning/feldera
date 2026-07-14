@@ -5,12 +5,10 @@
 
 import type { NodeAttributes, TooltipRow } from 'profiler-lib'
 import { measurementCategory, measurementDescription } from 'profiler-lib'
-import { type Format, inferFormat } from './format'
 
 export type RenderableMetric = {
   row: TooltipRow
   label: string
-  format: Format
 }
 
 export type RenderableBlock = {
@@ -47,9 +45,19 @@ export function buildBlocks(attrs: NodeAttributes, showAdvanced: boolean): Rende
     }
     bucket.push({
       row,
-      label: labelFor(row.metric),
-      format: inferFormat(row.cells[0]?.value ?? '')
+      label: labelFor(row.metric)
     })
+  }
+
+  // Sort metrics inside each block by their displayed label so users can scan a long block
+  // without re-reading the whole thing. Locale-aware compare with `numeric: true`
+  // keeps numbered labels like "slot 2 ..." / "slot 10 ..." in their natural sequence.
+  const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true })
+  for (const entries of byCategory.values()) {
+    entries.sort(
+      (a, b) =>
+        collator.compare(a.label, b.label) || collator.compare(a.row.metric, b.row.metric)
+    )
   }
 
   const out: RenderableBlock[] = []

@@ -141,6 +141,9 @@ import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
 import org.dbsp.sqlCompiler.compiler.frontend.ExtendedSqlParserPos;
+import org.dbsp.sqlCompiler.compiler.frontend.SqlComment;
+import org.dbsp.sqlCompiler.compiler.frontend.SqlCommentParser;
+import org.dbsp.sqlCompiler.compiler.frontend.SqlPrettyPrinter;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.optimizer.CalciteOptimizer;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.PropertyList;
@@ -165,6 +168,7 @@ import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlViewColumnDeclaration;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateAggregateStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateFunctionStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateIndexStatement;
+import org.dbsp.sqlCompiler.compiler.frontend.connectors.ConnectorValidator;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTableStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTypeStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateViewStatement;
@@ -846,9 +850,18 @@ public class SqlToRelCompiler implements IWritesLogs {
     /** Given a list of statements separated by semicolons, parse all of them.
      * @param saveLines True if the lines are from the user program; false if they are internally generated. */
     public List<ParsedStatement> parseStatements(String statements, boolean saveLines) throws SqlParseException {
+        // Debugging flag for (partially) testing SqlPrettyPrinter
+        final boolean ROUND_TRIP_CHECK = false;
+
         SqlParser sqlParser = this.createSqlParser(statements, saveLines);
         List<ParsedStatement> result = new ArrayList<>();
         SqlNodeList sqlNodes = sqlParser.parseStmtList();
+        if (saveLines && ROUND_TRIP_CHECK) {
+            List<SqlComment> comments = SqlCommentParser.parse(statements);
+            String sql = SqlPrettyPrinter.toString(sqlNodes, comments);
+            // System.out.println(sql);
+            this.createSqlParser(sql, false).parseStmtList();
+        }
         for (SqlNode node: sqlNodes) {
             SqlNode sqlNode = this.postParsingProcess(node, saveLines);
             ParsedStatement stat = new ParsedStatement(sqlNode, saveLines);
@@ -2052,16 +2065,21 @@ public class SqlToRelCompiler implements IWritesLogs {
                 }
                 JsonNode preprocessor = connector.get(CreateTableStatement.PREPROCESSOR);
                 if (preprocessor != null) {
+                    if (!isTable) {
+                        SourcePositionRange pos = elementPositionRange(value, ".", false);
+                        throw new CompilationError("\"preprocessor\" property for " +
+                                objectName + " must be attached to a table", pos);
+                    }
                     String pp = path + "/preprocessor";
                     if (!preprocessor.isArray()) {
                         SourcePositionRange pos = elementPositionRange(value, pp, false);
-                        throw new CompilationError("Preprocessor property for " +
+                        throw new CompilationError("\"preprocessor\" property for " +
                                 objectName + " must be an array", pos);
                     }
                     ArrayNode preprocessors = (ArrayNode) preprocessor;
                     if (preprocessors.size() != 1) {
                         SourcePositionRange pos = elementPositionRange(value, pp, false);
-                        throw new CompilationError("Preprocessor property for " +
+                        throw new CompilationError("\"preprocessor\" property for " +
                                 objectName + " must be an array with exactly 1 element", pos);
                     }
                     JsonNode preConf = preprocessors.get(0);
@@ -2077,7 +2095,7 @@ public class SqlToRelCompiler implements IWritesLogs {
                     String preName = preConf.get("name").asText();
                     if (!Utilities.isLegalRustIdentifier(preName)) {
                         SourcePositionRange pos = elementPositionRange(value, pp0 + "/name", true);
-                        throw new CompilationError("The value of preprocessor field \"name\": "
+                        throw new CompilationError("The value of Preprocessor field \"name\": "
                                 + Utilities.doubleQuote(preName, false) + " must be a legal Rust identifier", pos);
                     }
                     if (!preConf.has(CreateTableStatement.MESSAGE_ORIENTED)) {
@@ -2097,6 +2115,50 @@ public class SqlToRelCompiler implements IWritesLogs {
                         throw new CompilationError("Preprocessor field \"config\" must be a JSON object", pos);
                     }
                 }
+                JsonNode postprocessor = connector.get(CreateViewStatement.POSTPROCESSOR);
+                if (postprocessor != null) {
+                    if (isTable) {
+                        SourcePositionRange pos = elementPositionRange(value, ".", false);
+                        throw new CompilationError("\"postprocessor\" property for " +
+                                objectName + " must be attached to a view", pos);
+                    }
+                    String pp = path + "/postprocessor";
+                    if (!postprocessor.isArray()) {
+                        SourcePositionRange pos = elementPositionRange(value, pp, false);
+                        throw new CompilationError("\"postprocessor\" property for " +
+                                objectName + " must be an array", pos);
+                    }
+                    ArrayNode postprocessors = (ArrayNode) postprocessor;
+                    if (postprocessors.size() != 1) {
+                        SourcePositionRange pos = elementPositionRange(value, pp, false);
+                        throw new CompilationError("\"postprocessor\" property for " +
+                                objectName + " must be an array with exactly 1 element", pos);
+                    }
+                    JsonNode postConf = postprocessors.get(0);
+                    String pp0 = pp + "/0";
+                    if (!postConf.has("name")) {
+                        SourcePositionRange pos = elementPositionRange(value, pp0, false);
+                        throw new CompilationError("Postprocessor must have a field \"name\"", pos);
+                    }
+                    if (!postConf.get("name").isTextual()) {
+                        SourcePositionRange pos = elementPositionRange(value, pp0 + "/name", true);
+                        throw new CompilationError("Postprocessor field \"name\" must be a string", pos);
+                    }
+                    String postName = postConf.get("name").asText();
+                    if (!Utilities.isLegalRustIdentifier(postName)) {
+                        SourcePositionRange pos = elementPositionRange(value, pp0 + "/name", true);
+                        throw new CompilationError("The value of Postprocessor field \"name\": "
+                                + Utilities.doubleQuote(postName, false) + " must be a legal Rust identifier", pos);
+                    }
+                    if (!postConf.has("config") || !postConf.get("config").isObject()) {
+                        SourcePositionRange pos = elementPositionRange(value, pp0 + "/config", true);
+                        throw new CompilationError("Postprocessor field \"config\" must be a JSON object", pos);
+                    }
+                }
+                ConnectorValidator.validateFormatConfig(connector, path, isTable, json,
+                        value.getSourcePosition().start, this.errorReporter);
+                ConnectorValidator.validateTransportConfig(connector, path, isTable, json,
+                        value.getSourcePosition().start, this.errorReporter);
             }
         } else {
             var error = jsonNode.err();

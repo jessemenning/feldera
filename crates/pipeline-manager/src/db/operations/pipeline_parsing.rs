@@ -4,8 +4,8 @@ use crate::db::types::monitor::{
 };
 use crate::db::types::pipeline::{
     parse_string_as_bootstrap_config, parse_string_as_runtime_desired_status,
-    parse_string_as_runtime_status, ExtendedPipelineDescr, ExtendedPipelineDescrEventInfo,
-    ExtendedPipelineDescrMonitoring, PipelineId,
+    parse_string_as_runtime_status, ClientMetadata, ExtendedPipelineDescr,
+    ExtendedPipelineDescrEventInfo, ExtendedPipelineDescrMonitoring, PipelineId,
 };
 use crate::db::types::program::{ProgramError, ProgramStatus};
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
@@ -22,8 +22,10 @@ use tokio_postgres::Row;
 use tracing::error;
 use uuid::Uuid;
 
+/// Every pipeline table column, in the order expected when parsing a row into a
+/// complete [`ExtendedPipelineDescr`] (used by detailed single-pipeline reads).
 pub const PIPELINE_COLUMNS_ALL: &str =
-    "p.id, p.name, p.description, p.created_at, p.version, p.platform_version, p.runtime_config,
+    "p.id, p.name, p.client_metadata, p.created_at, p.version, p.platform_version, p.runtime_config,
      p.program_code, p.udf_rust, p.udf_toml, p.program_config, p.program_version, p.program_status,
      p.program_status_since, p.program_error, p.program_info,
      p.program_binary_source_checksum, p.program_binary_integrity_checksum, p.program_info_integrity_checksum,
@@ -35,8 +37,11 @@ pub const PIPELINE_COLUMNS_ALL: &str =
      p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy
      ";
 
+/// Subset of pipeline columns needed to parse a row into an
+/// [`ExtendedPipelineDescrMonitoring`]. It drops the heavy program-source and
+/// deployment-config fields that monitoring does not need.
 pub const PIPELINE_COLUMNS_MONITORING: &str =
-    "p.id, p.name, p.description, p.created_at, p.version, p.platform_version, p.runtime_config,
+    "p.id, p.name, p.client_metadata, p.created_at, p.version, p.platform_version, p.runtime_config,
      p.program_config, p.program_version, p.program_status, p.program_status_since,
      p.deployment_error, p.deployment_location, p.refresh_version,
      p.storage_status, p.storage_status_details, p.deployment_id, p.deployment_initial,
@@ -46,6 +51,9 @@ pub const PIPELINE_COLUMNS_MONITORING: &str =
      p.deployment_runtime_desired_status, p.deployment_runtime_desired_status_since, p.bootstrap_policy
      ";
 
+/// Minimal subset of pipeline columns used to parse a row into an
+/// [`ExtendedPipelineDescrEventInfo`]: only the status fields recorded with a
+/// pipeline monitor event.
 pub const PIPELINE_COLUMNS_EVENT_INFO: &str = "p.id,
      p.program_status,
      p.storage_status,
@@ -61,10 +69,14 @@ pub const PIPELINE_COLUMNS_EVENT_INFO: &str = "p.id,
 
 #[rustfmt::skip]
 pub fn parse_pipeline_row_all(row: &Row) -> Result<ExtendedPipelineDescr, DBError> {
+    // Destructuring is deliberate: adding a `ClientMetadata` field fails to
+    // compile here until it is read out into the descriptor.
+    let ClientMetadata { description, tags } = parse_from_row_client_metadata(row);
     Ok(ExtendedPipelineDescr {
         id: parse_from_row_id(row),
         name: parse_from_row_name(row),
-        description: parse_from_row_description(row),
+        description,
+        tags,
         created_at: parse_from_row_created_at(row),
         version: parse_from_row_version(row),
         platform_version: parse_from_row_platform_version(row),
@@ -105,10 +117,14 @@ pub fn parse_pipeline_row_all(row: &Row) -> Result<ExtendedPipelineDescr, DBErro
 
 #[rustfmt::skip]
 pub fn parse_pipeline_row_monitoring(row: &Row) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
+    // Destructuring is deliberate: adding a `ClientMetadata` field fails to
+    // compile here until it is read out into the descriptor.
+    let ClientMetadata { description, tags } = parse_from_row_client_metadata(row);
     Ok(ExtendedPipelineDescrMonitoring {
         id: parse_from_row_id(row),
         name: parse_from_row_name(row),
-        description: parse_from_row_description(row),
+        description,
+        tags,
         created_at: parse_from_row_created_at(row),
         version: parse_from_row_version(row),
         platform_version: parse_from_row_platform_version(row),
@@ -219,8 +235,8 @@ fn parse_from_row_name(row: &Row) -> String {
     row.get("name")
 }
 
-fn parse_from_row_description(row: &Row) -> String {
-    row.get("description")
+fn parse_from_row_client_metadata(row: &Row) -> ClientMetadata {
+    ClientMetadata::from_db_string(row.get::<_, &str>("client_metadata"))
 }
 
 fn parse_from_row_created_at(row: &Row) -> DateTime<Utc> {
@@ -536,10 +552,24 @@ mod tests {
     use std::collections::BTreeSet;
     use uuid::Uuid;
 
-    /// Splits the provided columns string into individual columns.
+    /// Expands a selected column into the descriptor fields it populates.
+    ///
+    /// The `client_metadata` column is a single JSON column holding both
+    /// `description` and `tags`, so it maps to those two descriptor fields.
+    /// Every other column maps to a field of the same name. This lets a column
+    /// set be compared directly against the serialized descriptor field names.
+    fn column_to_descriptor_fields(column: String) -> Vec<String> {
+        match column.as_str() {
+            "client_metadata" => vec!["description".to_string(), "tags".to_string()],
+            _ => vec![column],
+        }
+    }
+
+    /// Splits the provided columns string into individual descriptor fields.
     fn split_columns(s: &str) -> Vec<String> {
         s.split(",")
             .map(|s| s.split(".").collect_vec()[1].trim().to_string())
+            .flat_map(column_to_descriptor_fields)
             .collect()
     }
 
@@ -583,7 +613,8 @@ mod tests {
         let all_descr = serde_json::to_value(ExtendedPipelineDescr {
             id: PipelineId(Uuid::from_u128(1)),
             name: "".to_string(),
-            description: "".to_string(),
+            description: Default::default(),
+            tags: Default::default(),
             created_at: Default::default(),
             version: Version(1),
             platform_version: "".to_string(),
@@ -638,7 +669,8 @@ mod tests {
         let monitoring_descr = serde_json::to_value(ExtendedPipelineDescrMonitoring {
             id: PipelineId(Uuid::from_u128(1)),
             name: "".to_string(),
-            description: "".to_string(),
+            description: Default::default(),
+            tags: Default::default(),
             created_at: Default::default(),
             version: Version(1),
             platform_version: "".to_string(),

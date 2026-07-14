@@ -2002,7 +2002,10 @@
 //! Fixed-point computations are useful if you want to repeat a query until
 //! its result does not change anymore. Then, a fixed-point is reached and
 //! the query processing terminates, yielding the result. SQL provides this
-//! mechanism through recursive common table expressions (CTEs).
+//! mechanism through recursive common table expressions (CTEs). DBSP supports
+//! both self and mutual recursion.
+//!
+//! ## Fixed-Point Computation with Self-Recursion
 //!
 //! A classical use case for a fixed-point computation is the [transitive closure
 //! of a graph](https://en.wikipedia.org/wiki/Transitive_closure#In_graph_theory).
@@ -2053,9 +2056,9 @@
 //!
 //!     let (mut circuit_handle, output_handle) = Runtime::init_circuit(1, move |root_circuit| {
 //!         let mut edges_data = ([
-//!             zset_set! { Tup3(0_usize, 1_usize, 1_usize), Tup3(1, 2, 1), Tup3(2, 3, 2), Tup3(3, 4, 2) },
+//!             zset_set! { Tup3(0, 1, 1), Tup3(1, 2, 1), Tup3(2, 3, 2), Tup3(3, 4, 2) },
 //!             zset! { Tup3(1, 2, 1) => -1 },
-//!         ] as [_; STEPS])
+//!         ] as [OrdZSet<Tup3<usize, usize, usize>>; STEPS])
 //!         .into_iter();
 //!
 //!         let edges = root_circuit.add_source(Generator::new(move || edges_data.next().unwrap()));
@@ -2116,7 +2119,7 @@
 //!                 Tup4(1, 3, 3, 2) => -1,
 //!                 Tup4(1, 4, 5, 3) => -1,
 //!             },
-//!         ] as [_; STEPS])
+//!         ] as [OrdZSet<Tup4<usize, usize, usize, usize>>; STEPS])
 //!             .into_iter();
 //!
 //!         closure.inspect(move |output| {
@@ -2179,7 +2182,8 @@
 //! #     indexed_zset,
 //! #     operator::{Generator, Min},
 //! #     utils::{Tup2, Tup3, Tup4},
-//! #     zset_set, Circuit, NestedCircuit, OrdIndexedZSet, RootCircuit, Stream, IndexedZSetReader, Runtime
+//! #     zset_set, Circuit, NestedCircuit, OrdZSet, OrdIndexedZSet, RootCircuit,
+//! #     Stream, IndexedZSetReader, Runtime
 //! # };
 //! #
 //! type Accumulator =
@@ -2190,9 +2194,9 @@
 //! #
 //! #     let (mut circuit_handle, output_handle) = Runtime::init_circuit(1, move |root_circuit| {
 //! #         let mut edges_data = ([
-//! #             zset_set! { Tup3(0_usize, 1_usize, 1_usize), Tup3(1, 2, 1), Tup3(2, 3, 2), Tup3(3, 4, 2) },
+//! #             zset_set! { Tup3(0, 1, 1), Tup3(1, 2, 1), Tup3(2, 3, 2), Tup3(3, 4, 2) },
 //! #             zset_set! { Tup3(4, 0, 3)}
-//! #         ] as [_; STEPS])
+//! #         ] as [OrdZSet<Tup3<usize, usize, usize>>; STEPS])
 //! #         .into_iter();
 //! #
 //! #         let edges = root_circuit.add_source(Generator::new(move || edges_data.next().unwrap()));
@@ -2282,6 +2286,14 @@
 //! recursive queries with aggregates are not guaranteed to converge to the
 //! optimum of the aggregation function (here, the minimum function),
 //! even though there exists a finite solution.
+//!
+//! ## Fixed-Point Computation with Mutual Recursion
+//!
+//! The examples on the transitive closure above demonstrate how to express
+//! self-recursive queries. DBSP also supports _mutually_-recursive queries.
+//! As this is a little bit more involved than what would fit in here, we defer
+//! the interested reader to the example given in `tutorial12` which
+//! demonstrates mutual recursion in the domain of static program analysis.
 //!
 //! # Next steps
 //!

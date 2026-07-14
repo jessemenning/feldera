@@ -49,6 +49,7 @@ impl CompilerTest {
             https_tls_key_path: None,
             private_ca_cert_path: None,
             pipeline_monitor_events_retention: 720,
+            disable_cluster_monitor_resources: false,
         };
         let compiler_config = CompilerConfig {
             sql_compiler_path:
@@ -132,6 +133,7 @@ impl CompilerTest {
                 PipelineDescr {
                     name: name.to_string(),
                     description: "not-used".to_string(),
+                    tags: vec![],
                     runtime_config: json!({}),
                     program_code: program_code.to_string(),
                     udf_rust: udf_rust.to_string(),

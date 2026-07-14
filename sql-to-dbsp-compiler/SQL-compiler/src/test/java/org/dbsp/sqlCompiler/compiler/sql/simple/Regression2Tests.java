@@ -41,28 +41,6 @@ public class Regression2Tests extends SqlIoTest {
     }
 
     @Test
-    public void issue5481() {
-        this.statementsFailingInCompilation("""
-                CREATE TABLE tbl(
-                str VARCHAR,
-                bin BINARY,
-                uuidd UUID,
-                arr VARCHAR ARRAY);
-                
-                CREATE MATERIALIZED VIEW v1 AS
-                SELECT str FROM tbl
-                EXCEPT ALL
-                SELECT arr[1] FROM tbl;""", "Not yet implemented: EXCEPT/MINUS ALL");
-    }
-
-    @Test
-    public void intersectAllTest() {
-        this.statementsFailingInCompilation("""
-                CREATE TABLE T(x INT);
-                CREATE VIEW V AS SELECT * FROM T INTERSECT ALL SELECT * FROM T;""", "Not yet implemented: INTERSECT ALL");
-    }
-
-    @Test
     public void issue5425() {
         this.statementsFailingInCompilation("""
                 CREATE TABLE  tbl(
@@ -605,7 +583,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void testBetween() {
-        this.qs("""
+        this.qst("""
                 SELECT 1 BETWEEN 2 AND 0;
                  r
                 ---
@@ -627,7 +605,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void testStdDevPop() {
-        this.qs("""
+        this.qst("""
                 WITH T(x) as (VALUES(CAST(NULL AS DECIMAL(5, 2)))) SELECT STDDEV_POP(x) FROM T;
                  r
                 ---
@@ -911,7 +889,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void issue5981() {
-        this.qs("""
+        this.qst("""
                 SELECT TO_HEX(x'48656c6c6f');
                  r
                 ---
@@ -980,19 +958,20 @@ public class Regression2Tests extends SqlIoTest {
         ccs.stepWeightOne("", """
                  g | max
                 ---------""");
-        ccs.stepWeightOne("INSERT INTO T VALUES ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5);", """
+        ccs.stepWeightOne("INSERT INTO T VALUES ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5), ('e', NULL);", """
                  g | max
                 ---------
                  a| 0
                  b| 1
                  c| 1
-                 d| 1""");
+                 d| 1
+                 e| 0""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 
     @Test
     public void testXxHash() {
-        this.qs("""
+        this.qst("""
                 SELECT XXHASH('abc', 2);
                  r
                 ---
@@ -1043,6 +1022,81 @@ public class Regression2Tests extends SqlIoTest {
     }
 
     @Test
+    public void issue6590() {
+        // MAX(CASE WHEN cond THEN 1 ELSE NULL END) — ELSE NULL variant
+        var ccs = this.getCCS("""
+                CREATE TABLE T(g VARCHAR, x INT);
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE NULL END) FROM T GROUP BY g;""");
+        // Validated on Postgres: NULL when no row satisfies cond, 1 otherwise.
+        ccs.stepWeightOne("", """
+                 g | max
+                ---------""");
+        ccs.stepWeightOne("""
+                    INSERT INTO T VALUES
+                        ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5), ('e', NULL);
+                    """, """
+                 g | max
+                ---------
+                 a| NULL
+                 b| 1
+                 c| 1
+                 d| 1
+                 e| NULL""");
+        ccs.visit(this.findLinear(ccs.compiler));
+    }
+
+    @Test
+    public void issue6590a() {
+        // MAX(CASE WHEN cond THEN 1 END) — no ELSE clause (equivalent to ELSE NULL)
+        var ccs = this.getCCS("""
+                CREATE TABLE T(g VARCHAR, x INT);
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 END) FROM T GROUP BY g;""");
+        // Validated on Postgres: NULL when no row satisfies cond, 1 otherwise.
+        ccs.stepWeightOne("", """
+                 g | max
+                ---------""");
+        ccs.stepWeightOne("""
+                    INSERT INTO T VALUES
+                        ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5),
+                        ('e', NULL);
+                    """, """
+                 g | max
+                ---------
+                 a| NULL
+                 b| 1
+                 c| 1
+                 d| 1
+                 e| NULL""");
+        ccs.visit(this.findLinear(ccs.compiler));
+    }
+
+    @Test
+    public void issue6590b() {
+        // MAX(CASE...) mixed with SUM in the same aggregate.
+        // Exercises the post-project index path for untransformed aggregate calls.
+        var ccs = this.getCCS("""
+                CREATE TABLE T(g VARCHAR, x INT);
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE 0 END), SUM(x) FROM T GROUP BY g;""");
+        // Validated on Postgres
+        ccs.stepWeightOne("", """
+                 g | max | sum
+                --------------""");
+        ccs.stepWeightOne("""
+                    INSERT INTO T VALUES
+                        ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5),
+                        ('e', NULL);
+                    """, """
+                 g | max | sum
+                --------------
+                 a| 0| 1
+                 b| 1| 3
+                 c| 1| 8
+                 d| 1| 6
+                 e| 0| NULL""");
+        ccs.visit(this.findLinear(ccs.compiler));
+    }
+
+    @Test
     public void calciteIssue7501() {
         this.getCC("""
                 CREATE TABLE D(sk_cid INT, dt DATE, dm_sym VARCHAR, fhd DATE);
@@ -1061,7 +1115,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void testFiniteOrNull() {
-        this.qs("""
+        this.qst("""
                 SELECT FINITE_OR_NULL(1e0);
                  r
                 ---
@@ -1100,7 +1154,7 @@ public class Regression2Tests extends SqlIoTest {
                  r
                 ---
                 NULL""");
-        this.qs("""
+        this.qst("""
                SELECT INTERVAL '+1' HOURS / 5;
                 r
                ---
@@ -1687,7 +1741,7 @@ public class Regression2Tests extends SqlIoTest {
     @Test
     public void issue4146a() {
         // Validated on postgres
-        this.qs("""
+        this.qst("""
                 SELECT COALESCE(NULL, TIMESTAMP WITH TIME ZONE '2020-01-01 10:10:10 America/New_York');
                  r
                 ---
@@ -1776,6 +1830,6 @@ public class Regression2Tests extends SqlIoTest {
                  "Operation < between TIMESTAMP and TIMESTAMP WITH TIME ZONE not supported");
         this.statementsFailingInCompilation(
                 "CREATE VIEW V AS SELECT TIMESTAMP '2020-01-01 10:00:00' - TIMESTAMP WITH TIME ZONE '2020-01-01 10:00:00 UTC'",
-                "Cannot apply '-' to arguments of type '<TIMESTAMP(0)> - <TIMESTAMP_TZ(0)>'");
+                "Cannot apply '-' to arguments of type '<TIMESTAMP(0)> - <TIMESTAMP WITH TIME ZONE(0)>'");
     }
 }

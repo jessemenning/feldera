@@ -7,12 +7,15 @@ use crate::api::endpoints::pipeline_management::{
 };
 use crate::api::error::ApiError;
 use crate::db::error::DBError;
-use crate::db::types::pipeline::{ExtendedPipelineDescr, PipelineId};
+use crate::db::types::pipeline::{
+    ClientMetadata, ExtendedPipelineDescr, PatchClientMetadata, PipelineId,
+};
 use crate::db::types::program::{CompilationProfile, ProgramConfig, ProgramError, ProgramStatus};
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::utils::{
     validate_program_config, validate_program_info, validate_runtime_config,
+    PATTERN_KUBERNETES_LABEL_VALUE, PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION,
 };
 use crate::db::types::version::Version;
 use crate::runner::error::RunnerError;
@@ -32,6 +35,7 @@ fn extended_pipeline_1() -> ExtendedPipelineDescr {
         id: PipelineId(uuid!("67e55044-10b1-426f-9247-bb680e5fe0c8")),
         name: "example1".to_string(),
         description: "Description of the pipeline example1".to_string(),
+        tags: vec![],
         created_at: Default::default(),
         version: Version(4),
         platform_version: "v0".to_string(),
@@ -48,6 +52,7 @@ fn extended_pipeline_1() -> ExtendedPipelineDescr {
             profile: Some(CompilationProfile::Optimized),
             cache: true,
             runtime_version: None,
+            use_platform_compiler: false,
         })
         .unwrap(),
         program_version: Version(2),
@@ -90,6 +95,7 @@ fn extended_pipeline_2() -> ExtendedPipelineDescr {
         id: PipelineId(uuid!("67e55044-10b1-426f-9247-bb680e5fe0c9")),
         name: "example2".to_string(),
         description: "Description of the pipeline example2".to_string(),
+        tags: vec![],
         created_at: Default::default(),
         version: Version(1),
         platform_version: "v0".to_string(),
@@ -136,6 +142,7 @@ fn extended_pipeline_2() -> ExtendedPipelineDescr {
             profile: Some(CompilationProfile::Unoptimized),
             cache: true,
             runtime_version: None,
+            use_platform_compiler: false,
         })
         .unwrap(),
         program_version: Version(1),
@@ -179,7 +186,7 @@ fn pipeline_info_internal_to_external(pipeline: PipelineInfoInternal) -> Pipelin
     PipelineInfo {
         id: pipeline.id,
         name: pipeline.name,
-        description: pipeline.description,
+        client_metadata: pipeline.client_metadata,
         created_at: pipeline.created_at,
         version: pipeline.version,
         platform_version: pipeline.platform_version,
@@ -198,7 +205,8 @@ fn pipeline_info_internal_to_external(pipeline: PipelineInfoInternal) -> Pipelin
             let program_info = validate_program_info(&v)
                 .expect("example must have a valid program_info if specified");
             PartialProgramInfo {
-                schema: program_info.schema,
+                schema: serde_json::from_value(program_info.schema)
+                    .expect("example should have a valid program_info.schema if specified"),
                 udf_stubs: program_info.udf_stubs,
                 input_connectors: program_info.input_connectors,
                 output_connectors: program_info.output_connectors,
@@ -237,7 +245,7 @@ fn pipeline_selected_info_internal_to_external(
     PipelineSelectedInfo {
         id: pipeline.id,
         name: pipeline.name,
-        description: pipeline.description,
+        client_metadata: pipeline.client_metadata,
         created_at: pipeline.created_at,
         version: pipeline.version,
         platform_version: pipeline.platform_version,
@@ -259,7 +267,8 @@ fn pipeline_selected_info_internal_to_external(
                 let program_info = validate_program_info(&v)
                     .expect("example must have a valid program_info if specified");
                 PartialProgramInfo {
-                    schema: program_info.schema,
+                    schema: serde_json::from_value(program_info.schema)
+                        .expect("example should have a valid program_info.schema if specified"),
                     udf_stubs: program_info.udf_stubs,
                     input_connectors: program_info.input_connectors,
                     output_connectors: program_info.output_connectors,
@@ -319,7 +328,10 @@ pub(crate) fn list_pipeline_selected_info() -> Vec<PipelineSelectedInfo> {
 pub(crate) fn pipeline_post_put() -> PostPutPipeline {
     PostPutPipeline {
         name: "example1".to_string(),
-        description: Some("Description of the pipeline example1".to_string()),
+        client_metadata: ClientMetadata {
+            description: "Description of the pipeline example1".to_string(),
+            ..ClientMetadata::default()
+        },
         runtime_config: Some(RuntimeConfig {
             workers: 16,
             tracing_endpoint_jaeger: "".to_string(),
@@ -332,6 +344,7 @@ pub(crate) fn pipeline_post_put() -> PostPutPipeline {
             profile: Some(CompilationProfile::Optimized),
             cache: true,
             runtime_version: None,
+            use_platform_compiler: false,
         }),
     }
 }
@@ -340,7 +353,10 @@ pub(crate) fn pipeline_post_put() -> PostPutPipeline {
 pub(crate) fn patch_pipeline() -> PatchPipeline {
     PatchPipeline {
         name: None,
-        description: Some("This is a new description".to_string()),
+        client_metadata: PatchClientMetadata {
+            description: Some("This is a new description".to_string()),
+            ..PatchClientMetadata::default()
+        },
         runtime_config: None,
         program_code: Some("CREATE TABLE table3 ( col3 INT );".to_string()),
         udf_rust: None,
@@ -356,9 +372,11 @@ pub(crate) fn error_duplicate_name() -> ErrorResponse {
     ErrorResponse::from_error_nolog(&DBError::DuplicateName)
 }
 
-pub(crate) fn error_name_does_not_match_pattern() -> ErrorResponse {
+pub(crate) fn error_pipeline_name_does_not_match_pattern() -> ErrorResponse {
     ErrorResponse::from_error_nolog(&DBError::NameDoesNotMatchPattern {
         name: "name-with-invalid-char-#".to_string(),
+        pattern: PATTERN_KUBERNETES_LABEL_VALUE.to_string(),
+        pattern_description: PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION.to_string(),
     })
 }
 

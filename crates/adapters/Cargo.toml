@@ -25,9 +25,19 @@ default = [
     "with-redis",
     "with-nats",
     "with-postgres-cdc",
+    "with-dynamodb",
+    "with-solace",
 ]
 with-kafka = ["rdkafka"]
-with-deltalake = ["deltalake", "deltalake-catalog-unity"]
+# `parquet/async` + `parquet/object_store` serve only the deletion-vector
+# reader (`integrated/delta_table/deletion_vector.rs`).
+with-deltalake = [
+    "deltalake",
+    "deltalake-catalog-unity",
+    "roaring",
+    "parquet/async",
+    "parquet/object_store",
+]
 with-iceberg = ["feldera-iceberg"]
 with-pubsub = ["google-cloud-pubsub", "google-cloud-gax"]
 with-avro = [
@@ -35,9 +45,16 @@ with-avro = [
     "schema_registry_converter",
     "feldera-adapterlib/with-avro",
 ]
+with-dynamodb = [
+    "aws-sdk-dynamodb",
+    "serde_dynamo",
+    "feldera-adapterlib/with-dynamodb",
+]
 with-nexmark = ["dbsp_nexmark"]
 with-redis = ["redis", "r2d2"]
 with-nats = []
+# Solace Platform SMF input/output. Requires the Solace C SDK on the build host.
+with-solace = ["dep:solace-rs"]
 # Run delta table tests against an S3 bucket.  Requires S3 authentication key
 # to be provided via an environment variable.
 delta-s3-test = []
@@ -51,9 +68,13 @@ feldera-enterprise = []
 iceberg-tests-fs = []
 iceberg-tests-glue = []
 iceberg-tests-rest = []
+iceberg-tests-s3tables = []
 fips = ["rustls/fips"]
 bench-mode = []
 with-postgres-cdc = ["etl", "etl-config", "etl-postgres"]
+# jemalloc heap-profiling endpoint (/heap_profile). Linux-only dep; on other
+# targets the feature is a no-op.
+with-heap-profiling = ["dep:jemalloc_pprof"]
 
 [dependencies]
 feldera-types = { workspace = true }
@@ -70,6 +91,7 @@ awc = { workspace = true, features = [
     "rustls-0_23-webpki-roots",
 ] }
 async-nats = { workspace = true }
+solace-rs = { git = "https://github.com/jessemenning/solace-rs", rev = "2f7c899", features = ["async"], optional = true }
 async-stream = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
 bytestring = "1.4.0"
@@ -78,6 +100,7 @@ crossbeam = { workspace = true }
 dbsp = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
+serde_dynamo = { workspace = true, optional = true }
 erased-serde = { workspace = true }
 serde_yaml = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -91,6 +114,7 @@ rdkafka = { workspace = true, features = [
     "libz",
 ], optional = true }
 aws-config = { workspace = true }
+aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true }
 aws-types = { workspace = true }
 actix = { workspace = true }
@@ -202,6 +226,7 @@ sentry = { workspace = true }
 zip = { workspace = true }
 smallvec = { workspace = true }
 delta_kernel = { workspace = true }
+roaring = { workspace = true, optional = true }
 flate2 = { workspace = true }
 etl = { workspace = true, optional = true }
 etl-config = { workspace = true, optional = true }
@@ -211,7 +236,12 @@ etl-postgres = { workspace = true, optional = true }
 ignored = ["num-traits"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-jemalloc_pprof = { workspace = true, features = ["symbolize"] }
+# Optional so the SQL test fixture (sql-to-dbsp-compiler/temp), which builds
+# adapters with default-features = false, drops the jemalloc/tikv-jemalloc-sys
+# C-build subtree. That subtree has a non-deterministic build fingerprint that
+# made cargo recompile it on every test invocation. Production pipelines build
+# adapters with default features, so they keep heap profiling.
+jemalloc_pprof = { workspace = true, features = ["symbolize"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

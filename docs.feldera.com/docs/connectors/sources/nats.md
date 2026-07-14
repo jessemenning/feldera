@@ -6,12 +6,6 @@ with the `nats_input` connector.
 The NATS input connector supports exactly-once [fault
 tolerance](/pipelines/fault-tolerance) using JetStream's ordered pull consumer.
 
-:::warning
-
-NATS support is still experimental, and it may be substantially modified in the future.
-
-:::
-
 ## How it works
 
 The NATS input connector uses JetStream's **ordered pull consumer**, which provides:
@@ -149,7 +143,7 @@ Before using the NATS input connector, you need a NATS server with JetStream ena
 The quickest way to start experimenting with Feldera and NATS is to use Docker Compose:
 
 ```bash
-curl -L https://raw.githubusercontent.com/feldera/feldera/main/deploy/docker-compose.yml -o docker-compose.yml
+curl -L 'https://raw.githubusercontent.com/feldera/feldera/main/deploy/docker-compose.yml' -o docker-compose.yml
 docker compose --profile nats up
 ```
 

@@ -33,6 +33,7 @@ import org.dbsp.sqlCompiler.compiler.backend.MerkleOuter;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.CanonicalForm;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.EliminateDump;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.SimplifyConditionals;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.expandCasts.ExpandCasts;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.ExpandWriteLog;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.ImplementStatics;
@@ -55,7 +56,7 @@ public class CircuitOptimizer extends Passes {
         super("Optimizer", compiler);
         this.createOptimizer();
     }
-    
+
     static class StopOnError extends CircuitVisitor {
         public StopOnError(DBSPCompiler compiler) {
             super(compiler);
@@ -125,6 +126,8 @@ public class CircuitOptimizer extends Passes {
         this.add(new OptimizeWithGraph(compiler, g -> new CloneOperatorsWithFanout(compiler, g)));
         this.add(new LinearPostprocessRetainKeys(compiler));
         this.add(new ExpandIndexedInputs(compiler));
+        this.add(new Conditional(compiler, new InsertWeightValidation(compiler),
+                this.compiler.metadata::enforcePositiveInputs));
         this.add(new OptimizeWithGraph(compiler, g -> new FilterJoinVisitor(compiler, g)));
         this.add(new DeadCode(compiler, true));
         this.add(new Simplify(compiler).circuitRewriter(true));
@@ -153,6 +156,7 @@ public class CircuitOptimizer extends Passes {
         this.add(new OptimizeWithGraph(compiler, g -> new ChainVisitor(compiler, g)));
         this.add(new ImplementChains(compiler));
         this.add(new ExpandCasts(compiler));
+        this.add(new CircuitRewriter(compiler, new SimplifyConditionals(compiler), false));
         this.add(new Simplify(compiler).getCircuitRewriter(true));
         this.add(new ImplementJoins(compiler));
         this.add(new RemoveViewOperators(compiler, true));

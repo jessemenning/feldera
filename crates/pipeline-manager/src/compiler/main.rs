@@ -20,7 +20,7 @@ use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use actix_files::NamedFile;
 use actix_web::{get, post, web, HttpRequest, HttpResponse, HttpServer, Responder};
-use futures_util::{join, StreamExt};
+use futures_util::StreamExt;
 use std::net::TcpListener;
 use std::path::Path;
 use std::str::FromStr;
@@ -577,6 +577,7 @@ pub async fn compiler_precompile(
         profile: None, // The pre-compilation will use the compiler configuration default profile
         cache: false,
         runtime_version: None,
+        use_platform_compiler: false,
     };
     let program_config = serde_json::to_value(&program_config).map_err(|e| {
         CommonError::json_serialization_error(
@@ -685,6 +686,7 @@ pub async fn compiler_main(
     db: Arc<Mutex<StoragePostgres>>,
     worker_id: usize,
     total_workers: usize,
+    allow_exit_upon_target_cleared: bool,
 ) -> Result<(), ManagerError> {
     // All threads will operate in the same working directory.
     // This must be created in advance such that there is no
@@ -705,6 +707,7 @@ pub async fn compiler_main(
         common_config.clone(),
         config.clone(),
         db.clone(),
+        allow_exit_upon_target_cleared,
     ));
 
     // Spawn HTTP server thread
@@ -758,9 +761,16 @@ pub async fn compiler_main(
     );
 
     // All threads should run indefinitely
-    let _ = join!(sql_task, rust_task, http_server);
-    error!("Compiler task threads all exited unexpectedly");
-    Ok(())
+    let error = tokio::select! {
+        _ = sql_task => "Compiler SQL task ended prematurely",
+        _ = rust_task => "Compiler Rust task ended prematurely",
+        _ = http_server => "Compiler HTTP(S) server task ended prematurely",
+    };
+    error!("{error}");
+    error!("Returning compiler thread");
+    Err(ManagerError::from(CompilerError::TaskFailed {
+        error: error.to_string(),
+    }))
 }
 
 #[cfg(test)]

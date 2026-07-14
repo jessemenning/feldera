@@ -311,9 +311,21 @@ pub enum PipelineAction {
         /// and is still in development. Use for testing purposes only.
         #[arg(long, short = 'r', env = "FELDERA_RUNTIME_VERSION")]
         runtime_version: Option<String>,
+        /// Whether to use the SQL compiler from the runtime or the platform.
+        ///
+        /// This should usually be false, which is the default.  It is only meaningful
+        /// when the runtime version is set.
+        #[arg(long, env = "FELDERA_USE_PLATFORM_COMPILER", default_value_t = false)]
+        use_platform_compiler: bool,
         /// The compilation profile to use.
         #[arg(default_value = "optimized")]
         profile: CompilationProfile,
+        /// A tag to assign to the pipeline.
+        ///
+        /// Repeat the flag to assign several tags, e.g. `--tag prod --tag team-billing`.
+        /// Tags are deduplicated and stored in sorted order.
+        #[arg(long = "tag", value_hint = ValueHint::Other)]
+        tags: Vec<String>,
         /// Read the program code from stdin.
         ///
         /// EXAMPLES:
@@ -329,6 +341,15 @@ pub enum PipelineAction {
             conflicts_with = "program_path"
         )]
         stdin: bool,
+    },
+    /// Copy a pipeline's program and configuration into a new pipeline.
+    #[clap(aliases = &["clone"])]
+    Copy {
+        /// The name of the pipeline to copy from.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        source: String,
+        /// The name of the new pipeline.
+        destination: String,
     },
     /// Start a pipeline.
     ///
@@ -508,6 +529,31 @@ pub enum PipelineAction {
         key: RuntimeConfigKey,
         /// The new value for the configuration.
         value: String,
+    },
+    /// Retrieve the tags of a pipeline.
+    ///
+    /// Prints the tags as a comma-separated list, in sorted order.
+    Tags {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Replace the tags of a pipeline.
+    ///
+    /// Takes the new tags as a single comma-separated list, replacing whatever the
+    /// pipeline carried before; pass an empty list to clear all tags. To append
+    /// instead, include the current tags, e.g.
+    /// `fda set-tags my-pipeline $(fda tags my-pipeline),d,e`.
+    ///
+    /// A tag containing spaces must be quoted, e.g. `"team billing",prod`. Each tag
+    /// may be named alone; its color is filled in from the same tag used elsewhere.
+    SetTags {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+        /// The new tags, as a comma-separated list. Omit to clear all tags.
+        #[arg(default_value = "")]
+        tags: String,
     },
     /// Recompile a pipeline with the Feldera runtime version included in the
     /// currently installed Feldera platform.
@@ -979,9 +1025,21 @@ pub enum ProgramAction {
         /// If not specified, the default version will be used.
         #[arg(verbatim_doc_comment, short = 'r', long)]
         runtime_version: Option<String>,
+        /// Whether to use the SQL compiler from the runtime or the platform.
+        ///
+        /// This should usually be false, which is the default.  It is only meaningful
+        /// when the runtime version is set.
+        #[arg(long, env = "FELDERA_USE_PLATFORM_COMPILER", default_value_t = false)]
+        use_platform_compiler: bool,
     },
     /// Retrieve the compilation status of the program.
     Status {
+        /// The name of the pipeline.
+        #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
+        name: String,
+    },
+    /// Retrieve program compilation errors and warnings.
+    Errors {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
         name: String,
@@ -999,7 +1057,7 @@ pub enum ConnectorAction {
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::Cli;
+    use crate::cli::{Cli, Commands, PipelineAction, ProgramAction};
     use clap::Parser;
 
     /// [clap] will panic inside `try_parse` if it finds anything invalid in the
@@ -1008,5 +1066,34 @@ mod tests {
     #[test]
     fn basic_validation() {
         let _ = Cli::try_parse();
+    }
+
+    #[test]
+    fn parse_program_errors_command() {
+        let cli = Cli::try_parse_from(["fda", "program", "errors", "pipeline"])
+            .expect("program errors command should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Pipeline(PipelineAction::Program {
+                action: ProgramAction::Errors { name }
+            }) if name == "pipeline"
+        ));
+    }
+
+    #[test]
+    fn parse_pipeline_copy_command_and_alias() {
+        for command in ["copy", "clone"] {
+            let cli = Cli::try_parse_from(["fda", command, "source", "destination"])
+                .expect("copy command should parse");
+
+            assert!(matches!(
+                cli.command,
+                Commands::Pipeline(PipelineAction::Copy {
+                    source,
+                    destination
+                }) if source == "source" && destination == "destination"
+            ));
+        }
     }
 }

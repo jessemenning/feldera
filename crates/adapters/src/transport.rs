@@ -31,8 +31,10 @@ use http::HttpInputEndpoint;
 use pubsub::PubSubInputEndpoint;
 
 pub mod adhoc;
+mod empty;
 mod file;
 pub mod http;
+mod null;
 
 pub mod url;
 
@@ -48,6 +50,9 @@ pub(crate) mod nats;
 #[cfg(feature = "with-nexmark")]
 mod nexmark;
 
+#[cfg(feature = "with-solace")]
+pub(crate) mod solace;
+
 #[cfg(feature = "with-pubsub")]
 mod pubsub;
 
@@ -59,14 +64,19 @@ use feldera_types::config::TransportConfig;
 #[cfg(feature = "with-redis")]
 use redis::output::RedisOutputEndpoint;
 
+use crate::transport::empty::EmptyInputEndpoint;
 #[cfg(test)]
 pub use crate::transport::file::set_barrier;
 use crate::transport::file::{FileInputEndpoint, FileOutputEndpoint};
 #[cfg(feature = "with-kafka")]
 use crate::transport::kafka::{KafkaFtInputEndpoint, KafkaFtOutputEndpoint, KafkaOutputEndpoint};
+use crate::transport::null::NullOutputEndpoint;
 
 #[cfg(feature = "with-nats")]
 use crate::transport::nats::NatsInputEndpoint;
+
+#[cfg(feature = "with-solace")]
+use crate::transport::solace::{SolaceInputEndpoint, SolaceOutputEndpoint};
 
 #[cfg(feature = "with-nexmark")]
 use crate::transport::nexmark::NexmarkEndpoint;
@@ -98,6 +108,10 @@ pub fn input_transport_config_to_endpoint(
         TransportConfig::NatsInput(config) => Box::new(NatsInputEndpoint::new(config)?),
         #[cfg(not(feature = "with-nats"))]
         TransportConfig::NatsInput(_) => return Ok(None),
+        #[cfg(feature = "with-solace")]
+        TransportConfig::SolaceInput(config) => Box::new(SolaceInputEndpoint::new(config)),
+        #[cfg(not(feature = "with-solace"))]
+        TransportConfig::SolaceInput(_) => return Ok(None),
         #[cfg(feature = "with-pubsub")]
         TransportConfig::PubSubInput(config) => Box::new(PubSubInputEndpoint::new(config.clone())?),
         #[cfg(not(feature = "with-pubsub"))]
@@ -112,16 +126,20 @@ pub fn input_transport_config_to_endpoint(
         TransportConfig::HttpInput(config) => Box::new(HttpInputEndpoint::new(config)),
         TransportConfig::AdHocInput(config) => Box::new(AdHocInputEndpoint::new(config)),
         TransportConfig::ClockInput(config) => Box::new(ClockEndpoint::new(config)?),
+        TransportConfig::EmptyInput => Box::new(EmptyInputEndpoint),
         TransportConfig::FileOutput(_)
         | TransportConfig::KafkaOutput(_)
         | TransportConfig::DeltaTableInput(_)
         | TransportConfig::DeltaTableOutput(_)
+        | TransportConfig::DynamoDBOutput(_)
         | TransportConfig::PostgresInput(_)
         | TransportConfig::PostgresCdcInput(_)
         | TransportConfig::PostgresOutput(_)
         | TransportConfig::HttpOutput(_)
         | TransportConfig::RedisOutput(_)
-        | TransportConfig::IcebergInput(_) => return Ok(None),
+        | TransportConfig::IcebergInput(_)
+        | TransportConfig::NullOutput
+        | TransportConfig::SolaceOutput(_) => return Ok(None),
     };
     Ok(Some(endpoint))
 }
@@ -156,6 +174,11 @@ pub fn output_transport_config_to_endpoint(
         #[cfg(feature = "with-redis")]
         TransportConfig::RedisOutput(config) => {
             Ok(Some(Box::new(RedisOutputEndpoint::new(config)?)))
+        }
+        TransportConfig::NullOutput => Ok(Some(Box::new(NullOutputEndpoint))),
+        #[cfg(feature = "with-solace")]
+        TransportConfig::SolaceOutput(config) => {
+            Ok(Some(Box::new(SolaceOutputEndpoint::new(config))))
         }
         _ => Ok(None),
     }

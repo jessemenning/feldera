@@ -36,6 +36,7 @@ import {
   listClusterEvents,
   listPipelineEvents,
   listPipelines,
+  type PatchPipeline,
   type PipelineSelectedInfo,
   type PostPutPipeline,
   type ProgramError,
@@ -74,7 +75,7 @@ import JSONbig from 'true-json-bigint'
 import { singleton } from '$lib/functions/common/array'
 import { tuple } from '$lib/functions/common/tuple'
 import { felderaEndpoint } from '$lib/functions/configs/felderaEndpoint'
-import { applyAuthToRequest, handleAuthResponse } from '$lib/services/auth'
+import { applyAuthToRequest, getAuthorizationHeaders, handleAuthResponse } from '$lib/services/auth'
 import { createClient } from '$lib/services/manager/client'
 
 const unauthenticatedClient = createClient({
@@ -242,7 +243,8 @@ const toPipelineThumb = (
   pipeline: Omit<ExtendedPipelineDescr, 'program_code' | 'program_error' | 'udf_rust' | 'udf_toml'>
 ) => ({
   name: pipeline.name,
-  description: pipeline.description,
+  description: pipeline.description ?? '',
+  tags: pipeline.tags ?? [],
   storageStatus: pipeline.storage_status,
   ...consolidatePipelineStatus(
     pipeline.program_status,
@@ -273,6 +275,7 @@ const toPipeline = <
 ) => ({
   name: pipeline.name,
   description: pipeline.description ?? '',
+  tags: pipeline.tags ?? [],
   runtimeConfig: pipeline.runtime_config,
   programConfig: pipeline.program_config!,
   programCode: pipeline.program_code ?? '',
@@ -293,7 +296,8 @@ const toExtendedPipeline = ({
   deploymentStatus: deployment_status,
   deploymentStatusSince: pipeline.deployment_status_since,
   programStatusSince: pipeline.program_status_since,
-  description: pipeline.description,
+  description: pipeline.description ?? '',
+  tags: pipeline.tags ?? [],
   id: pipeline.id,
   name: pipeline.name,
   programCode: pipeline.program_code ?? '',
@@ -327,6 +331,7 @@ const toExtendedPipeline = ({
 const fromPipeline = <T extends Partial<Pipeline>>(pipeline: T) => ({
   name: pipeline?.name,
   description: pipeline?.description,
+  tags: pipeline?.tags,
   runtime_config: pipeline?.runtimeConfig,
   program_config: pipeline?.programConfig,
   program_code: pipeline?.programCode,
@@ -841,20 +846,25 @@ const getAuthenticatedFetch = (options?: FetchOptions): typeof globalThis.fetch 
 }
 
 function formatValue(details: unknown): string {
+  if (!details) {
+    return ''
+  }
   if (typeof details === 'string') {
     return details
   }
 
-  // Pretty‑print objects, arrays, numbers, booleans, etc.
+  // Pretty‑print objects, arrays, numbers, booleans, etc., dropping any
+  // `error` field that merely duplicates the message shown above it.
   try {
-    return JSON.stringify(details, null, 2)
+    const json = JSON.stringify(details, (key, value) => (key === 'error' ? undefined : value), 2)
+    return json === '{}' ? '' : json
   } catch {
     return String(details)
   }
 }
 
 const apiErrorText = (error: ErrorResponse) => {
-  return `${error.message}${error.details ? `\n${formatValue(error.details)}` : ''}`
+  return `${error.message}\n${formatValue(error.details)}`
 }
 
 const streamingFetch = (
@@ -949,14 +959,118 @@ export const pipelineLogsStream = async (
   )
 }
 
-export const adHocQuery = async (pipelineName: string, query: string, options?: FetchOptions) => {
-  return streamResponse(
-    streamingFetch(
-      getAuthenticatedFetch(options),
-      `${felderaEndpoint}/v0/pipelines/${pipelineName}/query?sql=${encodeURIComponent(query)}&format=json`,
-      {}
-    )
-  )
+const httpToWs = (endpoint: string) => endpoint.replace(/^http(s?):\/\//, 'ws$1://')
+
+// base64url (no padding) — the only encoding whose alphabet is a valid
+// WebSocket subprotocol token, so it can carry the bearer token/tenant.
+const base64UrlEncode = (value: string): string =>
+  btoa(String.fromCharCode(...new TextEncoder().encode(value)))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '')
+
+// Extract a human-readable message from an ad-hoc error frame, which the
+// server sends as a serialized `PipelineError` (JSON) over the websocket.
+const adhocErrorText = (raw: string): string => {
+  try {
+    const body = JSON.parse(raw)
+    if (body && typeof body === 'object') {
+      if ('message' in body) {
+        return apiErrorText(body as ErrorResponse)
+      }
+      if ('error' in body && typeof body.error === 'string') {
+        return body.error
+      }
+    }
+  } catch {
+    // Not JSON — fall through to the raw text.
+  }
+  return raw
+}
+
+/**
+ * Runs an ad-hoc query over a WebSocket and returns its Arrow IPC result as a
+ * byte stream (or an `Error` if the socket cannot be created).
+ *
+ * The WebSocket transport carries the result as binary frames and reports a
+ * query error as a single text frame followed by an error close; that text
+ * frame surfaces as a stream error, so the caller's existing arrow-decode
+ * error handling reports it — without having to encode the error into the
+ * result stream itself.
+ *
+ * Browsers cannot set the `Authorization` header on a WebSocket handshake, so
+ * the bearer token and selected tenant are passed as `feldera-bearer.*` /
+ * `feldera-tenant.*` subprotocols; the manager promotes them back to headers
+ * (see `promote_websocket_subprotocol_auth` in the pipeline manager).
+ */
+export const adHocQuery = async (pipelineName: string, query: string) => {
+  const url = `${httpToWs(felderaEndpoint)}/v0/pipelines/${pipelineName}/query`
+
+  const authHeaders = await getAuthorizationHeaders()
+  const protocols: string[] = []
+  const token = authHeaders['Authorization']?.replace(/^Bearer /, '')
+  if (token) {
+    protocols.push(`feldera-bearer.${base64UrlEncode(token)}`)
+    const tenant = authHeaders['Feldera-Tenant']
+    if (tenant) {
+      protocols.push(`feldera-tenant.${base64UrlEncode(tenant)}`)
+    }
+  }
+
+  let ws: WebSocket
+  try {
+    ws = new WebSocket(url, protocols)
+  } catch (e) {
+    return e instanceof Error ? e : new Error(String(e))
+  }
+  ws.binaryType = 'arraybuffer'
+
+  // Errors are reported out of band rather than via `controller.error`:
+  // apache-arrow's ReadableStream adapter swallows a stream error (it cancels
+  // and ends the stream instead of rethrowing), so the byte stream is always
+  // closed cleanly and the caller inspects `error()` after draining it.
+  let streamError: Error | undefined
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let settled = false
+      const close = () => {
+        if (settled) {
+          return
+        }
+        settled = true
+        controller.close()
+      }
+      ws.onopen = () => ws.send(JSON.stringify({ sql: query, format: 'arrow_ipc' }))
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          // Query error: a text frame carrying the message, then a close.
+          streamError ??= new Error(adhocErrorText(event.data))
+          close()
+          ws.close()
+          return
+        }
+        if (!settled) {
+          controller.enqueue(new Uint8Array(event.data as ArrayBuffer))
+        }
+      }
+      ws.onclose = (event) => {
+        // An abnormal close with no preceding error frame (e.g. a failed
+        // handshake or a dropped connection) still has to surface something.
+        if (streamError === undefined && event.code !== 1000 && event.code !== 1005) {
+          streamError = new Error(
+            event.reason || `Connection to the pipeline closed (code ${event.code})`
+          )
+        }
+        close()
+      }
+    },
+    cancel() {
+      ws.close()
+    }
+  })
+
+  return { stream, cancel: () => ws.close(), error: () => streamError }
 }
 
 export const pipelineTimeSeriesStream = async (pipelineName: string, options?: FetchOptions) => {

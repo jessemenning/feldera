@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # These two environment variables are used to make openssl-sys pick
 # up libssl-dev and statically link it. Without it, our build defaults
 # to building a vendored version of OpenSSL.
-RUN apt update --fix-missing && apt install \
+RUN apt update --fix-missing && apt -y dist-upgrade && apt install \
   # bindgen needs this (at least the dec crate uses bindgen)
   libclang-dev \
   # pkg-config is required for cargo to find libssl
@@ -70,10 +70,10 @@ COPY --chown=ubuntu crates/pipeline-manager/demos/sql feldera/demos/sql
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.1
 # The download URL for mold uses x86_64/aarch64 whereas dpkg --print-architecture says amd64/arm64
 RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
-  curl -LO https://github.com/rui314/mold/releases/download/v2.40.1/mold-2.40.1-$arch-linux.tar.gz \
-  && tar -xzvf mold-2.40.1-$arch-linux.tar.gz \
-  && mv mold-2.40.1-$arch-linux $HOME/mold \
-  && rm mold-2.40.1-$arch-linux.tar.gz
+  curl -LO https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-$arch-linux.tar.gz \
+  && tar -xzvf mold-2.40.4-$arch-linux.tar.gz \
+  && mv mold-2.40.4-$arch-linux $HOME/mold \
+  && rm mold-2.40.4-$arch-linux.tar.gz
 ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
 
@@ -96,7 +96,23 @@ RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/rele
 #
 FROM base AS release
 
-# Run the precompile phase to speed up Rust compilations during deployment
-RUN ./feldera/build/pipeline-manager --bind-address=0.0.0.0 --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock --dbsp-override-path=$HOME/feldera --precompile
+# Pre-warm the Rust compilation cache so first user pipeline compiles fast.
+# CARGO_BUILD_JOBS=2 caps parallel rustc workers to ~4 GB RAM.
+# The heartbeat loop prints a timestamp every 30 s so CI logs show the step
+# is still alive (cargo runs as a subprocess; its output is not forwarded).
+RUN bash -c ' \
+    CARGO_BUILD_JOBS=2 \
+    ./feldera/build/pipeline-manager \
+      --bind-address=0.0.0.0 \
+      --sql-compiler-path=$HOME/feldera/build/sql2dbsp-jar-with-dependencies.jar \
+      --compilation-cargo-lock-path=$HOME/feldera/Cargo.lock \
+      --dbsp-override-path=$HOME/feldera \
+      --precompile & \
+    PID=$! ; \
+    while kill -0 $PID 2>/dev/null; do \
+        echo "[precompile] still running at $(date -u +%T) UTC" ; \
+        sleep 30 ; \
+    done ; \
+    wait $PID'
 ENV BANNER_ADDR=localhost
 ENTRYPOINT ["./feldera/build/pipeline-manager", "--bind-address=0.0.0.0", "--sql-compiler-path=/home/ubuntu/feldera/build/sql2dbsp-jar-with-dependencies.jar", "--compilation-cargo-lock-path=/home/ubuntu/feldera/Cargo.lock", "--dbsp-override-path=/home/ubuntu/feldera", "--demos-dir", "/home/ubuntu/feldera/demos/sql"]

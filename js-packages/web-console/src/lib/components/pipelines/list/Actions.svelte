@@ -49,15 +49,24 @@ groups related actions into multi-action dropdowns when multiple options are ava
   import DeleteDialog, { deleteDialogProps } from '$lib/components/dialogs/DeleteDialog.svelte'
   import JSONDialog from '$lib/components/dialogs/JSONDialog.svelte'
   import PipelineConfigurationsPopup from '$lib/components/layout/pipelines/PipelineConfigurationsPopup.svelte'
+  import { duplicatePipeline, duplicatePipelineTooltip } from '$lib/compositions/duplicatePipeline'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
   import { useIsMobile } from '$lib/compositions/layout/useIsMobile.svelte'
   import { usePipelineActionCallbacks } from '$lib/compositions/pipelines/usePipelineActionCallbacks.svelte'
+  import {
+    usePipelineList,
+    useUpdatePipelineList
+  } from '$lib/compositions/pipelines/usePipelineList.svelte'
   import { getPipelineAction } from '$lib/compositions/usePipelineAction.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { usePremiumFeatures } from '$lib/compositions/usePremiumFeatures.svelte'
   import { useToast } from '$lib/compositions/useToastNotification'
   import type { WritablePipeline } from '$lib/compositions/useWritablePipeline.svelte'
-  import { getDeploymentStatusLabel, isPipelineShutdown } from '$lib/functions/pipelines/status'
+  import {
+    deletePipelineDisabledReason,
+    getDeploymentStatusLabel,
+    isPipelineShutdown
+  } from '$lib/functions/pipelines/status'
   import { resolve } from '$lib/functions/svelte'
   import type { PipelineAction } from '$lib/services/pipelineManager'
   import type { Snippet } from '$lib/types/svelte'
@@ -84,12 +93,33 @@ groups related actions into multi-action dropdowns when multiple options are ava
 
   const globalDialog = useGlobalDialog()
   const api = usePipelineManager()
+  const pipelineList = usePipelineList()
+  const { discardPendingListRefresh, updatePipeline, updatePipelines } = useUpdatePipelineList()
   const deletePipeline = async (pipelineName: string) => {
     await api.deletePipeline(pipelineName)
     onDeletePipeline?.(pipelineName)
     goto(resolve('/'))
   }
+  const duplicateCurrentPipeline = async () => {
+    const pipelines = pipelineList.pipelines
+    if (!pipelines || unsavedChanges) {
+      return
+    }
+
+    const newPipeline = await duplicatePipeline(api, pipeline.current, pipelines, {
+      discardPendingListRefresh,
+      updatePipeline,
+      updatePipelines
+    })
+    await goto(resolve(`/pipelines/${encodeURIComponent(newPipeline.name)}/`))
+  }
   const { toastError } = useToast()
+
+  // An already-deleted pipeline offers no Delete action; otherwise the backend
+  // dictates when deletion is possible (fully stopped, storage cleared).
+  const deleteDisabledReason = $derived(
+    deletePipelineDisabledReason(pipeline.current.status, pipeline.current.storageStatus, deleted)
+  )
 
   const actions = {
     _start,
@@ -105,7 +135,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
     _stop,
     _multiStop,
     _multiStart,
-    _delete,
+    _more,
     _spacer_short,
     _spacer_long,
     _spinner,
@@ -135,7 +165,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Preparing', 'Provisioning', 'Initializing', () => [
         '_kill',
@@ -143,7 +173,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Pausing', 'Resuming', () => [
         ...stopButtons,
@@ -151,7 +181,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Unavailable', () => [
         ...stopButtons,
@@ -159,7 +189,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Running', () => [
         ...stopButtons,
@@ -167,7 +197,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Paused', () => [
         ...stopButtons,
@@ -175,7 +205,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Suspending', () => [
         '_kill',
@@ -183,7 +213,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Suspended', () => [
         '_spinner',
@@ -191,7 +221,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Standby', () => [
         '_kill',
@@ -199,7 +229,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Bootstrapping', () => [
         '_kill',
@@ -207,7 +237,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Replaying', () => [
         '_kill',
@@ -215,14 +245,14 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('AwaitingApproval', () => [
         '_kill',
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with('Stopping', () => [
         '_kill',
@@ -230,7 +260,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .with(
         { Queued: P.any },
@@ -243,7 +273,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
           '_saveFile',
           '_configurations',
           '_storage_indicator',
-          '_delete'
+          '_more'
         ]
       )
       .with('SqlError', 'RustError', 'SystemError', () => [
@@ -251,7 +281,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_saveFile',
         '_configurations',
         '_storage_indicator',
-        '_delete'
+        '_more'
       ])
       .exhaustive()
   }
@@ -637,18 +667,56 @@ groups related actions into multi-action dropdowns when multiple options are ava
   </GenericDialog>
 {/snippet} -->
 
-{#snippet _delete()}
-  <div>
-    <button
-      class="{buttonClass} {shortClass} {shortColor} fd fd-trash-2 preset-tonal-surface {iconClass}"
-      disabled={editConfigDisabled}
-      onclick={() => (globalDialog.dialog = deleteDialog)}
-    >
-    </button>
-  </div>
-  {#if editConfigDisabled}
-    <Tooltip class="whitespace-nowrap" placement="top">Stop the pipeline to delete it</Tooltip>
-  {/if}
+{#snippet _more()}
+  <Popup>
+    {#snippet trigger(toggle)}
+      <button
+        class="{buttonClass} {shortClass} {shortColor} fd fd-more_horiz preset-tonal-surface {iconClass}"
+        onclick={toggle}
+        aria-label="Pipeline options"
+      >
+      </button>
+    {/snippet}
+    {#snippet content(close)}
+      <div
+        transition:slide={{ duration: 100 }}
+        class="bg-white-dark absolute right-0 z-30 mt-2 flex w-44 flex-col justify-stretch rounded shadow-md"
+      >
+        <button
+          class="flex items-center gap-2 px-4 py-3 text-left hover:bg-surface-50-950 disabled:opacity-50"
+          disabled={!pipelineList.pipelines || unsavedChanges}
+          onclick={() => {
+            close()
+            void duplicateCurrentPipeline()
+          }}
+        >
+          <span class="fd fd-copy-plus text-[20px]"></span>
+          Duplicate
+        </button>
+        <Tooltip placement="top">
+          {#if unsavedChanges}
+            Save the program before duplicating.
+          {:else}
+            {duplicatePipelineTooltip}
+          {/if}
+        </Tooltip>
+        <button
+          class="flex items-center gap-2 px-4 py-3 text-left hover:bg-surface-50-950 disabled:opacity-50"
+          disabled={!!deleteDisabledReason}
+          onclick={() => {
+            close()
+            globalDialog.dialog = deleteDialog
+          }}
+        >
+          <span class="fd fd-trash-2 text-[20px]"></span>
+          Delete
+        </button>
+        {#if deleteDisabledReason}
+          <Tooltip class="whitespace-nowrap" placement="top">{deleteDisabledReason}</Tooltip>
+        {/if}
+      </div>
+    {/snippet}
+  </Popup>
 {/snippet}
 {#snippet start({
   text,

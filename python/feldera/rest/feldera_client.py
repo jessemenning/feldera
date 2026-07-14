@@ -4,7 +4,7 @@ import pathlib
 import time
 import warnings
 from decimal import Decimal
-from typing import Any, Dict, Generator, Mapping, Optional
+from typing import Any, Dict, Generator, List, Mapping, Optional
 from urllib.parse import quote
 
 import pyarrow as pa
@@ -18,6 +18,7 @@ from feldera.rest.config import Config
 from feldera.rest.errors import FelderaAPIError, FelderaTimeoutError
 from feldera.rest.feldera_config import FelderaConfig
 from feldera.rest.pipeline import Pipeline
+from feldera.tags import _normalize_tags
 from feldera.rest.retry import RetryConfig
 
 logger = logging.getLogger(__name__)
@@ -332,6 +333,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "program_config": pipeline.program_config,
             "runtime_config": pipeline.runtime_config,
             "description": pipeline.description or "",
+            "tags": _normalize_tags(pipeline.tags),
         }
 
         self.http.post(
@@ -364,6 +366,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "program_config": pipeline.program_config,
             "runtime_config": pipeline.runtime_config,
             "description": pipeline.description or "",
+            "tags": _normalize_tags(pipeline.tags),
         }
 
         self.http.put(
@@ -385,11 +388,21 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         program_config: Optional[Mapping[str, Any]] = None,
         runtime_config: Optional[Mapping[str, Any]] = None,
         description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
     ):
         """
         Incrementally update pipeline
 
         :param name: The name of the pipeline
+
+        Each field is patched independently: a provided value overwrites the
+        stored one, and a field left as ``None`` is omitted from the request and
+        leaves the stored value untouched. To clear the description or tags, pass
+        an empty string or empty list, respectively.
+
+        Tags, when provided, are normalized before being sent: color variants of
+        the same display name are collapsed and the result is stored in API server database
+        in lexicographic order (see :mod:`feldera.tags`).
         """
 
         self.http.patch(
@@ -401,6 +414,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
                 "program_config": program_config,
                 "runtime_config": runtime_config,
                 "description": description,
+                "tags": _normalize_tags(tags) if tags is not None else None,
             },
         )
 
@@ -1506,12 +1520,12 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             stream=True,
         )
 
-        buffer = b""
+        buffer = bytearray()
         for chunk in resp.iter_content(chunk_size=1024):
             if chunk:
                 buffer += chunk
 
-        return buffer
+        return bytes(buffer)
 
     def start_samply_profile(self, pipeline_name: str, duration: int):
         """
@@ -1546,12 +1560,12 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             stream=True,
         )
 
-        buffer = b""
+        buffer = bytearray()
         for chunk in resp.iter_content(chunk_size=1024):
             if chunk:
                 buffer += chunk
 
-        return buffer
+        return bytes(buffer)
 
     def generate_completion_token(
         self, pipeline_name: str, table_name: str, connector_name: str
@@ -1613,6 +1627,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
     def get_checkpoints(self, pipeline_name: str):
         return self.http.get(path=f"/pipelines/{pipeline_name}/checkpoints")
+
+    def get_remote_checkpoints(self, pipeline_name: str) -> list[dict]:
+        """List checkpoints available in the configured remote object storage."""
+        return self.http.get(path=f"/pipelines/{pipeline_name}/checkpoints/remote")
 
     def get_pipeline_events(
         self, pipeline_name: str, *, selector: str = "status"

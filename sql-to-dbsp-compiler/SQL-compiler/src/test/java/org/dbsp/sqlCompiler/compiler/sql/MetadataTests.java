@@ -12,6 +12,8 @@ import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.errors.CompilerMessages;
+import org.dbsp.sqlCompiler.compiler.frontend.SqlComment;
+import org.dbsp.sqlCompiler.compiler.frontend.SqlCommentParser;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTableStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.DeclareViewStatement;
@@ -36,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -78,7 +81,7 @@ public class MetadataTests extends BaseSQLTests {
                 CREATE FUNCTION g(x int NOT NULL) RETURNS ROW(a INT, b INT) NOT NULL;
                 CREATE VIEW V AS SELECT f(X(1)), g(2).a;""");
 
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use crate::{Tup1, Tup2};
@@ -92,7 +95,7 @@ public class MetadataTests extends BaseSQLTests {
                       }
                    }
                 }
-                
+
                 pub fn g(x: i32) -> Result<Tup2<i32, i32>, Box<dyn std::error::Error>> {
                    Ok(Tup2::new(x-1, x+1))
                 }""");
@@ -101,18 +104,19 @@ public class MetadataTests extends BaseSQLTests {
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
         BaseSQLTests.compileAndTestRust(false);
+        cleanupUdf();
     }
 
     @Test
     public void issue3637() throws IOException, SQLException {
         String sql = """
                 CREATE TABLE t (id VARCHAR);
-                
+
                 DECLARE RECURSIVE VIEW v(
                     id VARCHAR,
                     parent_id VARCHAR
                 );
-                
+
                 CREATE MATERIALIZED VIEW v
                 AS SELECT id,
                     -- Delta lake output connector using field type Null instead of using the explicit VARCHAR
@@ -160,7 +164,7 @@ public class MetadataTests extends BaseSQLTests {
     @Test
     public void lineageTest() throws SQLException, IOException {
         // Check that the calcite property in the dataflow graph is never "null" for this program
-        final String file = "../../crates/pipeline-manager/demos/sql/08-fine-grained-authorization.sql";
+        final String file = "../../crates/pipeline-manager/demos/sql/09-fine-grained-authorization.sql";
         File json = this.createTempJsonFile();
         CompilerMain.execute("--dataflow", json.getPath(), "--noRust", file);
         ObjectMapper mapper = Utilities.deterministicObjectMapper();
@@ -341,7 +345,7 @@ public class MetadataTests extends BaseSQLTests {
                       }
                     }]'
                 );
-                
+
                 CREATE TABLE TRANSACTION (
                     ts TIMESTAMP LATENESS INTERVAL 10 MINUTES, -- Transaction time
                     amt DOUBLE,                                -- Transaction amount
@@ -371,7 +375,7 @@ public class MetadataTests extends BaseSQLTests {
                       }
                     }]'
                 );
-                
+
                 CREATE VIEW TRANSACTION_WITH_DISTANCE AS
                     SELECT
                         t.*,
@@ -380,7 +384,7 @@ public class MetadataTests extends BaseSQLTests {
                         TRANSACTION as t
                         LEFT JOIN CUSTOMER as c
                         ON t.cc_num = c.cc_num;
-                
+
                 -- Compute two rolling aggregates over a 1-day time window for each transaction:
                 -- 1. Average spend per transaction.
                 -- 2. The number of transactions whose shipping address is more than 50,000 meters away from
@@ -398,54 +402,6 @@ public class MetadataTests extends BaseSQLTests {
         CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         String rust = Utilities.readFile(Paths.get(BaseSQLTests.TEST_FILE_PATH));
         Assert.assertFalse(rust.contains(CreateTableStatement.CONNECTORS));
-    }
-
-    @Test
-    public void issue4896() {
-        String sql = """
-               CREATE TABLE T (COL1 INT) WITH (
-                  'connectors' = '[{
-                    "url": "localhost"
-                  }]'
-               );""";
-        DBSPCompiler compiler = this.chattyCompiler();
-        compiler.submitStatementsForCompilation(sql);
-        // Force compilation
-        compiler.getFinalCircuit(true);
-        Assert.assertTrue(compiler.messages.toString().contains(
-                "warning: Unnamed connector: Connector nr. 1 for table 't' does not have a name.\n" +
-                "It is recommended to name all connectors using the \"name\" property; " +
-                        "names will be required in the future."));
-
-        sql = """
-               CREATE TABLE T (COL1 INT) WITH (
-                  'connectors' = '[{
-                    "name": [],
-                    "url": "localhost"
-                  }]'
-               );""";
-        this.statementsFailingInCompilation(sql, """
-               Compilation error: Expected a string value for the connector "name" property
-                   3|     "name": [],
-                                  ^
-                   4|     "url": "localhost"
-               """);
-
-        sql = """
-               CREATE TABLE T (COL1 INT) WITH (
-                  'connectors' = '[{
-                    "name": "Bob",
-                    "url": "localhost"
-                  }, {
-                    "name": "Bob",
-                    "url": "localhost:8080"
-                  }]'
-               );""";
-        this.statementsFailingInCompilation(sql,"""
-               error: Compilation error: Two connectors for the same table 't' cannot have the same name: 'Bob'
-                   6|     "name": "Bob",
-                                  ^
-                   7|     "url": "localhost:8080\"""");
     }
 
     @Test
@@ -482,6 +438,9 @@ public class MetadataTests extends BaseSQLTests {
         CompilerMain.execute("--jit", "-o", json.getPath(), file.getPath());
         ObjectMapper mapper = Utilities.deterministicObjectMapper();
         JsonNode parsed = mapper.readTree(json);
+        String contents = Utilities.readFile(json.getPath());
+        // File contains source position information
+        Assert.assertTrue(contents.contains("position"));
         DBSPCompiler compiler = new DBSPCompiler(new CompilerOptions());
         JsonDecoder decoder = new JsonDecoder(compiler.sqlToRelCompiler.typeFactory);
         DBSPCircuit result = decoder.decodeOuter(parsed, DBSPCircuit.class);
@@ -720,6 +679,13 @@ public class MetadataTests extends BaseSQLTests {
         BaseSQLTests.compileAndTestRust(true);
     }
 
+    void cleanupUdf() throws IOException {
+        Files.newOutputStream(Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME),
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING).close();
+        createEmptyStubs();
+    }
+
     @Test
     public void testUDFTypeError() throws IOException, SQLException {
         File file = createInputScript("""
@@ -739,18 +705,18 @@ public class MetadataTests extends BaseSQLTests {
                 CREATE TABLE T(x TINYINT);
                 CREATE VIEW V AS SELECT I8_AVG(x) FROM T;""");
 
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use feldera_sqllib::*;
                 use crate::Tup2;
-                
+
                 pub type i8_avg_accumulator_type = Tup2<i32, i32>;
-                
+
                 pub fn i8_avg_map(val: i8) -> i8_avg_accumulator_type {
                     Tup2::new(val as i32, 1)
                 }
-                
+
                 pub fn i8_avg_post(val: i8_avg_accumulator_type) -> i8 {
                     (val.0 / val.1).try_into().unwrap()
                 }
@@ -760,17 +726,14 @@ public class MetadataTests extends BaseSQLTests {
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
         BaseSQLTests.compileAndTestRust(false);
-
-        // Truncate file to 0 bytes
-        FileWriter writer = new FileWriter(udf);
-        writer.close();
+        cleanupUdf();
     }
 
     @Test
     public void issue5300() throws IOException, SQLException, InterruptedException {
         File file = createInputScript("""
                 CREATE LINEAR AGGREGATE u64_sum(value INT) RETURNS INT;
-                
+
                 CREATE TABLE A (
                     id VARCHAR(20) NOT NULL PRIMARY KEY,
                     a VARCHAR(64),
@@ -780,23 +743,23 @@ public class MetadataTests extends BaseSQLTests {
                     num1 INT,
                     num2 INT
                 ) WITH ('append_only' = 'true');
-                
+
                 CREATE VIEW b AS
                 SELECT id, a, b, u64_sum(num1), u64_sum(num2), SUM(small), MAX(sno)
                 FROM A
                 GROUP BY id, a, b""");
 
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use feldera_sqllib::*;
-                
+
                 pub type u64_sum_accumulator_type = i64;
-                
+
                 pub fn u64_sum_map(val: i32) -> u64_sum_accumulator_type {
                     val.into()
                 }
-                
+
                 pub fn u64_sum_post(val: u64_sum_accumulator_type) -> i32 {
                     val.try_into().unwrap()
                 }
@@ -806,10 +769,7 @@ public class MetadataTests extends BaseSQLTests {
         if (messages.errorCount() > 0)
             throw new RuntimeException(messages.toString());
         BaseSQLTests.compileAndTestRust(false);
-
-        // Truncate file to 0 bytes
-        FileWriter writer = new FileWriter(udf);
-        writer.close();
+        cleanupUdf();
     }
 
 
@@ -836,7 +796,7 @@ public class MetadataTests extends BaseSQLTests {
             p.write(cargoContents);
             p.close();
 
-            File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+            File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
             PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
             script.println("""
                     use i256::I256;
@@ -846,22 +806,22 @@ public class MetadataTests extends BaseSQLTests {
                     use num_traits::Zero;
                     use rkyv::Fallible;
                     use std::ops::AddAssign;
-                    
+
                     #[derive(Add, Clone, Debug, Default, PartialOrd, Ord, Eq, PartialEq, Hash)]
                     pub struct I256Wrapper {
                         pub data: I256,
                     }
-                    
+
                     impl SizeOf for I256Wrapper {
                         fn size_of_children(&self, context: &mut size_of::Context) {}
                     }
-                    
+
                     impl From<[u8; 32]> for I256Wrapper {
                         fn from(value: [u8; 32]) -> Self {
                             Self { data: I256::from_be_bytes(value) }
                         }
                     }
-                    
+
                     impl From<&[u8]> for I256Wrapper {
                         fn from(value: &[u8]) -> Self {
                             let mut padded = [0u8; 32];
@@ -877,10 +837,10 @@ public class MetadataTests extends BaseSQLTests {
                             Self { data: I256::from_be_bytes(padded) }
                         }
                     }
-                    
+
                     impl MulByRef<Weight> for I256Wrapper {
                         type Output = Self;
-                    
+
                         fn mul_by_ref(&self, other: &Weight) -> Self::Output {
                             println!("Mul {:?} by {}", self, other);
                             Self {
@@ -889,39 +849,39 @@ public class MetadataTests extends BaseSQLTests {
                             }
                         }
                     }
-                    
+
                     impl HasZero for I256Wrapper {
                         fn zero() -> Self {
                             Self { data: I256::zero() }
                         }
-                    
+
                         fn is_zero(&self) -> bool {
                             self.data.is_zero()
                         }
                     }
-                    
+
                     impl AddByRef for I256Wrapper {
                         fn add_by_ref(&self, other: &Self) -> Self {
                             Self { data: self.data.add(other.data) }
                         }
                     }
-                    
+
                     impl AddAssignByRef<Self> for I256Wrapper {
                         fn add_assign_by_ref(&mut self, other: &Self) {
                             self.data += other.data
                         }
                     }
-                    
+
                     #[repr(C)]
                     #[derive(Debug, Copy, Clone, PartialOrd, Ord, Eq, PartialEq)]
                     pub struct ArchivedI256Wrapper {
                         pub bytes: [u8; 32],
                     }
-                    
+
                     impl rkyv::Archive for I256Wrapper {
                         type Archived = ArchivedI256Wrapper;
                         type Resolver = ();
-                    
+
                         #[inline]
                         unsafe fn resolve(&self, pos: usize, _: Self::Resolver, out: *mut Self::Archived) {
                             out.write(ArchivedI256Wrapper {
@@ -929,27 +889,27 @@ public class MetadataTests extends BaseSQLTests {
                             });
                         }
                     }
-                    
+
                     impl<S: Fallible + ?Sized> rkyv::Serialize<S> for I256Wrapper {
                         #[inline]
                         fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
                             Ok(())
                         }
                     }
-                    
+
                     impl<D: Fallible + ?Sized> rkyv::Deserialize<I256Wrapper, D> for ArchivedI256Wrapper {
                         #[inline]
                         fn deserialize(&self, _: &mut D) -> Result<I256Wrapper, D::Error> {
                             Ok(I256Wrapper::from(self.bytes))
                         }
                     }
-                    
+
                     pub type i128_sum_accumulator_type = I256Wrapper;
-                    
+
                     pub fn i128_sum_map(val: ByteArray) -> i128_sum_accumulator_type {
                         I256Wrapper::from(val.as_slice())
                     }
-                    
+
                     pub fn i128_sum_post(val: i128_sum_accumulator_type) -> ByteArray {
                         // Check for overflow
                         if val.data < I256::from(i128::MIN) || val.data > I256::from(i128::MAX) {
@@ -963,66 +923,12 @@ public class MetadataTests extends BaseSQLTests {
             if (messages.errorCount() > 0)
                 throw new RuntimeException(messages.toString());
             BaseSQLTests.compileAndTestRust(false);
-            // Truncate udf file to 0 bytes
-            FileWriter writer = new FileWriter(udf);
-            writer.close();
         } finally {
             // Restore cargo.toml
+            cleanupUdf();
             Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
             Utilities.deleteFile(cargoBackup.toFile(), true);
         }
-    }
-
-    @Test
-    public void testUDPValidation() {
-        this.statementsFailingInCompilation("""
-                CREATE TABLE T(x INT) WITH ('connectors' = '[{
-                   "name": "0",
-                   "transport": {
-                     "name": "datagen",
-                     "config": {}
-                   },
-                   "preprocessor": [{
-                      "config": {}
-                   }]
-                }]');""", """
-                Compilation error: Preprocessor must have a field "name"
-                    7|   "preprocessor": [{
-                                          ^
-                    8|      "config": {}""");
-        this.statementsFailingInCompilation("""
-                CREATE TABLE T(x INT) WITH ('connectors' = '[{
-                   "name": "0",
-                   "transport": {
-                     "name": "datagen",
-                     "config": {}
-                   },
-                   "preprocessor": [{
-                      "name": "Bob",
-                      "config": {}
-                   }]
-                }]');""", """
-                Compilation error: Preprocessor must have a field "message_oriented"
-                    7|   "preprocessor": [{
-                                          ^
-                    8|      "name": "Bob",""");
-        this.statementsFailingInCompilation("""
-                CREATE TABLE T(x INT) WITH ('connectors' = '[{
-                   "name": "0",
-                   "transport": {
-                     "name": "datagen",
-                     "config": {}
-                   },
-                   "preprocessor": [{
-                      "message_oriented": "streaming",
-                      "name": "Bob",
-                      "config": {}
-                   }]
-                }]');""", """
-                Compilation error: Preprocessor field "message_oriented" must be a Boolean value
-                    8|      "message_oriented": "streaming",
-                                                ^
-                    9|      "name": "Bob",""");
     }
 
     @Test
@@ -1046,7 +952,7 @@ public class MetadataTests extends BaseSQLTests {
         // Save a copy of cargo.toml
         Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
         Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         try {
             Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
             String cargoContents = Utilities.readFile(cargo);
@@ -1077,7 +983,7 @@ public class MetadataTests extends BaseSQLTests {
                         fn fork(&self) -> Box<dyn Preprocessor> {
                             Box::new(ExamplePreprocessor)
                         }
-                    
+
                         fn splitter(&self) -> Option<Box<dyn Splitter>> {
                             None
                         }
@@ -1091,6 +997,79 @@ public class MetadataTests extends BaseSQLTests {
                             _config: &PreprocessorConfig,
                         ) -> Result<Box<dyn Preprocessor>, PreprocessorCreateError> {
                             Ok(Box::new(ExamplePreprocessor))
+                        }
+                    }""");
+            udfWriter.close();
+            File file = createInputScript(sql);
+            CompilerMessages messages = CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+            if (messages.errorCount() > 0)
+                throw new RuntimeException(messages.toString());
+            BaseSQLTests.compileAndTestRust(false);
+        } finally {
+            // Restore cargo.toml
+            cleanupUdf();
+            Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
+            Utilities.deleteFile(cargoBackup.toFile(), true);
+        }
+    }
+
+    @Test
+    public void testPostprocessor() throws IOException, InterruptedException, SQLException {
+        // Test user-defined postprocessor
+        String sql = """
+                CREATE TABLE T(x INT);
+                CREATE VIEW V WITH ('connectors' = '[{
+                   "postprocessor": [{
+                      "name": "example",
+                      "config": {}
+                   }],
+                   "config": {}
+                }]') AS SELECT * FROM T;""";
+
+        // Save a copy of cargo.toml
+        Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
+        Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
+        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        try {
+            Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
+            String cargoContents = Utilities.readFile(cargo);
+            cargoContents = cargoContents.replace("[dependencies]",
+                    """
+                            [dependencies]
+                            feldera-adapterlib = { path = "../../crates/adapterlib" }
+                            """);
+            PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
+            p.write(cargoContents);
+            p.close();
+
+            PrintWriter udfWriter = new PrintWriter(udf, StandardCharsets.UTF_8);
+            udfWriter.println("""
+                    use feldera_adapterlib::format::{ParseError, Splitter};
+                    use feldera_types::postprocess::PostprocessorConfig;
+                    use feldera_adapterlib::postprocess::{
+                        Postprocessor, PostprocessorCreateError, PostprocessorFactory,
+                    };
+
+                    pub struct ExamplePostprocessor;
+
+                    impl Postprocessor for ExamplePostprocessor {
+                        fn push_buffer(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+                            Ok(data.to_vec())
+                        }
+
+                        fn fork(&self) -> Box<dyn Postprocessor> {
+                            Box::new(ExamplePostprocessor)
+                        }
+                    }
+
+                    pub struct ExamplePostprocessorFactory;
+
+                    impl PostprocessorFactory for ExamplePostprocessorFactory {
+                        fn create(
+                            &self,
+                            _config: &PostprocessorConfig,
+                        ) -> Result<Box<dyn Postprocessor>, PostprocessorCreateError> {
+                            Ok(Box::new(ExamplePostprocessor))
                         }
                     }""");
             udfWriter.close();
@@ -1117,7 +1096,7 @@ public class MetadataTests extends BaseSQLTests {
                 CREATE FUNCTION "EMPTY"() RETURNS VARCHAR;
                 CREATE VIEW V1 AS SELECT "EMPTY"();""");
 
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         PrintWriter script = new PrintWriter(udf, StandardCharsets.UTF_8);
         script.println("""
                 use feldera_sqllib::*;
@@ -1155,16 +1134,13 @@ public class MetadataTests extends BaseSQLTests {
                         str,
                         value)
                 }
-                
+
                 pub fn EMPTY() -> Result<Option<SqlString>, Box<dyn std::error::Error>> {
                     udf::EMPTY()
                 }
                 """, String.join(System.lineSeparator(), str));
         Utilities.deleteFile(protos.toFile(), true);
-
-        // Truncate file to 0 bytes
-        FileWriter writer = new FileWriter(udf);
-        writer.close();
+        cleanupUdf();
     }
 
     @Test
@@ -1227,6 +1203,9 @@ public class MetadataTests extends BaseSQLTests {
                     --errors
                       Error output file; stderr if not specified
                       Default: <empty string>
+                    --format
+                      Output the SQL program reformatted
+                      Default: false
                     --handles
                       Use handles (true) or Catalog (false) in the emitted Rust code
                       Default: false
@@ -1271,6 +1250,9 @@ public class MetadataTests extends BaseSQLTests {
                       Default: <empty string>
                     --streaming
                       Compiling a streaming program, where only inserts are allowed
+                      Default: false
+                    --svg, -svg
+                      Emit an svg image of the circuit instead of Rust
                       Default: false
                     --trimInputs
                       Do not ingest unused fields of input tables
@@ -1357,7 +1339,7 @@ public class MetadataTests extends BaseSQLTests {
         String sql = """
                 DECLARE RECURSIVE view fibonacci(n INT, value INT);
                 create table input (x int);
-                
+
                 create view fibonacci AS
                 (
                     -- Base case: first two Fibonacci numbers
@@ -1397,7 +1379,7 @@ public class MetadataTests extends BaseSQLTests {
         String sql = """
                 DECLARE RECURSIVE view fibonacci(n INT, value INT);
                 create table input (x int);
-                
+
                 create view fibonacci AS
                 (
                     -- Base case: first two Fibonacci numbers
@@ -1416,7 +1398,7 @@ public class MetadataTests extends BaseSQLTests {
                     on prev.n = curr.n - 1
                     where curr.n < 10 and prev.n < 10
                 );
-                
+
                 create view fib_outputs as select * from fibonacci;""";
         File file = createInputScript(sql);
         File json = this.createTempJsonFile();
@@ -1648,7 +1630,7 @@ public class MetadataTests extends BaseSQLTests {
                     'materialized' = 'true',
                     'append_only' = 'true'
                 );
-                
+
                 CREATE TABLE returns (
                     customer_id INT,
                     ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR,
@@ -1656,7 +1638,7 @@ public class MetadataTests extends BaseSQLTests {
                 ) WITH (
                     'materialized' = 'true'
                 );
-                
+
                 CREATE TABLE customer (
                     customer_id INT,
                     ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 DAY,
@@ -1664,7 +1646,7 @@ public class MetadataTests extends BaseSQLTests {
                 ) WITH (
                     'materialized' = 'true'
                 );
-                
+
                 -- Daily MAX purchase amount.
                 CREATE MATERIALIZED VIEW daily_max AS
                 SELECT
@@ -1674,7 +1656,7 @@ public class MetadataTests extends BaseSQLTests {
                     purchase
                 GROUP BY
                     TIMESTAMP_TRUNC(ts, DAY);
-                
+
                 -- Daily total purchase amount.
                 CREATE MATERIALIZED VIEW daily_total AS
                 SELECT
@@ -1684,7 +1666,7 @@ public class MetadataTests extends BaseSQLTests {
                     purchase
                 GROUP BY
                     TIMESTAMP_TRUNC(ts, DAY);
-                
+
                 -- Like `daily_total`, but this view uses the 'emit_final' annotation to only
                 -- produce the final value of the aggregate at the end of each day.
                 CREATE MATERIALIZED VIEW daily_total_final
@@ -1697,7 +1679,7 @@ public class MetadataTests extends BaseSQLTests {
                     purchase
                 GROUP BY
                     TIMESTAMP_TRUNC(ts, DAY);
-                
+
                 -- Daily MAX purchase amount computed using tumbling windows.
                 CREATE MATERIALIZED VIEW daily_max_tumbling AS
                 SELECT
@@ -1710,7 +1692,7 @@ public class MetadataTests extends BaseSQLTests {
                     "SIZE" => INTERVAL 1 DAY))
                 GROUP BY
                     window_start;
-                
+
                 -- Daily MAX purchase amount computed as a rolling aggregate.
                 CREATE MATERIALIZED VIEW daily_max_rolling AS
                 SELECT
@@ -1719,7 +1701,7 @@ public class MetadataTests extends BaseSQLTests {
                     MAX(amount) OVER window_1_day
                 FROM purchase
                 WINDOW window_1_day AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW);
-                
+
                 -- Use an OUTER JOIN to compute a daily transaction summary, including daily totals
                 -- from `purchase` and `returns` tables.
                 CREATE MATERIALIZED VIEW daily_totals AS
@@ -1750,7 +1732,7 @@ public class MetadataTests extends BaseSQLTests {
                     return_totals
                 ON
                     purchase_totals.purchase_date = return_totals.return_date;
-                
+
                 -- Use an ASOF JOIN to extract the customer’s address at the time of
                 -- purchase from the `customer` table.
                 CREATE MATERIALIZED VIEW purchase_with_address AS
@@ -1761,7 +1743,7 @@ public class MetadataTests extends BaseSQLTests {
                 FROM purchase
                 LEFT ASOF JOIN customer MATCH_CONDITION(purchase.ts >= customer.ts)
                 ON purchase.customer_id = customer.customer_id;
-                
+
                 -- Use LAG and LEAD operators to lookup previous and next purchase
                 -- amounts for each record in the `purchase` table.
                 CREATE MATERIALIZED VIEW purchase_with_prev_next AS
@@ -1773,7 +1755,7 @@ public class MetadataTests extends BaseSQLTests {
                     LEAD(amount) OVER(PARTITION BY customer_id ORDER BY ts) as next_amount
                 FROM
                     purchase;
-                
+
                 -- Temporal filter query that uses the current physical time (NOW())
                 -- to compute transactions made in the last 7 days.
                 CREATE MATERIALIZED VIEW recent_purchases AS
@@ -1798,7 +1780,7 @@ public class MetadataTests extends BaseSQLTests {
                    i INT,
                    s VARCHAR
                 );
-                
+
                 CREATE TABLE t (
                     i INT,
                     ti TINYINT,
@@ -1818,58 +1800,58 @@ public class MetadataTests extends BaseSQLTests {
                     s VARCHAR,
                     ms MY_STRUCT
                 ) with ('materialized' = 'true');
-                
+
                 CREATE FUNCTION bool2bool(i BOOLEAN) RETURNS BOOLEAN;
                 CREATE FUNCTION nbool2nbool(i BOOLEAN NOT NULL) RETURNS BOOLEAN NOT NULL;
-                
+
                 CREATE FUNCTION i2i(i INT) RETURNS INT;
                 CREATE FUNCTION ni2ni(i INT NOT NULL) RETURNS INT NOT NULL;
-                
+
                 CREATE FUNCTION ti2ti(i TINYINT) RETURNS TINYINT;
                 CREATE FUNCTION nti2nti(i TINYINT NOT NULL) RETURNS TINYINT NOT NULL;
-                
+
                 CREATE FUNCTION si2si(i SMALLINT) RETURNS SMALLINT;
                 CREATE FUNCTION nsi2nsi(i SMALLINT NOT NULL) RETURNS SMALLINT NOT NULL;
-                
+
                 CREATE FUNCTION bi2bi(i BIGINT) RETURNS BIGINT;
                 CREATE FUNCTION nbi2nbi(i BIGINT NOT NULL) RETURNS BIGINT NOT NULL;
-                
+
                 CREATE FUNCTION r2r(i REAL) RETURNS REAL;
                 CREATE FUNCTION nr2nr(i REAL NOT NULL) RETURNS REAL NOT NULL;
-                
+
                 CREATE FUNCTION d2d(i DOUBLE) RETURNS DOUBLE;
                 CREATE FUNCTION nd2nd(i DOUBLE NOT NULL) RETURNS DOUBLE NOT NULL;
-                
+
                 CREATE FUNCTION bin2bin(i VARBINARY) RETURNS VARBINARY;
                 CREATE FUNCTION nbin2nbin(i VARBINARY NOT NULL) RETURNS VARBINARY NOT NULL;
-                
+
                 CREATE FUNCTION date2date(i DATE) RETURNS DATE;
                 CREATE FUNCTION ndate2ndate(i DATE NOT NULL) RETURNS DATE NOT NULL;
-                
+
                 CREATE FUNCTION ts2ts(i TIMESTAMP) RETURNS TIMESTAMP;
                 CREATE FUNCTION nts2nts(i TIMESTAMP NOT NULL) RETURNS TIMESTAMP NOT NULL;
-                
+
                 CREATE FUNCTION t2t(i TIME) RETURNS TIME;
                 CREATE FUNCTION nt2nt(i TIME NOT NULL) RETURNS TIME NOT NULL;
-                
+
                 CREATE FUNCTION arr2arr(i INT ARRAY) RETURNS INT ARRAY;
                 CREATE FUNCTION narr2narr(i INT ARRAY NOT NULL) RETURNS INT ARRAY NOT NULL;
-                
+
                 CREATE FUNCTION map2map(i MAP<VARCHAR, VARCHAR>) RETURNS MAP<VARCHAR, VARCHAR>;
                 CREATE FUNCTION nmap2nmap(i MAP<VARCHAR, VARCHAR> NOT NULL) RETURNS MAP<VARCHAR, VARCHAR> NOT NULL;
-                
+
                 CREATE FUNCTION var2var(i VARIANT) RETURNS VARIANT;
                 CREATE FUNCTION nvar2nvar(i VARIANT NOT NULL) RETURNS VARIANT NOT NULL;
-                
+
                 CREATE FUNCTION dec2dec(i DECIMAL(7, 2)) RETURNS DECIMAL(7, 2);
                 CREATE FUNCTION ndec2ndec(i DECIMAL(7, 2) NOT NULL) RETURNS DECIMAL(7, 2) NOT NULL;
-                
+
                 CREATE FUNCTION str2str(i VARCHAR) RETURNS VARCHAR;
                 CREATE FUNCTION nstr2nstr(i VARCHAR NOT NULL) RETURNS VARCHAR NOT NULL;
-                
+
                 CREATE FUNCTION struct2struct(i my_struct) RETURNS my_struct;
                 CREATE FUNCTION nstruct2nstruct(i my_struct NOT NULL) RETURNS my_struct NOT NULL;
-                
+
                 CREATE MATERIALIZED VIEW v AS
                 SELECT
                     bool2bool(b),
@@ -2034,7 +2016,7 @@ public class MetadataTests extends BaseSQLTests {
                     }
                   }
                 ]');
-                
+
                 create view v as select trans_date_trans_time, cc_num, amt, is_fraud from transaction;""";
         File json = this.createTempJsonFile();
         File file = createInputScript(sql);
@@ -2082,6 +2064,270 @@ public class MetadataTests extends BaseSQLTests {
                 FROM ID_4
                 GROUP BY ID_4.ID_6, ID_7;""", result);
         // Anonymized program is valid
+        execute = CompilerMain.execute("--noRust", "-i", out.getPath());
+        Assert.assertEquals(0, execute.exitCode);
+        Utilities.deleteFile(input, false);
+    }
+
+    // Helpers for SqlCommentParser unit tests
+    static void assertComment(SqlComment c, SqlComment.Kind kind, String text, int line, int col) {
+        Assert.assertEquals(kind, c.kind);
+        Assert.assertEquals(text, c.text);
+        Assert.assertEquals(line, c.pos.getLineNum());
+        Assert.assertEquals(col, c.pos.getColumnNum());
+    }
+
+    /** Verify that {@code sql} is accepted by the SQL compiler without errors. */
+    private void assertCompilesWithoutError(String sql) {
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.submitStatementsForCompilation(sql);
+        getCircuit(compiler);
+        Assert.assertEquals(0, compiler.messages.exitCode);
+    }
+
+    @Test
+    public void testCommentParserLineDash() {
+        List<SqlComment> cs = SqlCommentParser.parse("-- hello\n");
+        Assert.assertEquals(1, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.LINE_DASH, "-- hello\n", 1, 1);
+    }
+
+    @Test
+    public void testCommentParserLineSlash() {
+        // "CREATE VIEW V AS SELECT 1; " is 27 chars, so "//" is at col 28.
+        String sql = "CREATE VIEW V AS SELECT 1; // end\n";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(1, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.LINE_SLASH, "// end\n", 1, 28);
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserBlock() {
+        List<SqlComment> cs = SqlCommentParser.parse("/* hello */");
+        Assert.assertEquals(1, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.BLOCK, "/* hello */", 1, 1);
+    }
+
+    @Test
+    public void testCommentParserNoTrailingNewline() {
+        // Single-line comment at EOF with no newline: text has no trailing newline.
+        String sql = "CREATE VIEW V AS SELECT 1; -- end";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(1, cs.size());
+        Assert.assertEquals("-- end", cs.get(0).text);
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserMultipleComments() {
+        // Line 2: "CREATE VIEW V AS SELECT 1; " is 27 chars, so "--" is at col 28.
+        String sql = "-- first\nCREATE VIEW V AS SELECT 1; -- second\n/* third */\n";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(3, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.LINE_DASH, "-- first\n", 1, 1);
+        assertComment(cs.get(1), SqlComment.Kind.LINE_DASH, "-- second\n", 2, 28);
+        assertComment(cs.get(2), SqlComment.Kind.BLOCK, "/* third */", 3, 1);
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserBlockMultiline() {
+        // Block comment spanning two lines; position tracks correctly.
+        String sql = "/* line 1\n   line 2 */";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(1, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.BLOCK, sql, 1, 1);
+    }
+
+    @Test
+    public void testCommentParserInsideSingleQuote() {
+        // Comment markers inside a single-quoted string are not comments.
+        String sql = "CREATE VIEW V AS SELECT '-- not a comment /* also not */'";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(0, cs.size());
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserInsideDoubleQuote() {
+        // Comment markers inside a double-quoted identifier are not comments.
+        String sql =
+                "CREATE TABLE t (\"-- not a comment\" INT);\n" +
+                "CREATE VIEW V AS SELECT \"-- not a comment\" FROM t;";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(0, cs.size());
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserInsideBacktick() {
+        // Comment markers inside a backtick-quoted identifier are not comments.
+        List<SqlComment> cs = SqlCommentParser.parse("SELECT `-- not a comment` FROM t");
+        Assert.assertEquals(0, cs.size());
+    }
+
+    @Test
+    public void testCommentParserHintNotComment() {
+        // Calcite query hints /*+ ... */ are not collected as comments:
+        // they are already in the SqlNode tree and emitted by SqlPrettyPrinter.
+        String sql =
+                "CREATE TABLE t (x INT);\n" +
+                "CREATE TABLE s (x INT);\n" +
+                "CREATE VIEW V AS SELECT /*+ broadcast(t), shard(s) */ * FROM t JOIN s USING (x);";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(0, cs.size());
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserEscapedSingleQuote() {
+        // '' is an escaped quote; the string continues past it, so -- is not a comment.
+        String sql = "CREATE VIEW V AS SELECT 'it''s -- not a comment'";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(0, cs.size());
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserEscapedDoubleQuote() {
+        // "" is an escaped double-quote inside a double-quoted identifier.
+        String sql =
+                "CREATE TABLE t (\"my\"\"-- not a comment\" INT);\n" +
+                "CREATE VIEW V AS SELECT \"my\"\"-- not a comment\" FROM t;";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(0, cs.size());
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserEscapedBacktick() {
+        // `` is an escaped backtick inside a backtick-quoted identifier.
+        List<SqlComment> cs = SqlCommentParser.parse("SELECT `my``-- not a comment`");
+        Assert.assertEquals(0, cs.size());
+    }
+
+    @Test
+    public void testCommentParserStringWithNewline() {
+        // A string literal containing a newline: the -- on line 2 is still inside the string.
+        List<SqlComment> cs = SqlCommentParser.parse("SELECT 'line1\n-- not a comment\n'");
+        Assert.assertEquals(0, cs.size());
+    }
+
+    @Test
+    public void testCommentParserCommentAfterString() {
+        // Real comment immediately following a closed string.
+        // "CREATE VIEW V AS SELECT 'value' " is 32 chars, so "--" is at col 33.
+        String sql = "CREATE VIEW V AS SELECT 'value' -- real comment\n";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(1, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.LINE_DASH, "-- real comment\n", 1, 33);
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testCommentParserInsideTableDef() {
+        // Comments between columns of a CREATE TABLE, verifying line/col positions.
+        String sql =
+                "CREATE TABLE t (\n" +
+                "    -- col a\n" +
+                "    a INT,\n" +
+                "    -- col b\n" +
+                "    b VARCHAR\n" +
+                ");\n";
+        List<SqlComment> cs = SqlCommentParser.parse(sql);
+        Assert.assertEquals(2, cs.size());
+        assertComment(cs.get(0), SqlComment.Kind.LINE_DASH, "-- col a\n", 2, 5);
+        assertComment(cs.get(1), SqlComment.Kind.LINE_DASH, "-- col b\n", 4, 5);
+        assertCompilesWithoutError(sql);
+    }
+
+    @Test
+    public void testFormat() throws IOException, SQLException {
+        File input = createInputScript("""
+                -- Custom type for JSON payloads
+                CREATE TYPE TYP AS ("Z" INT);
+                CREATE FUNCTION jsonstring_as_typ(l VARCHAR) RETURNS TYP;
+                -- Main fact table
+                CREATE TABLE T(
+                    -- primary key
+                    x INT,
+                    y INT LATENESS 0,
+                    "Z" TYP ARRAY,
+                    W STRING
+                ) WITH ('connectors' = '[{"name": "kafka", "url": "localhost"}]');
+                CREATE TABLE orders(id INT NOT NULL, product VARCHAR, amount BIGINT, customer_x INT);
+                /* Aggregation view */
+                CREATE VIEW V WITH ('emit_final' = 'y', 'connectors' = '[]') AS
+                SELECT jsonstring_as_typ(W), y, SUM(T.x) as sum, COUNT(T."Z"[1]) FROM T GROUP BY T.y, W;
+                CREATE VIEW v2 WITH ('connectors' = '[{"name": "http", "url": "localhost:8080"}]') AS
+                SELECT t.y, o.product, SUM(o.amount) AS total,
+                       CASE WHEN SUM(o.amount) > 100 THEN 'high' ELSE 'low' END AS tier
+                FROM t JOIN orders AS o ON t.x = o.customer_x
+                WHERE o.amount > (SELECT AVG(amount) FROM orders)
+                GROUP BY t.y, o.product
+                HAVING COUNT(*) > 2;""");
+        File out = File.createTempFile("out", ".sql", new File("."));
+        out.deleteOnExit();
+        CompilerMessages execute = CompilerMain.execute("--format", "-o", out.getPath(), input.getPath());
+        Assert.assertEquals(0, execute.exitCode);
+        String result = Utilities.readFile(out.getAbsolutePath());
+        Assert.assertEquals("""
+                -- Custom type for JSON payloads
+                CREATE TYPE typ AS ("Z" INTEGER);
+                CREATE FUNCTION jsonstring_as_typ (l VARCHAR) RETURNS typ;
+                -- Main fact table
+                CREATE TABLE t (
+                    -- primary key
+                    x INTEGER,
+                    y INTEGER LATENESS 0,
+                    "Z" typ ARRAY,
+                    w string
+                ) WITH (
+                    'connectors' = '[{
+                        "name" : "kafka",
+                        "url" : "localhost"
+                    }]'
+                );
+                CREATE TABLE orders (
+                    id INTEGER NOT NULL,
+                    product VARCHAR,
+                    amount BIGINT,
+                    customer_x INTEGER
+                );
+                /* Aggregation view */
+                CREATE VIEW v WITH (
+                    'emit_final' = 'y',
+                    'connectors' = '[ ]'
+                ) AS
+                SELECT
+                    jsonstring_as_typ(w),
+                    y,
+                    SUM(t.x) AS sum,
+                    COUNT(t."Z"[1])
+                FROM t
+                GROUP BY t.y, w;
+                CREATE VIEW v2 WITH (
+                    'connectors' = '[{
+                        "name" : "http",
+                        "url" : "localhost:8080"
+                    }]'
+                ) AS
+                SELECT
+                    t.y,
+                    o.product,
+                    SUM(o.amount) AS total,
+                    CASE WHEN SUM(o.amount) > 100 THEN 'high' ELSE 'low' END AS tier
+                FROM t
+                INNER JOIN orders AS o ON t.x = o.customer_x
+                WHERE o.amount > (
+                    SELECT
+                        AVG(amount)
+                    FROM orders
+                )
+                GROUP BY t.y, o.product
+                HAVING COUNT(*) > 2;""", result);
+        // Reformatted program is valid
         execute = CompilerMain.execute("--noRust", "-i", out.getPath());
         Assert.assertEquals(0, execute.exitCode);
         Utilities.deleteFile(input, false);

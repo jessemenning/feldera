@@ -81,7 +81,7 @@ The support bundle has the following content:
 
 **Error**: `Table metadata is invalid: Number of checkpoint files '0' is not equal to number of checkpoint metadata parts 'None'`
 
-**Solution**: This usually happens when the Delta Table uses features unsupported by `delta-rs` like liquid clustering or deletion vectors. Check the table properties and set the checkpoint policy to "classic":
+**Solution**: This usually happens when the Delta Table uses features unsupported by `delta-rs`, such as liquid clustering. Check the table properties and set the checkpoint policy to "classic":
 
 ```sql
 ALTER TABLE my_table SET TBLPROPERTIES (
@@ -94,7 +94,7 @@ ALTER TABLE my_table SET TBLPROPERTIES (
 **Error**: `The pipeline container has restarted. This was likely caused by an Out-Of-Memory (OOM) crash.`
 
 Feldera runs each pipeline in a separate container with configurable memory limits.
-See [documentation on the pipeline's memory usage](memory) for a detailed breakdown
+See [documentation on the pipeline's memory usage](memory.md) for a detailed breakdown
 of how memory is used and available control knobs.
 
 ### Out-of-storage Errors

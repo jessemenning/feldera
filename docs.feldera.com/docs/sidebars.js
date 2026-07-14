@@ -115,6 +115,16 @@ const guides = {
             ]
         },
         {
+            type: 'category',
+            label: 'Real-Time Medallion Architecture',
+            items: [
+                'use_cases/medallion_architecture/part1',
+                'use_cases/medallion_architecture/part2',
+                'use_cases/medallion_architecture/part3',
+                'use_cases/medallion_architecture/part4'
+            ]
+        },
+        {
             type: 'doc',
             id: 'use_cases/fraud_detection/fraud_detection',
             label: 'Real-time Fraud Detection',
@@ -308,6 +318,11 @@ const connectors = {
                 },
                 {
                     type: 'doc',
+                    id: 'connectors/sources/postgresql-cdc',
+                    label: 'PostgreSQL CDC'
+                },
+                {
+                    type: 'doc',
                     id: 'connectors/sources/s3',
                     label: 'AWS S3'
                 },
@@ -320,6 +335,11 @@ const connectors = {
                     type: 'doc',
                     id: 'connectors/sources/file',
                     label: 'File'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sources/empty',
+                    label: 'Empty'
                 }
             ]
         },
@@ -363,6 +383,11 @@ const connectors = {
                 },
                 {
                     type: 'doc',
+                    id: 'connectors/sinks/dynamodb',
+                    label: 'DynamoDB (experimental)'
+                },
+                {
+                    type: 'doc',
                     id: 'connectors/sinks/snowflake',
                     label: 'Snowflake (experimental)'
                 },
@@ -375,6 +400,11 @@ const connectors = {
                     type: 'doc',
                     id: 'connectors/sinks/iceberg',
                     label: 'Iceberg (experimental)'
+                },
+                {
+                    type: 'doc',
+                    id: 'connectors/sinks/null',
+                    label: 'Null'
                 }
             ]
         }
@@ -477,6 +507,7 @@ const operations = {
         'operations/metrics',
         'operations/json-logging',
         'operations/visualizing-profiles',
+        'operations/required-domains',
     ]
 };
 

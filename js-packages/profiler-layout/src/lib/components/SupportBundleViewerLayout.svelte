@@ -14,31 +14,41 @@
     Dataflow,
     JsonProfiles,
     MetricOption,
+    NodeAttributes,
     ProfilerCallbacks,
     SourcePositionRange,
     WorkerOption
   } from 'profiler-lib'
   import { type Snippet, untrack } from 'svelte'
   import type { TriageResults } from 'triage-types'
+  import type { GlobalMetrics } from '../functions/globalMetrics'
   import { createLookupCoordinator } from '../functions/lookup'
+  import { type AnalysisView, isNodeView, metricsModeOf } from '../functions/metricsMode'
   import { severityLabel, uniqueCategories, uniqueSeverities } from '../functions/triage'
-  import { isOverviewAttributes, type MetricsMode } from './MetricsView.svelte'
+  import type { MetricsMode } from './MetricsView.svelte'
   import ProfilerDiagram from './ProfilerDiagram.svelte'
   import type { TooltipData } from './ProfilerTooltip.svelte'
   import ProfileTimestampSelector from './ProfileTimestampSelector.svelte'
+  import ConfigTab from './tabs/ConfigTab.svelte'
   import IssuesTab from './tabs/IssuesTab.svelte'
   import LogsTab from './tabs/LogsTab.svelte'
   import MetricsTab, { type AnalysisTabProps } from './tabs/MetricsTab.svelte'
   import SqlTab, { type SqlTabProps } from './tabs/SqlTab.svelte'
 
-  const TABS = ['Metrics', 'Logs', 'Issues'] as const
+  const TABS = ['Metrics', 'Logs', 'Config', 'Issues'] as const
   type AnalysisTab = (typeof TABS)[number]
 
   interface Props {
-    profileData: JsonProfiles
+    /** Parsed circuit profile */
+    profileData?: JsonProfiles
     dataflowData: Dataflow | undefined
     programCode: string[] | undefined
     logText?: string
+    /** Cumulative pipeline-wide metrics from the bundle's `stats.json`; shown in the overview. */
+    globalMetrics?: GlobalMetrics
+    /** Pipeline runtime configuration from the bundle's `pipeline_config.json`; shown in the Config
+     *  tab. Absent when the bundle carried no config. */
+    runtimeConfig?: unknown
     triageResults: TriageResults
     profileFiles: [Date, ZipItem[]][]
     selectedTimestamp: Date | null
@@ -49,6 +59,9 @@
     /** Optional slot for a richer SQL panel; receives current highlight ranges */
     sqlPanel?: Snippet<[highlightRanges: SourcePositionRange[]]>
     onHighlightSourceRanges?: (ranges: SourcePositionRange[]) => void
+    /** Fired when the graph rendering enters or leaves its asynchronous layout phase.
+     */
+    onRenderingChange?: (rendering: boolean) => void
   }
 
   let {
@@ -56,6 +69,8 @@
     dataflowData,
     programCode,
     logText,
+    globalMetrics,
+    runtimeConfig,
     triageResults,
     profileFiles,
     selectedTimestamp,
@@ -63,18 +78,31 @@
     sqlPanelFullHeight = $bindable(),
     loadProfileControl,
     sqlPanel,
-    onHighlightSourceRanges
+    onHighlightSourceRanges,
+    onRenderingChange
   }: Props = $props()
 
+  const hasProfile = $derived(profileData !== undefined)
+
+  const graphPaneDefaultSize = 55
+  const graphPaneMinSize = 20
+  const belowGraphPaneDefaultSize = 100 - graphPaneDefaultSize
+
   let profilerDiagram: ProfilerDiagram | undefined = $state()
+  // The loaded profile's toplevel node id, so the analysis panel can recognise overview data.
+  const diagramRootNodeId = $derived(profilerDiagram?.getProfile()?.rootNodeId)
   let tooltipData: TooltipData | null = $state(null)
-  let lastNodeData: TooltipData | null = $state(null)
+  // Most recently inspected operator; the "Node" segment restores it via `setMetricsMode('node')`.
+  let lastNodeData: NodeAttributes | null = $state(null)
   let metrics: MetricOption[] = $state([])
   let selectedMetricId = $state('')
   let message = $state('')
   let error = $state('')
   let currentTab = $state<AnalysisTab>('Metrics')
-  let metricsMode = $state<MetricsMode>('overview')
+  // Tracked explicitly so the SegmentedControl indicator follows the user's choice instead of a
+  // title heuristic on `tooltipData`.
+  let analysisView = $state<AnalysisView>('overview')
+  const metricsMode = $derived<MetricsMode>(metricsModeOf(analysisView))
   let showAdvancedMetrics = $state(false)
   let issueSeverityFilter = $state<'all' | 'error' | 'warning' | 'info'>('all')
   let issueCategoryFilter = $state<string>('all')
@@ -82,6 +110,13 @@
   const issueSeverities = $derived(uniqueSeverities(triageResults.results))
   let nodeSearchQuery = $state('')
   let lookupQuery = $state('')
+  // Bound to the shared analysis-panel lookup <input>. Tabs (e.g. the log list) can request
+  // focus via the `onSearchShortcut` callback threaded through `analysisTabProps`.
+  let searchInputEl: HTMLInputElement | undefined = $state()
+  const onAnalysisSearchShortcut = () => {
+    searchInputEl?.focus()
+    searchInputEl?.select()
+  }
   let highlightRanges: SourcePositionRange[] = $state([])
 
   // The graph panel's diagram is hoisted to a <PersistentContent> overlay so it survives the
@@ -100,27 +135,29 @@
   const lookup = createLookupCoordinator()
 
   const callbacks: ProfilerCallbacks = {
-    // Profiler callbacks only update metrics data; they never drive view mode. The view
-    // (showGlobalMetrics / showTopNodes) is driven directly by the controls in setMetricsMode,
-    // so nothing here feeds back into a reactive effect.
+    // Sticky callbacks only refresh the payload — view state is driven by `onNodeClick` and
+    // `setMetricsMode`, never inferred from the data.
     displayNodeAttributes: (data, isSticky) => {
       if (!isSticky) {
         return
       }
-      const attrs = data.match({ some: (v) => ({ nodeAttributes: v }), none: () => null })
+      const attrs = data.match({ some: (v) => v, none: () => null })
       untrack(() => {
         if (attrs) {
-          const isOverview = isOverviewAttributes(attrs.nodeAttributes)
-          currentTab = 'Metrics'
-          // A node click while viewing the top-nodes table should reveal that node's
-          // attributes.
-          metricsMode = isOverview ? 'overview' : 'node'
-          tooltipData = attrs
-          if (!isOverview) {
+          tooltipData = { nodeAttributes: attrs }
+          // Only cache while we're on a node view, so an `'overview'` round-trip can't
+          // overwrite the operator the user actually inspected.
+          if (isNodeView(analysisView)) {
             lastNodeData = attrs
           }
         }
       })
+    },
+    onNodeClick: (nodeId) => {
+      // The only path outside `setMetricsMode` that switches to "Node"; `displayNodeAttributes`
+      // fires right after with the payload.
+      analysisView = { nodeId }
+      currentTab = 'Metrics'
     },
     displayTopNodes(data, _isSticky) {
       tooltipData = data.match({
@@ -161,6 +198,9 @@
       }
       highlightRanges = ranges
       onHighlightSourceRanges?.(ranges)
+    },
+    onRenderingChange: (rendering) => {
+      onRenderingChange?.(rendering)
     }
   }
 
@@ -171,33 +211,34 @@
     profilerDiagram?.selectMetric(selectedMetricId)
   })
 
-  // Initial display: show the overview once the diagram is ready and whenever a new profile
-  // loads. Depends only on profileData + profilerDiagram (NOT metricsMode), so it runs once
-  // per profile and never re-fires from the callbacks it triggers.
+  // Reset to the overview whenever the loaded bundle changes. `analysisView` is reset first so the
+  // SegmentedControl indicator follows the new view, and so the sticky `displayNodeAttributes`
+  // that `showGlobalMetrics` triggers sees a non-node view and can't overwrite `lastNodeData`
+  // with the overview payload.
   $effect(() => {
     void profileData
     const diagram = profilerDiagram
-    if (!diagram) {
-      return
-    }
     queueMicrotask(() => {
-      diagram.showGlobalMetrics(true)
-      metricsMode = 'overview'
+      analysisView = 'overview'
+      tooltipData = null
+      lastNodeData = null
+      diagram?.showGlobalMetrics(true)
     })
   })
 
-  /** Switch the metrics view. Driven directly by the SegmentedControl (a user action), so the
-   *  profiler calls happen here rather than via an effect reacting to `metricsMode` — that
-   *  decoupling is what removes the feedback loop. */
+  /** Switch the analysis panel's view. Writes `analysisView` first so the SegmentedControl
+   *  indicator follows the user's pick, then asks the visualizer for the matching payload. */
   function setMetricsMode(mode: MetricsMode) {
-    metricsMode = mode
     currentTab = 'Metrics'
     if (mode === 'overview') {
+      analysisView = 'overview'
       profilerDiagram?.showGlobalMetrics(true)
     } else if (mode === 'top-nodes') {
+      analysisView = 'top-nodes'
       profilerDiagram?.showTopNodes(true)
-    } else if (mode === 'node') {
-      tooltipData = lastNodeData
+    } else if (mode === 'node' && lastNodeData) {
+      analysisView = { nodeId: lastNodeData.nodeId }
+      tooltipData = { nodeAttributes: lastNodeData }
     }
   }
 
@@ -233,13 +274,17 @@
   const analysisTabProps = $derived<AnalysisTabProps>({
     metricsMode,
     tooltipData,
+    rootNodeId: diagramRootNodeId,
+    globalMetrics,
+    runtimeConfig,
     showAdvancedMetrics,
     lookup,
     logText,
     triageResults,
     issueSeverityFilter,
     issueCategoryFilter,
-    onSearchNode: (query) => profilerDiagram?.search(query)
+    onSearchNode: (query) => profilerDiagram?.search(query),
+    onSearchShortcut: onAnalysisSearchShortcut
   })
   const analysisTabs = $derived<TabSpec<AnalysisTabProps>[]>([
     {
@@ -257,6 +302,14 @@
       tabBarEnd: commonTabBarEnd
     },
     {
+      id: 'Config',
+      label: configLabel,
+      panel: ConfigTab,
+      keepAlive: true,
+      // No runtime config in the bundle → nothing to show, so the tab is present but unselectable.
+      disabled: runtimeConfig === undefined
+    },
+    {
       id: 'Issues',
       label: issuesLabel,
       panel: IssuesTab,
@@ -268,42 +321,54 @@
 
 <!-- ── Graph panel (dataflow graph) ────────────────────────────────────────── -->
 {#snippet graphPanel()}
-  <div class="flex h-full flex-col overflow-hidden rounded-container bg-surface-50-950">
+  <div
+    class="flex flex-col overflow-hidden rounded-container bg-surface-50-950 {hasProfile
+      ? 'h-full'
+      : ''}"
+  >
     <!-- Header -->
     <div class="flex flex-shrink-0 flex-wrap items-center gap-2 p-4">
       {@render loadProfileControl?.()}
       <ProfileTimestampSelector {profileFiles} {selectedTimestamp} {onSelectTimestamp} />
-      <div class="ml-auto">
-        <input
-          bind:value={nodeSearchQuery}
-          type="text"
-          placeholder="Search node"
-          title="Search for a node by ID or persistent ID"
-          onkeydown={(e) => e.key === 'Enter' && handleSearch()}
-          class="input h-6 w-36 text-sm"
-        />
-      </div>
+      {#if hasProfile}
+        <div class="ml-auto">
+          <input
+            bind:value={nodeSearchQuery}
+            type="text"
+            placeholder="Search node"
+            title="Search for a node by ID or persistent ID"
+            onkeydown={(e) => e.key === 'Enter' && handleSearch()}
+            class="input h-6 w-36 text-sm"
+          />
+        </div>
+      {:else}
+        <p class="text-sm text-surface-600-400">
+          This bundle has no circuit profile, so the dataflow graph is unavailable.
+        </p>
+      {/if}
     </div>
     <!-- Diagram slot. The actual <ProfilerDiagram> is rendered once outside the layout-
          toggle as a <PersistentContent> overlay so it survives the sqlPanelFullHeight
          layout toggle without re-initialising the Visualizer. The `use:` action mirrors
          this div's bounding rect onto the shared handle. -->
-    <div use:diagramRect.placeholder class="relative min-h-0 flex-1 bg-white-dark">
-      {#if error}
-        <div
-          class="absolute inset-x-4 top-4 z-10 rounded border border-red-300 bg-white p-3 font-mono text-sm text-red-600 shadow"
-        >
-          {error}
-        </div>
-      {/if}
-      {#if message}
-        <div
-          class="absolute left-2 top-2 z-10 rounded bg-white/90 px-2 py-1 font-mono text-sm shadow"
-        >
-          {message}
-        </div>
-      {/if}
-    </div>
+    {#if hasProfile}
+      <div use:diagramRect.placeholder class="relative min-h-0 flex-1 bg-white-dark">
+        {#if error}
+          <div
+            class="absolute inset-x-4 top-4 z-10 rounded border border-red-300 bg-white p-3 font-mono text-sm text-red-600 shadow"
+          >
+            {error}
+          </div>
+        {/if}
+        {#if message}
+          <div
+            class="absolute left-2 top-2 z-10 rounded bg-white/90 px-2 py-1 font-mono text-sm shadow"
+          >
+            {message}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
 {/snippet}
 
@@ -326,6 +391,7 @@
 <!-- ── Analysis panel labels and tab-bar-end snippets ────────────────────────── -->
 {#snippet metricsLabel()}Metrics{/snippet}
 {#snippet logsLabel()}Logs{/snippet}
+{#snippet configLabel()}Config{/snippet}
 {#snippet issuesLabel()}
   Issues &amp; Suggestions
   {#if triageResults.results.length > 0}
@@ -349,6 +415,7 @@
       </Select>
     {/if}
     <input
+      bind:this={searchInputEl}
       bind:value={lookupQuery}
       type="text"
       placeholder={currentTab === 'Logs'
@@ -356,7 +423,7 @@
         : currentTab === 'Issues'
           ? 'Search issues'
           : 'Search metrics'}
-      title="Search within active tab (Enter to jump)"
+      title="Search within active tab (Enter to jump, Ctrl/Cmd-F to focus)"
       onkeydown={(e) => e.key === 'Enter' && handleLookup()}
       class="input h-6 w-28 text-sm"
     />
@@ -396,7 +463,7 @@
     items={[
       { value: 'overview', label: 'Overview' },
       { value: 'node', label: 'Node', disabled: !lastNodeData },
-      { value: 'top-nodes', label: 'Top nodes' }
+      { value: 'top-nodes', label: 'Top nodes', disabled: !hasProfile }
     ]}
     class="px-2"
   />
@@ -441,11 +508,17 @@
 <!-- ══ Layout: normal (graph top, SQL + tabs bottom) ══════════════════════ -->
 {#if !sqlPanelFullHeight}
   <PaneGroup direction="vertical" class="!overflow-visible h-full">
-    <Pane defaultSize={55} minSize={20} class="!overflow-visible">
-      {@render graphPanel()}
-    </Pane>
-    <PaneResizer class="pane-divider-horizontal my-2" />
-    <Pane defaultSize={45} minSize={15} class="!overflow-visible">
+    {#if hasProfile}
+      <Pane defaultSize={graphPaneDefaultSize} minSize={graphPaneMinSize} class="!overflow-visible">
+        {@render graphPanel()}
+      </Pane>
+      <PaneResizer class="pane-divider-horizontal my-2" />
+    {:else}
+      <div class="mb-4">
+        {@render graphPanel()}
+      </div>
+    {/if}
+    <Pane defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
       <PaneGroup direction="horizontal" class="!overflow-visible h-full">
         <Pane defaultSize={50} minSize={0} class="!overflow-visible">
           <div use:sqlPanelRect.placeholder class="h-full"></div>
@@ -466,11 +539,21 @@
     <PaneResizer class="pane-divider-vertical mx-1.5" />
     <Pane minSize={20} class="!overflow-visible">
       <PaneGroup direction="vertical" class="!overflow-visible h-full">
-        <Pane defaultSize={55} minSize={20} class="!overflow-visible">
-          {@render graphPanel()}
-        </Pane>
-        <PaneResizer class="pane-divider-horizontal my-2" />
-        <Pane defaultSize={45} minSize={15} class="!overflow-visible">
+        {#if hasProfile}
+          <Pane
+            defaultSize={graphPaneDefaultSize}
+            minSize={graphPaneMinSize}
+            class="!overflow-visible"
+          >
+            {@render graphPanel()}
+          </Pane>
+          <PaneResizer class="pane-divider-horizontal my-2" />
+        {:else}
+          <div class="mb-4">
+            {@render graphPanel()}
+          </div>
+        {/if}
+        <Pane defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
           {@render analysisPanel()}
         </Pane>
       </PaneGroup>
@@ -482,15 +565,17 @@
      <PersistentPlaceholder> in graphPanel. Surviving the layout toggle (and any other
      conditional re-render of graphPanel) is what keeps the Visualizer's internal state intact
      instead of being torn down and re-created from `profileData` each time. -->
-<PersistentContent persistent={diagramRect} class="overflow-hidden bg-white-dark">
-  <ProfilerDiagram
-    bind:this={profilerDiagram}
-    {profileData}
-    {dataflowData}
-    {programCode}
-    {callbacks}
-  />
-</PersistentContent>
+{#if profileData}
+  <PersistentContent persistent={diagramRect} class="overflow-hidden bg-white-dark">
+    <ProfilerDiagram
+      bind:this={profilerDiagram}
+      {profileData}
+      {dataflowData}
+      {programCode}
+      {callbacks}
+    />
+  </PersistentContent>
+{/if}
 
 <!-- Persistent SQL panel overlay. Hoisted out of the layout branches for the same reason as the
      diagram: rendered once, it mirrors the placeholder in whichever {#if} branch is active, so the

@@ -39,7 +39,12 @@
   type ExtraType = {
     fields: Record<string, Field>
     selected: boolean
+    // Full teardown: stops the network read AND drops this relation's rows from the
+    // buffer (used when a relation is unchecked or the pipeline is torn down).
     cancelStream?: () => void
+    // Bare network stop used by scroll-pause: halts reading but keeps the rows already
+    // received so the paused view stays put. Resume re-establishes the stream.
+    stopStream?: () => void
   }
 
   let pipelinesRelations = $state<
@@ -82,9 +87,16 @@
     pipelineName: string,
     relationName: string
   ) => {
+    const clearStreamHandles = () => {
+      const relation = pipelinesRelations[tenantName]?.[pipelineName]?.[relationName]
+      if (relation) {
+        relation.cancelStream = undefined
+        relation.stopStream = undefined
+      }
+    }
     const request = api.relationEgressStream(pipelineName, relationName).then((result) => {
       if (result instanceof Error) {
-        pipelinesRelations[tenantName][pipelineName][relationName].cancelStream = undefined
+        clearStreamHandles()
         return undefined
       }
 
@@ -113,45 +125,57 @@
 
       const { cancel } = parseStream(
         result,
-        createBigNumberStreamParser<XgressEntry>({
-          paths: ['$.json_data.*'],
-          separator: ''
-        }),
+        newlineJsonDecoder<XgressEntry>(
+          createBigNumberStreamParser<XgressEntry>({
+            paths: ['$.json_data.*'],
+            separator: ''
+          }),
+          {
+            bufferSize: 4 * 1024 * 1024,
+            onBytesSkipped: (skippedBytes) => {
+              const cs = changeStream[tenantName][pipelineName]
+              // Coalesce consecutive skip markers for the same relation: if the row
+              // at the tail is already a skip marker tagged with this relation, just
+              // bump its byte count in place instead of pushing another row. Keeps
+              // the change-stream view from getting flooded with one-line "Skipped N bytes"
+              // entries when backpressure drops sustained traffic.
+              const lastRow = cs.rows.at(-1)
+              if (lastRow && 'skippedBytes' in lastRow && lastRow.relationName === relationName) {
+                lastRow.skippedBytes += skippedBytes
+              } else {
+                appendForRelation([{ relationName, skippedBytes }])
+              }
+              cs.totalSkippedBytes += skippedBytes
+            }
+          }
+        ),
         {
           pushChanges: (rows: XgressEntry[]) => {
             appendForRelation(rows as unknown as Row[], rows[0])
           },
-          onBytesSkipped: (skippedBytes) => {
-            const cs = changeStream[tenantName][pipelineName]
-            // Coalesce consecutive skip markers for the same relation: if the row at
-            // the tail is already a skip marker tagged with this relation, just bump
-            // its byte count in place instead of pushing another row. Keeps the
-            // change-stream view from getting flooded with one-line "Skipped N bytes"
-            // entries when backpressure drops sustained traffic.
-            const lastRow = cs.rows.at(-1)
-            if (lastRow && 'skippedBytes' in lastRow && lastRow.relationName === relationName) {
-              lastRow.skippedBytes += skippedBytes
-            } else {
-              appendForRelation([{ relationName, skippedBytes }])
-            }
-            cs.totalSkippedBytes += skippedBytes
-          },
           onParseEnded: () => {
-            pipelinesRelations[tenantName][pipelineName][relationName].cancelStream = undefined
+            clearStreamHandles()
           }
-        },
-        {
-          bufferSize: 4 * 1024 * 1024
         }
       )
       return () => {
         cancel()
       }
     })
-    return () => {
+    // Bare network stop: halt reading without removing already-received rows. Drives
+    // scroll-pause, where the paused view must keep showing the latest data.
+    pipelinesRelations[tenantName][pipelineName][relationName].stopStream = () => {
       request.then((cancel) => {
         cancel?.()
-        pipelinesRelations[tenantName][pipelineName][relationName].cancelStream = undefined
+        clearStreamHandles()
+      })
+    }
+    // Full teardown: stop reading and drop this relation's rows from the buffer (used when a
+    // relation is unchecked or the pipeline is torn down).
+    pipelinesRelations[tenantName][pipelineName][relationName].cancelStream = () => {
+      request.then((cancel) => {
+        cancel?.()
+        clearStreamHandles()
         ;({
           rows: changeStream[tenantName][pipelineName].rows,
           headers: changeStream[tenantName][pipelineName].headers
@@ -177,12 +201,40 @@
       if (pipelinesRelations[tenantName][pipelineName][relationName].cancelStream) {
         continue
       }
-      pipelinesRelations[tenantName][pipelineName][relationName].cancelStream = startReadingStream(
-        api,
-        tenantName,
-        pipelineName,
-        relationName
-      )
+      startReadingStream(api, tenantName, pipelineName, relationName)
+    }
+    getChangeStream.current = changeStream
+  }
+  // Scroll-pause: stop reading every selected relation's stream without touching the
+  // buffer, so the view freezes on the rows already received and no new data arrives.
+  const pauseSelectedStreams = (tenantName: string, pipelineName: string) => {
+    const relations = pipelinesRelations[tenantName]?.[pipelineName]
+    if (!relations) {
+      return
+    }
+    for (const relation of Object.values(relations)) {
+      if (relation.selected) {
+        relation.stopStream?.()
+      }
+    }
+  }
+  // Scroll-resume: re-establish a stream for every selected relation that isn't already
+  // streaming. Unlike `startSelectedStreams`, the existing buffer is preserved — resuming
+  // continues the history rather than wiping it.
+  const resumeSelectedStreams = (
+    api: PipelineManagerApi,
+    tenantName: string,
+    pipelineName: string
+  ) => {
+    const relations = pipelinesRelations[tenantName]?.[pipelineName]
+    if (!relations) {
+      return
+    }
+    for (const [relationName, relation] of Object.entries(relations)) {
+      if (!relation.selected || relation.cancelStream) {
+        continue
+      }
+      startReadingStream(api, tenantName, pipelineName, relationName)
     }
     getChangeStream.current = changeStream
   }
@@ -244,6 +296,7 @@
   import {
     appendRowsForRelation,
     createBigNumberStreamParser,
+    newlineJsonDecoder,
     parseStream
   } from '$lib/functions/pipelines/changeStream'
   import JSONbig from 'true-json-bigint'
@@ -427,6 +480,7 @@
     >
       <input
         type="checkbox"
+        data-testid="input-changestream-relation-{relation.relationName}"
         class="bg-white-dark m-1 checkbox translate-y-1"
         checked={relation.selected}
         disabled={isDisabled}
@@ -435,8 +489,7 @@
           pipelinesRelations[tenantName][pipelineName][relation.relationName].selected = follow
           if (follow) {
             // If stream is stopped - the action will silently fail
-            pipelinesRelations[tenantName][pipelineName][relation.relationName].cancelStream =
-              startReadingStream(api, tenantName, pipelineName, relation.relationName)
+            startReadingStream(api, tenantName, pipelineName, relation.relationName)
           } else {
             pipelinesRelations[tenantName][pipelineName][relation.relationName].cancelStream?.()
             pipelinesRelations[tenantName][pipelineName][relation.relationName].cancelStream =
@@ -493,7 +546,16 @@
 {#snippet dataView()}
   {#if getChangeStream.current[tenantName]?.[pipelineName]?.rows?.length}
     {#key `${tenantName}::${pipelineName}`}
-      <ChangeStream changeStream={getChangeStream.current[tenantName][pipelineName]}></ChangeStream>
+      <ChangeStream
+        changeStream={getChangeStream.current[tenantName][pipelineName]}
+        onScrollPausedChange={(paused) => {
+          if (paused) {
+            pauseSelectedStreams(tenantName, pipelineName)
+          } else {
+            resumeSelectedStreams(api, tenantName, pipelineName)
+          }
+        }}
+      ></ChangeStream>
     {/key}
   {:else}
     <span class="p-2 text-surface-600-400">

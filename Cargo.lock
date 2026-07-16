@@ -5175,7 +5175,7 @@ dependencies = [
 [[package]]
 name = "etl"
 version = "0.1.0"
-source = "git+https://github.com/supabase/etl?rev=b2aab62d#b2aab62db1830df5b72d1d09ad5c053ee8e44db2"
+source = "git+https://github.com/supabase/etl?rev=ab5a659b#ab5a659b0d3c2ee50389ed1916a1c3f57bb4b0b2"
 dependencies = [
  "byteorder",
  "bytes",
@@ -5204,7 +5204,7 @@ dependencies = [
 [[package]]
 name = "etl-config"
 version = "0.1.0"
-source = "git+https://github.com/supabase/etl?rev=b2aab62d#b2aab62db1830df5b72d1d09ad5c053ee8e44db2"
+source = "git+https://github.com/supabase/etl?rev=ab5a659b#ab5a659b0d3c2ee50389ed1916a1c3f57bb4b0b2"
 dependencies = [
  "config",
  "secrecy",
@@ -5218,7 +5218,7 @@ dependencies = [
 [[package]]
 name = "etl-postgres"
 version = "0.1.0"
-source = "git+https://github.com/supabase/etl?rev=b2aab62d#b2aab62db1830df5b72d1d09ad5c053ee8e44db2"
+source = "git+https://github.com/supabase/etl?rev=ab5a659b#ab5a659b0d3c2ee50389ed1916a1c3f57bb4b0b2"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -6674,7 +6674,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -10084,7 +10084,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -10123,7 +10123,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -12810,7 +12810,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.59.0",

@@ -88,6 +88,19 @@ impl OutputFormat for JsonOutputFormat {
             json_config.buffer_size_records = 1;
         }
 
+        // Solace resolves a per-row `{field}` topic template from each message
+        // (see `resolve_topic` in the solace output transport), so every Solace
+        // message must contain exactly one record encoded as a bare object — not
+        // a batch and not a JSON array. Force one-record-per-buffer, matching the
+        // Snowflake/Debezium/Redis behavior above. `array = false` guarantees a
+        // bare `{"insert":{…}}` object (a one-element `[{…}]` array would defeat
+        // `resolve_topic`'s `.get("insert")` lookup and drop back to the literal
+        // template topic).
+        if matches!(&config.transport, TransportConfig::SolaceOutput(_)) {
+            json_config.buffer_size_records = 1;
+            json_config.array = false;
+        }
+
         let key_separator = match &config.transport {
             TransportConfig::RedisOutput(config) => Some(config.key_separator.clone()),
             _ => None,

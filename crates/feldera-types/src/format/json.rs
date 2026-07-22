@@ -246,6 +246,12 @@ pub struct JsonEncoderConfig {
     ///
     /// This option is only valid with the `debezium` update format.
     pub key_fields: Option<Vec<String>>,
+
+    /// When true, retraction (delete) records are NOT emitted — the sink publishes an
+    /// insert-only upsert/current-state stream. Intended for `insert_delete` output feeding
+    /// consumers that act on current state (e.g. a topic-per-key trigger), so they never
+    /// receive delete envelopes. Only affects the `insert_delete` update format. Default false.
+    pub skip_deletes: bool,
 }
 
 impl Default for JsonEncoderConfig {
@@ -256,6 +262,7 @@ impl Default for JsonEncoderConfig {
             buffer_size_records: 10_000,
             array: false,
             key_fields: None,
+            skip_deletes: false,
         }
     }
 }

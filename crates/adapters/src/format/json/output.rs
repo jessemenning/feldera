@@ -291,6 +291,18 @@ impl Encoder for JsonEncoder {
             }
 
             while w != 0 {
+                // Upsert / current-state output: when skip_deletes is set, drop retraction
+                // (negative-weight) records so the sink emits an insert-only stream. Applies
+                // to insert_delete output only. Skipping here avoids any buffer/array/newline/
+                // num_records work, so an all-deletes batch yields no push_buffer call.
+                if w < 0
+                    && self.config.skip_deletes
+                    && matches!(self.config.update_format, JsonUpdateFormat::InsertDelete)
+                {
+                    w += 1;
+                    continue;
+                }
+
                 let prev_len = buffer.len();
 
                 if self.config.array {

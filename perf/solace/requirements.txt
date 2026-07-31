@@ -1,0 +1,4 @@
+# The Feldera Python SDK is installed separately by run.sh from ../../python
+# (editable) so the harness always matches the fork's API.
+solace-pubsubplus>=1.7
+requests>=2.31

@@ -1,0 +1,54 @@
+name: feldera-solace-perf
+services:
+  solace:
+    image: solace/solace-pubsub-standard:${SOLACE_TAG:-10.10}
+    shm_size: 1g
+    ulimits:
+      core: 1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - username_admin_globalaccesslevel=admin
+      - username_admin_password=admin
+      # Multi-publisher runs need more than the broker's minimum; 1000 is
+      # still within the Standard edition's limits.
+      - system_scaling_maxconnectioncount=1000
+    ports:
+      - "55555:55555" # SMF (harness publisher + sink listener)
+      - "8088:8080"   # SEMP (host 8088 -- 8080 is taken by feldera)
+    healthcheck:
+      # Solace 10.x returns 400 for the top-level __about resource; probe the
+      # config API instead.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf -u admin:admin http://localhost:8080/SEMP/v2/config/about/api >/dev/null"
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      # 25-40 s on a laptop, 3-5 min on a cold CI runner.
+      start_period: 300s
+
+  feldera:
+    image: ${FELDERA_IMAGE:-ghcr.io/jessemenning/feldera:feat-solace-connector}
+    ports:
+      - "8080:8080"
+    stop_grace_period: 0s
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    depends_on:
+      solace:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail --request GET --url http://localhost:8080/healthz"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s

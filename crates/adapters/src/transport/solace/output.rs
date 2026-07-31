@@ -1,11 +1,25 @@
 use anyhow::Result as AnyResult;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
+use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::message::{DeliveryMode, DestinationType, MessageDestination, OutboundMessageBuilder};
 use solace_rs::{Context, SolaceLogLevel};
 use tracing::{info, warn};
 
 use super::output_config::{OutputDeliveryMode, SolaceOutputConfig};
+
+/// Map the connector's log-level config to the Solace SDK enum (default
+/// `Warning`).
+fn solace_log_level(cfg: Option<ConfigLogLevel>) -> SolaceLogLevel {
+    match cfg {
+        Some(ConfigLogLevel::Critical) => SolaceLogLevel::Critical,
+        Some(ConfigLogLevel::Error) => SolaceLogLevel::Error,
+        Some(ConfigLogLevel::Warning) | None => SolaceLogLevel::Warning,
+        Some(ConfigLogLevel::Notice) => SolaceLogLevel::Notice,
+        Some(ConfigLogLevel::Info) => SolaceLogLevel::Info,
+        Some(ConfigLogLevel::Debug) => SolaceLogLevel::Debug,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Endpoint
@@ -18,6 +32,9 @@ use super::output_config::{OutputDeliveryMode, SolaceOutputConfig};
 pub struct SolaceOutputEndpoint {
     config: SolaceOutputConfig,
     conn: Option<SolaceConnection>,
+    /// True when the topic has no `{field}` placeholders, so every record
+    /// publishes to the same destination.
+    static_topic: bool,
 }
 
 struct SolaceConnection {
@@ -27,8 +44,30 @@ struct SolaceConnection {
 }
 
 impl SolaceOutputEndpoint {
-    pub fn new(config: SolaceOutputConfig) -> Self {
-        Self { config, conn: None }
+    pub fn new(config: SolaceOutputConfig) -> AnyResult<Self> {
+        config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid Solace output config: {e}"))?;
+        // A static topic (no `{` placeholders) resolves to the same
+        // destination for every record, so validate it once here and fail
+        // fast on an invalid topic string rather than per-publish.
+        let is_static = !config.topic.contains('{');
+        if is_static {
+            MessageDestination::new(DestinationType::Topic, config.topic.as_str())
+                .map_err(|e| anyhow::anyhow!("invalid topic '{}': {e:?}", config.topic))?;
+        }
+        Ok(Self {
+            config,
+            conn: None,
+            static_topic: is_static,
+        })
+    }
+
+    fn delivery_mode(&self) -> DeliveryMode {
+        match self.config.delivery_mode {
+            OutputDeliveryMode::Direct => DeliveryMode::Direct,
+            OutputDeliveryMode::Persistent => DeliveryMode::Persistent,
+        }
     }
 
     fn publish(&self, topic: &str, payload: &[u8]) -> AnyResult<()> {
@@ -40,14 +79,9 @@ impl SolaceOutputEndpoint {
         let dest = MessageDestination::new(DestinationType::Topic, topic)
             .map_err(|e| anyhow::anyhow!("invalid topic '{topic}': {e:?}"))?;
 
-        let mode = match self.config.delivery_mode {
-            OutputDeliveryMode::Direct => DeliveryMode::Direct,
-            OutputDeliveryMode::Persistent => DeliveryMode::Persistent,
-        };
-
         let msg = OutboundMessageBuilder::new()
             .destination(dest)
-            .delivery_mode(mode)
+            .delivery_mode(self.delivery_mode())
             .payload(payload.to_vec())
             .build()
             .map_err(|e| anyhow::anyhow!("message build: {e:?}"))?;
@@ -62,17 +96,33 @@ impl SolaceOutputEndpoint {
 
 impl OutputEndpoint for SolaceOutputEndpoint {
     fn connect(&mut self, _async_error_callback: AsyncErrorCallback) -> AnyResult<()> {
-        let context = Context::new(SolaceLogLevel::Warning)
+        // NOTE: async delivery errors (broker rejections, connection-down) are
+        // not yet surfaced through `_async_error_callback`.  Draining the
+        // session event channel from a sync `OutputEndpoint` requires
+        // `AsyncSession::take_event_receiver`, a pending change in the
+        // solace-rs fork.  Until it lands, only synchronous publish errors
+        // reach the controller; persistent-mode broker ACKs accumulate in the
+        // session event channel.  See the connector improvement plan, P0.4.
+        let context = Context::new(solace_log_level(self.config.log_level))
             .map_err(|e| anyhow::anyhow!("Solace context init: {e:?}"))?;
 
         // AsyncSessionBuilder::build() is synchronous despite the async session type —
         // the "async" refers to message delivery, not the build process.
-        let session = AsyncSessionBuilder::new(&context)
+        let mut builder = AsyncSessionBuilder::new(&context)
             .host_name(self.config.smf_url())
             .vpn_name(self.config.vpn.clone())
             .username(self.config.username.clone())
             .password(self.config.password.clone())
-            .reconnect_retries(3)
+            .reconnect_retries(self.config.reconnect_retries)
+            .reconnect_retry_wait_ms(self.config.reconnect_retry_wait_ms)
+            .connect_timeout_ms(self.config.connect_timeout_secs.saturating_mul(1000));
+        if let Some(name) = &self.config.client_name {
+            builder = builder.client_name(name.clone());
+        }
+        if let Some(dir) = &self.config.ssl_trust_store_dir {
+            builder = builder.ssl_trust_store_dir(dir.clone());
+        }
+        let session = builder
             .build()
             .map_err(|e| anyhow::anyhow!("Solace session: {e:?}"))?;
 
@@ -97,8 +147,13 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     }
 
     fn push_buffer(&mut self, buffer: &[u8]) -> AnyResult<()> {
-        let topic = resolve_topic(&self.config.topic, buffer);
-        self.publish(&topic, buffer)
+        if self.static_topic {
+            // No template to resolve — publish straight to the fixed topic.
+            self.publish(&self.config.topic, buffer)
+        } else {
+            let topic = resolve_topic(&self.config.topic, buffer);
+            self.publish(&topic, buffer)
+        }
     }
 
     fn push_key(
@@ -108,8 +163,12 @@ impl OutputEndpoint for SolaceOutputEndpoint {
         _headers: &[(&str, Option<&[u8]>)],
     ) -> AnyResult<()> {
         if let Some(bytes) = val {
-            let topic = resolve_topic(&self.config.topic, bytes);
-            self.publish(&topic, bytes)?;
+            if self.static_topic {
+                self.publish(&self.config.topic, bytes)?;
+            } else {
+                let topic = resolve_topic(&self.config.topic, bytes);
+                self.publish(&topic, bytes)?;
+            }
         }
         Ok(())
     }

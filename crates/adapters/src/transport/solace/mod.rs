@@ -3,9 +3,13 @@
 //! # Input (`SolaceInputEndpoint`)
 //!
 //! Binds to a durable Solace queue via `solace-rs` (Solace C SDK wrapper).
-//! Uses `AckMode::Client` so messages are held unacked until Feldera confirms the
-//! circuit step has completed via `completion_watcher()`, providing at-least-once
-//! delivery with in-session RGMID dedup.
+//! Uses `AckMode::Client`: a message is acknowledged to the broker only after
+//! the circuit step that ingested it has been fully processed, tracked via
+//! `checkpoint_watcher()` when the pipeline is fault-tolerant, otherwise
+//! `completion_watcher()`. This gives at-least-once delivery — a crash before
+//! step completion leaves the message unacked, so the broker redelivers it —
+//! with in-session RGMID deduplication of those redeliveries. Acks are drained
+//! from a dedicated task branch so they never block the circuit's step loop.
 //!
 //! Hierarchical topic decomposition: configure `topic_pattern` (e.g.
 //! `"demo/events/{region}/{event_type}"`) and the connector automatically

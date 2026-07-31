@@ -109,7 +109,7 @@ pub fn input_transport_config_to_endpoint(
         #[cfg(not(feature = "with-nats"))]
         TransportConfig::NatsInput(_) => return Ok(None),
         #[cfg(feature = "with-solace")]
-        TransportConfig::SolaceInput(config) => Box::new(SolaceInputEndpoint::new(config)),
+        TransportConfig::SolaceInput(config) => Box::new(SolaceInputEndpoint::new(config)?),
         #[cfg(not(feature = "with-solace"))]
         TransportConfig::SolaceInput(_) => return Ok(None),
         #[cfg(feature = "with-pubsub")]
@@ -178,7 +178,7 @@ pub fn output_transport_config_to_endpoint(
         TransportConfig::NullOutput => Ok(Some(Box::new(NullOutputEndpoint))),
         #[cfg(feature = "with-solace")]
         TransportConfig::SolaceOutput(config) => {
-            Ok(Some(Box::new(SolaceOutputEndpoint::new(config))))
+            Ok(Some(Box::new(SolaceOutputEndpoint::new(config)?)))
         }
         _ => Ok(None),
     }

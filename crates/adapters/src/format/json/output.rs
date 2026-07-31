@@ -88,17 +88,22 @@ impl OutputFormat for JsonOutputFormat {
             json_config.buffer_size_records = 1;
         }
 
-        // Solace resolves a per-row `{field}` topic template from each message
-        // (see `resolve_topic` in the solace output transport), so every Solace
-        // message must contain exactly one record encoded as a bare object — not
-        // a batch and not a JSON array. Force one-record-per-buffer, matching the
-        // Snowflake/Debezium/Redis behavior above. `array = false` guarantees a
-        // bare `{"insert":{…}}` object (a one-element `[{…}]` array would defeat
-        // `resolve_topic`'s `.get("insert")` lookup and drop back to the literal
-        // template topic).
-        if matches!(&config.transport, TransportConfig::SolaceOutput(_)) {
-            json_config.buffer_size_records = 1;
-            json_config.array = false;
+        // A Solace output with a per-row `{field}` topic template resolves the
+        // destination from each message (see `resolve_topic` in the solace
+        // output transport), so such messages must each contain exactly one
+        // record encoded as a bare object — not a batch and not a JSON array.
+        // Force one-record-per-buffer, matching the Snowflake/Debezium/Redis
+        // behavior above. `array = false` guarantees a bare `{"insert":{…}}`
+        // object (a one-element `[{…}]` array would defeat `resolve_topic`'s
+        // `.get("insert")` lookup and drop back to the literal template topic).
+        //
+        // A static topic (no `{`) publishes every record to the same
+        // destination, so it keeps normal batching for throughput.
+        if let TransportConfig::SolaceOutput(solace_config) = &config.transport {
+            if solace_config.topic.contains('{') {
+                json_config.buffer_size_records = 1;
+                json_config.array = false;
+            }
         }
 
         let key_separator = match &config.transport {
@@ -682,6 +687,7 @@ mod test {
             json_flavor: None,
             buffer_size_records: 3,
             array,
+            skip_deletes: false,
             key_fields: None,
         };
 
@@ -885,6 +891,7 @@ mod test {
             json_flavor: None,
             buffer_size_records: 3,
             array: false,
+            skip_deletes: false,
             key_fields: None,
         };
 
@@ -922,6 +929,7 @@ mod test {
             json_flavor: None,
             buffer_size_records: 1,
             array: false,
+            skip_deletes: false,
             key_fields: Some(vec!["id".to_string(), "s".to_string()]),
         };
 
@@ -995,6 +1003,7 @@ mod test {
             json_flavor: None,
             buffer_size_records: 1,
             array: false,
+            skip_deletes: false,
             key_fields: Some(vec!["id".to_owned(), "s".to_owned()]),
         };
 

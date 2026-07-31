@@ -146,7 +146,7 @@ const _postPipelineAction = (
 
 export type PipelineStatus = ReturnType<typeof consolidatePipelineStatus>['status']
 
-const consolidatePipelineStatus = (
+export const consolidatePipelineStatus = (
   programStatus: ProgramStatus,
   deploymentStatus: _CombinedStatus,
   desiredStatus: _CombinedDesiredStatus,
@@ -191,6 +191,8 @@ const consolidatePipelineStatus = (
     .with(['Standby', P._, P._], () => 'Standby' as const)
     .with(['Bootstrapping', P._, P._], () => 'Bootstrapping' as const)
     .with(['Replaying', P._, P._], () => 'Replaying' as const)
+    .with(['ConcurrentBootstrapping', P._, P._], () => 'ConcurrentBootstrapping' as const)
+    .with(['Synchronizing', P._, P._], () => 'Synchronizing' as const)
     .with(['Running', P.any, P._], () => 'Running' as const)
     .with(['Unavailable', P.any, P.any], () => 'Unavailable' as const)
     .with(['AwaitingApproval', P.any, P._], () => 'AwaitingApproval' as const)
@@ -229,6 +231,8 @@ export const programStatusOf = (status: PipelineStatus) =>
       'Standby',
       'Bootstrapping',
       'Replaying',
+      'ConcurrentBootstrapping',
+      'Synchronizing',
       'AwaitingApproval',
       () => 'Success' as const
     )
@@ -961,6 +965,10 @@ export const pipelineLogsStream = async (
 
 const httpToWs = (endpoint: string) => endpoint.replace(/^http(s?):\/\//, 'ws$1://')
 
+// Subprotocol the manager echoes back on every browser WebSocket handshake.
+// Keep in sync with `WS_SUBPROTOCOL` in crates/feldera-types.
+const WS_SUBPROTOCOL = 'feldera-ws-v1'
+
 // base64url (no padding) — the only encoding whose alphabet is a valid
 // WebSocket subprotocol token, so it can carry the bearer token/tenant.
 const base64UrlEncode = (value: string): string =>
@@ -1007,7 +1015,7 @@ export const adHocQuery = async (pipelineName: string, query: string) => {
   const url = `${httpToWs(felderaEndpoint)}/v0/pipelines/${pipelineName}/query`
 
   const authHeaders = await getAuthorizationHeaders()
-  const protocols: string[] = []
+  const protocols = [WS_SUBPROTOCOL]
   const token = authHeaders['Authorization']?.replace(/^Bearer /, '')
   if (token) {
     protocols.push(`feldera-bearer.${base64UrlEncode(token)}`)

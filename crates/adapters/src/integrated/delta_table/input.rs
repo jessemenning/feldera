@@ -5,11 +5,12 @@ use crate::integrated::delta_table::deletion_vector::{
 };
 use crate::integrated::delta_table::{delta_input_serde_config, register_storage_handlers};
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint};
-use crate::util::JobQueue;
 use crate::{ControllerError, InputConsumer, InputReader, PipelineState};
 use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
-use arrow::array::BooleanArray;
-use arrow::datatypes::{FieldRef, Schema as ArrowSchema, SchemaRef};
+use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray, make_array};
+use arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
+};
 use chrono::{DateTime, Utc};
 use datafusion::catalog::TableProvider;
 use datafusion::common::DataFusionError;
@@ -18,6 +19,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::physical_plan::{PhysicalExpr, displayable};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use dbsp::circuit::tokio::TOKIO;
@@ -38,19 +40,20 @@ use deltalake::{DeltaTable, DeltaTableBuilder, Path, datafusion};
 use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
 use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
 use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
+use feldera_adapterlib::utils::backoff::calculate_backoff_delay;
 use feldera_adapterlib::utils::datafusion::{
-    array_to_string, columns_referenced_by_expression, columns_referenced_by_order_by,
-    create_session_context_with, execute_query_collect, execute_singleton_query,
-    timestamp_to_sql_expression, validate_sql_expression, validate_sql_order_by,
-    validate_timestamp_column,
+    ColumnNameSet, array_to_string, columns_referenced_by_expression,
+    columns_referenced_by_order_by, create_session_context_with, execute_query_collect,
+    execute_singleton_query, quote_sql_identifier, timestamp_to_sql_expression,
+    validate_sql_expression, validate_sql_order_by, validate_timestamp_column,
 };
+use feldera_adapterlib::utils::job_queue::JobQueue;
 use feldera_storage::tokio::TOKIO_DEDICATED_IO;
 use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::{FtModel, PipelineConfig};
 use feldera_types::program_schema::{Field, Relation};
 use feldera_types::transport::delta_table::{DeltaTableReaderConfig, DeltaTableTransactionMode};
 use futures_util::StreamExt;
-use rand::Rng;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -70,21 +73,6 @@ use tracing::{debug, info, trace, warn};
 
 /// Polling interval when following a delta table.
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
-
-/// Calculate exponential backoff delay for retrying delta log reads.
-/// Starts at 0.5s, doubles each retry, caps at 32s, plus uniform jitter up to 25% of that delay
-/// (capped at `max_delay_ms`) to reduce synchronized retries.
-fn calculate_backoff_delay(retry_count: u32) -> Duration {
-    let base_delay_ms: u64 = 500; // 0.5 seconds
-    let max_delay_ms: u64 = 32_000; // 32 seconds
-    let delay_ms = min(
-        base_delay_ms.checked_shl(retry_count).unwrap_or(u64::MAX),
-        max_delay_ms,
-    );
-    let jitter_span = (delay_ms / 4).max(1);
-    let jitter_ms = rand::thread_rng().gen_range(0..jitter_span);
-    Duration::from_millis(min(delay_ms + jitter_ms, max_delay_ms))
-}
 
 /// Default object store timeout. When not explicitly set by the user,
 /// we use a large timeout value to avoid this issue:
@@ -112,24 +100,29 @@ const DEFAULT_MAX_CONCURRENT_READERS: usize = 6;
 /// connector initialization.
 static MAX_CONCURRENT_READERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Takes a column name from a DeltaLake schema and returns a quoted string
-/// that can be used in datafusion queries like `select "foo""bar" from my_table`.
-fn quote_sql_identifier<S: AsRef<str>>(ident: S) -> String {
-    format!("\"{}\"", ident.as_ref().replace("\"", "\"\""))
-}
-
 /// Format a DataFusion error, appending actionable guidance when the
 /// underlying variant is `ResourcesExhausted` (the shared memory pool ran
 /// out). `find_root` walks past `Context(...)` / `ArrowError(...)` wrappers
 /// so the check is robust to the deeply nested errors DataFusion typically
 /// produces during sort/merge.
-fn format_datafusion_error(prefix: &str, e: &DataFusionError) -> String {
+fn format_datafusion_error(
+    session_ctx: &SessionContext,
+    prefix: &str,
+    e: &DataFusionError,
+) -> String {
     let base = format!("{prefix}: {e:?}");
     if matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)) {
+        let memory_limit = session_ctx.runtime_env().memory_pool.memory_limit();
+        let current_pool_limit = match memory_limit {
+            MemoryLimit::Finite(size) => format!("{} MB", size / 1024 / 1024),
+            MemoryLimit::Infinite => "infinite".to_string(),
+            MemoryLimit::Unknown => "unknown".to_string(),
+        };
+
         format!(
             "{base}\n\
-             DataFusion memory pool is exhausted. \
-             Consider increasing 'datafusion_memory_mb' in the pipeline runtime config. \
+             DataFusion memory pool is exhausted. Current datafusion memory pool limit: {current_pool_limit}. \
+             Consider setting or increasing 'datafusion_memory_mb' in the pipeline runtime config. \
              If raising the budget is not an option, reduce 'io_workers' / 'workers' or \
              set the env var 'DELTA_DF_TARGET_PARTITIONS=1' to lower per-scan parallelism.\n"
         )
@@ -141,6 +134,177 @@ fn format_datafusion_error(prefix: &str, e: &DataFusionError) -> String {
 /// A deletion vector is only in effect when it flags at least one row.
 fn is_active_dv(dv: &DeletionVectorDescriptor) -> bool {
     dv.cardinality > 0
+}
+
+/// A `uc://` location is path-less, so a `ListingTable` built from `root_url() +
+/// Add.path` reads empty. Such tables must read through the object store directly.
+fn requires_direct_object_store_read(table: &DeltaTable) -> bool {
+    table.log_store().root_url().scheme() == "uc"
+}
+
+/// The table root as a base URL guaranteed to end in `/`, so string-joining a
+/// relative `Add.path` yields a well-formed URL. delta-rs normalizes the location
+/// to a trailing slash only when it has a path, so a root with none (`uc://cat.db.tbl`,
+/// or a table at a bucket root) would otherwise collapse into the joined file name.
+fn table_root_base(table: &DeltaTable) -> String {
+    let root = table.log_store().root_url().to_string();
+    if root.ends_with('/') {
+        root
+    } else {
+        format!("{root}/")
+    }
+}
+
+/// A field's physical (on-disk) name under column mapping, or its logical name
+/// when unmapped. Delta stamps it into the Arrow field metadata at every level.
+fn physical_name(field: &ArrowField) -> String {
+    field
+        .metadata()
+        .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        .cloned()
+        .unwrap_or_else(|| field.name().clone())
+}
+
+/// Returns a copy of `field` whose own name, and every nested field name (struct
+/// children and list/map element fields, at any depth), is `rename`d. Nullability
+/// and metadata carry over unchanged.
+fn rename_fields(field: &FieldRef, rename: &dyn Fn(&ArrowField) -> String) -> FieldRef {
+    Arc::new(
+        ArrowField::new(
+            rename(field.as_ref()),
+            rename_nested_fields(field.data_type(), rename),
+            field.is_nullable(),
+        )
+        .with_metadata(field.metadata().clone()),
+    )
+}
+
+/// Recurse [`rename_fields`] into every field a container type holds. Scalar
+/// types are returned unchanged.
+fn rename_nested_fields(
+    data_type: &ArrowDataType,
+    rename: &dyn Fn(&ArrowField) -> String,
+) -> ArrowDataType {
+    let renamed = |field: &FieldRef| rename_fields(field, rename);
+    match data_type {
+        ArrowDataType::Struct(fields) => {
+            ArrowDataType::Struct(fields.iter().map(renamed).collect())
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(renamed(field)),
+        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(renamed(field)),
+        ArrowDataType::FixedSizeList(field, len) => {
+            ArrowDataType::FixedSizeList(renamed(field), *len)
+        }
+        ArrowDataType::Map(field, sorted) => ArrowDataType::Map(renamed(field), *sorted),
+        other => other.clone(),
+    }
+}
+
+/// Returns a copy of `field` named as it appears on disk at every level: each
+/// column-mapped name becomes its physical name, unmapped names carry over.
+fn field_to_physical(field: &FieldRef) -> FieldRef {
+    rename_fields(field, &physical_name)
+}
+
+/// Maps each nested column-mapped field's physical name to its logical name,
+/// descending through struct children and list/map element fields at any depth.
+/// Top-level fields are excluded. Empty unless the table nests column-mapped
+/// fields.
+fn nested_physical_to_logical(schema: &ArrowSchema) -> HashMap<String, String> {
+    fn collect(data_type: &ArrowDataType, map: &mut HashMap<String, String>) {
+        for field in child_fields(data_type) {
+            let physical = physical_name(field);
+            if physical != *field.name() {
+                map.insert(physical, field.name().clone());
+            }
+            collect(field.data_type(), map);
+        }
+    }
+    let mut map = HashMap::new();
+    for field in schema.fields() {
+        collect(field.data_type(), &mut map);
+    }
+    map
+}
+
+/// The fields a container type holds directly: a struct's children, or the sole
+/// element field of a list/map. Scalar types hold none.
+fn child_fields(data_type: &ArrowDataType) -> Vec<&FieldRef> {
+    match data_type {
+        ArrowDataType::Struct(fields) => fields.iter().collect(),
+        ArrowDataType::List(field)
+        | ArrowDataType::LargeList(field)
+        | ArrowDataType::FixedSizeList(field, _)
+        | ArrowDataType::Map(field, _) => vec![field],
+        _ => vec![],
+    }
+}
+
+/// Rebuild `array` with every struct/list/map field name substituted through
+/// `map`, at any nesting depth, reusing the underlying buffers. Only field-name
+/// metadata changes; the physical layout is untouched. Names absent from `map`
+/// carry over unchanged.
+fn relabel_array(array: &ArrayRef, map: &HashMap<String, String>) -> AnyResult<ArrayRef> {
+    Ok(make_array(relabel_array_data(array.to_data(), map)?))
+}
+
+/// Recursive core of [`relabel_array`], operating on the raw [`ArrayData`] tree.
+fn relabel_array_data(data: ArrayData, map: &HashMap<String, String>) -> AnyResult<ArrayData> {
+    let relabeled_type = relabel_data_type(data.data_type(), map);
+    let children: Vec<ArrayData> = data
+        .child_data()
+        .iter()
+        .map(|child| relabel_array_data(child.clone(), map))
+        .collect::<AnyResult<_>>()?;
+    // Relabeling only renames fields; buffers, offsets, lengths, and null bitmaps
+    // carry over untouched, so the built data is structurally identical. `build`
+    // only errors on a real layout mismatch, which would be a bug here.
+    data.into_builder()
+        .data_type(relabeled_type)
+        .child_data(children)
+        .build()
+        .map_err(|e| anyhow!("relabeling column-mapped field names failed: {e}"))
+}
+
+/// Substitute nested field names in `data_type` through `map`. Names absent from
+/// `map`, and scalar types, are left unchanged.
+fn relabel_data_type(data_type: &ArrowDataType, map: &HashMap<String, String>) -> ArrowDataType {
+    rename_nested_fields(data_type, &|field| {
+        map.get(field.name())
+            .cloned()
+            .unwrap_or_else(|| field.name().clone())
+    })
+}
+
+/// Translate a batch's nested field names physical-to-logical. Top-level names
+/// are left as-is (already logical); only names nested inside a struct, list, or
+/// map are rewritten.
+fn relabel_nested_columns(
+    batch: &RecordBatch,
+    map: &HashMap<String, String>,
+) -> AnyResult<RecordBatch> {
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|c| relabel_array(c, map))
+        .collect::<AnyResult<_>>()?;
+    let fields: Vec<FieldRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .zip(&columns)
+        .map(|(f, c)| {
+            Arc::new(
+                ArrowField::new(f.name(), c.data_type().clone(), f.is_nullable())
+                    .with_metadata(f.metadata().clone()),
+            )
+        })
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(fields).with_metadata(batch.schema().metadata().clone())),
+        columns,
+    )
+    .map_err(|e| anyhow!("relabeling column-mapped field names failed: {e}"))
 }
 
 /// Build the `DataFrame` that streams a CDC transaction to the circuit.
@@ -883,29 +1047,6 @@ struct CatchupFollowState {
     transaction: Option<Option<String>>,
 }
 
-/// A set of column names compared case-insensitively. Delta schemas carry no
-/// case-sensitivity information, so names are stored and probed in lowercased
-/// form (mirrors the long-standing matching in [`used_columns`](DeltaTableInputEndpointInner::used_columns)).
-///
-/// SQL is case-sensitive for quoted column names, but an external table cannot
-/// hold two columns with the same lowercase form, so collapsing to a single
-/// canonical form is safe here.
-#[derive(Default)]
-struct ColumnNameSet {
-    lowercase: BTreeSet<String>,
-}
-
-impl ColumnNameSet {
-    fn from_names(names: impl IntoIterator<Item = String>) -> Self {
-        let lowercase = names.into_iter().map(|c| c.to_lowercase()).collect();
-        Self { lowercase }
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.lowercase.contains(&name.to_lowercase())
-    }
-}
-
 struct DeltaTableInputEndpointInner {
     endpoint_name: String,
     schema: Relation,
@@ -1090,8 +1231,7 @@ impl DeltaTableInputEndpointInner {
     fn skip_unused_columns(&self) -> bool {
         // Old-style: property in the connector configuration.
         // New-style: property in the table definition.
-        self.config.skip_unused_columns
-            || self.schema.get_property("skip_unused_columns") == Some("true")
+        self.config.skip_unused_columns || self.schema.skip_unused_columns()
     }
 
     fn new_follow_transaction_label(&self) -> Option<Option<String>> {
@@ -2533,6 +2673,18 @@ impl DeltaTableInputEndpointInner {
         self.consumer
             .update_connector_health(ConnectorHealth::healthy());
 
+        // Nested struct fields are read under physical names; restore their
+        // logical names per batch (top-level names are already logical). Empty,
+        // a no-op, unless the table nests column-mapped fields.
+        let nested_map = nested_physical_to_logical(
+            self.schema_snapshot()
+                .snapshot()
+                .map_err(|e| format!("error accessing Delta table snapshot: {e}"))?
+                .snapshot()
+                .arrow_schema()
+                .as_ref(),
+        );
+
         let mut num_batches = 0;
         let mut total_records = 0usize;
 
@@ -2611,12 +2763,17 @@ impl DeltaTableInputEndpointInner {
                     );
 
                     return Err(format_datafusion_error(
+                        &self.datafusion,
                         &format!("error retrieving batch {num_batches}"),
                         &e,
                     ));
                 }
             };
-            // info!("schema: {}", batch.schema());
+            let batch = if nested_map.is_empty() {
+                batch
+            } else {
+                relabel_nested_columns(&batch, &nested_map).map_err(|e| e.to_string())?
+            };
             num_batches += 1;
             total_records += batch.num_rows();
 
@@ -3070,12 +3227,13 @@ impl DeltaTableInputEndpointInner {
             .collect())
     }
 
-    /// Returns the Arrow schema to use when reading the raw data files, named as
-    /// they appear on disk: the table's logical schema restricted to the columns
-    /// `keep` accepts (in schema order, so unions with another read side line
-    /// up), with each column-mapped field renamed to its physical (`col-<uuid>`)
-    /// name so DataFusion's by-name matching finds them. The same as the kept
-    /// logical schema when column mapping is off.
+    /// Arrow schema for reading the raw data files, named as they appear on disk:
+    /// the logical schema restricted to columns `keep` accepts (in schema order,
+    /// so read sides line up), with each column-mapped field renamed to its
+    /// physical (`col-<uuid>`) name so DataFusion matches by name. It recurses
+    /// into nested struct, list, and map fields. Logical names are restored afterwards:
+    /// top level in `project_physical_to_logical`, nested in `relabel_nested_columns`.
+    /// The kept logical schema when column mapping is off.
     fn physical_read_schema(&self, keep: impl Fn(&str) -> bool) -> AnyResult<SchemaRef> {
         let schema_table = self.schema_snapshot();
         let logical = schema_table
@@ -3083,19 +3241,11 @@ impl DeltaTableInputEndpointInner {
             .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?
             .snapshot()
             .arrow_schema();
-        let pairs = self.column_mapping()?;
-        let to_physical: HashMap<&str, &str> = pairs
-            .iter()
-            .map(|(l, p)| (l.as_str(), p.as_str()))
-            .collect();
         let fields: Vec<FieldRef> = logical
             .fields()
             .iter()
             .filter(|f| keep(f.name()))
-            .map(|f| match to_physical.get(f.name().as_str()) {
-                Some(physical) => Arc::new(f.as_ref().clone().with_name(*physical)),
-                None => Arc::clone(f),
-            })
+            .map(field_to_physical)
             .collect();
         Ok(Arc::new(
             ArrowSchema::new(fields).with_metadata(logical.metadata().clone()),
@@ -3233,11 +3383,11 @@ impl DeltaTableInputEndpointInner {
     /// [`Self::project_cdc_columns`] keeps), so they line up by position for the
     /// `EXCEPT ALL` in `build_cdc_dataframe` and never decode unused columns.
     ///
-    /// Plain files use the table's `root_url()`, not the synthetic
-    /// `delta-rs://` URL from `object_store_url()`. The latter folds the table
-    /// path into the URL host (slashes become dashes), which routes DataFusion's
-    /// object store but is malformed once joined with `Add.path`.
-    /// `start_input_endpoint` registers the store under `root_url()`.
+    /// Plain files are addressed under the table root (see [`table_root_base`]),
+    /// not the synthetic `delta-rs://` URL from `object_store_url()`. The latter
+    /// folds the table path into the URL host (slashes become dashes), which
+    /// routes DataFusion's object store but is malformed once joined with
+    /// `Add.path`. `start_input_endpoint` registers the store under `root_url()`.
     async fn cdc_side_dataframe(
         &self,
         table: &DeltaTable,
@@ -3258,12 +3408,8 @@ impl DeltaTableInputEndpointInner {
         let mut dfs: Vec<DataFrame> = Vec::new();
 
         if !plain.is_empty() {
-            let log_store = table.log_store();
-            let root_url = log_store.root_url();
-            let files = plain
-                .iter()
-                .map(|p| format!("{}{}", root_url.as_str(), p))
-                .collect();
+            let base = table_root_base(table);
+            let files = plain.iter().map(|p| format!("{base}{p}")).collect();
             let listing_table = Arc::new(self.create_parquet_table(files, description).await?);
             let df = self.datafusion.read_table(listing_table).map_err(|e| {
                 anyhow!("internal error processing {description}; {REPORT_ERROR}; error reading Parquet files: {e}")
@@ -3368,27 +3514,27 @@ impl DeltaTableInputEndpointInner {
     ) -> AnyResult<()> {
         let description = format!("file '{path}'");
 
-        // An active deletion vector routes the file through a streaming provider
-        // that masks the deleted rows, restricted to `used_columns` so unread
-        // columns are never decoded; otherwise the regular `ListingTable` path
-        // applies.
-        let provider: Arc<dyn TableProvider> =
-            if let Some(dv) = deletion_vector.filter(|d| is_active_dv(d)) {
-                let bitmap = self.decode_dv(table, Some(dv), &description).await?;
-                self.file_provider(table, path, bitmap, ReadMode::NotInBitmap, |name| {
-                    used_columns.contains(&name)
-                })
-                .await?
-            } else {
-                // Address files via the table's real `root_url()` (e.g. `file:///...`
-                // or `s3://bucket/prefix/`). See `cdc_side_dataframe` for why we
-                // don't use `object_store_url()` here.
-                let full_path = format!("{}{}", table.log_store().root_url().as_str(), path);
-                Arc::new(
-                    self.create_parquet_table(vec![full_path], &description)
-                        .await?,
-                )
+        // DV files, and uc:// tables (whose path-less location a ListingTable
+        // can't resolve), read through the object store directly. An empty bitmap
+        // reads every row. Other schemes use the ListingTable path.
+        let provider: Arc<dyn TableProvider> = if requires_direct_object_store_read(table)
+            || deletion_vector.is_some_and(is_active_dv)
+        {
+            let bitmap = match deletion_vector.filter(|d| is_active_dv(d)) {
+                Some(dv) => self.decode_dv(table, Some(dv), &description).await?,
+                None => RoaringTreemap::new(),
             };
+            self.file_provider(table, path, bitmap, ReadMode::NotInBitmap, |name| {
+                used_columns.contains(&name)
+            })
+            .await?
+        } else {
+            let full_path = format!("{}{}", table_root_base(table), path);
+            Arc::new(
+                self.create_parquet_table(vec![full_path], &description)
+                    .await?,
+            )
+        };
 
         self.emit_provider(
             provider,
@@ -3525,8 +3671,16 @@ async fn wait_running(receiver: &mut Receiver<PipelineState>) {
 
 #[cfg(test)]
 mod format_datafusion_error_tests {
+    use std::sync::Arc;
+
     use super::format_datafusion_error;
-    use datafusion::common::DataFusionError;
+    use datafusion::{
+        common::DataFusionError,
+        execution::{
+            SessionStateBuilder, memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder,
+        },
+        prelude::SessionContext,
+    };
 
     #[test]
     fn appends_pool_hint_for_resources_exhausted() {
@@ -3534,7 +3688,8 @@ mod format_datafusion_error_tests {
             "Failed to allocate additional 64.0 MB ...".to_string(),
         );
         let wrapped = DataFusionError::Context("external sort".to_string(), Box::new(inner));
-        let msg = format_datafusion_error("error retrieving batch 0", &wrapped);
+        let session_context = SessionContext::new();
+        let msg = format_datafusion_error(&session_context, "error retrieving batch 0", &wrapped);
         assert!(
             msg.contains("DataFusion memory pool is exhausted"),
             "missing actionable hint; got: {msg}"
@@ -3548,7 +3703,8 @@ mod format_datafusion_error_tests {
     #[test]
     fn passes_through_unrelated_errors() {
         let other = DataFusionError::Plan("bad column reference".to_string());
-        let msg = format_datafusion_error("error retrieving batch 0", &other);
+        let session_context = SessionContext::new();
+        let msg = format_datafusion_error(&session_context, "error retrieving batch 0", &other);
         assert!(
             !msg.contains("memory pool"),
             "spurious pool hint on non-exhaustion error; got: {msg}"
@@ -3556,6 +3712,30 @@ mod format_datafusion_error_tests {
         assert!(
             msg.contains("bad column reference"),
             "lost the original error text; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn logs_pool_size_correctly() {
+        let inner = DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 64.0 MB ...".to_string(),
+        );
+        let wrapped = DataFusionError::Context("external sort".to_string(), Box::new(inner));
+        // restrict to using at most 10MB of memory
+        let pool_size = 10 * 1024 * 1024;
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(pool_size)))
+            .build()
+            .unwrap();
+        let state = SessionStateBuilder::new()
+            .with_runtime_env(runtime_env.into())
+            .with_default_features()
+            .build();
+        let session_context = SessionContext::new_with_state(state);
+        let msg = format_datafusion_error(&session_context, "error retrieving batch 0", &wrapped);
+        assert!(
+            msg.contains("Current datafusion memory pool limit: 10 MB"),
+            "missing actionable hint; got: {msg}"
         );
     }
 }
@@ -3592,5 +3772,213 @@ mod is_skippable_tests {
         assert!(!DeltaTableInputEndpointInner::is_unused_and_omittable(
             &field(true, false, None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod column_mapping_tests {
+    use super::{field_to_physical, nested_physical_to_logical, relabel_nested_columns};
+    use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A column-mapped field: logical `name`, physical name in its metadata.
+    fn mapped(name: &str, data_type: DataType, physical: &str) -> Field {
+        Field::new(name, data_type, true).with_metadata(HashMap::from([(
+            "delta.columnMapping.physicalName".to_string(),
+            physical.to_string(),
+        )]))
+    }
+
+    /// A `struct<..>` data type from mapped fields.
+    fn struct_of(fields: Vec<Field>) -> DataType {
+        DataType::Struct(Fields::from(fields))
+    }
+
+    /// A `list<element: ..>` data type. The `element` field itself is not column
+    /// mapped, matching how Delta stores list elements.
+    fn list_of(element: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("element", element, true)))
+    }
+
+    /// The children of a struct-typed field, or panic.
+    fn struct_children(field: &Field) -> &Fields {
+        match field.data_type() {
+            DataType::Struct(children) => children,
+            other => panic!("expected struct, got {other:?}"),
+        }
+    }
+
+    /// The element field of a list-typed field, or panic.
+    fn list_element(field: &Field) -> &Field {
+        match field.data_type() {
+            DataType::List(element) => element,
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    // The read side: nested struct children must be renamed to physical names,
+    // else the Parquet read fails the struct cast.
+    #[test]
+    fn read_schema_renames_nested_fields() {
+        let after = DataType::Struct(Fields::from(vec![
+            mapped("id", DataType::Utf8, "col-id"),
+            mapped("amount", DataType::Utf8, "col-amount"),
+        ]));
+        let physical = field_to_physical(&Arc::new(mapped("after", after, "col-after")));
+
+        assert_eq!(physical.name(), "col-after");
+        let DataType::Struct(children) = physical.data_type() else {
+            panic!("`after` must stay a struct");
+        };
+        assert_eq!(children[0].name(), "col-id");
+        assert_eq!(children[1].name(), "col-amount");
+    }
+
+    // The write side: the read batch arrives with logical top-level names but
+    // physical nested names; relabeling must restore logical nested names while
+    // preserving the data, else nested fields silently read as NULL.
+    #[test]
+    fn relabel_restores_nested_names_and_preserves_data() {
+        let ids: ArrayRef = Arc::new(StringArray::from(vec!["t1", "t2"]));
+        let amounts: ArrayRef = Arc::new(StringArray::from(vec!["10", "20"]));
+        let after: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("col-id", DataType::Utf8, true)),
+                ids.clone(),
+            ),
+            (
+                Arc::new(Field::new("col-amount", DataType::Utf8, true)),
+                amounts.clone(),
+            ),
+        ]));
+        let batch = RecordBatch::try_from_iter(vec![("after", after)]).unwrap();
+
+        let map = nested_physical_to_logical(&Schema::new(vec![mapped(
+            "after",
+            DataType::Struct(Fields::from(vec![
+                mapped("id", DataType::Utf8, "col-id"),
+                mapped("amount", DataType::Utf8, "col-amount"),
+            ])),
+            "col-after",
+        )]));
+        let relabeled = relabel_nested_columns(&batch, &map).unwrap();
+
+        let DataType::Struct(children) = relabeled.schema().field(0).data_type().clone() else {
+            panic!("`after` must stay a struct");
+        };
+        assert_eq!(children[0].name(), "id");
+        assert_eq!(children[1].name(), "amount");
+
+        let after = relabeled
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(after.column(0).as_ref(), ids.as_ref());
+        assert_eq!(after.column(1).as_ref(), amounts.as_ref());
+    }
+
+    // Structs in structs: the rename must reach every level.
+    #[test]
+    fn read_schema_renames_struct_in_struct() {
+        let inner = struct_of(vec![mapped("leaf", DataType::Utf8, "col-leaf")]);
+        let outer = struct_of(vec![mapped("inner", inner, "col-inner")]);
+        let physical = field_to_physical(&Arc::new(mapped("outer", outer, "col-outer")));
+
+        assert_eq!(physical.name(), "col-outer");
+        let inner = &struct_children(&physical)[0];
+        assert_eq!(inner.name(), "col-inner");
+        assert_eq!(struct_children(inner)[0].name(), "col-leaf");
+    }
+
+    // Arrays in structs: the rename descends through the list element.
+    #[test]
+    fn read_schema_renames_array_in_struct() {
+        let outer = struct_of(vec![mapped("items", list_of(DataType::Utf8), "col-items")]);
+        let physical = field_to_physical(&Arc::new(mapped("outer", outer, "col-outer")));
+
+        // The list element itself carries no mapping, so it keeps its name; only
+        // the struct field wrapping the list is renamed.
+        let items = &struct_children(&physical)[0];
+        assert_eq!(items.name(), "col-items");
+        assert!(matches!(items.data_type(), DataType::List(_)));
+    }
+
+    // Structs in arrays: the rename descends into the list element's struct.
+    #[test]
+    fn read_schema_renames_struct_in_array() {
+        let element = struct_of(vec![mapped("id", DataType::Utf8, "col-id")]);
+        let physical = field_to_physical(&Arc::new(mapped("items", list_of(element), "col-items")));
+
+        assert_eq!(physical.name(), "col-items");
+        let element = list_element(&physical);
+        assert_eq!(struct_children(element)[0].name(), "col-id");
+    }
+
+    // Structs of structs of arrays of structs: the deepest leaf must be renamed.
+    #[test]
+    fn read_schema_renames_struct_of_struct_of_array_of_struct() {
+        let leaf = struct_of(vec![mapped("amount", DataType::Utf8, "col-amount")]);
+        let mid = struct_of(vec![mapped("rows", list_of(leaf), "col-rows")]);
+        let outer = struct_of(vec![mapped("mid", mid, "col-mid")]);
+        let physical = field_to_physical(&Arc::new(mapped("outer", outer, "col-outer")));
+
+        let mid = &struct_children(&physical)[0];
+        assert_eq!(mid.name(), "col-mid");
+        let rows = &struct_children(mid)[0];
+        assert_eq!(rows.name(), "col-rows");
+        let leaf = list_element(rows);
+        assert_eq!(struct_children(leaf)[0].name(), "col-amount");
+    }
+
+    // Structs in arrays of structs, end to end: relabeling must restore logical
+    // names inside the list element and preserve the leaf data.
+    #[test]
+    fn relabel_restores_names_inside_array_of_structs() {
+        // A list<struct<col-id: utf8>> with two lists over three elements.
+        let ids: ArrayRef = Arc::new(StringArray::from(vec!["t1", "t2", "t3"]));
+        let element_values: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("col-id", DataType::Utf8, true)),
+            ids.clone(),
+        )]));
+        let element_field = Arc::new(Field::new(
+            "element",
+            element_values.data_type().clone(),
+            true,
+        ));
+        let items: ArrayRef = Arc::new(ListArray::new(
+            element_field,
+            OffsetBuffer::new(vec![0, 2, 3].into()),
+            element_values,
+            None,
+        ));
+        let batch = RecordBatch::try_from_iter(vec![("items", items)]).unwrap();
+
+        let map = nested_physical_to_logical(&Schema::new(vec![mapped(
+            "items",
+            list_of(struct_of(vec![mapped("id", DataType::Utf8, "col-id")])),
+            "col-items",
+        )]));
+        let relabeled = relabel_nested_columns(&batch, &map).unwrap();
+
+        let schema = relabeled.schema();
+        let element = list_element(schema.field(0));
+        assert_eq!(struct_children(element)[0].name(), "id");
+
+        // The leaf data survives the relabel unchanged.
+        let list = relabeled
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let element = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(element.column(0).as_ref(), ids.as_ref());
     }
 }

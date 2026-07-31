@@ -74,7 +74,7 @@ pub fn validate_struct_schema(
             // Allow nullable fields to be missing in the Avro schema. This is useful to, e.g.,
             // support inputs encoded using older versions of the schema missing some fields.
             if field.columntype.nullable {
-                return Ok(());
+                continue;
             } else {
                 return Err(format!(
                     "column '{}' is missing in the Avro schema",
@@ -458,6 +458,12 @@ pub fn is_valid_avro_identifier(ident: &str) -> bool {
         && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// A valid Avro fullname is a sequence of dot-separated identifiers, such as
+/// `namespace.record_name`.
+pub fn is_valid_avro_fullname(fullname: &str) -> bool {
+    fullname.split('.').all(is_valid_avro_identifier)
+}
+
 #[derive(Default)]
 pub struct AvroSchemaBuilder {
     namespace: Option<String>,
@@ -497,9 +503,25 @@ impl AvroSchemaBuilder {
         top_level: bool,
     ) -> Result<RecordSchema, String> {
         let name = name.name();
-        if !is_valid_avro_identifier(&name) {
-            return Err(format!("'{name}' is not a valid Avro identifier"));
+        if !is_valid_avro_fullname(&name) {
+            return Err(format!(
+                "'{name}' is not a valid Avro name: each dot-separated segment must start with a letter or underscore and contain only letters, digits, and underscores"
+            ));
         }
+
+        // Names such as 'view.key', which the catalog assigns to the key
+        // schema of an indexed view, are Avro fullnames: the segments before
+        // the last dot form a namespace, appended to the configured one.
+        let (namespace, name) = match name.rsplit_once('.') {
+            Some((prefix, base)) => (
+                Some(match &self.namespace {
+                    Some(ns) => format!("{ns}.{prefix}"),
+                    None => prefix.to_string(),
+                }),
+                base.to_string(),
+            ),
+            None => (self.namespace.clone(), name),
+        };
 
         let mut fields = Vec::with_capacity(struct_fields.len());
         let mut lookup = BTreeMap::new();
@@ -513,10 +535,7 @@ impl AvroSchemaBuilder {
         }
 
         Ok(RecordSchema {
-            name: Name {
-                name: name.to_string(),
-                namespace: self.namespace.clone(),
-            },
+            name: Name { name, namespace },
             aliases: None,
             doc: None,
             fields,
@@ -627,7 +646,7 @@ impl AvroSchemaBuilder {
                 return Err("not implemented: Avro encoding for user-defined SQL types".to_string());
             }
             SqlType::Map => {
-                let key_type = column_type.value.as_ref().ok_or(
+                let key_type = column_type.key.as_ref().ok_or(
                     "internal error: relation schema contains a map field, with a missing key type",
                 )?;
                 if !key_type.typ.is_string() {
@@ -645,5 +664,126 @@ impl AvroSchemaBuilder {
             SqlType::Uuid => AvroSchema::String,
             SqlType::Null => AvroSchema::Null,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{AvroSchemaBuilder, is_valid_avro_fullname, schema_json, validate_struct_schema};
+    use apache_avro::{Schema as AvroSchema, schema::Name};
+    use feldera_adapterlib::catalog::AvroSchemaRefs;
+    use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+    use std::collections::BTreeMap;
+
+    fn relation(name: &str) -> Relation {
+        Relation::new(
+            SqlIdentifier::new(name, false),
+            vec![Field::new(
+                SqlIdentifier::new("id", false),
+                ColumnType::boolean(false),
+            )],
+            false,
+            BTreeMap::new(),
+        )
+    }
+
+    fn record_name(schema: &AvroSchema) -> Name {
+        match schema {
+            AvroSchema::Record(record) => record.name.clone(),
+            _ => panic!("expected a record schema, got {schema:?}"),
+        }
+    }
+
+    #[test]
+    fn fullname_validation() {
+        for valid in ["key", "v.key", "_a1.b2.c3"] {
+            assert!(is_valid_avro_fullname(valid), "'{valid}' should be valid");
+        }
+        for invalid in ["", ".", "v..key", ".key", "key.", "1v.key", "v-1.key"] {
+            assert!(
+                !is_valid_avro_fullname(invalid),
+                "'{invalid}' should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_relation_name_becomes_namespace() {
+        let schema = AvroSchemaBuilder::new()
+            .relation_to_avro_schema(&relation("v.key"))
+            .unwrap();
+        let name = record_name(&schema);
+        assert_eq!(name.name, "key");
+        assert_eq!(name.namespace.as_deref(), Some("v"));
+
+        // The apache_avro parser must accept the generated schema.
+        AvroSchema::parse_str(&schema_json(&schema)).unwrap();
+    }
+
+    #[test]
+    fn configured_namespace_prefixes_derived_namespace() {
+        let schema = AvroSchemaBuilder::new()
+            .with_namespace(Some("com.acme"))
+            .relation_to_avro_schema(&relation("v.key"))
+            .unwrap();
+        let name = record_name(&schema);
+        assert_eq!(name.name, "key");
+        assert_eq!(name.namespace.as_deref(), Some("com.acme.v"));
+    }
+
+    #[test]
+    fn plain_relation_name_keeps_configured_namespace() {
+        let schema = AvroSchemaBuilder::new()
+            .with_namespace(Some("com.acme"))
+            .relation_to_avro_schema(&relation("v"))
+            .unwrap();
+        let name = record_name(&schema);
+        assert_eq!(name.name, "v");
+        assert_eq!(name.namespace.as_deref(), Some("com.acme"));
+    }
+
+    #[test]
+    fn invalid_relation_name_is_rejected() {
+        for invalid in ["v..key", ".key", "key.", "v-1"] {
+            assert!(
+                AvroSchemaBuilder::new()
+                    .relation_to_avro_schema(&relation(invalid))
+                    .is_err(),
+                "'{invalid}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn map_schema_uses_key_type() {
+        let builder = AvroSchemaBuilder::new();
+        let valid = ColumnType::map(false, ColumnType::varchar(false), ColumnType::bigint(false));
+        builder.column_type_to_avro_schema_inner(&valid).unwrap();
+
+        let invalid = ColumnType::map(false, ColumnType::int(false), ColumnType::varchar(false));
+        let error = builder
+            .column_type_to_avro_schema_inner(&invalid)
+            .unwrap_err();
+        assert!(error.contains("Avro only allows string keys"));
+    }
+
+    #[test]
+    fn missing_nullable_field_does_not_stop_validation() {
+        let avro_schema =
+            AvroSchema::parse_str(r#"{"type":"record","name":"input","fields":[]}"#).unwrap();
+        let struct_schema = vec![
+            Field::new(
+                SqlIdentifier::new("optional", false),
+                ColumnType::bigint(true),
+            ),
+            Field::new(
+                SqlIdentifier::new("required", false),
+                ColumnType::bigint(false),
+            ),
+        ];
+
+        let error = validate_struct_schema(&avro_schema, &AvroSchemaRefs::new(), &struct_schema)
+            .unwrap_err();
+        assert_eq!(error, "column 'required' is missing in the Avro schema");
     }
 }

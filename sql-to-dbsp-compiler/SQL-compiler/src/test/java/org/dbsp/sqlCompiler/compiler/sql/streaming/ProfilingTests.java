@@ -52,7 +52,7 @@ public class ProfilingTests extends StreamingTestBase {
             return Linq.map(split, Long::parseLong, Long.class);
         } finally {
             File mainFile = new File(mainFilePath);
-            Utilities.deleteFile(mainFile, true);
+            // Utilities.deleteFile(mainFile, true);
         }
     }
 
@@ -92,7 +92,7 @@ public class ProfilingTests extends StreamingTestBase {
                 // a file called "mem.txt".
                 pub fn test() {
                     let (mut circuit, streams) = circuit(
-                        CircuitConfig::with_workers(2)).expect("could not build circuit");
+                        CircuitConfig::with_workers(3)).expect("could not build circuit");
                     // uncomment if you want a CPU profile
                     // let _ = circuit.enable_cpu_profiler();
                     let start = SystemTime::now();
@@ -158,7 +158,7 @@ public class ProfilingTests extends StreamingTestBase {
                 #[test]
                 pub fn test() {
                     let (mut circuit, streams) = circuit(
-                        CircuitConfig::with_workers(2)).expect("could not build circuit");
+                        CircuitConfig::with_workers(3)).expect("could not build circuit");
                     let _ = circuit.enable_cpu_profiler();
                     for i in 0..10000 {
                         let data = zset!(Tup1::new(Some(i)) => 1);
@@ -342,7 +342,8 @@ public class ProfilingTests extends StreamingTestBase {
                 CREATE TABLE auction (
                    date_time TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE,
                    expires   TIMESTAMP NOT NULL,
-                   id        INT NOT NULL PRIMARY KEY
+                   id        INT NOT NULL,
+                   PRIMARY KEY (date_time, id)
                 );
 
                 CREATE VIEW V AS
@@ -356,7 +357,7 @@ public class ProfilingTests extends StreamingTestBase {
                         let expire = Timestamp::from_milliseconds(timestamp.milliseconds() + 1000000);
                         timestamp = Timestamp::from_milliseconds(timestamp.milliseconds() + 20000);
                         let auction = zset!(Tup3::new(timestamp, expire, i) => 1);
-                        append_to_map_handle(&auction, &streams.0, |x| Tup1::new(x.2));
+                        append_to_map_handle(&auction, &streams.0, |x| Tup2::new(x.0, x.2));
                         if i % 100 == 0 {
                             let _ = circuit.transaction().expect("could not run circuit");
                             let _ = &read_output_spine(&streams.2);

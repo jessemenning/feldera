@@ -48,6 +48,29 @@ pub enum IcebergCatalogType {
     S3Tables,
 }
 
+/// Iceberg table transaction mode.
+///
+/// Determines how the connector breaks up its input into Feldera transactions.
+///
+/// * `none` - the connector does not break up its input into transactions.
+/// * `snapshot` - ingest the initial snapshot of the table in one or several transactions.
+///
+/// # How the table snapshot is ingested using transactions
+///
+/// When `transaction_mode` is set to `snapshot`, the connector ingests the snapshot in one
+/// or several transactions, depending on `timestamp_column`. If `timestamp_column` is not set,
+/// the whole snapshot is ingested in a single Feldera transaction. If `timestamp_column` is set,
+/// the connector ingests the snapshot in a series of timestamp ranges of width equal to the
+/// `LATENESS` attribute of the column, each range in a separate transaction.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema, Default)]
+pub enum IcebergTransactionMode {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "snapshot")]
+    Snapshot,
+}
+
 /// AWS Glue catalog config.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct GlueCatalogConfig {
@@ -176,11 +199,22 @@ pub struct S3TablesCatalogConfig {
     pub region: Option<String>,
 }
 
+fn default_num_parsers() -> u32 {
+    4
+}
+
 /// Iceberg input connector configuration.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct IcebergReaderConfig {
     /// Table read mode.
     pub mode: IcebergIngestMode,
+
+    /// Transaction mode.
+    ///
+    /// Determines how the connector breaks up its input into Feldera transactions.
+    /// See [`IcebergTransactionMode`]. Defaults to [`IcebergTransactionMode::None`].
+    #[serde(default)]
+    pub transaction_mode: IcebergTransactionMode,
 
     /// Table column that serves as an event timestamp.
     ///
@@ -262,6 +296,24 @@ pub struct IcebergReaderConfig {
     /// Supported options include "rest", "glue", and "s3tables". This property is mutually
     /// exclusive with `metadata_location`.
     pub catalog_type: Option<IcebergCatalogType>,
+
+    /// The number of parallel parsing tasks the connector uses to process data read from the
+    /// table. Increasing this value can enhance performance by allowing more concurrent processing.
+    /// Recommended range: 1-10. The default is 4.
+    #[serde(default = "default_num_parsers")]
+    #[schema(minimum = 1)]
+    pub num_parsers: u32,
+
+    /// Maximum number of retries for reading the table snapshot.
+    ///
+    /// When reading the snapshot fails partway through, for example because an
+    /// object-store read times out or is throttled, the connector retries the
+    /// entire read with exponential backoff. This is in addition to the
+    /// lower-level retries performed by the object-store client.
+    ///
+    /// Defaults to unlimited retries. Set to 0 to disable retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
 
     #[serde(flatten)]
     pub glue_catalog_config: GlueCatalogConfig,
@@ -426,6 +478,11 @@ fn ensure_s3tables_property_not_set<T>(property: &Option<T>, name: &str) -> Resu
 }
 
 impl IcebergReaderConfig {
+    /// Maximum number of high-level operation retries. Defaults to unlimited.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries.unwrap_or(u32::MAX)
+    }
+
     /// `true` if the configuration requires taking an initial snapshot of the table.
     pub fn snapshot(&self) -> bool {
         matches!(
@@ -522,5 +579,59 @@ mod test {
         .validate_catalog_config()
         .unwrap_err();
         assert!(err.contains("s3tables.table-bucket-arn"), "{err}");
+    }
+
+    #[test]
+    fn num_parsers_and_max_retries_defaults() {
+        // With neither field set, num_parsers defaults to 4 and retries are unlimited.
+        let config: IcebergReaderConfig = serde_json::from_str(
+            r#"{"mode":"snapshot","metadata_location":"file:///tmp/t/metadata.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.num_parsers, 4);
+        assert_eq!(config.max_retries, None);
+        assert_eq!(config.max_retries(), u32::MAX);
+    }
+
+    #[test]
+    fn num_parsers_and_max_retries_explicit() {
+        let config: IcebergReaderConfig = serde_json::from_str(
+            r#"{"mode":"snapshot","metadata_location":"file:///tmp/t/metadata.json","num_parsers":8,"max_retries":0}"#,
+        )
+        .unwrap();
+        assert_eq!(config.num_parsers, 8);
+        assert_eq!(config.max_retries, Some(0));
+        // 0 disables retries: the first attempt is the last.
+        assert_eq!(config.max_retries(), 0);
+    }
+
+    #[test]
+    fn transaction_mode_defaults_to_none() {
+        let config: IcebergReaderConfig = serde_json::from_str(
+            r#"{"mode":"snapshot","metadata_location":"file:///tmp/t/metadata.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.transaction_mode, IcebergTransactionMode::None);
+    }
+
+    #[test]
+    fn transaction_mode_snapshot_parses() {
+        let config: IcebergReaderConfig = serde_json::from_str(
+            r#"{"mode":"snapshot","metadata_location":"file:///tmp/t/metadata.json","transaction_mode":"snapshot"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.transaction_mode, IcebergTransactionMode::Snapshot);
+    }
+
+    #[test]
+    fn reader_config_roundtrips() {
+        let config: IcebergReaderConfig = serde_json::from_str(
+            r#"{"mode":"snapshot","metadata_location":"file:///tmp/t/metadata.json","num_parsers":2}"#,
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reparsed: IcebergReaderConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(config, reparsed);
+        assert_eq!(reparsed.num_parsers, 2);
     }
 }

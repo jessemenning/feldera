@@ -336,13 +336,13 @@
             bind:value={nodeSearchQuery}
             type="text"
             placeholder="Search node"
-            title="Search for a node by ID or persistent ID"
+            title="Search for a node by ID, by table or view name, or by a substring of a persistent ID"
             onkeydown={(e) => e.key === 'Enter' && handleSearch()}
             class="input h-6 w-36 text-sm"
           />
         </div>
       {:else}
-        <p class="text-sm text-surface-600-400">
+        <p class="text-surface-800-200">
           This bundle has no circuit profile, so the dataflow graph is unavailable.
         </p>
       {/if}
@@ -509,7 +509,12 @@
 {#if !sqlPanelFullHeight}
   <PaneGroup direction="vertical" class="!overflow-visible h-full">
     {#if hasProfile}
-      <Pane defaultSize={graphPaneDefaultSize} minSize={graphPaneMinSize} class="!overflow-visible">
+      <Pane
+        order={1}
+        defaultSize={graphPaneDefaultSize}
+        minSize={graphPaneMinSize}
+        class="!overflow-visible"
+      >
         {@render graphPanel()}
       </Pane>
       <PaneResizer class="pane-divider-horizontal my-2" />
@@ -518,7 +523,7 @@
         {@render graphPanel()}
       </div>
     {/if}
-    <Pane defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
+    <Pane order={2} defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
       <PaneGroup direction="horizontal" class="!overflow-visible h-full">
         <Pane defaultSize={50} minSize={0} class="!overflow-visible">
           <div use:sqlPanelRect.placeholder class="h-full"></div>
@@ -541,6 +546,7 @@
       <PaneGroup direction="vertical" class="!overflow-visible h-full">
         {#if hasProfile}
           <Pane
+            order={1}
             defaultSize={graphPaneDefaultSize}
             minSize={graphPaneMinSize}
             class="!overflow-visible"
@@ -553,7 +559,7 @@
             {@render graphPanel()}
           </div>
         {/if}
-        <Pane defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
+        <Pane order={2} defaultSize={belowGraphPaneDefaultSize} minSize={15} class="!overflow-visible">
           {@render analysisPanel()}
         </Pane>
       </PaneGroup>

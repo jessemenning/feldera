@@ -299,7 +299,8 @@
           <CreatePipelineButton inputClass="max-w-64" btnClass="preset-filled-surface-50-950"
           ></CreatePipelineButton>
         </div>
-        <BookADemo class="btn-icon preset-filled-surface-50-950"></BookADemo>
+        <BookADemo class="btn-icon preset-filled-surface-50-950" triggerLocation="pipeline_editor"
+        ></BookADemo>
         <Tooltip class="">Book a demo</Tooltip>
       {/if}
     {/snippet}
@@ -345,7 +346,11 @@
     {/if}
 
     <Pane class="!overflow-visible">
-      <PaneGroup direction="vertical" class="!overflow-visible">
+      <PaneGroup
+        direction="vertical"
+        class="!overflow-visible"
+        autoSaveId="layout/pipelines/monitoringPanel/size"
+      >
         {#if pipelineBannerMessage}
           <div class="pb-2 md:pb-4">
             <PipelineBanner {...pipelineBannerMessage}></PipelineBanner>
@@ -353,7 +358,11 @@
         {/if}
 
         <Pane defaultSize={60} minSize={15} class="!overflow-visible">
-          <PaneGroup direction="horizontal" class="!overflow-visible">
+          <PaneGroup
+            direction="horizontal"
+            class="!overflow-visible"
+            autoSaveId="layout/pipelines/interactionPanel/size"
+          >
             <Pane minSize={30} class="!overflow-visible">
               {#if pipeline.current}
                 <PipelineCodePanel

@@ -545,6 +545,47 @@ async fn read_program_code(
     }
 }
 
+/// Validate a SQL program via `POST /v0/validate_program` and print the result
+/// (success, SQL errors/warnings, or a system error) as pretty JSON. Validation
+/// failures are reported in the output; the command exits non-zero only on a
+/// system-level error.
+async fn validate_program(
+    program_path: Option<String>,
+    stdin: bool,
+    runtime_version: Option<String>,
+    ir: bool,
+    client: Client,
+) {
+    let program_code = match read_program_code(program_path, stdin).await {
+        Ok(Some(program_code)) => program_code,
+        Ok(None) => {
+            eprintln!("No SQL program provided: pass a program file path or --stdin.");
+            std::process::exit(1);
+        }
+        Err(()) => std::process::exit(1),
+    };
+    let response = client
+        .post_validate_program()
+        .body(ValidateProgramRequest {
+            program_code,
+            runtime_version,
+            ir: Some(ir),
+        })
+        .send()
+        .await
+        .map_err(handle_errors_fatal(
+            client.baseurl().clone(),
+            "Failed to validate program",
+            1,
+        ))
+        .unwrap();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&response.into_inner())
+            .expect("failed to serialize validation response")
+    );
+}
+
 async fn wait_for_status(
     client: &Client,
     name: String,
@@ -578,7 +619,11 @@ async fn wait_for_status_one_of(
             return pc.deployment_status;
         }
         if print_every_30_seconds.elapsed().as_secs() > 30 {
-            info!("{}", waiting_text);
+            info!(
+                "{} (current status: {})",
+                waiting_text,
+                pc.deployment_status.to_string()
+            );
             print_every_30_seconds = Instant::now();
         }
 
@@ -929,6 +974,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             initial,
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             no_dismiss_error,
         } => {
             if initial != "standby" && initial != "paused" && initial != "running" {
@@ -1051,6 +1097,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .initial(&initial)
                 .bootstrap_policy(&bootstrap_policy)
                 .silent_bootstrap(silent_bootstrap)
+                .concurrent_bootstrap(concurrent_bootstrap)
                 .dismiss_error(false) // It has already been separately dismissed
                 .send()
                 .await
@@ -1076,7 +1123,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 )
                 .await;
                 if status == CombinedStatus::AwaitingApproval {
-                    let diff = client
+                    let runtime_status_details = client
                         .get_pipeline()
                         .pipeline_name(name.clone())
                         .selector(PipelineFieldSelector::Status)
@@ -1095,10 +1142,11 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         "Pipeline definition has changed since the last checkpoint. The pipeline is awaiting approval to proceed with bootstrapping the modified components. Run 'fda approve' to approve the changes or 'fda stop' to terminate the pipeline. Summary of changes:"
                     );
 
-                    let diff_str = match diff {
+                    let diff_str = match runtime_status_details.map(|details| details.approval_diff)
+                    {
                         // Normally shouldn't happen.
-                        None => "<not available>".to_string(),
-                        Some(diff) => match format {
+                        None | Some(None) => "<not available>".to_string(),
+                        Some(Some(diff)) => match format {
                             OutputFormat::Text => json_to_table(&diff)
                                 .collapse()
                                 .into_pool_table()
@@ -1149,11 +1197,13 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
         PipelineAction::Approve {
             name,
             silent_bootstrap,
+            concurrent_bootstrap,
         } => {
             let response = client
                 .post_pipeline_approve()
                 .pipeline_name(name.clone())
                 .silent_bootstrap(silent_bootstrap)
+                .concurrent_bootstrap(concurrent_bootstrap)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
@@ -1223,6 +1273,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             initial,
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             no_dismiss_error,
         } => {
             let current_status = client
@@ -1271,6 +1322,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     initial,
                     bootstrap_policy,
                     silent_bootstrap,
+                    concurrent_bootstrap,
                     no_dismiss_error,
                 },
                 client,
@@ -1888,6 +1940,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             initial,
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             no_dismiss_error,
         } => {
             let client2 = client.clone();
@@ -1901,6 +1954,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         initial,
                         bootstrap_policy,
                         silent_bootstrap,
+                        concurrent_bootstrap,
                         no_dismiss_error,
                     },
                     client,
@@ -2121,6 +2175,36 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     std::process::exit(1);
                 }
             }
+        }
+        PipelineAction::Diff {
+            name,
+            program_path,
+            stdin,
+            runtime_version,
+        } => {
+            let program_code = read_program_code(program_path, stdin)
+                .await
+                .unwrap_or_else(|()| std::process::exit(1));
+            let response = client
+                .post_pipeline_diff()
+                .pipeline_name(name.clone())
+                .body(PipelineDiffRequest {
+                    program_code,
+                    runtime_version,
+                })
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().clone(),
+                    "Failed to compute pipeline diff",
+                    1,
+                ))
+                .unwrap();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.into_inner())
+                    .expect("failed to serialize pipeline diff")
+            );
         }
         PipelineAction::Rebalance { name } => {
             client
@@ -3134,6 +3218,12 @@ fn main() {
                 Commands::Apikey { action } => api_key_commands(cli.format, action, client()).await,
                 Commands::Pipelines => pipelines(cli.format, client()).await,
                 Commands::Pipeline(action) => pipeline(cli.format, action, client()).await,
+                Commands::ValidateProgram {
+                    program_path,
+                    stdin,
+                    runtime_version,
+                    ir,
+                } => validate_program(program_path, stdin, runtime_version, ir, client()).await,
                 Commands::Cluster { action } => cluster(cli.format, action, client()).await,
                 Commands::Debug { action } => debug::debug(cli.format, action, client()).await,
             }

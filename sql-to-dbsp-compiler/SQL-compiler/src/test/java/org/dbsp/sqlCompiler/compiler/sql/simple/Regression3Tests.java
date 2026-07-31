@@ -1,5 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
+import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWaterlineOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
@@ -63,9 +65,9 @@ public class Regression3Tests extends SqlIoTest {
                 CREATE VIEW W AS SELECT R[1], R[2], R[3][1] FROM V;""");
         ccs.stepWeightOne("""
                 INSERT INTO T VALUES(0, 1, 2); INSERT INTO S VALUES(3, 4);""", """
-                  y | z | b
-                 -----------
-                  1 | 2 | 4""");
+                 y | z | b
+                -----------
+                 1 | 2 | 4""");
     }
 
     @Test
@@ -144,8 +146,6 @@ public class Regression3Tests extends SqlIoTest {
                 ) WITH (
                 'append_only' = 'true'
                 );
-
-
                 CREATE MATERIALIZED VIEW v1
                 WITH ('emit_final' = 'a_ts')
                 AS
@@ -727,5 +727,138 @@ public class Regression3Tests extends SqlIoTest {
         compiler.submitStatementsForCompilation(sql);
         this.runtimeFail(compiler, "REMOVE FROM T VALUES (1);",
                 "Table t: negative weight found");
+    }
+
+    @Test
+    public void issue6453() {
+        var ccs = this.getCCS("""
+                CREATE TABLE t (id INT, arr ROW(name VARCHAR, score INT) ARRAY);
+                CREATE MATERIALIZED VIEW v AS
+                SELECT id, TRANSFORM(arr, x -> x.name) AS names FROM t;""");
+        String insert = """
+                INSERT INTO t VALUES
+                  -- Simple single-element array
+                  (1, ARRAY[
+                        ROW('alice', 10)
+                      ]),
+                
+                  -- Multi-element array
+                  (2, ARRAY[
+                        ROW('bob', 5),
+                        ROW('carol', 7),
+                        ROW('dave', 3)
+                      ]),
+                
+                  -- Empty array; direct casts of ARRAY[] do not work
+                  (3, ARRAY_REMOVE(ARRAY[NULL], NULL)),
+                
+                  -- Array with NULL element
+                  (4, ARRAY[
+                        NULL,
+                        ROW('eve', 42)
+                      ]),
+                
+                  -- Repeated names, varied scores
+                  (5, ARRAY[
+                        ROW('zoe', 1),
+                        ROW('zoe', 99),
+                        ROW('max', 50)
+                      ]),
+                
+                  -- Stress test: longer array
+                  (6, ARRAY[
+                        ROW('p1', 10),
+                        ROW('p2', 20),
+                        ROW('p3', 30),
+                        ROW('p4', 40)
+                      ]);""";
+        String expected = """
+                 id | names
+                -------------
+                  1 | { alice}
+                  2 | { bob, carol, dave}
+                  3 | {}
+                  4 | {NULL, eve}
+                  5 | { zoe, zoe, max}
+                  6 | { p1, p2, p3, p4}""";
+        ccs.stepWeightOne(insert, expected);
+
+        ccs = this.getCCS("""
+                CREATE TABLE t (id INT, arr ROW(name VARCHAR, score INT) ARRAY);
+                CREATE MATERIALIZED VIEW v AS
+                SELECT id, TRANSFORM(arr, x -> (x).name) AS names FROM t;""");
+        ccs.stepWeightOne(insert, expected);
+    }
+
+    @Test
+    public void testMapCast() {
+        this.getCCS("""
+                CREATE TABLE T(id INT, mapp MAP<VARCHAR, INT>);
+                CREATE MATERIALIZED VIEW V AS SELECT
+                SAFE_CAST(mapp AS MAP<VARCHAR, VARCHAR>) AS map FROM T;
+                --MAP[id, id] as map1 FROM T;""");
+    }
+
+    @Test
+    public void testMapNullable() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(id INT);
+                CREATE MATERIALIZED VIEW V AS SELECT
+                MAP[id, id] as m FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL);", """
+                 m
+                -------------
+                 {NULL: NULL}
+                """);
+    }
+
+    @Test
+    public void issue6565() {
+        var ccs = this.getCCS("""
+                CREATE TABLE employees(dept VARCHAR);
+                CREATE VIEW V AS SELECT dept, COUNT(*) AS n
+                FROM employees
+                GROUP BY dept
+                HAVING dept LIKE 'S%';""");
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            boolean filterFound = false;
+
+            @Override
+            public void postorder(DBSPFlatMapIndexOperator node) {
+                // Source is input
+                this.filterFound = true;
+                Assert.assertTrue(node.input().node().is(DBSPSourceTableOperator.class));
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(this.filterFound);
+            }
+        });
+    }
+
+    @Test
+    public void issue6565b() {
+        var ccs = this.getCCS("""
+                CREATE TABLE employees(dept VARCHAR);
+                CREATE LOCAL VIEW V AS SELECT dept, COUNT(*) AS n
+                FROM employees
+                GROUP BY dept;
+                CREATE VIEW W AS SELECT * FROM V WHERE dept LIKE 'S%';""");
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            boolean filterFound = false;
+
+            @Override
+            public void postorder(DBSPFlatMapIndexOperator node) {
+                // Source is input
+                this.filterFound = true;
+                Assert.assertTrue(node.input().node().is(DBSPSourceTableOperator.class));
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(this.filterFound);
+            }
+        });
     }
 }

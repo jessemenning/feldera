@@ -267,6 +267,13 @@ export type CheckpointSyncFailure = {
 }
 
 /**
+ * Response to a sync checkpoint request.
+ */
+export type CheckpointSyncResponse = {
+  checkpoint_uuid: string
+}
+
+/**
  * Checkpoint status returned by the `/checkpoint/sync_status` endpoint.
  */
 export type CheckpointSyncStatus = {
@@ -495,6 +502,8 @@ export type CombinedStatus =
   | 'AwaitingApproval'
   | 'Initializing'
   | 'Bootstrapping'
+  | 'ConcurrentBootstrapping'
+  | 'Synchronizing'
   | 'Replaying'
   | 'Paused'
   | 'Running'
@@ -607,11 +616,18 @@ export type CompletionTokenResponse = {
   token: string
 }
 
+/**
+ * Phase of a concurrent bootstrap.
+ *
+ * `#[repr(u8)]` + `NoUninit` so it can be stored in a lock-free `Atomic`.
+ */
+export type ConcurrentBootstrapPhase = 'Inactive' | 'ConcurrentBootstrapping' | 'Synchronizing'
+
 export type Condition = {
   literal?: boolean
   op?: Op | null
   operands?: Array<Operand> | null
-  [key: string]: unknown | boolean | Op | null | Array<Operand> | null | undefined
+  [key: string]: unknown
 }
 
 export type Configuration = {
@@ -625,10 +641,22 @@ export type Configuration = {
    */
   changelog_url: string
   /**
+   * ConceptualHQ analytics key. Empty when disabled.
+   */
+  conceptualhq: string
+  /**
    * Feldera edition: "Open source" or "Enterprise"
    */
   edition: string
   license_validity?: LicenseValidity | null
+  /**
+   * PostHog telemetry key. Empty when disabled.
+   */
+  posthog: string
+  /**
+   * Product Fruits workspace code for in-app onboarding. Empty when disabled.
+   */
+  product_fruits: string
   /**
    * Specific revision corresponding to the edition `version` (e.g., git commit hash).
    */
@@ -637,10 +665,6 @@ export type Configuration = {
    * Specific revision corresponding to the default runtime version of the platform (e.g., git commit hash).
    */
   runtime_revision: string
-  /**
-   * Telemetry key.
-   */
-  telemetry: string
   /**
    * List of unstable features that are enabled.
    */
@@ -780,6 +804,13 @@ export type ConnectorConfig = OutputBufferConfig & {
    * The default is `false`.
    */
   paused?: boolean
+  /**
+   * Optional postprocessor configuration
+   */
+  postprocessor?: Array<PostprocessorConfig> | null
+  /**
+   * Optional preprocessor configuration
+   */
   preprocessor?: Array<PreprocessorConfig> | null
   /**
    * Send a full snapshot of a materialized view when the connector first
@@ -840,16 +871,12 @@ export type ConnectorHealth = {
 export type ConnectorHealthStatus = 'Healthy' | 'Unhealthy'
 
 /**
- * Aggregated connector error statistics.
- *
- * This structure contains the sum of all error counts across all input and output connectors
- * for a pipeline.
+ * Statistics across all connectors.
  */
 export type ConnectorStats = {
   /**
    * Total number of errors across all connectors.
    *
-   * This is the sum of:
    * - `num_transport_errors` from all input connectors
    * - `num_parse_errors` from all input connectors
    * - `num_encode_errors` from all output connectors
@@ -1702,59 +1729,7 @@ export type DevTweaks = {
    * `false`
    */
   streaming_exchange?: boolean | null
-  [key: string]:
-    | unknown
-    | boolean
-    | null
-    | number
-    | null
-    | number
-    | null
-    | number
-    | null
-    | number
-    | null
-    | number
-    | null
-    | BufferCacheAllocationStrategy
-    | null
-    | BufferCacheStrategy
-    | null
-    | number
-    | null
-    | boolean
-    | null
-    | boolean
-    | null
-    | boolean
-    | null
-    | number
-    | null
-    | boolean
-    | null
-    | boolean
-    | null
-    | number
-    | null
-    | MergerType
-    | null
-    | number
-    | null
-    | number
-    | null
-    | boolean
-    | null
-    | string
-    | null
-    | number
-    | null
-    | boolean
-    | null
-    | number
-    | null
-    | boolean
-    | null
-    | undefined
+  [key: string]: unknown
 }
 
 export type DisplaySchedule =
@@ -1769,6 +1744,93 @@ export type DisplaySchedule =
       }
     }
   | 'Always'
+
+/**
+ * DynamoDB write API used by the output connector.
+ */
+export type DynamoDbWriteMode = 'batch' | 'transactional'
+
+/**
+ * DynamoDB output connector configuration.
+ */
+export type DynamoDbWriterConfig = {
+  /**
+   * AWS access key ID.
+   *
+   * If both `aws_access_key_id` and `aws_secret_access_key` are specified,
+   * the connector uses these static credentials. Otherwise it uses the
+   * default AWS credential provider chain, including IAM Roles for Service
+   * Accounts (IRSA) in EKS.
+   *
+   * Static credentials are treated as long-lived IAM keys: no session token
+   * is sent, so STS-issued temporary credentials are not supported via these
+   * fields. To use temporary credentials, rely on the default provider chain
+   * instead (leave these unset).
+   */
+  aws_access_key_id?: string | null
+  /**
+   * AWS secret access key.
+   */
+  aws_secret_access_key?: string | null
+  /**
+   * Maximum number of write requests in one DynamoDB write call.
+   *
+   * DynamoDB supports at most 100 for `TransactWriteItems` and at most 25
+   * for `BatchWriteItem`. If omitted, the connector uses the maximum for
+   * the selected `write_mode`.
+   */
+  batch_size?: number | null
+  /**
+   * Optional endpoint URL, for example when using a local
+   * DynamoDB-compatible service.
+   */
+  endpoint_url?: string | null
+  /**
+   * Maximum number of bytes buffered by each worker before flushing writes.
+   *
+   * This is an approximate size based on encoded DynamoDB attributes.
+   */
+  max_buffer_size_bytes?: number
+  /**
+   * Maximum number of DynamoDB write requests in flight per worker thread.
+   *
+   * The total in-flight request count across the connector is
+   * `threads × max_concurrent_requests`. Size this accordingly when
+   * tuning against a provisioned-throughput table to avoid excessive
+   * throttling.
+   */
+  max_concurrent_requests?: number
+  /**
+   * Maximum number of retries for a failed or partially-applied DynamoDB write chunk.
+   *
+   * For `batch` writes, `BatchWriteItem` may return some items as "unprocessed" in a
+   * successful 200 response; those are re-submitted and counted as retries. For
+   * `transactional` writes, a failed `TransactWriteItems` call is retried in full.
+   *
+   * Transient errors (throttling, network failures) are first handled transparently by the
+   * AWS SDK. Only attempts that reach this connector's retry loop count against this limit.
+   * Each retry waits longer than the previous one (exponential backoff), up to a ceiling
+   * of roughly 13 seconds.
+   *
+   * Set to `null` to retry indefinitely. After the backoff ceiling is reached the connector
+   * keeps retrying at that interval, providing backpressure until DynamoDB recovers.
+   * Defaults to `10`.
+   */
+  max_retries?: number | null
+  /**
+   * AWS region.
+   */
+  region: string
+  /**
+   * Name of the DynamoDB table to write to.
+   */
+  table: string
+  /**
+   * Number of worker threads used to encode and write disjoint key ranges.
+   */
+  threads?: number
+  write_mode?: DynamoDbWriteMode
+}
 
 /**
  * Information returned by REST API endpoints on error.
@@ -2042,6 +2104,8 @@ export type GlobalControllerMetrics = {
    */
   buffered_input_records: number
   commit_progress?: CommitProgressSummary | null
+  concurrent_bootstrap_phase: ConcurrentBootstrapPhase
+  concurrent_bootstrap_progress?: CommitProgressSummary | null
   /**
    * CPU time used by the pipeline across all threads, in milliseconds.
    */
@@ -2217,6 +2281,72 @@ export type GlueCatalogConfig = {
   'glue.warehouse'?: string | null
 }
 
+/**
+ * A boolean filter over the headers of a Kafka message.
+ *
+ * The Kafka input connector uses this to drop messages whose headers do not
+ * satisfy a predicate.  It is a tree of boolean operators (`and`, `or`, `not`)
+ * whose leaves are regular expression tests on individual header values.  It
+ * serializes as an externally tagged JSON object, for example:
+ *
+ * ```json
+ * {
+ * "and": [
+ * { "header": { "name": "event-type", "pattern": "created|updated" } },
+ * { "not": { "header": { "name": "source", "pattern": "test-.*" } } }
+ * ]
+ * }
+ * ```
+ *
+ * This admits a message only if it has an `event-type` header valued exactly
+ * `created` or `updated` and does not have a `source` header whose value
+ * starts with `test-`.
+ */
+export type HeaderFilter =
+  | {
+      header: HeaderMatch
+    }
+  | {
+      /**
+       * Conjunction: matches when every nested filter matches.  Must have at
+       * least one operand.
+       */
+      and: Array<HeaderFilter>
+    }
+  | {
+      /**
+       * Disjunction: matches when at least one nested filter matches.  Must have
+       * at least one operand.
+       */
+      or: Array<HeaderFilter>
+    }
+  | {
+      not: HeaderFilter
+    }
+
+/**
+ * A leaf of a [`HeaderFilter`]: a regular expression tested against the value
+ * of a named Kafka header.
+ */
+export type HeaderMatch = {
+  /**
+   * Name of the header to test, matched exactly against the header key.
+   */
+  name: string
+  /**
+   * Regular expression ([Rust `regex` crate
+   * syntax](https://docs.rs/regex/latest/regex/#syntax)) tested against the
+   * header value.
+   *
+   * The value is matched as raw bytes, so non-UTF-8 values and byte patterns
+   * work.  The pattern must match the *entire* value: it is anchored
+   * automatically, so `^`/`$` are unnecessary (though harmless).  A header
+   * present with a null value is matched as an empty byte sequence; a header
+   * that appears more than once matches if any of its values match.
+   */
+  pattern: string
+}
+
 export type HealthStatus = {
   all_healthy: boolean
   api: ServiceStatus
@@ -2260,7 +2390,7 @@ export type HttpOutputConfig = {
   backpressure?: boolean
 }
 
-export type IcebergCatalogType = 'rest' | 'glue'
+export type IcebergCatalogType = 'rest' | 'glue' | 's3tables'
 
 /**
  * Iceberg table read mode.
@@ -2281,7 +2411,8 @@ export type IcebergIngestMode = 'snapshot' | 'follow' | 'snapshot_and_follow'
  * Iceberg input connector configuration.
  */
 export type IcebergReaderConfig = GlueCatalogConfig &
-  RestCatalogConfig & {
+  RestCatalogConfig &
+  S3TablesCatalogConfig & {
     catalog_type?: IcebergCatalogType | null
     /**
      * Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g.,
@@ -2589,6 +2720,7 @@ export type KafkaInputConfig = {
    * consumer group during initialization.
    */
   group_join_timeout_secs?: number
+  header_filter?: HeaderFilter | null
   /**
    * Whether to include Kafka headers in the record metadata.
    *
@@ -2720,6 +2852,8 @@ export type KafkaInputConfig = {
   [key: string]:
     | string
     | number
+    | HeaderFilter
+    | null
     | boolean
     | null
     | boolean
@@ -2927,7 +3061,7 @@ export type MetricsParameters = {
 export type MirInput = {
   node: string
   output: number
-  [key: string]: unknown | string | number
+  [key: string]: unknown
 }
 
 export type MirNode = {
@@ -2939,22 +3073,7 @@ export type MirNode = {
   positions?: Array<SourcePosition>
   table?: string | null
   view?: string | null
-  [key: string]:
-    | unknown
-    | CalciteId
-    | null
-    | Array<MirInput>
-    | string
-    | Array<MirInput | null>
-    | null
-    | string
-    | null
-    | Array<SourcePosition>
-    | string
-    | null
-    | string
-    | null
-    | undefined
+  [key: string]: unknown
 }
 
 export type MonitorStatus = 'InitialUnhealthy' | 'Unhealthy' | 'Healthy'
@@ -3107,13 +3226,13 @@ export type Op = {
   kind: string
   name: string
   syntax: string
-  [key: string]: unknown | string
+  [key: string]: unknown
 }
 
 export type Operand = {
   input?: number | null
   name?: string | null
-  [key: string]: unknown | number | null | string | null | undefined
+  [key: string]: unknown
 }
 
 export type OutputBufferConfig = {
@@ -3149,8 +3268,7 @@ export type OutputBufferConfig = {
    * total number of updates output by the pipeline. Updates to the
    * same record can overwrite or cancel previous updates.
    *
-   * By default, the buffer can grow indefinitely until one of
-   * the other output conditions is satisfied.
+   * The default is 10,000,000.
    *
    * NOTE: this configuration option requires the `enable_output_buffer` flag
    * to be set.
@@ -3634,7 +3752,7 @@ export type PipelineInfo = ClientMetadata & {
   deployment_runtime_desired_status?: RuntimeDesiredStatus | null
   deployment_runtime_desired_status_since?: string | null
   deployment_runtime_status?: RuntimeStatus | null
-  deployment_runtime_status_details?: unknown
+  deployment_runtime_status_details?: RuntimeStatusDetails | null
   deployment_runtime_status_since?: string | null
   deployment_status: CombinedStatus
   deployment_status_since: string
@@ -3651,7 +3769,7 @@ export type PipelineInfo = ClientMetadata & {
   refresh_version: Version
   runtime_config: RuntimeConfig
   storage_status: StorageStatus
-  storage_status_details?: unknown
+  storage_status_details?: StorageStatusDetails | null
   udf_rust: string
   udf_toml: string
   version: Version
@@ -3705,7 +3823,7 @@ export type PipelineSelectedInfo = ClientMetadata & {
   deployment_runtime_desired_status?: RuntimeDesiredStatus | null
   deployment_runtime_desired_status_since?: string | null
   deployment_runtime_status?: RuntimeStatus | null
-  deployment_runtime_status_details?: unknown
+  deployment_runtime_status_details?: RuntimeStatusDetails | null
   deployment_runtime_status_since?: string | null
   deployment_status: CombinedStatus
   deployment_status_since: string
@@ -3722,7 +3840,7 @@ export type PipelineSelectedInfo = ClientMetadata & {
   refresh_version: Version
   runtime_config?: RuntimeConfig | null
   storage_status: StorageStatus
-  storage_status_details?: unknown
+  storage_status_details?: StorageStatusDetails | null
   udf_rust?: string | null
   udf_toml?: string | null
   version: Version
@@ -4074,6 +4192,22 @@ export type PostgresWriterConfig = {
 }
 
 /**
+ * Configuration for describing a postprocessor
+ */
+export type PostprocessorConfig = {
+  /**
+   * Arbitrary additional configuration expected by the postprocessor
+   * encoded as a JSON Value.
+   */
+  config: unknown
+  /**
+   * Name of the postprocessor.
+   * All postprocessors with the same name will perform the same task.
+   */
+  name: string
+}
+
+/**
  * Configuration for describing a preprocessor
  */
 export type PreprocessorConfig = {
@@ -4130,6 +4264,24 @@ export type ProgramConfig = {
    * If not set (null), the runtime version will be the same as the platform version.
    */
   runtime_version?: string | null
+  /**
+   * Use the platform SQL compiler when a non-platform `runtime_version` is specified.
+   *
+   * Warning: This setting is experimental and may change in the future.
+   * Requires the platform to run with the unstable feature `runtime_version` enabled.
+   *
+   * When `false` (default), the SQL compiler matching the `runtime_version` is
+   * downloaded and used. When `true`, the platform's SQL compiler is used instead.
+   *
+   * Setting this to `true` avoids downloading the runtime-version-specific SQL
+   * compiler JAR (e.g., when network access is unavailable or slow), at the cost
+   * of potentially using a mismatched SQL compiler. The Rust runtime sources are
+   * still checked out and compiled from the requested `runtime_version`.
+   *
+   * Has no effect when `runtime_version` is not set or the platform does not have
+   * the unstable feature `runtime_version` enabled.
+   */
+  use_platform_compiler?: boolean
 }
 
 /**
@@ -4353,28 +4505,7 @@ export type Rel = {
    * e.g., usually is of the form `[$namespace, $table] / [schema, table]`
    */
   table?: Array<string> | null
-  [key: string]:
-    | unknown
-    | Array<unknown>
-    | null
-    | boolean
-    | null
-    | Condition
-    | null
-    | Array<Operand>
-    | null
-    | Array<string>
-    | null
-    | Array<number>
-    | null
-    | number
-    | Array<number>
-    | string
-    | null
-    | string
-    | Array<string>
-    | null
-    | undefined
+  [key: string]: unknown
 }
 
 /**
@@ -4389,6 +4520,16 @@ export type Relation = SqlIdentifier & {
   properties?: {
     [key: string]: PropertyValue
   }
+}
+
+/**
+ * A checkpoint that exists in remote object storage.
+ */
+export type RemoteCheckpoint = {
+  /**
+   * UUID of the checkpoint.
+   */
+  uuid: string
 }
 
 export type ReplayPolicy = 'Instant' | 'Original'
@@ -4842,6 +4983,28 @@ export type RuntimeStatus =
   | 'Paused'
   | 'Running'
   | 'Suspended'
+  | 'ConcurrentBootstrapping'
+  | 'Synchronizing'
+
+/**
+ * Details about the current runtime status. The fields in this struct should all be **optional**
+ * and set only by a runtime status when they are known. Otherwise, they can just be set `None`.
+ */
+export type RuntimeStatusDetails = {
+  /**
+   * The diff which is awaiting approval.
+   *
+   * Specifically useful for: `AwaitingApproval`.
+   */
+  approval_diff?: unknown
+  connector_stats?: ConnectorStats | null
+  /**
+   * Free form text giving an explanation why it is currently in this runtime status.
+   *
+   * Specifically useful for: `Unavailable`, `Initializing`.
+   */
+  reason?: string | null
+}
 
 /**
  * Rust compilation information.
@@ -4913,6 +5076,46 @@ export type S3InputConfig = {
    * AWS region.
    */
   region: string
+}
+
+/**
+ * Amazon S3 Tables catalog config.
+ */
+export type S3TablesCatalogConfig = {
+  /**
+   * Access key id used to access the S3 Tables catalog.
+   */
+  's3tables.access-key-id'?: string | null
+  /**
+   * Custom endpoint URL for the S3 Tables service.
+   *
+   * Primarily used to target a local or mock S3 Tables implementation for testing.
+   * When omitted, the default regional endpoint is used.
+   */
+  's3tables.endpoint'?: string | null
+  /**
+   * Profile used to access the S3 Tables catalog.
+   */
+  's3tables.profile-name'?: string | null
+  /**
+   * Region of the S3 Tables catalog.
+   */
+  's3tables.region'?: string | null
+  /**
+   * Secret access key used to access the S3 Tables catalog.
+   */
+  's3tables.secret-access-key'?: string | null
+  /**
+   * Static session token used to access the S3 Tables catalog.
+   */
+  's3tables.session-token'?: string | null
+  /**
+   * ARN of the S3 table bucket that contains the table.
+   *
+   * Note that this is the ARN of the table *bucket*, not of an individual table,
+   * e.g., `"arn:aws:s3tables:us-east-2:123456789012:bucket/my-bucket"`.
+   */
+  's3tables.table-bucket-arn'?: string | null
 }
 
 /**
@@ -5025,7 +5228,7 @@ export type SqlIdentifier = {
 }
 
 /**
- * The available SQL types as specified in `CREATE` statements.
+ * The available SQL column type names. Each value is the platform's wire encoding of the type (e.g. `BIGINT`, `INTEGER`, `INTERVAL_DAY`), not valid SQL type syntax.
  */
 export type SqlType =
   | 'BOOLEAN'
@@ -5181,6 +5384,17 @@ export type StorageOptions = {
 export type StorageStatus = 'Cleared' | 'InUse' | 'Clearing'
 
 /**
+ * Details about pipeline storage, which are returned as part of the regular runtime status polling
+ * by the runner.
+ */
+export type StorageStatusDetails = {
+  /**
+   * Present checkpoints.
+   */
+  checkpoints: Array<CheckpointMetadata>
+}
+
+/**
  * Whether a pipeline supports checkpointing and suspend-and-resume.
  */
 export type SuspendError =
@@ -5269,6 +5483,19 @@ export type SyncConfig = {
    */
   multi_thread_streams?: number | null
   /**
+   * When true, checkpoint downloads use the maximum resources available on
+   * the host: `transfers` and `checkers` are scaled to the number of CPUs,
+   * and the download buffer is allowed to grow up to most of the available
+   * memory. This maximizes download throughput at the cost of higher CPU and
+   * memory usage during a pull.
+   *
+   * When false, downloads use the values configured via `transfers`,
+   * `checkers`, and the rclone defaults instead.
+   *
+   * Default: true
+   */
+  optimize_download_resources?: boolean
+  /**
    * The name of the cloud storage provider (e.g., `"AWS"`, `"Minio"`).
    *
    * Used for provider-specific behavior in rclone.
@@ -5334,19 +5561,9 @@ export type SyncConfig = {
    */
   secret_key?: string | null
   /**
-   * When `true`, the pipeline starts in **standby** mode; processing doesn't
-   * start until activation (`POST /activate`).
-   * If this pipeline was previously activated and the storage has not been
-   * cleared, the pipeline will auto activate, no newer checkpoints will be
-   * fetched.
+   * **Deprecated.** Use `initial=standby` when starting the pipeline instead.
    *
-   * Standby behavior depends on `start_from_checkpoint`:
-   * - If `latest`, pipeline continuously fetches the latest available
-   * checkpoint until activated.
-   * - If checkpoint UUID, pipeline fetches this checkpoint once and waits
-   * in standby until activated.
-   *
-   * Default: `false`
+   * @deprecated
    */
   standby?: boolean
   start_from_checkpoint?: StartFromCheckpoint | null
@@ -5464,6 +5681,10 @@ export type TransportConfig =
   | {
       config: DeltaTableWriterConfig
       name: 'delta_table_output'
+    }
+  | {
+      config: DynamoDbWriterConfig
+      name: 'dynamodb_output'
     }
   | {
       config: RedisOutputConfig
@@ -5690,7 +5911,7 @@ export type GetApiKeyResponses = {
   /**
    * API key retrieved successfully
    */
-  200: ApiKeyDescr
+  200: Array<ApiKeyDescr>
 }
 
 export type GetApiKeyResponse = GetApiKeyResponses[keyof GetApiKeyResponses]
@@ -6095,7 +6316,7 @@ export type PostPipelineActivateResponses = {
   /**
    * Pipeline activation initiated
    */
-  202: CheckpointResponse
+  202: string
 }
 
 export type PostPipelineActivateResponse =
@@ -6114,11 +6335,21 @@ export type PostPipelineApproveData = {
      * Bootstrap the pipeline with output connectors disabled.
      */
     silent_bootstrap?: boolean
+    /**
+     * Bootstrap new and modified views concurrently, keeping the pre-existing
+     * views live while the new ones backfill. Mutually exclusive with
+     * `silent_bootstrap`.
+     */
+    concurrent_bootstrap?: boolean
   }
   url: '/v0/pipelines/{pipeline_name}/approve'
 }
 
 export type PostPipelineApproveErrors = {
+  /**
+   * Bootstrap options are mutually inconsistent
+   */
+  400: ErrorResponse
   /**
    * Pipeline with that name does not exist
    */
@@ -6131,9 +6362,9 @@ export type PostPipelineApproveError = PostPipelineApproveErrors[keyof PostPipel
 
 export type PostPipelineApproveResponses = {
   /**
-   * Pipeline activation initiated
+   * Bootstrap approved
    */
-  202: CheckpointResponse
+  200: string
 }
 
 export type PostPipelineApproveResponse =
@@ -6197,9 +6428,9 @@ export type SyncCheckpointError = SyncCheckpointErrors[keyof SyncCheckpointError
 
 export type SyncCheckpointResponses = {
   /**
-   * Checkpoint synced to object store
+   * Checkpoint sync to object store initiated
    */
-  200: CheckpointResponse
+  202: CheckpointSyncResponse
 }
 
 export type SyncCheckpointResponse = SyncCheckpointResponses[keyof SyncCheckpointResponses]
@@ -6296,12 +6527,45 @@ export type GetCheckpointsError = GetCheckpointsErrors[keyof GetCheckpointsError
 
 export type GetCheckpointsResponses = {
   /**
-   * Checkpoints retrieved successfully
+   * Checkpoints retrieved successfully. For multihost pipelines the list contains entries from all hosts; the shape of this response may change in a future release.
    */
-  200: CheckpointMetadata
+  200: Array<CheckpointMetadata>
 }
 
 export type GetCheckpointsResponse = GetCheckpointsResponses[keyof GetCheckpointsResponses]
+
+export type GetRemoteCheckpointsData = {
+  body?: never
+  path: {
+    /**
+     * Unique pipeline name
+     */
+    pipeline_name: string
+  }
+  query?: never
+  url: '/v0/pipelines/{pipeline_name}/checkpoints/remote'
+}
+
+export type GetRemoteCheckpointsErrors = {
+  /**
+   * Pipeline with that name does not exist
+   */
+  404: ErrorResponse
+  500: ErrorResponse
+  503: ErrorResponse
+}
+
+export type GetRemoteCheckpointsError = GetRemoteCheckpointsErrors[keyof GetRemoteCheckpointsErrors]
+
+export type GetRemoteCheckpointsResponses = {
+  /**
+   * Remote checkpoints retrieved successfully.
+   */
+  200: Array<RemoteCheckpoint>
+}
+
+export type GetRemoteCheckpointsResponse =
+  GetRemoteCheckpointsResponses[keyof GetRemoteCheckpointsResponses]
 
 export type GetPipelineCircuitJsonProfileData = {
   body?: never
@@ -7137,6 +7401,11 @@ export type PostPipelineStartData = {
      * Bootstrap the pipeline with output connectors disabled.
      */
     silent_bootstrap?: boolean
+    /**
+     * Bootstrap new and modified views concurrently, keeping the pre-existing
+     * views live while the new ones backfill in the background.
+     */
+    concurrent_bootstrap?: boolean
     dismiss_error?: boolean
   }
   url: '/v0/pipelines/{pipeline_name}/start'
@@ -7519,40 +7788,6 @@ export type PostPipelineInputConnectorActionError =
 export type PostPipelineInputConnectorActionResponses = {
   /**
    * Action has been processed
-   */
-  200: unknown
-}
-
-export type PostPipelineTestingData = {
-  body?: never
-  path: {
-    /**
-     * Unique pipeline name
-     */
-    pipeline_name: string
-  }
-  query?: {
-    set_platform_version?: string | null
-  }
-  url: '/v0/pipelines/{pipeline_name}/testing'
-}
-
-export type PostPipelineTestingErrors = {
-  /**
-   * Pipeline with that name does not exist
-   */
-  404: ErrorResponse
-  /**
-   * Endpoint is disabled. Set FELDERA_UNSTABLE_FEATURES="testing" to enable.
-   */
-  405: ErrorResponse
-}
-
-export type PostPipelineTestingError = PostPipelineTestingErrors[keyof PostPipelineTestingErrors]
-
-export type PostPipelineTestingResponses = {
-  /**
-   * Request successfully processed
    */
   200: unknown
 }

@@ -3,13 +3,17 @@ import {
     BooleanValue,
     BytesValue,
     CircuitProfile,
+    ComplexNode,
     CountValue,
     MissingValue,
     PercentValue,
     PropertyValue,
+    SimpleNode,
     StringValue,
     TimeValue
 } from './profile.js'
+import type { Dataflow } from './dataflow.js'
+import { NumericRange } from './util.js'
 
 describe('CircuitProfile.isTop', () => {
     it('recognises the toplevel node by the parsed root id', () => {
@@ -301,5 +305,111 @@ describe('PropertyValue contract', () => {
             // Self-average: every kind should accept an empty `others` array without throwing.
             expect(() => v.average([])).not.toThrow()
         }
+    })
+})
+
+// The profiler colors per-worker bars against the metric's range across ALL nodes
+// (`CircuitProfile.dataRange`, built by unioning each node's per-worker values), not against the
+// current node's local spread. `computePropertyRanges` composes `NumericRange.union` + `percents`;
+// these tests pin that composition so a value's color depends on the whole circuit.
+describe('NumericRange cross-node normalization', () => {
+    // Two nodes: A workers [10, 20], B workers [100, 200]. The global range unions to [10, 200].
+    const nodeA = NumericRange.getRange([10, 20])
+    const nodeB = NumericRange.getRange([100, 200])
+    const global = nodeA.union(nodeB)
+
+    it('union spans the min and max across every node', () => {
+        expect(global.min).toBe(10)
+        expect(global.max).toBe(200)
+    })
+
+    it('normalizes a value against the global range, not its own node', () => {
+        // A's local max (20) is near the bottom of the circuit, so it colors cool, not hot.
+        // Local normalization would place 20 at 100% of node A's [10, 20] range — the regression.
+        expect(global.percents(20)).toBeCloseTo((100 * (20 - 10)) / (200 - 10), 5)
+        expect(global.percents(20)).toBeLessThan(10)
+        expect(nodeA.percents(20)).toBe(100)
+        expect(global.percents(200)).toBe(100)
+    })
+
+    it('a value has the same color wherever it appears, regardless of node-local spread', () => {
+        // 100 sits at the same global percentile whether reached from node A or node B.
+        expect(global.percents(100)).toBeCloseTo(nodeA.union(nodeB).percents(100), 5)
+    })
+
+    it('degenerate ranges collapse to a single point value', () => {
+        // Empty (no numeric readings) unions away; a single distinct value yields a point range.
+        const empty = NumericRange.empty()
+        expect(empty.union(nodeA)).toEqual(nodeA)
+        const point = NumericRange.getRange([42, 42])
+        expect(point.isPoint()).toBe(true)
+    })
+})
+
+describe('CircuitProfile.byName', () => {
+    const mirNode = (persistent_id: string, table: string | null, view: string | null) => ({
+        operation: 'op', table, view, inputs: [], calcite: {}, positions: [], persistent_id
+    })
+
+    const makeProfile = () => {
+        const profile = new CircuitProfile(1, 'n')
+        const source = new SimpleNode('n1', 'source', 1)
+        const sink = new SimpleNode('n2', 'sink', 1)
+        const port = new SimpleNode('n3', 'source', 1)
+        for (const [pid, node] of [['abc123', source], ['def456', sink], ['789fed', port]] as const) {
+            profile.simpleNodes.set(node.id, node)
+            profile.byPersistentId.set(pid, node)
+        }
+        const dataflow: Dataflow = {
+            calcite_plan: {},
+            mir: {
+                s1: mirNode('abc123', 'CUSTOMERS', null),
+                s2: mirNode('def456', null, 'report'),
+                s3: mirNode('789fed', 'port', null)
+            }
+        }
+        profile.setDataflow(dataflow)
+        return { profile, source, sink, port }
+    }
+
+    it('indexes input tables and output views by lowercase name', () => {
+        const { profile, source, sink } = makeProfile()
+        // Quoted uppercase table names are found by their lowercase key
+        expect(profile.byName.get('customers').unwrap()).toBe(source)
+        expect(profile.byName.get('report').unwrap()).toBe(sink)
+        expect(profile.byName.get('missing').isNone()).toBe(true)
+    })
+
+    it('findByName falls back to a substring match', () => {
+        const { profile, source, sink } = makeProfile()
+        expect(profile.findByName('CUSTOM').unwrap()).toBe(source)
+        expect(profile.findByName('epor').unwrap()).toBe(sink)
+        expect(profile.findByName('missing').isNone()).toBe(true)
+    })
+
+    it('findByName prefers an exact match over a substring match', () => {
+        const { profile, port } = makeProfile()
+        // 'port' is a substring of 'report', but the exact match wins
+        expect(profile.findByName('port').unwrap()).toBe(port)
+    })
+
+    it('propagates the name to ancestors for collapsed display', () => {
+        const profile = new CircuitProfile(1, 'n')
+        const outer = new ComplexNode('c1', 'region', 1)
+        const inner = new ComplexNode('c2', 'subregion', 1)
+        const source = new SimpleNode('n1', 'source', 1)
+        profile.complexNodes.set(outer.id, outer)
+        profile.complexNodes.set(inner.id, inner)
+        profile.simpleNodes.set(source.id, source)
+        profile.parents.set(inner.id, outer.id)
+        profile.parents.set(source.id, inner.id)
+        profile.byPersistentId.set('abc123', source)
+
+        profile.setDataflow({ calcite_plan: {}, mir: { s1: mirNode('abc123', 'customers', null) } })
+
+        expect(outer.collapsedOperation()).toBe('region customers')
+        expect(inner.collapsedOperation()).toBe('subregion customers')
+        // The expanded label stays unchanged
+        expect(outer.operation).toBe('region')
     })
 })

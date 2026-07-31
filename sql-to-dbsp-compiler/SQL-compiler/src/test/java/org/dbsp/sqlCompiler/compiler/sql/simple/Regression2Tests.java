@@ -13,6 +13,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
+import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuit;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
@@ -413,6 +414,57 @@ public class Regression2Tests extends SqlIoTest {
     }
 
     @Test
+    public void issue6658() {
+        // now() used in SELECT
+        String sql = """
+                CREATE TABLE transactions (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW window_computation AS
+                SELECT ts > NOW()
+                FROM transactions;""";
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.options.ioOptions.quiet = false;
+        PrintStream saved = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
+        compiler.submitStatementsForCompilation(sql);
+        System.setErr(saved);
+        TestUtil.assertMessagesContain(compiler, """
+                warning: Inefficient pattern: NOW() expression is used in a pattern that could require expensive computations
+                See https://docs.feldera.com/sql/datetime/#now
+                    6|SELECT ts > NOW()
+                                  ^^^^^
+                    7|FROM transactions;""");
+    }
+
+    @Test
+    public void issue6658a() {
+        // now() used in SELECT
+        String sql = """
+                CREATE TABLE transactions (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW window_computation AS
+                SELECT id, ts
+                FROM transactions
+                WHERE LEAST(ts, NOW()) < ts - INTERVAL 1 DAY;""";
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.options.ioOptions.quiet = false;
+        PrintStream saved = System.err;
+        System.setErr(NullPrintStream.INSTANCE);
+        compiler.submitStatementsForCompilation(sql);
+        System.setErr(saved);
+        TestUtil.assertMessagesContain(compiler, """
+                warning: Inefficient pattern: NOW() expression is used in a pattern that could require expensive computations
+                See https://docs.feldera.com/sql/datetime/#now
+                    7|FROM transactions
+                    8|WHERE LEAST(ts, NOW()) < ts - INTERVAL 1 DAY;
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^""");
+    }
+
+    @Test
     public void issue5541c() {
         DBSPCompiler compiler = this.testCompiler();
         compiler.options.ioOptions.quiet = false;
@@ -777,7 +829,7 @@ public class Regression2Tests extends SqlIoTest {
 
     @Test
     public void rowsTest() {
-        this.statementsFailingInCompilation("""
+        this.getCCS("""
                 CREATE TABLE purchase (
                     ts TIMESTAMP NOT NULL,
                     amount BIGINT,
@@ -787,7 +839,7 @@ public class Regression2Tests extends SqlIoTest {
                 CREATE MATERIALIZED VIEW rolling_sum AS
                 SELECT ts,
                     SUM(value) OVER (ORDER BY ts ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling_sum
-                    FROM purchase;""", "Not yet implemented: Window aggregates with ROWS");
+                    FROM purchase;""");
     }
 
     @Test

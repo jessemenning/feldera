@@ -8,7 +8,7 @@ use crossbeam::channel::Receiver;
 use dbsp::DBData;
 use feldera_sqllib::Variant;
 #[cfg(feature = "iceberg-tests-fs")]
-use feldera_sqllib::{ByteArray, F32, F64};
+use feldera_sqllib::{ByteArray, F32, F64, Timestamp, TimestampTz};
 use feldera_types::{
     program_schema::Field,
     serde_with_context::{DeserializeWithContext, SerializeWithContext, SqlSerdeConfig},
@@ -23,6 +23,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[cfg(feature = "iceberg-tests-fs")]
 use std::io::Write;
 
+#[cfg(feature = "iceberg-tests-fs")]
+use super::IcebergSubsetTestStruct;
 #[cfg(any(
     feature = "iceberg-tests-fs",
     feature = "iceberg-tests-glue",
@@ -31,7 +33,7 @@ use std::io::Write;
 use super::IcebergTestStruct;
 #[cfg(feature = "iceberg-tests-s3tables")]
 use super::S3TablesTestStruct;
-use super::test_circuit;
+use super::test_circuit_with_properties;
 
 fn init_logging() {
     let _ = tracing_subscriber::registry()
@@ -63,8 +65,39 @@ fn data_to_ndjson(data: Vec<IcebergTestStruct>) -> NamedTempFile {
     file
 }
 
+/// Read the Iceberg connector's custom metrics into a `name -> value` map.
+fn iceberg_connector_metrics(pipeline: &Controller) -> HashMap<String, f64> {
+    let endpoint_id = pipeline
+        .input_endpoint_id_by_name("test_input1")
+        .expect("iceberg input endpoint must exist");
+    pipeline
+        .status()
+        .input_status()
+        .get(&endpoint_id)
+        .and_then(|status| status.custom_metrics.clone())
+        .map(|metrics| {
+            metrics
+                .metrics()
+                .into_iter()
+                .map(|(name, _, _, value)| (name.to_string(), value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Read a snapshot of an Iceberg table with records of type `T` to a temporary JSON file.
-fn iceberg_snapshot_to_json<T>(schema: &[Field], config: &HashMap<String, String>) -> NamedTempFile
+///
+/// `table_properties` are set on the input relation, the way table-level SQL
+/// `WITH` properties (e.g., `skip_unused_columns`) reach the connector.
+///
+/// `config` is the connector's transport config as a JSON object. This function
+/// forces `mode = snapshot`. Returns the output file and the connector's custom
+/// metrics captured just before the pipeline is stopped.
+fn iceberg_snapshot_to_json<T>(
+    schema: &[Field],
+    table_properties: &[(&str, &str)],
+    config: serde_json::Value,
+) -> (NamedTempFile, HashMap<String, f64>)
 where
     T: DBData
         + SerializeWithContext<SqlSerdeConfig>
@@ -78,11 +111,18 @@ where
         json_file.path().display()
     );
 
-    let mut config = config.clone();
-    config.insert("mode".to_string(), "snapshot".to_string());
+    let mut config = config;
+    config
+        .as_object_mut()
+        .expect("iceberg connector config must be a JSON object")
+        .insert("mode".to_string(), json!("snapshot"));
 
-    let (input_pipeline, err_receiver) =
-        iceberg_input_pipeline::<T>(schema, &config, &json_file.path().display().to_string());
+    let (input_pipeline, err_receiver) = iceberg_input_pipeline::<T>(
+        schema,
+        table_properties,
+        config,
+        &json_file.path().display().to_string(),
+    );
     input_pipeline.start();
     wait(
         || input_pipeline.status().pipeline_complete() || err_receiver.len() > 0,
@@ -92,17 +132,21 @@ where
 
     assert!(err_receiver.is_empty());
 
+    // Read metrics before stopping, while the connector status is still live.
+    let metrics = iceberg_connector_metrics(&input_pipeline);
+
     input_pipeline.stop().unwrap();
 
     info!("Read Iceberg snapshot in {:?}", start.elapsed());
 
-    json_file
+    (json_file, metrics)
 }
 
 /// Build a pipeline that reads from an Iceberg table and writes to a JSON file.
 fn iceberg_input_pipeline<T>(
     schema: &[Field],
-    config: &HashMap<String, String>,
+    table_properties: &[(&str, &str)],
+    config: serde_json::Value,
     output_file_path: &str,
 ) -> (Controller, Receiver<String>)
 where
@@ -147,11 +191,26 @@ where
     .unwrap();
 
     let schema = schema.to_vec();
+    let table_properties: Vec<(String, String)> = table_properties
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
     let (err_sender, err_receiver) = crossbeam::channel::unbounded();
 
     let controller = Controller::with_test_config(
-        move |workers| Ok(test_circuit::<T>(workers, &schema, &[None])),
+        move |workers| {
+            let table_properties: Vec<(&str, &str)> = table_properties
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            Ok(test_circuit_with_properties::<T>(
+                workers,
+                &schema,
+                &table_properties,
+                &[None],
+            ))
+        },
         &config,
         Box::new(move |e, _| {
             let msg = format!("iceberg_input_test: error: {e}");
@@ -187,6 +246,7 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
             // uuid: ByteArray::new([0u8; 16].as_slice()),
             fixed: ByteArray::new([0u8; 5].as_slice()),
             varbin: ByteArray::new([0u8; 5].as_slice()),
+            tstz: TimestampTz::from(Timestamp::from_naiveDateTime(time)),
         });
 
         time += std::time::Duration::from_secs(1);
@@ -198,41 +258,84 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_unordered() {
-    iceberg_localfs_input_test(&[], &|_| true);
+    iceberg_localfs_input_test(1_000_000, json!({}), &|_| true);
 }
 
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_ordered() {
-    iceberg_localfs_input_test(
-        &[("timestamp_column".to_string(), "ts".to_string())],
-        &|_| true,
-    );
+    iceberg_localfs_input_test(1_000_000, json!({ "timestamp_column": "ts" }), &|_| true);
 }
 
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_ordered_with_filter() {
     iceberg_localfs_input_test(
-        &[
-            ("timestamp_column".to_string(), "ts".to_string()),
-            ("snapshot_filter".to_string(), "i >= 10000".to_string()),
-        ],
+        1_000_000,
+        json!({ "timestamp_column": "ts", "snapshot_filter": "i >= 10000" }),
         &|x| x.i >= 10000,
     );
 }
 
+/// A single parser task must ingest the whole snapshot correctly (the parallel
+/// path defaults to 4 parsers and is covered by the tests above).
+#[test]
 #[cfg(feature = "iceberg-tests-fs")]
-fn iceberg_localfs_input_test(
-    extra_config: &[(String, String)],
-    filter: &dyn Fn(&IcebergTestStruct) -> bool,
-) {
-    let data = data(1_000_000);
+fn iceberg_localfs_input_test_single_parser() {
+    iceberg_localfs_input_test(100_000, json!({ "num_parsers": 1 }), &|_| true);
+}
 
+/// `transaction_mode = snapshot` on an unordered read ingests the whole snapshot
+/// in exactly one Feldera transaction; the ingested data must be identical to a
+/// non-transactional read.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_transactional() {
+    let metrics =
+        iceberg_localfs_input_test(100_000, json!({ "transaction_mode": "snapshot" }), &|_| {
+            true
+        });
+    // Unordered snapshot: exactly one transaction. (Reverting the transaction
+    // wiring drops this to 0.)
+    assert_eq!(
+        metrics
+            .get("input_connector_iceberg_snapshot_transaction_starts")
+            .copied(),
+        Some(1.0)
+    );
+}
+
+/// `transaction_mode = snapshot` on an ordered read ingests one Feldera
+/// transaction per lateness range; the ingested data must still be complete.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_ordered_transactional() {
+    let metrics = iceberg_localfs_input_test(
+        100_000,
+        json!({ "timestamp_column": "ts", "transaction_mode": "snapshot" }),
+        &|_| true,
+    );
+    // Ordered snapshot: one transaction per non-empty lateness range, so at
+    // least one, and (with data spanning multiple ranges) typically several.
+    let starts = metrics
+        .get("input_connector_iceberg_snapshot_transaction_starts")
+        .copied()
+        .unwrap_or(0.0);
+    assert!(
+        starts >= 1.0,
+        "expected >= 1 snapshot transaction, got {starts}"
+    );
+}
+
+/// Create a local Iceberg table populated with `data` and return its metadata
+/// location. With `extra_columns`, the table gets columns that no test SQL
+/// schema declares (see `--extra-columns` in `create_test_table_s3.py`).
+#[cfg(feature = "iceberg-tests-fs")]
+fn create_localfs_table(data: &[IcebergTestStruct], extra_columns: bool) -> String {
     let table_dir = tempfile::TempDir::new().unwrap();
     let table_path = table_dir.path().display().to_string();
 
-    let ndjson_file = data_to_ndjson(data.clone());
+    let ndjson_file = data_to_ndjson(data.to_vec());
     println!("wrote test data to {}", ndjson_file.path().display());
 
     // Uncomment to inspect output parquet files produced by the test.
@@ -241,11 +344,16 @@ fn iceberg_localfs_input_test(
     let script_path = "../iceberg/src/test/create_test_table_s3.py";
 
     // Run the Python script using the Python interpreter
-    let output = std::process::Command::new("python3")
+    let mut command = std::process::Command::new("python3");
+    command
         .arg(script_path)
         .arg("--catalog=sql")
         .arg(format!("--warehouse-path={table_path}"))
-        .arg(format!("--json-file={}", ndjson_file.path().display()))
+        .arg(format!("--json-file={}", ndjson_file.path().display()));
+    if extra_columns {
+        command.arg("--extra-columns");
+    }
+    let output = command
         .output()
         .map_err(|e| {
             format!("Error running '{script_path}' script to generate an Iceberg table: {e}")
@@ -262,19 +370,41 @@ fn iceberg_localfs_input_test(
     }
 
     // The script should print table metadata location on the last line.
-    let metadata_path = String::from_utf8(output.stdout.clone())
+    String::from_utf8(output.stdout.clone())
         .unwrap()
         .lines()
         .last()
         .unwrap()
-        .to_string();
+        .to_string()
+}
 
-    let mut json_file = iceberg_snapshot_to_json::<IcebergTestStruct>(
+/// Ingest a local-FS Iceberg table in snapshot mode and assert the ingested
+/// data matches `data(n_records)` filtered by `filter`. `extra_config` is
+/// merged into the connector's transport config as JSON. Returns the
+/// connector's custom metrics so callers can make mode-specific assertions.
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test(
+    n_records: usize,
+    extra_config: serde_json::Value,
+    filter: &dyn Fn(&IcebergTestStruct) -> bool,
+) -> HashMap<String, f64> {
+    let data = data(n_records);
+
+    let metadata_path = create_localfs_table(&data, false);
+
+    let mut config = json!({ "metadata_location": metadata_path });
+    let config_obj = config.as_object_mut().unwrap();
+    for (key, value) in extra_config
+        .as_object()
+        .expect("extra_config must be a JSON object")
+    {
+        config_obj.insert(key.clone(), value.clone());
+    }
+
+    let (mut json_file, metrics) = iceberg_snapshot_to_json::<IcebergTestStruct>(
         &IcebergTestStruct::schema_with_lateness(),
-        &[("metadata_location".to_string(), metadata_path.to_string())]
-            .into_iter()
-            .chain(extra_config.into_iter().cloned())
-            .collect::<HashMap<_, _>>(),
+        &[],
+        config,
     );
 
     let expected_zset = dbsp::OrdZSet::from_tuples(
@@ -288,6 +418,201 @@ fn iceberg_localfs_input_test(
     let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
 
     assert_eq!(zset, expected_zset);
+
+    // A snapshot-only connector must reach the completed phase (2).
+    assert_eq!(
+        metrics.get("input_connector_iceberg_phase").copied(),
+        Some(2.0)
+    );
+
+    // The test table is built with a single append, i.e. the ingested snapshot
+    // has sequence number 1. (An unset gauge would read -1.)
+    assert_eq!(
+        metrics
+            .get("input_connector_iceberg_last_ingested_sequence_number")
+            .copied(),
+        Some(1.0)
+    );
+
+    metrics
+}
+
+/// Read a table through a SQL declaration that names only a few of its
+/// columns, while the table also holds columns (including a `uuid` one, a
+/// type no test struct models) that the connector must ignore because it
+/// selects the declared columns instead of `*`.
+///
+/// With `skip_unused` (the `skip_unused_columns` table property), the
+/// connector must additionally not read the nullable `l` column, which the
+/// SQL schema marks unused, so `l` comes out NULL. This variant fails if the
+/// connector falls back to reading all columns.
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_subset_test(skip_unused: bool) {
+    let data = data(100_000);
+
+    let metadata_path = create_localfs_table(&data, true);
+
+    let table_properties: &[(&str, &str)] = if skip_unused {
+        &[("skip_unused_columns", "true")]
+    } else {
+        &[]
+    };
+
+    let (mut json_file, _metrics) = iceberg_snapshot_to_json::<IcebergSubsetTestStruct>(
+        &IcebergSubsetTestStruct::schema(),
+        table_properties,
+        json!({ "metadata_location": metadata_path }),
+    );
+
+    let expected_zset = dbsp::OrdZSet::from_tuples(
+        (),
+        data.into_iter()
+            .map(|x| IcebergSubsetTestStruct {
+                i: x.i,
+                s: x.s,
+                l: if skip_unused { None } else { Some(x.l) },
+            })
+            .map(|x| dbsp::utils::Tup2(dbsp::utils::Tup2(x, ()), 1))
+            .collect(),
+    );
+    let zset = file_to_zset::<IcebergSubsetTestStruct>(json_file.as_file_mut());
+
+    assert_eq!(zset, expected_zset);
+}
+
+/// The connector reads only the columns the SQL table declares.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_subset_schema() {
+    iceberg_localfs_input_subset_test(false);
+}
+
+/// The `skip_unused_columns` table property also drops declared-but-unused
+/// columns from the read.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_skip_unused_columns() {
+    iceberg_localfs_input_subset_test(true);
+}
+
+/// Build an input-only pipeline that reads a local-FS Iceberg snapshot with
+/// at-least-once fault tolerance, checkpointing to `storage_dir`. Rebuilding a
+/// pipeline with the same `storage_dir` resumes from the latest checkpoint.
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_ft_pipeline(
+    extra_config: serde_json::Value,
+    storage_dir: &std::path::Path,
+) -> Controller {
+    init_logging();
+
+    let mut config = json!({ "mode": "snapshot" });
+    let config_obj = config.as_object_mut().unwrap();
+    for (key, value) in extra_config
+        .as_object()
+        .expect("extra_config must be a JSON object")
+    {
+        config_obj.insert(key.clone(), value.clone());
+    }
+
+    let config: feldera_types::config::PipelineConfig = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 4,
+        "storage_config": { "path": storage_dir },
+        "fault_tolerance": { "model": "at_least_once" },
+        "inputs": {
+            "test_input1": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "iceberg_input",
+                    "config": config,
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    Controller::with_test_config(
+        move |workers| {
+            // A concrete persistent output id is required for checkpointing.
+            Ok(test_circuit_with_properties::<IcebergTestStruct>(
+                workers,
+                &IcebergTestStruct::schema_with_lateness(),
+                &[],
+                &[Some("output")],
+            ))
+        },
+        &config,
+        Box::new(|e, _| panic!("iceberg ft pipeline: error: {e}")),
+    )
+    .unwrap()
+}
+
+/// Checkpoint-and-suspend the pipeline, then stop it.
+#[cfg(feature = "iceberg-tests-fs")]
+fn suspend_and_stop(pipeline: Controller) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    pipeline.start_suspend(Box::new(move |result| {
+        let _ = sender.send(result.map(|_| ()).map_err(|e| e.to_string()));
+    }));
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(100))
+        .expect("suspend timed out")
+        .expect("suspend failed");
+    pipeline.stop().unwrap();
+}
+
+/// A snapshot fully ingested before a checkpoint must not be re-read after a
+/// suspend/resume: the resumed connector reaches the completed phase (2) and
+/// reads zero records. This is what lets a large Iceberg table survive a
+/// restart without re-ingesting all of its rows.
+///
+/// To confirm the assertion catches a regression, drop the terminal eoi
+/// boundary (or the `resume_info.eoi` short-circuit) in `input.rs`: the resumed
+/// run then re-reads the whole snapshot and `snapshot_records_total` is nonzero.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_resume_completed_snapshot() {
+    let data = data(100_000);
+    let metadata_path = create_localfs_table(&data, false);
+    let storage_dir = tempfile::TempDir::new().unwrap();
+
+    // Ordered snapshot so the read is resumable per lateness range.
+    let config = json!({ "metadata_location": metadata_path, "timestamp_column": "ts" });
+
+    // First run: ingest the whole snapshot, then checkpoint and suspend.
+    let pipeline = iceberg_ft_pipeline(config.clone(), storage_dir.path());
+    pipeline.start();
+    wait(|| pipeline.pipeline_complete(), 400_000).expect("timeout waiting for snapshot");
+    let first = iceberg_connector_metrics(&pipeline);
+    assert!(
+        first
+            .get("input_connector_iceberg_snapshot_records_total")
+            .copied()
+            .unwrap_or(0.0)
+            > 0.0,
+        "the first run should ingest the snapshot"
+    );
+    suspend_and_stop(pipeline);
+
+    // Second run: resume from the checkpoint. The snapshot is complete, so the
+    // connector reaches the completed phase without reading any records.
+    let pipeline = iceberg_ft_pipeline(config, storage_dir.path());
+    pipeline.start();
+    wait(|| pipeline.pipeline_complete(), 60_000).expect("timeout waiting for resume");
+    let second = iceberg_connector_metrics(&pipeline);
+    assert_eq!(
+        second
+            .get("input_connector_iceberg_snapshot_records_total")
+            .copied(),
+        Some(0.0),
+        "a resumed, already-completed snapshot must not be re-read"
+    );
+    assert_eq!(
+        second.get("input_connector_iceberg_phase").copied(),
+        Some(2.0),
+        "the resumed connector must reach the completed phase"
+    );
+    pipeline.stop().unwrap();
 }
 
 #[test]
@@ -295,39 +620,20 @@ fn iceberg_localfs_input_test(
 fn iceberg_glue_s3_input_test() {
     use dbsp::trace::BatchReader;
     // Read delta table unordered.
-    let mut json_file = iceberg_snapshot_to_json::<IcebergTestStruct>(
+    let (mut json_file, _metrics) = iceberg_snapshot_to_json::<IcebergTestStruct>(
         &IcebergTestStruct::schema_with_lateness(),
-        &[
-            ("catalog_type".to_string(), "glue".to_string()),
-            (
-                "glue.warehouse".to_string(),
-                "s3://feldera-iceberg-test/".to_string(),
-            ),
-            (
-                "table_name".to_string(),
-                "iceberg_test.test_table".to_string(),
-            ),
-            (
-                "glue.access-key-id".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            ),
-            (
-                "glue.secret-access-key".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            ),
-            ("glue.region".to_string(), "us-east-1".to_string()),
-            (
-                "s3.access-key-id".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            ),
-            (
-                "s3.secret-access-key".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            ),
-            ("s3.region".to_string(), "us-east-1".to_string()),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>(),
+        &[],
+        json!({
+            "catalog_type": "glue",
+            "glue.warehouse": "s3://feldera-iceberg-test/",
+            "table_name": "iceberg_test.test_table_v2",
+            "glue.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
+            "glue.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
+            "glue.region": "us-east-1",
+            "s3.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
+            "s3.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
+            "s3.region": "us-east-1",
+        }),
     );
 
     let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
@@ -352,20 +658,16 @@ fn iceberg_s3tables_input_test() {
     // `s3tables:GetTableData` (the FileIO reads the metadata and data files).
     // Run with AWS credentials configured, e.g. `AWS_PROFILE=<profile>` or
     // `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`(/`AWS_SESSION_TOKEN`) exported.
-    let mut json_file = iceberg_snapshot_to_json::<S3TablesTestStruct>(
+    let (mut json_file, _metrics) = iceberg_snapshot_to_json::<S3TablesTestStruct>(
         &S3TablesTestStruct::schema(),
-        &[
-            ("catalog_type".to_string(), "s3tables".to_string()),
-            (
-                "s3tables.table-bucket-arn".to_string(),
-                "arn:aws:s3tables:us-west-1:737834633458:bucket/iceberg-test".to_string(),
-            ),
-            ("table_name".to_string(), "dev.test_table".to_string()),
-            ("s3tables.region".to_string(), "us-west-1".to_string()),
-            ("s3.region".to_string(), "us-west-1".to_string()),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>(),
+        &[],
+        json!({
+            "catalog_type": "s3tables",
+            "s3tables.table-bucket-arn": "arn:aws:s3tables:us-west-1:737834633458:bucket/iceberg-test",
+            "table_name": "dev.test_table",
+            "s3tables.region": "us-west-1",
+            "s3.region": "us-west-1",
+        }),
     );
 
     let zset = file_to_zset::<S3TablesTestStruct>(json_file.as_file_mut());
@@ -379,31 +681,18 @@ fn iceberg_rest_s3_input_test() {
     use dbsp::trace::BatchReader;
 
     // Read delta table unordered.
-    let mut json_file = iceberg_snapshot_to_json::<IcebergTestStruct>(
+    let (mut json_file, _metrics) = iceberg_snapshot_to_json::<IcebergTestStruct>(
         &IcebergTestStruct::schema_with_lateness(),
-        &[
-            ("catalog_type".to_string(), "rest".to_string()),
-            ("rest.uri".to_string(), "http://localhost:8181".to_string()),
-            (
-                "rest.warehouse".to_string(),
-                "s3://feldera-iceberg-test/".to_string(),
-            ),
-            (
-                "table_name".to_string(),
-                "iceberg_test.test_table".to_string(),
-            ),
-            (
-                "s3.access-key-id".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            ),
-            (
-                "s3.secret-access-key".to_string(),
-                std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            ),
-            ("s3.region".to_string(), "us-east-1".to_string()),
-        ]
-        .into_iter()
-        .collect::<HashMap<_, _>>(),
+        &[],
+        json!({
+            "catalog_type": "rest",
+            "rest.uri": "http://localhost:8181",
+            "rest.warehouse": "s3://feldera-iceberg-test/",
+            "table_name": "iceberg_test.test_table_v2",
+            "s3.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
+            "s3.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
+            "s3.region": "us-east-1",
+        }),
     );
 
     let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());

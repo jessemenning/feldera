@@ -256,7 +256,13 @@ public class CalciteOptimizer implements IWritesLogs {
                 PruneEmptyRules.SORT_FETCH_ZERO_INSTANCE
         ));
         this.addStep(new SimpleOptimizerStep("Convert complex aggregates", 0,
-                new MaxCaseToCountRule()
+                // MaxCaseToCountRule must run before AGGREGATE_CASE_TO_FILTER:
+                // both match MAX(CASE WHEN c THEN 1 END), but a COUNT-based
+                // rewrite is linear.
+                new MaxCaseToCountRule(),
+                // Prepares inputs for next rule
+                CoreRules.AGGREGATE_CASE_TO_FILTER,
+                new AggregateNowFilterRule()
         ));
         this.addStep(new SimpleOptimizerStep("Simplify set operations", 0,
                 CoreRules.UNION_MERGE,
@@ -364,6 +370,8 @@ public class CalciteOptimizer implements IWritesLogs {
                 // See discussion in https://issues.apache.org/jira/browse/CALCITE-6020
                 CoreRules.PROJECT_TO_LOGICAL_PROJECT_AND_WINDOW
         ));
+        this.addStep(new SimpleOptimizerStep("Window ROWS to RANGE", 0,
+                new RowsToRangeRule()));
         this.addStep(new SimpleOptimizerStep("Isolate DISTINCT aggregates", 0,
                 CoreRules.AGGREGATE_EXPAND_DISTINCT_AGGREGATES_TO_JOIN,
                 CoreRules.AGGREGATE_EXPAND_DISTINCT_AGGREGATES
@@ -391,7 +399,8 @@ public class CalciteOptimizer implements IWritesLogs {
                 // CoreRules.PROJECT_CORRELATE_TRANSPOSE,
                 CoreRules.PROJECT_WINDOW_TRANSPOSE,
                 CoreRules.PROJECT_SET_OP_TRANSPOSE,
-                CoreRules.FILTER_PROJECT_TRANSPOSE
+                CoreRules.FILTER_PROJECT_TRANSPOSE,
+                CoreRules.FILTER_AGGREGATE_TRANSPOSE
                 // Rule is unsound, replaced with UnusedFields done later.
                 //CoreRules.PROJECT_JOIN_TRANSPOSE
         ));

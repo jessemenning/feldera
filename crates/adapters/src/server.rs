@@ -9,8 +9,11 @@ use crate::server::metrics::{
 };
 use crate::static_compile::catalog::OUTPUT_MAPPING;
 use crate::transport::http::HttpOutputFormat;
-use crate::util::{LongOperationWarning, RateLimitCheckResult, TokenBucketRateLimiter};
-use crate::{Catalog, dyn_event};
+use crate::util::{
+    LongOperationWarning, RateLimitCheckResult, TokenBucketRateLimiter,
+    missing_pipeline_identity_message,
+};
+use crate::{Catalog, ControllerStatus, dyn_event};
 use crate::{
     CircuitCatalog, Controller, ControllerError, FormatConfig, InputEndpointConfig, OutputEndpoint,
     OutputEndpointConfig, PipelineConfig, TransportInputEndpoint,
@@ -62,7 +65,7 @@ use feldera_types::checkpoint::{
 use feldera_types::completion_token::{
     CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
 };
-use feldera_types::config::SyncConfig;
+use feldera_types::config::{PipelineIdentity, SyncConfig};
 use feldera_types::constants::STATUS_FILE;
 use feldera_types::coordination::{
     AdHocScan, CoordinationActivate, CoordinationStatus, Labels, RestartArgs, Step, StepRequest,
@@ -71,14 +74,16 @@ use feldera_types::format::json::JsonEncoderConfig;
 use feldera_types::pipeline_diff::PipelineDiff;
 use feldera_types::query_params::{
     ActivateParams, ApproveParameters, MetricsFormat, MetricsParameters, SamplyProfileGetParams,
-    SamplyProfileParams,
+    SamplyProfileParams, StatsParams,
 };
 use feldera_types::runtime_status::{
-    BootstrapConfig, BootstrapPolicy, ExtendedRuntimeStatus, ExtendedRuntimeStatusError,
-    RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
+    BootstrapConfig, BootstrapPolicy, ConnectorStats, ExtendedRuntimeStatus,
+    ExtendedRuntimeStatusError, RuntimeDesiredStatus, RuntimeStatus, RuntimeStatusDetails,
+    StorageStatusDetails,
 };
 use feldera_types::suspend::{SuspendError, SuspendableResponse};
 use feldera_types::time_series::TimeSeries;
+use feldera_types::transaction::ConcurrentBootstrapPhase;
 use feldera_types::transport::http::HttpOutputConfig;
 use feldera_types::{
     checkpoint::CheckpointMetadata, config::TransportConfig, transport::http::HttpInputConfig,
@@ -100,7 +105,6 @@ use std::ffi::OsStr;
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
 use std::mem::take;
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -165,6 +169,17 @@ impl PipelinePhase {
             self,
             PipelinePhase::Initializing(InitializationState::AwaitingApproval(_))
         )
+    }
+
+    /// True if the pipeline never leaves this phase: it has failed or has been
+    /// suspended, and either way it never runs again.
+    fn is_terminal(&self) -> bool {
+        match self {
+            PipelinePhase::InitializationError(_)
+            | PipelinePhase::Failed(_)
+            | PipelinePhase::Suspended => true,
+            PipelinePhase::Initializing(_) | PipelinePhase::InitializationComplete => false,
+        }
     }
 }
 
@@ -255,19 +270,13 @@ pub(crate) struct ServerState {
     /// Notified when `desired_status` or `phase` changes.
     desired_status_change: Arc<Notify>,
 
-    /// `phase` nests inside `controller`.
-    ///
-    /// Use `controller()`, `take_controller()`, `set_controller()` to access.
-    ///
-    /// This lock is only held momentarily.
-    controller: Mutex<Option<Controller>>,
-
     /// Leaf lock (no more locks may be taken while holding it).
     ///
-    /// Use `phase()` and `set_phase()` to access.
+    /// Use `controller()`, `phase()` and the [Lifecycle] transitions to
+    /// access.
     ///
     /// This lock is only held momentarily.
-    phase: Mutex<PipelinePhase>,
+    lifecycle: Mutex<Lifecycle>,
 
     /// Leaf lock.
     checkpoint_state: Mutex<CheckpointState>,
@@ -284,6 +293,13 @@ pub(crate) struct ServerState {
     /// This comes from [ServerArgs].  It remains unchanged across automatic
     /// restarts.
     deployment_id: Uuid,
+
+    /// Identity of this pipeline (system name + given name).
+    ///
+    /// Used by the `/coordination/checkpoint/pull` endpoint to identify the
+    /// pipeline when checking S3 bucket ownership.  `None` when the pipeline has
+    /// no system-assigned name.
+    pipeline_identity: Option<PipelineIdentity>,
 
     /// Incarnation UUID.
     ///
@@ -319,6 +335,41 @@ pub(crate) struct ServerState {
     leases: Mutex<HashMap<Step, Lease>>,
 }
 
+/// Pipeline phase + controller.
+///
+/// `controller` and `phase` answer one question between them, so they are
+/// guarded together: several threads publish them concurrently, and updating
+/// them separately lets an observer see a pair that never legitimately occurs.
+///
+/// Every transition that changes both fields does so in one critical section
+/// (see [`ServerState::complete_initialization`], [`ServerState::fail`] and
+/// [`ServerState::suspended`]), so the pair is always consistent and
+/// [`ServerState::lifecycle`] can read it without coordinating with the writers.
+#[derive(Clone)]
+struct Lifecycle {
+    /// Tracks the health of the pipeline.
+    phase: PipelinePhase,
+
+    /// The controller, once initialization has produced one and before a
+    /// failure or a suspend has deallocated it.
+    controller: Option<Controller>,
+}
+
+impl Lifecycle {
+    /// Records `phase`, unless a terminal phase was already recorded: the first
+    /// terminal phase is final (see [`PipelinePhase::is_terminal`]), because a
+    /// thread that reports a later phase is not necessarily better informed.
+    ///
+    /// Returns whether the phase was recorded.
+    fn set_phase(&mut self, phase: PipelinePhase) -> bool {
+        if self.phase.is_terminal() {
+            return false;
+        }
+        self.phase = phase;
+        true
+    }
+}
+
 /// Leases on snapshots of particular steps.
 ///
 /// A lease gives the coordinator the ability to read tables within a step with
@@ -339,6 +390,7 @@ impl ServerState {
         desired_status: RuntimeDesiredStatus,
         bootstrap_config: BootstrapConfig,
         deployment_id: Uuid,
+        pipeline_identity: Option<PipelineIdentity>,
         storage: Option<Arc<dyn StorageBackend>>,
         sync_config: Option<SyncConfig>,
         host_info: Option<HostInfo>,
@@ -346,15 +398,18 @@ impl ServerState {
         // Max 10 errors per minute
         let rate_limiter = TokenBucketRateLimiter::new(10, Duration::from_secs(60));
         Self {
-            phase: Mutex::new(phase),
+            lifecycle: Mutex::new(Lifecycle {
+                phase,
+                controller: None,
+            }),
             desired_status_change: Arc::default(),
             metadata: md,
-            controller: Mutex::new(None),
             checkpoint_state: Default::default(),
             sync_checkpoint_state: Default::default(),
             desired_status: Mutex::new(desired_status),
             bootstrap_config: Mutex::new(bootstrap_config),
             deployment_id,
+            pipeline_identity,
             storage,
             sync_config,
             host_info,
@@ -377,14 +432,18 @@ impl ServerState {
             None,
             None,
             None,
+            None,
         )
     }
 
-    /// Generate an appropriate error when `state.controller` is set to
-    /// `None`, which can mean that the pipeline is initializing, failed to
-    /// initialize, has been shut down or failed.
-    fn missing_controller_error(&self) -> PipelineError {
-        match self.phase() {
+    /// Generate an appropriate error when the controller is `None`, which can
+    /// mean that the pipeline is initializing, failed to initialize, has been
+    /// shut down or failed.
+    ///
+    /// Takes `phase` rather than reading it, because the callers hold the
+    /// `runtime` lock and it is not reentrant.
+    fn missing_controller_error(phase: &PipelinePhase) -> PipelineError {
+        match phase {
             PipelinePhase::Initializing(_) => PipelineError::Initializing,
             PipelinePhase::InitializationError(e) => {
                 PipelineError::InitializationError { error: e.clone() }
@@ -409,30 +468,96 @@ impl ServerState {
 
     /// Grabs a clone of the controller, or an error if there isn't one.
     fn controller(&self) -> Result<Controller, PipelineError> {
-        self.controller
-            .lock()
-            .unwrap()
-            .deref()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| self.missing_controller_error())
+        let lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle
+            .controller
+            .clone()
+            .ok_or_else(|| Self::missing_controller_error(&lifecycle.phase))
     }
 
-    /// Removes the controller and returns it, or an error if there wasn't one.
+    /// Reads the phase and the controller together, so the caller sees a
+    /// consistent pair.
+    fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.lock().unwrap().clone()
+    }
+
+    /// Publishes `controller` as the result of a successful initialization.
     ///
-    /// This only makes sense when we're terminating.
-    fn take_controller(&self) -> Result<Controller, PipelineError> {
-        self.controller
-            .lock()
-            .unwrap()
-            .deref_mut()
-            .take()
-            .ok_or_else(|| self.missing_controller_error())
+    /// Hands `controller` back without publishing it if the pipeline has already
+    /// reached a terminal phase, which happens when the circuit thread reports a
+    /// fatal error while `do_bootstrap` is still finishing: the circuit thread
+    /// reports that initialization is complete and then starts stepping the
+    /// circuit right away (see `CircuitThread::run`).  Publishing a controller
+    /// that a failure has already invalidated would claim the pipeline is
+    /// runnable when it is not, and the caller owns stopping the circuit that
+    /// controller belongs to, because nothing else can reach it any more.
+    fn complete_initialization(&self, controller: Controller) -> Result<(), Controller> {
+        let published = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            if lifecycle.set_phase(PipelinePhase::InitializationComplete) {
+                lifecycle.controller = Some(controller);
+                Ok(())
+            } else {
+                Err(controller)
+            }
+        };
+        if published.is_ok() {
+            self.desired_status_change.notify_waiters();
+        }
+        published
     }
 
-    /// Sets the controller.  This should only be done once.
-    fn set_controller(&self, controller: Controller) {
-        *self.controller.lock().unwrap() = Some(controller);
+    /// Records that the pipeline failed with `error`, and returns the controller
+    /// to stop if one was still allocated.
+    ///
+    /// Recording the failure and deallocating the controller in one step keeps
+    /// `/status` from ever seeing a failed pipeline that still advertises a
+    /// controller, or a controller-less pipeline that still advertises
+    /// [`PipelinePhase::InitializationComplete`].
+    fn fail(&self, error: Arc<ControllerError>) -> Option<Controller> {
+        let (recorded, controller) = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            let recorded = lifecycle.set_phase(PipelinePhase::Failed(error));
+            (recorded, lifecycle.controller.take())
+        };
+        if recorded {
+            self.desired_status_change.notify_waiters();
+        }
+        controller
+    }
+
+    /// Records the outcome of a suspend, and returns the controller to stop if
+    /// one was still allocated.
+    ///
+    /// `error` is the suspend's own failure, if it had one.  A pipeline that
+    /// already failed keeps that failure: a suspend gives up waiting for a
+    /// controller as soon as the phase turns terminal, so it arrives here with
+    /// nothing of its own to report even though no checkpoint was written.
+    fn suspended(&self, error: Option<Arc<ControllerError>>) -> Option<Controller> {
+        let phase = match error {
+            Some(error) => PipelinePhase::Failed(error),
+            None => PipelinePhase::Suspended,
+        };
+        let (recorded, controller) = {
+            let mut lifecycle = self.lifecycle.lock().unwrap();
+            let recorded = lifecycle.set_phase(phase);
+            (recorded, lifecycle.controller.take())
+        };
+        if recorded {
+            self.desired_status_change.notify_waiters();
+        }
+        controller
+    }
+
+    /// Deallocates the controller without recording why, so that a test can
+    /// simulate a pipeline process dying without reporting anything.
+    ///
+    /// Production code deallocates the controller only as part of recording a
+    /// terminal phase, which is what keeps the two consistent; see
+    /// [`Lifecycle`].
+    #[cfg(test)]
+    fn abandon_controller(&self) -> Option<Controller> {
+        self.lifecycle.lock().unwrap().controller.take()
     }
 
     fn desired_status(&self) -> RuntimeDesiredStatus {
@@ -448,12 +573,27 @@ impl ServerState {
     }
 
     fn phase(&self) -> PipelinePhase {
-        self.phase.lock().unwrap().clone()
+        self.lifecycle.lock().unwrap().phase.clone()
     }
 
+    /// Records `phase` and leaves the controller as it is.
+    ///
+    /// Use this for the phases that report progress through initialization, and
+    /// for an initialization failure: none of them allocate or deallocate the
+    /// controller.  The transitions that do are
+    /// [`Self::complete_initialization`], [`Self::fail`] and
+    /// [`Self::suspended`], which update the phase and the controller together.
+    ///
+    /// See [`Lifecycle::set_phase`] for what happens if a terminal phase was
+    /// already recorded.
     pub fn set_phase(&self, phase: PipelinePhase) {
-        *self.phase.lock().unwrap() = phase;
-        self.desired_status_change.notify_waiters();
+        // Bind the result rather than testing it inline: a temporary lock guard in
+        // an `if` condition lives until the end of the `if`, and `lifecycle` is a
+        // leaf lock, so the notification below must not run while it is held.
+        let recorded = self.lifecycle.lock().unwrap().set_phase(phase);
+        if recorded {
+            self.desired_status_change.notify_waiters();
+        }
     }
 }
 
@@ -512,6 +652,12 @@ pub struct ServerArgs {
     /// Bootstrap the pipeline with output connectors disabled.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub silent_bootstrap: bool,
+
+    /// Bootstrap new and modified views concurrently, keeping pre-existing
+    /// views live while the new ones backfill. Mutually exclusive with
+    /// `--silent-bootstrap`.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub concurrent_bootstrap: bool,
 
     /// UUID generated by the runner for the compute resources that were provisioned to keep this
     /// pipeline process running. It will thus only change if the pipeline is stopped and started
@@ -706,7 +852,8 @@ pub fn run_server(
                 (
                     args.initial,
                     BootstrapConfig::from(args.bootstrap_policy)
-                        .with_silent_bootstrap(args.silent_bootstrap),
+                        .with_silent_bootstrap(args.silent_bootstrap)
+                        .with_concurrent_bootstrap(args.concurrent_bootstrap),
                 )
             }
             Some(stored) if stored.deployment_id == args.deployment_id => {
@@ -715,7 +862,8 @@ pub fn run_server(
                 (
                     stored.desired_status,
                     BootstrapConfig::from(stored.bootstrap_policy)
-                        .with_silent_bootstrap(stored.silent_bootstrap),
+                        .with_silent_bootstrap(stored.silent_bootstrap)
+                        .with_concurrent_bootstrap(stored.concurrent_bootstrap),
                 )
             }
             Some(stored) => {
@@ -733,7 +881,8 @@ pub fn run_server(
                 (
                     args.initial,
                     BootstrapConfig::from(args.bootstrap_policy)
-                        .with_silent_bootstrap(args.silent_bootstrap),
+                        .with_silent_bootstrap(args.silent_bootstrap)
+                        .with_concurrent_bootstrap(args.concurrent_bootstrap),
                 )
             }
             None => {
@@ -743,10 +892,16 @@ pub fn run_server(
                 (
                     args.initial,
                     BootstrapConfig::from(args.bootstrap_policy)
-                        .with_silent_bootstrap(args.silent_bootstrap),
+                        .with_silent_bootstrap(args.silent_bootstrap)
+                        .with_concurrent_bootstrap(args.concurrent_bootstrap),
                 )
             }
         };
+
+        // `silent_bootstrap` and `concurrent_bootstrap` are mutually exclusive.
+        bootstrap_config
+            .validate()
+            .map_err(|error| ControllerError::BootstrapNotAllowed { error })?;
 
         let md = match &args.metadata_file {
             None => String::new(),
@@ -787,6 +942,7 @@ pub fn run_server(
             initial_status,
             bootstrap_config,
             args.deployment_id,
+            config.pipeline_identity(),
             builder.storage().clone(),
             builder.sync_config(),
             host_info,
@@ -816,6 +972,7 @@ pub fn run_server(
                         desired_status,
                         bootstrap_policy: bootstrap_config.active_bootstrap_policy(),
                         silent_bootstrap: bootstrap_config.silent_bootstrap,
+                        concurrent_bootstrap: bootstrap_config.concurrent_bootstrap,
                         deployment_id: state.deployment_id,
                     };
                     if Some(stored_status) != prev_stored_status {
@@ -1006,7 +1163,7 @@ fn parse_config(config_file: impl AsRef<Path>) -> Result<PipelineConfig, Control
     }
 
     let path = config_file.as_ref();
-    let config = if path.extension() == Some(OsStr::new("json")) {
+    let mut config = if path.extension() == Some(OsStr::new("json")) {
         parse_json_config(path)
     } else {
         let json_path = path.with_extension("json");
@@ -1016,6 +1173,19 @@ fn parse_config(config_file: impl AsRef<Path>) -> Result<PipelineConfig, Control
             parse_yaml_config(path)
         }
     }?;
+
+    // This is run in the pipeline process itself, so on a multihost deployment every
+    // host derives the limit from its own machine.
+    if config.global.effective_memory_mb().is_none()
+        && let Some(available_mb) = observability::system::total_memory_megabyte()
+    {
+        // The logger is not running yet.
+        eprintln!(
+            "No memory limit configured ('max_rss_mb' or 'resources.memory_mb_max'); \
+using this host's available memory: 'max_rss_mb' = {available_mb} MB."
+        );
+        config.global.max_rss_mb = Some(available_mb);
+    }
 
     eprintln!(
         "Pipeline configuration loaded successfully: {}",
@@ -1082,9 +1252,8 @@ fn error_handler(state: &Weak<ServerState>, error: Arc<ControllerError>, tag: Op
     }
 
     if is_fatal_controller_error(&error)
-        && let Ok(controller) = state.take_controller()
+        && let Some(controller) = state.fail(error)
     {
-        state.set_phase(PipelinePhase::Failed(error));
         controller.initiate_stop();
     }
 }
@@ -1231,11 +1400,25 @@ fn do_bootstrap(
         RuntimeDesiredStatus::Paused | RuntimeDesiredStatus::Suspended => controller.pause(),
         RuntimeDesiredStatus::Running => controller.start(),
     };
-    state.set_controller(controller);
+    // Publish under `desired_status` so that `/start` and `/pause` either run
+    // before this and are picked up by the `match` above, or run after and find
+    // the controller.
+    let published = state.complete_initialization(controller);
     drop(desired_status);
 
-    info!("Pipeline initialization complete");
-    state.set_phase(PipelinePhase::InitializationComplete);
+    match published {
+        Ok(()) => info!("Pipeline initialization complete"),
+        Err(controller) => {
+            // The failure that refused publication was recorded before the
+            // controller existed, so `fail` had no controller to stop. A circuit
+            // whose step fails keeps stepping (see `CircuitThread::step_circuit`),
+            // so stop it here: this is the last reference to it, and without this
+            // it runs on, holding the storage lock, after the pipeline has been
+            // reported dead.
+            warn!("Pipeline failed while initialization was being completed");
+            controller.initiate_stop();
+        }
+    }
 
     Ok(())
 }
@@ -1385,9 +1568,16 @@ async fn approve(
     state: WebData<ServerState>,
     args: Query<ApproveParameters>,
 ) -> Result<HttpResponse, PipelineError> {
-    state.set_bootstrap_config(
-        BootstrapConfig::from(BootstrapPolicy::Allow).with_silent_bootstrap(args.silent_bootstrap),
-    );
+    // The values passed to `/approve` are definitive: `silent_bootstrap` and
+    // `concurrent_bootstrap` are taken straight from the request (not OR-ed with
+    // the startup configuration), so the two flags are handled symmetrically.
+    let bootstrap_config = BootstrapConfig::from(BootstrapPolicy::Allow)
+        .with_silent_bootstrap(args.silent_bootstrap)
+        .with_concurrent_bootstrap(args.concurrent_bootstrap);
+    bootstrap_config
+        .validate()
+        .map_err(|error| PipelineError::InvalidParam { error })?;
+    state.set_bootstrap_config(bootstrap_config);
 
     // Make sure we don't return until the pipeline has moved on to the next phase
     // (InitializationStatus::Starting). This makes the API synchronous, so the user can
@@ -1416,7 +1606,7 @@ async fn approve(
 async fn status_handler(
     state: WebData<ServerState>,
 ) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
-    get_status(&state)
+    get_status(&state, true)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1426,22 +1616,22 @@ async fn status_handler(
 /// A successful suspend terminates the circuit before the server installs
 /// [`PipelinePhase::Suspended`] and deallocates the controller (see `/suspend`),
 /// so a status poll landing in that window observes the still-registered
-/// controller in `Terminated`. When a suspend was requested the pipeline is
-/// converging to `Suspended`, so report that clean status rather than a
-/// spurious `PipelineTerminated` error that the pipeline manager would record
-/// as a failed execution.
+/// controller in `Terminated`. Report the clean `Suspended` status the user asked
+/// for rather than a spurious `PipelineTerminated` error that the pipeline
+/// manager would record as a failed execution.
 ///
-/// This branch is reached only for a *successful* suspend: a failed suspend
-/// deliberately leaves the circuit running (see the `SuspendCommand` handler in
-/// `controller.rs`) so that it never masquerades here as a clean `Suspended`;
-/// the `/suspend` handler reports it as [`PipelinePhase::Failed`] instead. Any
-/// termination without a suspend request is an unexpected, fatal termination
-/// and stays an error.
+/// `suspended` must say that a suspend is what terminated the circuit (see
+/// `GlobalControllerMetrics::suspended`), not merely that one was requested. A
+/// circuit that dies while a suspend is pending also lands here, and reporting
+/// that as a clean `Suspended` would have the pipeline manager record a
+/// successful suspend for a pipeline that wrote no checkpoint, and later resume
+/// from a checkpoint that does not exist.
 fn terminated_status(
+    suspended: bool,
     runtime_desired_status: RuntimeDesiredStatus,
     storage_status_details: Option<StorageStatusDetails>,
 ) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
-    if matches!(runtime_desired_status, RuntimeDesiredStatus::Suspended) {
+    if suspended {
         Ok(ExtendedRuntimeStatus {
             runtime_status: RuntimeStatus::Suspended,
             runtime_status_details: json!(""),
@@ -1461,44 +1651,79 @@ fn terminated_status(
 }
 
 #[allow(clippy::result_large_err)]
-fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
+fn get_status(
+    state: &ServerState,
+    with_storage_status_details: bool,
+) -> Result<ExtendedRuntimeStatus, ExtendedRuntimeStatusError> {
     // Runtime desired status
     let runtime_desired_status = state.desired_status();
 
     // Storage status details
-    let storage_status_details = match &state.storage {
-        Some(backend) => match Checkpointer::read_checkpoints(&**backend) {
-            Ok(list_checkpoints) => Some(StorageStatusDetails {
-                checkpoints: list_checkpoints,
-            }),
-            Err(e) => {
-                error!(
+    let storage_status_details = if with_storage_status_details
+        && let Some(backend) = &state.storage
+    {
+        Checkpointer::read_checkpoints(&**backend).inspect_err(|e| error!(
                     "Unable to read checkpoints; storage status details are not provided. Error: {e}"
-                );
-                None
-            }
-        },
-        None => None,
+                )).ok().map(|list_checkpoints| StorageStatusDetails {
+                checkpoints: list_checkpoints.into(),
+            })
+    } else {
+        None
     };
 
-    // Current status
-    match state.controller() {
-        Ok(controller) => {
+    // Current status.  Read the phase and the controller as one consistent pair:
+    // a controller is present only while the pipeline has not reached a terminal
+    // phase, so the controller's own view is authoritative whenever it is set.
+    let Lifecycle { phase, controller } = state.lifecycle();
+    match controller {
+        Some(controller) => {
             fn inner_status(
                 runtime_desired_status: RuntimeDesiredStatus,
                 controller: &Controller,
                 default_status: RuntimeStatus,
                 storage_status_details: Option<StorageStatusDetails>,
             ) -> ExtendedRuntimeStatus {
+                // Error statistics across connectors
+                let (inputs, outputs) = retrieve_error_stats(controller.status());
+                let mut total_errors = 0u64;
+                for endpoint in inputs {
+                    total_errors = total_errors
+                        .saturating_add(endpoint.metrics.num_transport_errors)
+                        .saturating_add(endpoint.metrics.num_parse_errors);
+                }
+                for endpoint in outputs {
+                    total_errors = total_errors
+                        .saturating_add(endpoint.metrics.num_encode_errors)
+                        .saturating_add(endpoint.metrics.num_transport_errors);
+                }
+                let connector_stats = ConnectorStats {
+                    num_errors: total_errors,
+                };
+
                 ExtendedRuntimeStatus {
-                    runtime_status: if controller.status().bootstrap_in_progress() {
-                        RuntimeStatus::Bootstrapping
-                    } else if controller.is_replaying() {
-                        RuntimeStatus::Replaying
-                    } else {
-                        default_status
+                    // Order matters: the concurrent-bootstrap phases are more
+                    // specific than the (stop-the-world) `bootstrap_in_progress`
+                    // flag, which stays false on the concurrent path.
+                    runtime_status: match controller.status().concurrent_bootstrap_phase() {
+                        ConcurrentBootstrapPhase::Synchronizing => RuntimeStatus::Synchronizing,
+                        ConcurrentBootstrapPhase::ConcurrentBootstrapping => {
+                            RuntimeStatus::ConcurrentBootstrapping
+                        }
+                        ConcurrentBootstrapPhase::Inactive => {
+                            if controller.status().bootstrap_in_progress() {
+                                RuntimeStatus::Bootstrapping
+                            } else if controller.is_replaying() {
+                                RuntimeStatus::Replaying
+                            } else {
+                                default_status
+                            }
+                        }
                     },
-                    runtime_status_details: json!(""),
+                    runtime_status_details: RuntimeStatusDetails {
+                        connector_stats: Some(connector_stats),
+                        ..Default::default()
+                    }
+                    .serialize_guaranteed(),
                     runtime_desired_status,
                     storage_status_details,
                 }
@@ -1517,40 +1742,49 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
                     RuntimeStatus::Running,
                     storage_status_details,
                 )),
-                PipelineState::Terminated => {
-                    terminated_status(runtime_desired_status, storage_status_details)
-                }
+                PipelineState::Terminated => terminated_status(
+                    controller.status().global_metrics.suspended(),
+                    runtime_desired_status,
+                    storage_status_details,
+                ),
             };
         }
-        Err(_) => {
+        None => {
             // Controller isn't set.
         }
     };
 
-    // The controller is not set: acquire the phase read lock
-    match state.phase() {
+    // The controller is not set, so the phase says why.
+    match phase {
         PipelinePhase::Initializing(inner) => match inner {
             InitializationState::Starting => Ok(ExtendedRuntimeStatus {
                 runtime_status: RuntimeStatus::Initializing,
-                runtime_status_details: json!(""),
+                runtime_status_details: RuntimeStatusDetails::default().serialize_guaranteed(),
                 runtime_desired_status,
                 storage_status_details,
             }),
             InitializationState::DownloadingCheckpoint => Ok(ExtendedRuntimeStatus {
                 runtime_status: RuntimeStatus::Initializing,
-                runtime_status_details: json!("downloading checkpoint from object storage"),
+                runtime_status_details: RuntimeStatusDetails::new_only_reason(
+                    "downloading checkpoint from object storage",
+                )
+                .serialize_guaranteed(),
                 runtime_desired_status,
                 storage_status_details,
             }),
             InitializationState::Standby => Ok(ExtendedRuntimeStatus {
                 runtime_status: RuntimeStatus::Standby,
-                runtime_status_details: json!(""),
+                runtime_status_details: RuntimeStatusDetails::default().serialize_guaranteed(),
                 runtime_desired_status,
                 storage_status_details,
             }),
             InitializationState::AwaitingApproval(diff) => Ok(ExtendedRuntimeStatus {
                 runtime_status: RuntimeStatus::AwaitingApproval,
-                runtime_status_details: serde_json::to_value(&diff).unwrap_or_default(),
+                runtime_status_details: RuntimeStatusDetails {
+                    approval_diff: Some(serde_json::to_value(&diff).unwrap_or_default()),
+                    ..Default::default()
+                }
+                .serialize_guaranteed(),
                 runtime_desired_status,
                 storage_status_details,
             }),
@@ -1582,7 +1816,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
             if matches!(*e, ControllerError::RestoreInProgress) {
                 Ok(ExtendedRuntimeStatus {
                     runtime_status: RuntimeStatus::Replaying,
-                    runtime_status_details: json!(""),
+                    runtime_status_details: RuntimeStatusDetails::default().serialize_guaranteed(),
                     runtime_desired_status,
                     storage_status_details,
                 })
@@ -1609,7 +1843,7 @@ fn get_status(state: &ServerState) -> Result<ExtendedRuntimeStatus, ExtendedRunt
         }
         PipelinePhase::Suspended => Ok(ExtendedRuntimeStatus {
             runtime_status: RuntimeStatus::Suspended,
-            runtime_status_details: json!(""),
+            runtime_status_details: RuntimeStatusDetails::default().serialize_guaranteed(),
             runtime_desired_status,
             storage_status_details,
         }),
@@ -1659,16 +1893,6 @@ async fn query(
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct StatsParams {
-    /// When `true`, include the most recent error messages for each endpoint
-    /// in the response (up to `MAX_CONNECTOR_ERRORS` per list). Default is
-    /// `false` so that callers polling `/stats` keep getting a lightweight
-    /// response. This selector is intended for the support-bundle collector.
-    #[serde(default)]
-    include_connector_errors: bool,
-}
-
 #[get("/stats")]
 async fn stats(
     state: WebData<ServerState>,
@@ -1678,12 +1902,13 @@ async fn stats(
     Ok(HttpResponse::Ok().json(state.controller()?.api_status(include_connector_errors)))
 }
 
-/// This endpoint returns a subset of stats that don't need updating and so is more performant than /stats
-#[get("/stats/errors")]
-async fn error_stats(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
-    let controller = state.controller()?;
-    let controller_status = controller.status();
-
+/// Retrieves the error statistics across all endpoints.
+fn retrieve_error_stats(
+    controller_status: &ControllerStatus,
+) -> (
+    Vec<EndpointErrorStats<InputEndpointErrorMetrics>>,
+    Vec<EndpointErrorStats<OutputEndpointErrorMetrics>>,
+) {
     let inputs: Vec<EndpointErrorStats<InputEndpointErrorMetrics>> = controller_status
         .input_status()
         .values()
@@ -1707,7 +1932,15 @@ async fn error_stats(state: WebData<ServerState>) -> Result<HttpResponse, Pipeli
             },
         })
         .collect();
+    (inputs, outputs)
+}
 
+/// This endpoint returns a subset of stats that don't need updating and so is more performant than /stats
+#[get("/stats/errors")]
+async fn error_stats(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
+    let controller = state.controller()?;
+    let controller_status = controller.status();
+    let (inputs, outputs) = retrieve_error_stats(controller_status);
     Ok(HttpResponse::Ok().json(PipelineStatsErrorsResponse { inputs, outputs }))
 }
 
@@ -2189,18 +2422,14 @@ async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, Pipeline
                     };
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                // A failed suspend leaves the pipeline unsuspended: report it as
-                // a fatal error so the pipeline manager records the failure
-                // rather than a clean suspend. The circuit is deliberately left
-                // running on failure (see the `SuspendCommand` handler in
+                // A failed suspend leaves the pipeline unsuspended: `suspended`
+                // reports it as a fatal error so the pipeline manager records the
+                // failure rather than a clean suspend. The circuit is deliberately
+                // left running on failure (see the `SuspendCommand` handler in
                 // `controller.rs`), so `/status` never observed a `Terminated`
-                // circuit to mask as `Suspended`; this phase is what the poll
-                // sees once the controller is deallocated below.
-                state.set_phase(match suspend_error {
-                    Some(error) => PipelinePhase::Failed(error),
-                    None => PipelinePhase::Suspended,
-                });
-                if let Ok(controller) = state.take_controller()
+                // circuit to mask as `Suspended`; this phase is what the poll sees
+                // once the controller is deallocated.
+                if let Some(controller) = state.suspended(suspend_error)
                     && let Err(error) = controller.async_stop().await
                 {
                     error!("stopping controller failed ({error})");
@@ -2687,10 +2916,10 @@ async fn coordination_activate_handler(
 async fn coordination_status(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
     let stream = unfold((state, None), |(state, prev)| async move {
         let status = match prev {
-            None => get_status(&state),
+            None => get_status(&state, false),
             Some(prev) => loop {
                 let notify = state.desired_status_change.notified();
-                let status = get_status(&state);
+                let status = get_status(&state, false);
                 if status != prev {
                     break status;
                 }
@@ -2820,6 +3049,16 @@ async fn coordination_checkpoint_pull(
     let host_info = state.host_info;
     let standby = body.into_inner().standby;
 
+    let pipeline =
+        state
+            .pipeline_identity
+            .clone()
+            .ok_or_else(|| PipelineError::ControllerError {
+                error: Arc::new(ControllerError::checkpoint_fetch_error(
+                    missing_pipeline_identity_message("checkpoint pull requires pipeline identity"),
+                )),
+            })?;
+
     {
         let mut pull_state = state.pull_state.lock().unwrap();
         if matches!(*pull_state, CheckpointPullStatus::InProgress) {
@@ -2831,7 +3070,9 @@ async fn coordination_checkpoint_pull(
 
     spawn(async move {
         let result = spawn_blocking(move || {
-            crate::controller::sync::pull_once_with_backend(storage, &sync, host_info, standby)
+            crate::controller::sync::pull_once_with_backend(
+                storage, &sync, host_info, standby, &pipeline,
+            )
         })
         .await
         .unwrap();
@@ -3159,6 +3400,10 @@ struct StoredStatus {
     #[serde(default, skip_serializing_if = "is_false")]
     silent_bootstrap: bool,
 
+    /// Bootstrap new and modified views concurrently.
+    #[serde(default, skip_serializing_if = "is_false")]
+    concurrent_bootstrap: bool,
+
     // Deployment ID.
     deployment_id: Uuid,
 }
@@ -3194,9 +3439,14 @@ impl StoredStatus {
 /// off.
 #[cfg(test)]
 mod test_http_helpers {
-    use super::{ServerArgs, ServerState, bootstrap, build_app, parse_config, terminated_status};
+    use super::{
+        ServerArgs, ServerState, bootstrap, build_app, error_handler, get_status, parse_config,
+        terminated_status,
+    };
     use crate::{
+        ControllerError,
         controller::ControllerBuilder,
+        ensure_default_crypto_provider,
         server::{InitializationState, PipelinePhase},
         test::{TestStruct, async_wait, http::TestHttpSender, test_circuit},
     };
@@ -3222,31 +3472,339 @@ mod test_http_helpers {
         fs::File,
         io::Write,
         path::Path,
+        sync::Arc,
         thread,
         thread::sleep,
         time::{Duration, Instant},
     };
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
     use uuid::Uuid;
 
     /// A successful suspend terminates the circuit before the server reports
     /// `PipelinePhase::Suspended`, so `terminated_status` must report a clean
     /// `Suspended` while a suspend is in progress instead of the spurious
     /// `PipelineTerminated` error that flaked `suspend_and_resume_demos`.
-    ///
-    /// A *failed* suspend never reaches `terminated_status`: the `SuspendCommand`
-    /// handler leaves the circuit running instead of terminating it, and the
-    /// `/suspend` handler reports the failure as `PipelinePhase::Failed`.
     #[test]
     fn terminated_status_reports_suspended_while_suspending() {
-        let status = terminated_status(RuntimeDesiredStatus::Suspended, None)
+        let status = terminated_status(true, RuntimeDesiredStatus::Suspended, None)
             .expect("a suspending pipeline must not surface PipelineTerminated");
         assert!(matches!(status.runtime_status, RuntimeStatus::Suspended));
 
-        // An unexpected termination (no suspend requested) stays a fatal error.
-        let error = terminated_status(RuntimeDesiredStatus::Running, None)
+        // An unexpected termination stays a fatal error.
+        let error = terminated_status(false, RuntimeDesiredStatus::Running, None)
             .expect_err("an unexpected termination must remain PipelineTerminated");
         assert_eq!(error.error.error_code.as_ref(), "PipelineTerminated");
+    }
+
+    /// A completed suspend must read back as `Suspended` while the controller is
+    /// still registered.
+    ///
+    /// The `/suspend` task records [`PipelinePhase::Suspended`] only after
+    /// `async_suspend` returns, so a poll in between sees a live controller whose
+    /// circuit is already `Terminated`. Reporting that as a fatal
+    /// `PipelineTerminated` is what flaked `suspend_and_resume_demos`.
+    /// Suspending the controller directly, without going through `/suspend`,
+    /// leaves the state in exactly that window.
+    #[actix_web::test]
+    async fn completed_suspend_is_reported_before_the_phase_is_recorded() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        std::fs::create_dir(&storage_dir).unwrap();
+        let config_str = format!(
+            r#"
+name: test
+workers: 2
+storage_config:
+    path: "{}"
+storage: true
+clock_resolution_usecs:
+inputs:
+outputs:
+"#,
+            storage_dir.display()
+        );
+        let (_server, state) = start_test_server_with_state(
+            &config_str,
+            Uuid::now_v7(),
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            &[Some("v0")],
+            false,
+        )
+        .await;
+
+        state
+            .controller()
+            .expect("controller present")
+            .async_suspend()
+            .await
+            .expect("suspend succeeds");
+
+        // The window: the controller is still registered and the phase still says
+        // the pipeline is initialized.
+        assert!(matches!(
+            state.phase(),
+            PipelinePhase::InitializationComplete
+        ));
+        assert!(state.controller().is_ok());
+
+        let status = get_status(&state, false).expect("a completed suspend is not an error");
+        assert!(
+            matches!(status.runtime_status, RuntimeStatus::Suspended),
+            "a completed suspend read back as {:?}",
+            status.runtime_status
+        );
+    }
+
+    /// A circuit that dies while a suspend is pending must not be reported as a
+    /// clean suspend.
+    ///
+    /// Requesting a suspend does not make the termination a suspend: the circuit
+    /// thread also terminates the pipeline when it exits with an error that
+    /// `is_fatal_controller_error` does not classify as fatal, and then nothing
+    /// has written a checkpoint. Reporting `Suspended` would have the pipeline
+    /// manager record a successful suspend and later resume from a checkpoint
+    /// that does not exist, so only the reason recorded by the `SuspendCommand`
+    /// handler may produce it.
+    #[test]
+    fn terminated_status_reports_a_death_during_suspend_as_an_error() {
+        let error = terminated_status(false, RuntimeDesiredStatus::Suspended, None)
+            .expect_err("a pipeline that died while suspending must not report a clean suspend");
+        assert_eq!(error.error.error_code.as_ref(), "PipelineTerminated");
+    }
+
+    /// `/status` must report a fatal controller error that arrives after the
+    /// controller is published but before the phase is.
+    ///
+    /// The circuit thread reports initialization complete and then immediately
+    /// enters its step loop (see `CircuitThread::run`), so a fatal error from its
+    /// first steps races the tail of `do_bootstrap`, which publishes the
+    /// controller and the phase in two separate steps.  An error landing between
+    /// them leaves the controller deallocated, so the phase must stay `Failed`
+    /// rather than being overwritten with `InitializationComplete`: `/status`
+    /// reports a controller-less `InitializationComplete` as the fatal
+    /// `ControllerMissingAfterInitialization`, which masks the real error and
+    /// makes the pipeline manager record that instead.
+    #[test]
+    fn fatal_error_during_bootstrap_tail_is_reported() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        std::fs::create_dir(&storage_dir).unwrap();
+        let config_str = format!(
+            r#"
+name: test
+workers: 2
+storage_config:
+    path: "{}"
+storage: true
+clock_resolution_usecs:
+inputs:
+outputs:
+"#,
+            storage_dir.display()
+        );
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file.write_all(config_str.as_bytes()).unwrap();
+        let config = parse_config(config_file.path().display().to_string()).unwrap();
+        let builder = ControllerBuilder::new(&config).unwrap();
+
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        {
+            let state = state.clone();
+            thread::spawn(move || {
+                bootstrap(
+                    builder,
+                    Box::new(|workers| {
+                        Ok(test_circuit::<TestStruct>(
+                            workers,
+                            &TestStruct::schema(),
+                            &[None],
+                        ))
+                    }),
+                    state,
+                )
+            })
+        }
+        .join()
+        .unwrap();
+
+        // Baseline: a healthy pipeline reports a status, not an error.
+        assert!(get_status(&state, false).is_ok());
+
+        // Rewind to just before the bootstrap tail publishes its result.
+        let controller = state.abandon_controller().expect("controller present");
+
+        // The circuit thread reports a fatal error, which must be recorded even
+        // though there is no controller to deallocate yet.
+        let weak = Arc::downgrade(&state.clone().into_inner());
+        error_handler(&weak, Arc::new(ControllerError::DbspPanic), None);
+
+        // The bootstrap tail then finishes, and must not claim success.
+        assert!(
+            state.complete_initialization(controller).is_err(),
+            "the bootstrap tail published a controller that a failure invalidated"
+        );
+
+        let error = get_status(&state, false)
+            .expect_err("a pipeline that hit a fatal error must report an error");
+        assert_ne!(
+            error.error.error_code.as_ref(),
+            "ControllerMissingAfterInitialization",
+            "the bootstrap tail masked the fatal error"
+        );
+        assert_eq!(error.error.error_code.as_ref(), "DbspPanic");
+    }
+
+    /// Initialization whose result is refused must stop the circuit it built.
+    ///
+    /// The failure that refuses publication was recorded before the controller
+    /// existed, so `fail` had no controller to stop, and a circuit whose step
+    /// fails keeps stepping (see `CircuitThread::step_circuit`). The bootstrap() tail
+    /// holds the only remaining reference to that circuit, so dropping it instead
+    /// of stopping it leaves the circuit running with nobody able to reach it,
+    /// still holding the storage lock that the next pipeline process needs.
+    #[actix_web::test]
+    async fn a_refused_bootstrap_result_stops_the_circuit() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        std::fs::create_dir(&storage_dir).unwrap();
+        let config_str = format!(
+            r#"
+name: test
+workers: 2
+storage_config:
+    path: "{}"
+storage: true
+clock_resolution_usecs:
+inputs:
+outputs:
+"#,
+            storage_dir.display()
+        );
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file.write_all(config_str.as_bytes()).unwrap();
+        let config = parse_config(config_file.path().display().to_string()).unwrap();
+        let builder = ControllerBuilder::new(&config).unwrap();
+
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        // Record the failure before initialization starts, so the tail is
+        // certain to refuse the controller it builds.
+        let weak = Arc::downgrade(&state.clone().into_inner());
+        error_handler(&weak, Arc::new(ControllerError::DbspPanic), None);
+
+        let bootstrap_state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            bootstrap(
+                builder,
+                Box::new(|workers| {
+                    Ok(test_circuit::<TestStruct>(
+                        workers,
+                        &TestStruct::schema(),
+                        &[None],
+                    ))
+                }),
+                bootstrap_state,
+            )
+        })
+        .await
+        .unwrap();
+
+        // Nothing was published and the failure stands.
+        assert!(state.controller().is_err());
+        assert!(matches!(state.phase(), PipelinePhase::Failed(_)));
+
+        // The circuit was stopped, so it has let go of the storage lock.
+        wait_for_storage_unlock(&storage_dir).await;
+    }
+
+    /// `/status` must report a fatal controller error that arrives before the
+    /// controller is published.
+    ///
+    /// The circuit thread can fail before `do_bootstrap` reaches
+    /// `set_controller`, so recording the failure cannot depend on there being a
+    /// controller to deallocate; otherwise the error is dropped and the pipeline
+    /// goes on to report itself as initialized.
+    #[test]
+    fn fatal_error_before_controller_is_published_is_reported() {
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let weak = Arc::downgrade(&state.clone().into_inner());
+        error_handler(&weak, Arc::new(ControllerError::DbspPanic), None);
+
+        let error = get_status(&state, false)
+            .expect_err("a pipeline that hit a fatal error must report an error");
+        assert_eq!(error.error.error_code.as_ref(), "DbspPanic");
+    }
+
+    /// A suspend that overlaps a fatal controller error must not report a clean
+    /// suspend.
+    ///
+    /// The `/suspend` task waits for a controller to suspend and treats a
+    /// terminal phase as its cue to stop waiting.  It then reaches `suspended`
+    /// with no suspend error of its own to report, so
+    /// `PipelinePhase::Suspended` must not replace the recorded failure: the
+    /// pipeline failed and wrote no checkpoint, and the pipeline manager would
+    /// otherwise record a successful suspend and later try to resume from it.
+    #[test]
+    fn suspend_does_not_overwrite_a_fatal_error() {
+        let state = WebData::new(ServerState::new(
+            PipelinePhase::Initializing(InitializationState::Starting),
+            String::default(),
+            RuntimeDesiredStatus::Suspended,
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            Uuid::now_v7(),
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let weak = Arc::downgrade(&state.clone().into_inner());
+        error_handler(&weak, Arc::new(ControllerError::DbspPanic), None);
+        // What the `/suspend` task records once it stops waiting for a controller,
+        // having no suspend error of its own to report.
+        assert!(state.suspended(None).is_none());
+
+        let error = get_status(&state, false)
+            .expect_err("a pipeline that hit a fatal error must report an error");
+        assert_eq!(error.error.error_code.as_ref(), "DbspPanic");
     }
 
     pub(super) async fn get_stats(server: &TestServer) -> ExternalControllerStatus {
@@ -3296,6 +3854,36 @@ mod test_http_helpers {
         bootstrap_config: BootstrapConfig,
         persistent_output_ids: &'static [Option<&'static str>],
     ) -> TestServer {
+        start_test_server_with_state(
+            config_str,
+            deployment_id,
+            bootstrap_config,
+            persistent_output_ids,
+            false,
+        )
+        .await
+        .0
+    }
+
+    /// Like [start_test_server_with_options], but also returns the
+    /// [ServerState] so a test can reach the controller directly (e.g. to
+    /// simulate an ungraceful crash via [crash_pipeline]).
+    ///
+    /// When `with_program_ir` is set, a minimal (empty) `program_ir` is injected
+    /// into the pipeline config. The test circuit is a Rust closure with no
+    /// compiled program, so its checkpoint normally carries no program info,
+    /// which makes `compute_pipeline_diff` fail and forces the journal to be
+    /// discarded on restart (no replay). Injecting an identical empty
+    /// `program_ir` makes the diff empty across a same-program restart, so the
+    /// journal is replayed -- required to exercise the fault-tolerant replay
+    /// path in-process.
+    pub(super) async fn start_test_server_with_state(
+        config_str: &str,
+        deployment_id: Uuid,
+        bootstrap_config: BootstrapConfig,
+        persistent_output_ids: &'static [Option<&'static str>],
+        with_program_ir: bool,
+    ) -> (TestServer, WebData<ServerState>) {
         let mut config_file = NamedTempFile::new().unwrap();
         config_file.write_all(config_str.as_bytes()).unwrap();
 
@@ -3307,6 +3895,7 @@ mod test_http_helpers {
             RuntimeDesiredStatus::Paused,
             bootstrap_config,
             deployment_id,
+            None,
             None,
             None,
             None,
@@ -3325,11 +3914,18 @@ mod test_http_helpers {
             initial: RuntimeDesiredStatus::Paused,
             bootstrap_policy: bootstrap_config.active_bootstrap_policy(),
             silent_bootstrap: bootstrap_config.silent_bootstrap,
+            concurrent_bootstrap: bootstrap_config.concurrent_bootstrap,
             deployment_id,
             host_id: None,
         };
 
-        let config = parse_config(&args.config_file).unwrap();
+        let mut config = parse_config(&args.config_file).unwrap();
+        if with_program_ir {
+            config.program_ir = Some(feldera_types::config::ProgramIr {
+                mir: std::collections::HashMap::new(),
+                program_schema: serde_json::json!({ "inputs": [], "outputs": [] }),
+            });
+        }
         let builder = ControllerBuilder::new(&config).unwrap();
         thread::spawn(move || {
             bootstrap(
@@ -3345,6 +3941,7 @@ mod test_http_helpers {
             )
         });
 
+        let state_ret = state.clone();
         let server =
             actix_test::start(move || build_app(App::new().wrap(Logger::default()), state.clone()));
 
@@ -3355,7 +3952,20 @@ mod test_http_helpers {
             sleep(Duration::from_millis(200));
         }
 
-        server
+        (server, state_ret)
+    }
+
+    /// Simulate an ungraceful crash of a fault-tolerant pipeline: terminate the
+    /// circuit WITHOUT writing a checkpoint (unlike `/suspend`), so the journal
+    /// tail must be replayed on the next restart, and wait for the storage lock
+    /// to be released so a new server can reopen the same storage directory.
+    pub(super) async fn crash_pipeline(state: &WebData<ServerState>, storage_dir: &Path) {
+        let controller = state.abandon_controller().expect("controller present");
+        tokio::task::spawn_blocking(move || controller.stop())
+            .await
+            .unwrap()
+            .expect("controller stops cleanly");
+        wait_for_storage_unlock(storage_dir).await;
     }
 
     pub(super) fn flatten_and_sort_batches(data: &[Vec<TestStruct>]) -> Vec<TestStruct> {
@@ -3424,7 +4034,7 @@ mod test_http_helpers {
     }
 
     pub(super) async fn wait_for_completion(server: &TestServer, token: &str) {
-        async_wait(
+        let completed = async_wait(
             || async {
                 let CompletionStatusResponse { status, .. } =
                     get_completion_status(server, token).await;
@@ -3433,7 +4043,16 @@ mod test_http_helpers {
             20_000,
         )
         .await
-        .unwrap();
+        .is_ok();
+
+        if !completed {
+            // The step the token waits for, next to each connector's
+            // `total_processed_steps`, names the endpoint that is holding
+            // `total_completed_steps` back.
+            let status = get_completion_status(server, token).await;
+            print_stats(server).await;
+            panic!("completion token '{token}' is still {status:?} after 20 seconds");
+        }
     }
 
     pub(super) fn test_batches(start: u32, len: u32) -> Vec<Vec<TestStruct>> {
@@ -3597,6 +4216,29 @@ mod test_http_helpers {
         .unwrap();
     }
 
+    /// Run an ad-hoc query and return the integer value of its single `c`
+    /// column (used with `SELECT COUNT(*) AS c ...`).
+    pub(super) async fn adhoc_query_count(server: &TestServer, sql: &str) -> i64 {
+        let qs = form_urlencoded::Serializer::new(String::new())
+            .append_pair("sql", sql)
+            .append_pair("format", "json")
+            .finish();
+        let mut resp = server.get(format!("/query?{qs}")).send().await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "ad-hoc query failed: {}",
+            resp.status()
+        );
+        let body = resp.body().await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // Newline-delimited JSON; `SELECT COUNT(*) AS c` yields one `{"c":N}` row.
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|v| v.get("c").and_then(|c| c.as_i64()))
+            .unwrap_or(0)
+    }
+
     fn output_metrics(stats: &ExternalControllerStatus) -> &ExternalOutputEndpointMetrics {
         stats
             .outputs
@@ -3651,9 +4293,10 @@ mod test_http {
     use crate::{
         ensure_default_crypto_provider,
         server::test_http_helpers::{
-            assert_no_file_output, batch_num_records, commit_transaction, pause_pipeline,
-            send_input, send_input_no_wait, start_pipeline, start_test_server_with_options,
-            start_transaction, suspend_pipeline, test_batches, wait_for_file_output,
+            adhoc_query_count, assert_no_file_output, batch_num_records, commit_transaction,
+            crash_pipeline, pause_pipeline, send_input, send_input_no_wait, start_pipeline,
+            start_test_server_with_options, start_test_server_with_state, start_transaction,
+            suspend_pipeline, test_batches, wait_for_file_output,
         },
         test::{
             TestStruct, async_wait, generate_test_batches,
@@ -3957,6 +4600,261 @@ outputs:
         start_pipeline(&server).await;
         send_input(&server, &third_batch).await;
         wait_for_file_output(&output_path, &third_batch).await;
+        suspend_pipeline(&server, Some(&storage_dir)).await;
+    }
+
+    /// Concurrent bootstrap: on restart with a changed view and
+    /// `concurrent_bootstrap=true`, the new view backfills from the materialized
+    /// input in the background. Unlike a silent bootstrap, the new view's output
+    /// IS emitted at cutover, and it reflects the full input state (the
+    /// backfilled records plus any live records ingested during the backfill).
+    ///
+    #[actix_web::test]
+    async fn test_concurrent_bootstrap() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        let output_path = tempdir.path().join("output.csv");
+        std::fs::create_dir(&storage_dir).unwrap();
+
+        let config_str = format!(
+            r#"
+name: test
+workers: 4
+storage_config:
+    path: "{}"
+storage: true
+clock_resolution_usecs:
+inputs:
+outputs:
+    test_output1:
+        stream: test_output1
+        transport:
+            name: file_output
+            config:
+                path: "{}"
+        format:
+            name: csv
+            config: {{}}
+"#,
+            storage_dir.display(),
+            output_path.display()
+        );
+
+        let first_batch = test_batches(0, 10);
+        let second_batch = test_batches(10, 10);
+
+        // Initial deployment (view `v0`): ingest `first_batch`, then checkpoint.
+        let server = start_test_server_with_options(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            &[Some("v0")],
+        )
+        .await;
+        start_pipeline(&server).await;
+        send_input(&server, &first_batch).await;
+        wait_for_file_output(&output_path, &first_batch).await;
+        suspend_pipeline(&server, Some(&storage_dir)).await;
+        drop(server);
+
+        // Restart with a changed view (`v1`) and concurrent bootstrap. The new
+        // view backfills from the materialized input; its output is emitted at
+        // cutover (not suppressed) and equals the full input state.
+        let server = start_test_server_with_options(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow).with_concurrent_bootstrap(true),
+            &[Some("v1")],
+        )
+        .await;
+        start_pipeline(&server).await;
+        send_input(&server, &second_batch).await;
+        // The new view holds the full input state: the backfilled `first_batch`
+        // (emitted as its first output, not suppressed) plus the live
+        // `second_batch`.
+        let all = [first_batch.clone(), second_batch.clone()].concat();
+        wait_for_file_output(&output_path, &all).await;
+        suspend_pipeline(&server, Some(&storage_dir)).await;
+    }
+
+    /// Regression test: after a concurrent-bootstrap cutover, an ad-hoc query of
+    /// the backfilled view must observe its full contents WITHOUT any
+    /// post-cutover input.
+    ///
+    /// During the background backfill the new view is excluded from the live
+    /// schedule, so its queryable integral is never read into the ad-hoc
+    /// snapshot. Cutover swaps the backfilled integral into the live circuit,
+    /// but the snapshot is refreshed only by a circuit step (`update_snapshot`
+    /// runs inside `step`). Without the post-cutover snapshot-refresh step the
+    /// query keeps reading the empty pre-cutover snapshot and returns 0. This
+    /// exercises the ad-hoc path specifically (no input is fed after cutover --
+    /// feeding any would trigger a step and mask the bug).
+    #[actix_web::test]
+    async fn test_concurrent_bootstrap_adhoc_snapshot() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        let output_path = tempdir.path().join("output.csv");
+        std::fs::create_dir(&storage_dir).unwrap();
+
+        let config_str = format!(
+            r#"
+name: test
+workers: 4
+storage_config:
+    path: "{}"
+storage: true
+clock_resolution_usecs:
+inputs:
+outputs:
+    test_output1:
+        stream: test_output1
+        transport:
+            name: file_output
+            config:
+                path: "{}"
+        format:
+            name: csv
+            config: {{}}
+"#,
+            storage_dir.display(),
+            output_path.display()
+        );
+
+        let first_batch = test_batches(0, 10);
+
+        // Initial deployment (view `v0`): ingest 10 rows, then checkpoint.
+        let server = start_test_server_with_options(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            &[Some("v0")],
+        )
+        .await;
+        start_pipeline(&server).await;
+        send_input(&server, &first_batch).await;
+        wait_for_file_output(&output_path, &first_batch).await;
+        suspend_pipeline(&server, Some(&storage_dir)).await;
+        drop(server);
+
+        // Restart with a changed view (`v1`) and concurrent bootstrap. The new
+        // view backfills the 10 pre-existing rows. `start_pipeline` waits for
+        // `Running`, which is reached only after cutover.
+        let server = start_test_server_with_options(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow).with_concurrent_bootstrap(true),
+            &[Some("v1")],
+        )
+        .await;
+        // `start_pipeline` waits for `Running`, which a concurrent bootstrap
+        // reaches only after cutover AND the post-cutover snapshot-refresh step
+        // (the `Finalizing` phase). So once the pipeline is `Running` the ad-hoc
+        // snapshot must already hold the 10 backfilled rows -- queried once, with
+        // no polling and no post-cutover input. This pins the invariant that the
+        // pipeline is not reported `Running` until view snapshots are
+        // initialized; reporting `Running` at cutover (before the refresh step)
+        // would let this query observe the stale empty snapshot and return 0.
+        start_pipeline(&server).await;
+        let count = adhoc_query_count(&server, "SELECT COUNT(*) AS c FROM test_output1").await;
+        assert_eq!(
+            count, 10,
+            "ad-hoc query observed a stale snapshot after the pipeline reported Running"
+        );
+
+        suspend_pipeline(&server, Some(&storage_dir)).await;
+    }
+
+    /// Regression test for the fault-tolerant *replay* path, the analogue of
+    /// [test_concurrent_bootstrap_adhoc_snapshot]: after a restart that replays
+    /// the journal, an ad-hoc query must observe the replayed state.
+    ///
+    /// The ad-hoc snapshot is refreshed only by a circuit step (`update_snapshot`
+    /// inside `step`) and is not part of the checkpoint. If the pipeline reports
+    /// `Running` (clears `restoring`) as soon as the journal is exhausted, before
+    /// a step has refreshed the snapshot with the replayed state, an ad-hoc query
+    /// reads the stale (empty) pre-replay snapshot and returns 0.
+    ///
+    /// We crash the pipeline WITHOUT a checkpoint so the restart must replay,
+    /// then query once right after `Running` -- no polling and no post-restart
+    /// input (feeding any would trigger a step and mask the bug).
+    #[actix_web::test]
+    async fn test_ft_replay_adhoc_snapshot() {
+        ensure_default_crypto_provider();
+
+        let tempdir = TempDir::new().unwrap();
+        let storage_dir = tempdir.path().join("storage");
+        let output_path = tempdir.path().join("output.csv");
+        std::fs::create_dir(&storage_dir).unwrap();
+
+        let config_str = format!(
+            r#"
+name: test
+workers: 1
+storage_config:
+    path: "{}"
+storage: true
+fault_tolerance: latest_checkpoint
+clock_resolution_usecs:
+inputs:
+outputs:
+    test_output1:
+        stream: test_output1
+        transport:
+            name: file_output
+            config:
+                path: "{}"
+        format:
+            name: csv
+            config: {{}}
+"#,
+            storage_dir.display(),
+            output_path.display()
+        );
+
+        let batch = test_batches(0, 10);
+
+        // Start the fault-tolerant pipeline and ingest 10 rows. The input step is
+        // journaled; `send_input` waits for it to complete.
+        let (server, state) = start_test_server_with_state(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            &[Some("v0")],
+            true,
+        )
+        .await;
+        start_pipeline(&server).await;
+        send_input(&server, &batch).await;
+        wait_for_file_output(&output_path, &batch).await;
+
+        // Crash WITHOUT a checkpoint: the journaled input survives and must be
+        // replayed on restart (the `checkpoint_before = false` case).
+        crash_pipeline(&state, &storage_dir).await;
+        drop(server);
+
+        // Restart: reopen the initial (step 0) checkpoint and REPLAY the journal.
+        // `start_pipeline` waits for `Running`, reached only after `restoring`
+        // clears. Once `Running`, the ad-hoc snapshot must already hold the 10
+        // replayed rows -- queried once, with no polling and no new input.
+        let (server, _state) = start_test_server_with_state(
+            &config_str,
+            Uuid::new_v4(),
+            BootstrapConfig::from(BootstrapPolicy::Allow),
+            &[Some("v0")],
+            true,
+        )
+        .await;
+        start_pipeline(&server).await;
+        let count = adhoc_query_count(&server, "SELECT COUNT(*) AS c FROM test_output1").await;
+        assert_eq!(
+            count, 10,
+            "ad-hoc query observed a stale snapshot after fault-tolerant replay"
+        );
+
         suspend_pipeline(&server, Some(&storage_dir)).await;
     }
 

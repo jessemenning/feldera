@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.ipc
 import requests
 
+from feldera._long_operation_warning import LongOperationWarning
 from feldera.enums import BootstrapPolicy, PipelineFieldSelector, PipelineStatus
 from feldera.rest._helpers import determine_client_version
 from feldera.rest._httprequests import HttpRequests
@@ -175,6 +176,11 @@ class FelderaClient:
         """Wait for pipeline compilation -- internal use only."""
         wait = ["Pending", "CompilingSql", "SqlCompiled", "CompilingRust"]
         start_time = time.monotonic()
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still compiling {name}, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"{name} finished compiling after {elapsed:.1f} seconds",
+        )
         while True:
             elapsed = time.monotonic() - start_time
             if timeout_s is not None and elapsed > timeout_s:
@@ -187,6 +193,7 @@ class FelderaClient:
             status = p.program_status
 
             if status == "Success":
+                long_op.done()
                 if expected_program_version is None:
                     return self.get_pipeline(name, PipelineFieldSelector.ALL)
 
@@ -224,11 +231,7 @@ class FelderaClient:
 
                 raise RuntimeError(error_message)
 
-            logger.debug(
-                "still compiling %s, waiting for %.1f more seconds",
-                name,
-                poll_interval_s,
-            )
+            long_op.check()
             time.sleep(poll_interval_s)
 
     def __wait_for_pipeline_state(
@@ -240,6 +243,13 @@ class FelderaClient:
         poll_interval_s: float = 0.5,
     ):
         start_time = time.monotonic()
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still waiting for {pipeline_name} to transition to "
+            f"'{state}', waited {elapsed:.1f} seconds",
+            lambda elapsed: f"{pipeline_name} transitioned to '{state}' after "
+            f"{elapsed:.1f} seconds",
+        )
 
         while True:
             if timeout_s is not None:
@@ -254,6 +264,7 @@ class FelderaClient:
             status = resp.deployment_status
 
             if status.lower() == state.lower():
+                long_op.done()
                 break
             elif (
                 status == "Stopped"
@@ -267,11 +278,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 {resp.deployment_error.get("message", "")}"""
                 )
 
-            logger.debug(
-                "still starting %s, waiting for %.1f more seconds",
-                pipeline_name,
-                poll_interval_s,
-            )
+            long_op.check()
             time.sleep(poll_interval_s)
 
     def __wait_for_pipeline_state_one_of(
@@ -284,6 +291,12 @@ Reason: The pipeline is in a STOPPED state due to the following error:
     ) -> PipelineStatus:
         start_time = time.monotonic()
         states = [state.lower() for state in states]
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still waiting for {pipeline_name} to transition to "
+            f"one of {states}, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"{pipeline_name} transitioned after {elapsed:.1f} seconds",
+        )
 
         while True:
             if timeout_s is not None:
@@ -298,6 +311,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             status = resp.deployment_status
 
             if status.lower() in states:
+                long_op.done()
                 return PipelineStatus.from_str(status)
             elif (
                 status == "Stopped"
@@ -310,11 +324,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 Reason: The pipeline is in a STOPPED state due to the following error:
 {resp.deployment_error.get("message", "")}"""
                 )
-            logger.debug(
-                "still starting %s, waiting for %.1f more seconds",
-                pipeline_name,
-                poll_interval_s,
-            )
+            long_op.check()
             time.sleep(poll_interval_s)
 
     def create_pipeline(self, pipeline: Pipeline, wait: bool = True) -> Pipeline:
@@ -501,6 +511,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         initial: str = "running",
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -531,6 +542,9 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         if silent_bootstrap:
             start_params["silent_bootstrap"] = "true"
 
+        if concurrent_bootstrap:
+            start_params["concurrent_bootstrap"] = "true"
+
         self.http.post(
             path=f"/pipelines/{pipeline_name}/start",
             params=start_params,
@@ -550,6 +564,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -570,6 +585,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "running",
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -580,6 +596,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: float | None = None,
         dismiss_error: bool = True,
@@ -599,6 +616,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "paused",
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -609,6 +627,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         pipeline_name: str,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -628,6 +647,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             "standby",
             bootstrap_policy,
             silent_bootstrap,
+            concurrent_bootstrap,
             wait,
             timeout_s,
             dismiss_error,
@@ -687,6 +707,7 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         self,
         pipeline_name: str,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
     ):
         """
         Approve a pipeline awaiting approval to proceed with bootstrapping.
@@ -695,9 +716,17 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         :param silent_bootstrap: Set True to bootstrap with output connectors
             disabled, so no records are emitted during the bootstrap phase.
             False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         """
 
-        params = {"silent_bootstrap": "true"} if silent_bootstrap else {}
+        params = {}
+        if silent_bootstrap:
+            params["silent_bootstrap"] = "true"
+        if concurrent_bootstrap:
+            params["concurrent_bootstrap"] = "true"
 
         self.http.post(
             path=f"/pipelines/{pipeline_name}/approve",
@@ -733,6 +762,11 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             return
 
         start = time.monotonic()
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still stopping {pipeline_name}, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"{pipeline_name} stopped after {elapsed:.1f} seconds",
+        )
 
         while True:
             if timeout_s is not None and time.monotonic() - start > timeout_s:
@@ -745,12 +779,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             ).deployment_status
 
             if status == "Stopped":
+                long_op.done()
                 return
 
-            logger.debug(
-                "still stopping %s, waiting for 100 more milliseconds",
-                pipeline_name,
-            )
+            long_op.check()
             time.sleep(0.1)
 
     def dismiss_error_pipeline(
@@ -791,6 +823,11 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             return
 
         start = time.monotonic()
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still clearing {pipeline_name}, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"{pipeline_name} storage cleared after {elapsed:.1f} seconds",
+        )
         while True:
             if timeout_s is not None and time.monotonic() - start > timeout_s:
                 raise FelderaTimeoutError(
@@ -801,13 +838,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
             ).storage_status
 
             if status == "Cleared":
+                long_op.done()
                 return
 
-            logger.debug(
-                "still clearing %s, waiting for %.1f more seconds",
-                pipeline_name,
-                poll_interval_s,
-            )
+            long_op.check()
             time.sleep(poll_interval_s)
 
     def start_transaction(self, pipeline_name: str) -> int:
@@ -859,6 +893,92 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         return self.http.post(
             path=f"/pipelines/{pipeline_name}/clock/advance",
             body={"delta_ms": delta_ms},
+        )
+
+    def pipeline_diff(
+        self,
+        pipeline_name: str,
+        program_code: Optional[str] = None,
+        runtime_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute the diff between the pipeline's current program and a proposed
+        new version, without modifying or restarting the pipeline.
+
+        The diff lists the tables, views, and connectors that would be added,
+        removed, or modified. It is the same diff shown when approving changes
+        during bootstrapping, so it lets you preview the effect of a change
+        before applying it.
+
+        The baseline is the pipeline's currently configured program compiled
+        with its runtime, not necessarily the program in the latest checkpoint
+        (which may have been produced by a different program or runtime).
+
+        :param pipeline_name: The name of the pipeline.
+
+        :param program_code: New SQL program code to compare against. If
+            ``None`` (the default), the pipeline's current program code is used.
+
+        :param runtime_version: Runtime version to compile the new program with:
+            a version tag (``vX.Y.Z``) or a 40-character git SHA. If ``None``
+            (the default), the platform's default runtime is used.
+
+        :return: The pipeline diff as a dict (see the ``PipelineDiff`` schema).
+
+        :raises FelderaAPIError: If the current program is not compiled, the new
+            program fails to compile, the change cannot be bootstrapped, or the
+            compiler service is unavailable.
+        """
+
+        body: Dict[str, Any] = {}
+        if program_code is not None:
+            body["program_code"] = program_code
+        if runtime_version is not None:
+            body["runtime_version"] = runtime_version
+
+        return self.http.post(
+            path=f"/pipelines/{pipeline_name}/diff",
+            body=body,
+        )
+
+    def validate_program(
+        self,
+        program_code: str,
+        runtime_version: Optional[str] = None,
+        ir: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Validate a SQL program by compiling it, without creating a pipeline or
+        building the pipeline binary.
+
+        Reports SQL errors and warnings and the derived schema and connectors.
+        Set ``ir`` to also return the program IR (dataflow).
+
+        A SQL compilation error is reported in the returned result (as
+        ``SqlError``), not raised. ``FelderaAPIError`` is raised only for a
+        system-level failure, such as an invalid runtime version or the
+        compiler service being unavailable.
+
+        :param program_code: The SQL program to validate.
+
+        :param runtime_version: Runtime version to compile the program with: a
+            version tag (``vX.Y.Z``) or a 40-character git SHA. If ``None`` (the
+            default), the platform's default runtime is used.
+
+        :param ir: Also return the program IR (dataflow) in the result.
+
+        :return: The validation result as a dict (see the
+            ``ValidateProgramResponse`` schema): one of ``{"Success": {...}}``,
+            ``{"SqlError": {...}}``, or ``{"SystemError": {...}}``.
+        """
+
+        body: Dict[str, Any] = {"program_code": program_code, "ir": ir}
+        if runtime_version is not None:
+            body["runtime_version"] = runtime_version
+
+        return self.http.post(
+            path="/validate_program",
+            body=body,
         )
 
     def commit_transaction(
@@ -917,6 +1037,13 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         if not wait:
             return
 
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"transaction {transaction_id} on {pipeline_name} "
+            f"hasn't committed, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"transaction {transaction_id} on {pipeline_name} "
+            f"committed after {elapsed:.1f} seconds",
+        )
         while True:
             if timeout_s is not None:
                 elapsed = time.monotonic() - start_time
@@ -925,12 +1052,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
 
             stats = self.get_pipeline_stats(pipeline_name)
             if stats["global_metrics"]["transaction_id"] != transaction_id:
+                long_op.done()
                 return
 
-            logging.debug(
-                "commit hasn't completed, waiting for %.1f more seconds",
-                poll_interval_s,
-            )
+            long_op.check()
             time.sleep(poll_interval_s)
 
     def checkpoint_pipeline(self, pipeline_name: str) -> int:
@@ -1143,6 +1268,13 @@ Reason: The pipeline is in a STOPPED state due to the following error:
         max_backoff = 5
         exponent = 1.2
         retries = 0
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still waiting for inputs represented by {token} "
+            f"to be processed, waited {elapsed:.1f} seconds",
+            lambda elapsed: f"inputs represented by {token} processed after "
+            f"{elapsed:.1f} seconds",
+        )
 
         while True:
             if end:
@@ -1154,12 +1286,10 @@ Reason: The pipeline is in a STOPPED state due to the following error:
                     )
 
             if self.completion_token_processed(pipeline_name, token):
+                long_op.done()
                 break
 
-            elapsed = time.monotonic() - start
-            logger.debug(
-                f"still waiting for inputs represented by {token} to be processed; elapsed: {elapsed}s"
-            )
+            long_op.check()
 
             retries += 1
             backoff = min(max_backoff, initial_backoff * (exponent**retries))

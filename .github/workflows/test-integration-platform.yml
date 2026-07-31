@@ -155,10 +155,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: [k8s-runners-amd64]
+          - runner: [gke-runners-amd64]
             arch: x86_64
             target: x86_64-unknown-linux-gnu
-          #- runner: [k8s-runners-arm64 ]
+          #- runner: [gke-runners-arm64 ]
           #  arch: aarch64
           #  target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
@@ -171,7 +171,9 @@ jobs:
       OIDC_TEST_USERNAME: ${{ secrets.OIDC_TEST_USERNAME }}
       OIDC_TEST_PASSWORD: ${{ secrets.OIDC_TEST_PASSWORD }}
       FELDERA_TLS_INSECURE: true
-      FELDERA_HOST: https://localhost:8080
+      # Service containers live on the job's docker network under the dind
+      # runners and are addressed by service name, not localhost.
+      FELDERA_HOST: https://pipeline-manager:8080
 
     container:
       image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
@@ -198,11 +200,6 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Show Kubernetes node
-        if: always()
-        run: |
-          echo "K8S node: ${K8S_NODE_NAME}"
-
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -220,7 +217,7 @@ jobs:
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: |
           (cd crates/pipeline-manager/demos && uv run validate-preamble.py sql/*.sql)
-          uv run crates/pipeline-manager/demos/run.py --api-url https://localhost:8080
+          uv run crates/pipeline-manager/demos/run.py --api-url https://pipeline-manager:8080
         env:
           PYTHONPATH: ${{ github.workspace }}/python
 
@@ -231,11 +228,18 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/python
           IN_CI: 1 # We use this flag to skip some kafka tests in the python code base
-          # MinIO test-bucket credentials, surfaced under the standard env
-          # names the Delta tests read (see python/tests/utils.py). These are
-          # the only MinIO secrets available to the OSS platform job.
-          CI_K8S_MINIO_ACCESS_KEY_ID: ${{ secrets.CI_K8S_MINIO_TEST_BUCKET_ACCESS_KEY_ID }}
-          CI_K8S_MINIO_SECRET_ACCESS_KEY: ${{ secrets.CI_K8S_MINIO_TEST_BUCKET_SECRET_ACCESS_KEY }}
+          # GCS test-bucket credentials, surfaced under the standard env
+          # names the Delta tests read (see python/tests/utils.py).
+          CI_K8S_MINIO_ACCESS_KEY_ID: ${{ secrets.CI_GCS_HMAC_ACCESS_KEY_ID }}
+          CI_K8S_MINIO_SECRET_ACCESS_KEY: ${{ secrets.CI_GCS_HMAC_SECRET_ACCESS_KEY }}
+          CI_MINIO_ENDPOINT: https://storage.googleapis.com
+          CI_MINIO_BUCKET: feldera-ci-test-feldera-ci
+          # rclone quirks for GCS S3-interop; MinIO provider signing gets 403.
+          CI_MINIO_PROVIDER: GCS
+          # GCS S3-interop lacks x-amz checksums; newer AWS SDKs (pyarrow's C++
+          # SDK) fail GetObject with "Response checksums mismatch" otherwise.
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
 
       - name: Download fda binary
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7

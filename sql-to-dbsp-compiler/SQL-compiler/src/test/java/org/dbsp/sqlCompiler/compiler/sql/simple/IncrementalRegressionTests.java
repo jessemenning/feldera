@@ -8,6 +8,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinFilterMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPUnaryOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
@@ -29,9 +30,14 @@ import org.dbsp.sqlCompiler.ir.expression.literal.DBSPI32Literal;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPU64Literal;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
+import org.dbsp.sqlCompiler.ir.type.DBSPTypeCode;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeFunction;
+import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeRawTuple;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeAny;
 import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeBool;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeDate;
+import org.dbsp.sqlCompiler.ir.type.primitive.DBSPTypeInteger;
+import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeTypedBox;
 import org.junit.Assert;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
 import org.junit.Test;
@@ -837,6 +843,89 @@ public class IncrementalRegressionTests extends SqlIoTest {
                         window.left().getOutputIndexedZSetType().elementType.getToplevelFieldCount());
             }
         });
+    }
+
+    private void testDateTemporalFilter(String comparison) {
+        var ccs = this.getCCS("""
+                CREATE TABLE employee (
+                    id STRING NOT NULL,
+                    entry_date DATE,
+                    PRIMARY KEY (id)
+                );
+                CREATE VIEW label_result AS
+                SELECT id AS entity_id
+                FROM employee
+                WHERE entry_date %s;
+                """.formatted(comparison));
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int windows;
+
+            @Override public void postorder(DBSPWindowOperator window) {
+                this.windows++;
+                DBSPType keyType = window.left().getOutputIndexedZSetType().keyType;
+                Assert.assertTrue(keyType.sameType(DBSPTypeDate.INSTANCE));
+                DBSPType expectedControlType = new DBSPTypeRawTuple(
+                        new DBSPTypeTypedBox(keyType, false),
+                        new DBSPTypeTypedBox(keyType, false));
+                Assert.assertTrue(window.right().outputType().sameType(expectedControlType));
+            }
+
+            @Override public void endVisit() {
+                Assert.assertEquals(1, this.windows);
+            }
+        });
+    }
+
+    @Test
+    public void dateTemporalFilterWithLowerBound() {
+        this.testDateTemporalFilter(">= CAST(NOW() AS DATE) - INTERVAL '1' YEAR");
+    }
+
+    @Test
+    public void dateTemporalFilterWithUpperBound() {
+        this.testDateTemporalFilter("<= CAST(NOW() AS DATE) + INTERVAL '1' YEAR");
+    }
+
+    private void testIntegerTemporalFilter(String comparison) {
+        var ccs = this.getCCS("""
+                CREATE TABLE events (
+                    id STRING NOT NULL,
+                    event_epoch BIGINT NOT NULL,
+                    PRIMARY KEY (id)
+                );
+                CREATE VIEW recent_events AS
+                SELECT id AS entity_id
+                FROM events
+                WHERE event_epoch %s;
+                """.formatted(comparison));
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int windows;
+
+            @Override public void postorder(DBSPWindowOperator window) {
+                this.windows++;
+                DBSPType keyType = window.left().getOutputIndexedZSetType().keyType;
+                Assert.assertTrue(keyType.sameType(
+                        DBSPTypeInteger.getType(CalciteObject.EMPTY, DBSPTypeCode.INT64, false)));
+                DBSPType expectedControlType = new DBSPTypeRawTuple(
+                        new DBSPTypeTypedBox(keyType, false),
+                        new DBSPTypeTypedBox(keyType, false));
+                Assert.assertTrue(window.right().outputType().sameType(expectedControlType));
+            }
+
+            @Override public void endVisit() {
+                Assert.assertEquals(1, this.windows);
+            }
+        });
+    }
+
+    @Test
+    public void integerTemporalFilterWithLowerBound() {
+        this.testIntegerTemporalFilter(">= CAST(NOW() AS BIGINT) - 86400");
+    }
+
+    @Test
+    public void integerTemporalFilterWithUpperBound() {
+        this.testIntegerTemporalFilter("<= CAST(NOW() AS BIGINT) + 86400");
     }
 
     @Test
@@ -2026,6 +2115,7 @@ public class IncrementalRegressionTests extends SqlIoTest {
         ccs.step("INSERT INTO T VALUES(0, 0), (1, 2), (2, 2)", """
                  y | min | max | stddev | arg_max | weight
                 -------------------------------------------""");
+        ccs.blockForCompaction();
         // Insert one tuple which produces no output yet; output for
         // data inserted so far is now emitted.
         ccs.step("INSERT INTO T VALUES(1, 5)", """
@@ -2036,7 +2126,7 @@ public class IncrementalRegressionTests extends SqlIoTest {
             int joins = 0;
 
             @Override
-            public void postorder(DBSPStarJoinFilterMapOperator operator) {
+            public void postorder(DBSPStarJoinIndexOperator operator) {
                 this.joins++;
             }
 

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "feldera"
 readme = "README.md"
 description = "The feldera python client"
-version = "0.321.0"
+version = "0.326.0"
 license = "MIT"
 requires-python = ">=3.10,<3.14"
 authors = [
@@ -48,6 +48,7 @@ dev = [
     "simplejson==3.20.1",
     "confluent-kafka>=2.2.0",
     "deltalake>=1.6.0",
+    "pyiceberg[sql-sqlite]>=0.9.0",
 ]
 
 [tool.pytest.ini_options]

@@ -10,7 +10,7 @@
     "license": {
       "name": "MIT OR Apache-2.0"
     },
-    "version": "0.321.0"
+    "version": "0.326.0"
   },
   "paths": {
     "/config/authentication": {
@@ -619,6 +619,7 @@
                         "namespace": null
                       },
                       "clock_resolution_usecs": 1000000,
+                      "clock_timezone_offset": null,
                       "pin_cpus": [],
                       "provisioning_timeout_secs": null,
                       "max_parallel_connector_init": null,
@@ -712,6 +713,7 @@
                         "namespace": null
                       },
                       "clock_resolution_usecs": 100000,
+                      "clock_timezone_offset": null,
                       "pin_cpus": [],
                       "provisioning_timeout_secs": 1200,
                       "max_parallel_connector_init": 10,
@@ -835,6 +837,7 @@
                     "namespace": null
                   },
                   "clock_resolution_usecs": 1000000,
+                  "clock_timezone_offset": null,
                   "pin_cpus": [],
                   "provisioning_timeout_secs": null,
                   "max_parallel_connector_init": null,
@@ -911,6 +914,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -1099,6 +1103,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -1249,6 +1254,7 @@
                     "namespace": null
                   },
                   "clock_resolution_usecs": 1000000,
+                  "clock_timezone_offset": null,
                   "pin_cpus": [],
                   "provisioning_timeout_secs": null,
                   "max_parallel_connector_init": null,
@@ -1325,6 +1331,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -1428,6 +1435,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -1702,6 +1710,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -1991,6 +2000,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "concurrent_bootstrap",
+            "in": "query",
+            "description": "Bootstrap new and modified views concurrently, keeping the pre-existing\nviews live while the new ones backfill. Mutually exclusive with\n`silent_bootstrap`.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -2000,6 +2018,16 @@
               "application/json": {
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bootstrap options are mutually inconsistent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3534,6 +3562,105 @@
           },
           "500": {
             "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/pipelines/{pipeline_name}/diff": {
+      "post": {
+        "tags": [
+          "Pipeline Lifecycle"
+        ],
+        "summary": "Compute Program Diff",
+        "description": "Compute the diff between the pipeline's current program and a proposed new\nversion, without modifying or restarting the pipeline.\n\nThe diff lists the tables, views, and connectors that would be added,\nremoved, or modified. It is the same diff shown when approving changes during\nbootstrapping, letting you preview the effect of a change before applying it.\n\nThe baseline is the pipeline's currently configured program compiled with its\nruntime, not necessarily the program in the latest checkpoint (which may have\nbeen produced by a different program or runtime version).",
+        "operationId": "post_pipeline_diff",
+        "parameters": [
+          {
+            "name": "pipeline_name",
+            "in": "path",
+            "description": "Unique pipeline name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The proposed new SQL program and/or runtime version (both optional)",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PipelineDiffRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Diff successfully computed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineDiff"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The new program failed to compile or the change cannot be bootstrapped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pipeline does not exist or its current program has not been compiled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The compiler service is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The compiler did not respond within the configured timeout",
             "content": {
               "application/json": {
                 "schema": {
@@ -5207,6 +5334,15 @@
             }
           },
           {
+            "name": "concurrent_bootstrap",
+            "in": "query",
+            "description": "Bootstrap new and modified views concurrently, keeping the pre-existing\nviews live while the new ones backfill in the background.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "name": "dismiss_error",
             "in": "query",
             "required": false,
@@ -6701,6 +6837,7 @@
                       "namespace": null
                     },
                     "clock_resolution_usecs": 1000000,
+                    "clock_timezone_offset": null,
                     "pin_cpus": [],
                     "provisioning_timeout_secs": null,
                     "max_parallel_connector_init": null,
@@ -6951,6 +7088,84 @@
                       }
                     }
                   }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "JSON web token (JWT) or API key": []
+          }
+        ]
+      }
+    },
+    "/v0/validate_program": {
+      "post": {
+        "tags": [
+          "Pipeline Lifecycle"
+        ],
+        "summary": "Validate Program",
+        "description": "Validate a SQL program by compiling it, without creating a pipeline or\nbuilding the pipeline binary. Reports SQL errors and warnings and the derived\nschema and connectors. Set `ir` to also return the program IR (dataflow).\n\nNote that this endpoint returns HTTP 200, regardless of whether validation\nsucceeds or fails. The validation result, including any compiler warnings and errors,\nis encoded in the `ValidateProgramResponse` response body.",
+        "operationId": "post_validate_program",
+        "requestBody": {
+          "description": "The SQL program to validate, an optional runtime version, and whether to return the IR",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidateProgramRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Validation completed; the body reports success, SQL errors, or a system error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidateProgramResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The requested runtime version is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The compiler service is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The compiler did not respond within the configured timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -7591,6 +7806,11 @@
             "format": "int64",
             "description": "Target value for `NOW()` at the worker's first emitted tick, in\nmilliseconds since the Unix epoch.\n\nPopulated verbatim from `DevTweaks::now_offset` at endpoint\nconstruction; the wall-clock delta is computed inside the\nconnector's worker task from a single `SystemTime::now()`\nreading, so there is no drift between config construction and\nthe first emitted tick.  `None` means no shift is applied.",
             "nullable": true
+          },
+          "timezone_offset_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Constant offset added to every emitted `NOW()` value, in milliseconds\neast of UTC.  Populated from the `clock_timezone_offset` pipeline\nproperty; 0 means UTC."
           }
         }
       },
@@ -7775,6 +7995,8 @@
           "AwaitingApproval",
           "Initializing",
           "Bootstrapping",
+          "ConcurrentBootstrapping",
+          "Synchronizing",
           "Replaying",
           "Paused",
           "Running",
@@ -7919,6 +8141,15 @@
           }
         }
       },
+      "ConcurrentBootstrapPhase": {
+        "type": "string",
+        "description": "Phase of a concurrent bootstrap.\n\n`#[repr(u8)]` + `NoUninit` so it can be stored in a lock-free `Atomic`.",
+        "enum": [
+          "Inactive",
+          "ConcurrentBootstrapping",
+          "Synchronizing"
+        ]
+      },
       "Condition": {
         "type": "object",
         "properties": {
@@ -7946,7 +8177,9 @@
       "Configuration": {
         "type": "object",
         "required": [
-          "telemetry",
+          "posthog",
+          "conceptualhq",
+          "product_fruits",
           "edition",
           "version",
           "revision",
@@ -7967,6 +8200,10 @@
             "type": "string",
             "description": "URL that navigates to the changelog of the current version"
           },
+          "conceptualhq": {
+            "type": "string",
+            "description": "ConceptualHQ analytics key. Empty when disabled."
+          },
           "edition": {
             "type": "string",
             "description": "Feldera edition: \"Open source\" or \"Enterprise\""
@@ -7979,6 +8216,14 @@
             ],
             "nullable": true
           },
+          "posthog": {
+            "type": "string",
+            "description": "PostHog telemetry key. Empty when disabled."
+          },
+          "product_fruits": {
+            "type": "string",
+            "description": "Product Fruits workspace code for in-app onboarding. Empty when disabled."
+          },
           "revision": {
             "type": "string",
             "description": "Specific revision corresponding to the edition `version` (e.g., git commit hash)."
@@ -7986,10 +8231,6 @@
           "runtime_revision": {
             "type": "string",
             "description": "Specific revision corresponding to the default runtime version of the platform (e.g., git commit hash)."
-          },
-          "telemetry": {
-            "type": "string",
-            "description": "Telemetry key."
           },
           "unstable_features": {
             "type": "string",
@@ -8189,7 +8430,7 @@
       },
       "ConnectorStats": {
         "type": "object",
-        "description": "Aggregated connector error statistics.\n\nThis structure contains the sum of all error counts across all input and output connectors\nfor a pipeline.",
+        "description": "Statistics across all connectors.",
         "required": [
           "num_errors"
         ],
@@ -8197,7 +8438,7 @@
           "num_errors": {
             "type": "integer",
             "format": "int64",
-            "description": "Total number of errors across all connectors.\n\nThis is the sum of:\n- `num_transport_errors` from all input connectors\n- `num_parse_errors` from all input connectors\n- `num_encode_errors` from all output connectors\n- `num_transport_errors` from all output connectors",
+            "description": "Total number of errors across all connectors.\n\n- `num_transport_errors` from all input connectors\n- `num_parse_errors` from all input connectors\n- `num_encode_errors` from all output connectors\n- `num_transport_errors` from all output connectors",
             "minimum": 0
           }
         }
@@ -8934,6 +9175,12 @@
             "default": null,
             "nullable": true
           },
+          "optimize_input_during_commit": {
+            "type": "boolean",
+            "description": "Optimize input operators during transaction commit.",
+            "default": null,
+            "nullable": true
+          },
           "splitter_chunk_size_records": {
             "type": "integer",
             "format": "int64",
@@ -8958,7 +9205,7 @@
           },
           "streaming_exchange": {
             "type": "boolean",
-            "description": "Enable streaming exchange.\n\n`false`",
+            "description": "Enable streaming exchange.",
             "default": null,
             "nullable": true
           }
@@ -9047,6 +9294,11 @@
             "nullable": true,
             "minimum": 0
           },
+          "delete_condition_expression": {
+            "type": "string",
+            "description": "[Condition expression] evaluated before each delete.\n\nWhen the condition is false, the delete is skipped without failing the\nconnector. This option requires `transactional` [`write_mode`]. The\nexpression cannot use `ExpressionAttributeNames` or\n`ExpressionAttributeValues` placeholders.\n\n[Condition expression]: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html\n[`write_mode`]: Self::write_mode",
+            "nullable": true
+          },
           "endpoint_url": {
             "type": "string",
             "description": "Optional endpoint URL, for example when using a local\nDynamoDB-compatible service.",
@@ -9071,6 +9323,11 @@
             "default": 10,
             "nullable": true,
             "minimum": 0
+          },
+          "put_condition_expression": {
+            "type": "string",
+            "description": "[Condition expression] evaluated before each put (insert or upsert).\n\nWhen the condition is false, the record is skipped without failing the\nconnector. This option requires `transactional` [`write_mode`].\n\nThe condition gates every value write, and the connector cannot tell a\nreplayed insert from a legitimate update: both arrive as puts. A guard\nsuch as `attribute_not_exists(id)` therefore also suppresses updates to\nexisting keys, not just replayed duplicates. Choose the expression\naccordingly.\n\nThe connector does not currently support `ExpressionAttributeNames` or\n`ExpressionAttributeValues`, so the expression cannot use placeholders.\n\n[Condition expression]: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html\n[`write_mode`]: Self::write_mode",
+            "nullable": true
           },
           "region": {
             "type": "string",
@@ -9405,6 +9662,7 @@
           "transaction_status",
           "transaction_id",
           "transaction_initiators",
+          "concurrent_bootstrap_phase",
           "rss_bytes",
           "memory_pressure",
           "memory_pressure_epoch",
@@ -9446,6 +9704,17 @@
             "minimum": 0
           },
           "commit_progress": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CommitProgressSummary"
+              }
+            ],
+            "nullable": true
+          },
+          "concurrent_bootstrap_phase": {
+            "$ref": "#/components/schemas/ConcurrentBootstrapPhase"
+          },
+          "concurrent_bootstrap_progress": {
             "allOf": [
               {
                 "$ref": "#/components/schemas/CommitProgressSummary"
@@ -9811,6 +10080,13 @@
                 "description": "Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g.,\n\"2024-12-09T16:09:53+00:00\".\n\nWhen this option is set, the connector finds and opens the snapshot of the table as of the\nspecified point in time (based on the server time recorded in the transaction\nlog, not the event time encoded in the data).  In `snapshot` and `snapshot_and_follow`\nmodes, it retrieves this snapshot.  In `follow` and `snapshot_and_follow` modes, it\nfollows transaction log records **after** this snapshot.\n\nNote: at most one of `snapshot_id` and `datetime` options can be specified.\nWhen neither of the two options is specified, the latest committed version of the table\nis used.",
                 "nullable": true
               },
+              "max_retries": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Maximum number of retries for reading the table snapshot.\n\nWhen reading the snapshot fails partway through, for example because an\nobject-store read times out or is throttled, the connector retries the\nentire read with exponential backoff. This is in addition to the\nlower-level retries performed by the object-store client.\n\nDefaults to unlimited retries. Set to 0 to disable retries.",
+                "nullable": true,
+                "minimum": 0
+              },
               "metadata_location": {
                 "type": "string",
                 "description": "Location of the table metadata JSON file.\n\nThis propery is used to access an Iceberg table without a catalog. It is mutually\nexclusive with the `catalog_type` property.",
@@ -9818,6 +10094,12 @@
               },
               "mode": {
                 "$ref": "#/components/schemas/IcebergIngestMode"
+              },
+              "num_parsers": {
+                "type": "integer",
+                "format": "int32",
+                "description": "The number of parallel parsing tasks the connector uses to process data read from the\ntable. Increasing this value can enhance performance by allowing more concurrent processing.\nRecommended range: 1-10. The default is 4.",
+                "minimum": 1
               },
               "snapshot_filter": {
                 "type": "string",
@@ -9839,6 +10121,9 @@
                 "type": "string",
                 "description": "Table column that serves as an event timestamp.\n\nWhen this option is specified, and `mode` is one of `snapshot` or `snapshot_and_follow`,\ntable rows are ingested in the timestamp order, respecting the\n[`LATENESS`](https://docs.feldera.com/sql/streaming#lateness-expressions)\nproperty of the column: each ingested row has a timestamp no more than `LATENESS`\ntime units earlier than the most recent timestamp of any previously ingested row.\nThe ingestion is performed by partitioning the table into timestamp ranges of width\n`LATENESS`. Each range is processed sequentially, in increasing timestamp order.\n\n# Example\n\nConsider a table with timestamp column of type `TIMESTAMP` and lateness attribute\n`INTERVAL 1 DAY`. Assuming that the oldest timestamp in the table is\n`2024-01-01T00:00:00``, the connector will fetch all records with timestamps\nfrom `2024-01-01`, then all records for `2024-01-02`, `2024-01-03`, etc., until all records\nin the table have been ingested.\n\n# Requirements\n\n* The timestamp column must be of a supported type: integer, `DATE`, or `TIMESTAMP`.\n* The timestamp column must be declared with non-zero `LATENESS`.\n* For efficient ingest, the table must be optimized for timestamp-based\nqueries using partitioning, Z-ordering, or liquid clustering.",
                 "nullable": true
+              },
+              "transaction_mode": {
+                "$ref": "#/components/schemas/IcebergTransactionMode"
               }
             },
             "additionalProperties": {
@@ -9848,6 +10133,14 @@
           }
         ],
         "description": "Iceberg input connector configuration."
+      },
+      "IcebergTransactionMode": {
+        "type": "string",
+        "description": "Iceberg table transaction mode.\n\nDetermines how the connector breaks up its input into Feldera transactions.\n\n* `none` - the connector does not break up its input into transactions.\n* `snapshot` - ingest the initial snapshot of the table in one or several transactions.\n\n# How the table snapshot is ingested using transactions\n\nWhen `transaction_mode` is set to `snapshot`, the connector ingests the snapshot in one\nor several transactions, depending on `timestamp_column`. If `timestamp_column` is not set,\nthe whole snapshot is ingested in a single Feldera transaction. If `timestamp_column` is set,\nthe connector ingests the snapshot in a series of timestamp ranges of width equal to the\n`LATENESS` attribute of the column, each range in a separate transaction.",
+        "enum": [
+          "none",
+          "snapshot"
+        ]
       },
       "InputEndpointConfig": {
         "allOf": [
@@ -10786,7 +11079,7 @@
           "total_processed_input_records": {
             "type": "integer",
             "format": "int64",
-            "description": "The number of input records processed by the circuit.\n\nThis metric tracks the end-to-end progress of the pipeline: the output\nof this endpoint is equal to the output of the circuit after\nprocessing `total_processed_input_records` records.\n\nIn a multihost pipeline, this count reflects only the input records\nprocessed on the same host as the output endpoint, which is not usually\nmeaningful.",
+            "description": "The number of input records processed by the circuit.\n\nThis metric tracks the end-to-end progress of the pipeline: the output\nof this endpoint is equal to the output of the circuit after\nprocessing `total_processed_input_records` records.\n\nThe counter never runs ahead of the endpoint's output. It advances to a\nvalue `N` only once the endpoint has processed every batch derived from\nthe first `N` records received by the pipeline, which means transmitting\nthe batch, or discarding it while silent bootstrapping suppresses the\nendpoint's output.\n\nIn a multihost pipeline, this count reflects only the input records\nprocessed on the same host as the output endpoint, which is not usually\nmeaningful.",
             "minimum": 0
           },
           "total_processed_steps": {
@@ -11002,6 +11295,13 @@
                 "default": 1000000,
                 "nullable": true,
                 "minimum": 0
+              },
+              "clock_timezone_offset": {
+                "type": "string",
+                "description": "Fixed timezone offset for the SQL `NOW()` clock.\n\nAn ISO-8601 UTC offset, for example `\"+05:30\"` or `\"-08:00\"`, that the\nclock connector adds to every `NOW()` value it emits, so `NOW()`\nreturns local time in that fixed timezone instead of UTC.\n\nThe offset is baked into the pipeline's checkpointed state and cannot\nbe changed when the pipeline resumes from a checkpoint: the value from\nthe checkpoint stays in effect, and a differing new value is ignored\nwith a warning in the pipeline log.",
+                "default": null,
+                "example": "+05:30",
+                "nullable": true
               },
               "cpu_profiler": {
                 "type": "boolean",
@@ -11307,6 +11607,22 @@
           }
         }
       },
+      "PipelineDiffRequest": {
+        "type": "object",
+        "description": "Request body for the pipeline diff endpoint.",
+        "properties": {
+          "program_code": {
+            "type": "string",
+            "description": "New SQL program code to compare against. If omitted, the pipeline's\ncurrent program code is used.",
+            "nullable": true
+          },
+          "runtime_version": {
+            "type": "string",
+            "description": "Runtime version to compile the new program with: a version tag\n(`vX.Y.Z`) or a 40-character git SHA. If omitted, the platform's default\nruntime is used.",
+            "nullable": true
+          }
+        }
+      },
       "PipelineFieldSelector": {
         "type": "string",
         "enum": [
@@ -11425,6 +11741,11 @@
                 "nullable": true
               },
               "deployment_runtime_status_details": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeStatusDetails"
+                  }
+                ],
                 "nullable": true
               },
               "deployment_runtime_status_since": {
@@ -11485,6 +11806,11 @@
                 "$ref": "#/components/schemas/StorageStatus"
               },
               "storage_status_details": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/StorageStatusDetails"
+                  }
+                ],
                 "nullable": true
               },
               "udf_rust": {
@@ -11690,6 +12016,11 @@
                 "nullable": true
               },
               "deployment_runtime_status_details": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RuntimeStatusDetails"
+                  }
+                ],
                 "nullable": true
               },
               "deployment_runtime_status_since": {
@@ -11766,6 +12097,11 @@
                 "$ref": "#/components/schemas/StorageStatus"
               },
               "storage_status_details": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/StorageStatusDetails"
+                  }
+                ],
                 "nullable": true
               },
               "udf_rust": {
@@ -12937,6 +13273,13 @@
             "nullable": true,
             "minimum": 0
           },
+          "clock_timezone_offset": {
+            "type": "string",
+            "description": "Fixed timezone offset for the SQL `NOW()` clock.\n\nAn ISO-8601 UTC offset, for example `\"+05:30\"` or `\"-08:00\"`, that the\nclock connector adds to every `NOW()` value it emits, so `NOW()`\nreturns local time in that fixed timezone instead of UTC.\n\nThe offset is baked into the pipeline's checkpointed state and cannot\nbe changed when the pipeline resumes from a checkpoint: the value from\nthe checkpoint stays in effect, and a differing new value is ignored\nwith a warning in the pipeline log.",
+            "default": null,
+            "example": "+05:30",
+            "nullable": true
+          },
           "cpu_profiler": {
             "type": "boolean",
             "description": "Enable CPU profiler.\n\nThe default value is `true`.",
@@ -13142,8 +13485,33 @@
           "Replaying",
           "Paused",
           "Running",
-          "Suspended"
+          "Suspended",
+          "ConcurrentBootstrapping",
+          "Synchronizing"
         ]
+      },
+      "RuntimeStatusDetails": {
+        "type": "object",
+        "description": "Details about the current runtime status. The fields in this struct should all be **optional**\nand set only by a runtime status when they are known. Otherwise, they can just be set `None`.",
+        "properties": {
+          "approval_diff": {
+            "description": "The diff which is awaiting approval.\n\nSpecifically useful for: `AwaitingApproval`.",
+            "nullable": true
+          },
+          "connector_stats": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConnectorStats"
+              }
+            ],
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "description": "Free form text giving an explanation why it is currently in this runtime status.\n\nSpecifically useful for: `Unavailable`, `Initializing`.",
+            "nullable": true
+          }
+        }
       },
       "RustCompilationInfo": {
         "type": "object",
@@ -13684,6 +14052,22 @@
           "InUse",
           "Clearing"
         ]
+      },
+      "StorageStatusDetails": {
+        "type": "object",
+        "description": "Details about pipeline storage, which are returned as part of the regular runtime status polling\nby the runner.",
+        "required": [
+          "checkpoints"
+        ],
+        "properties": {
+          "checkpoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckpointMetadata"
+            },
+            "description": "Present checkpoints."
+          }
+        }
       },
       "SuspendError": {
         "oneOf": [
@@ -14464,6 +14848,91 @@
             "type": "string"
           }
         }
+      },
+      "ValidateProgramRequest": {
+        "type": "object",
+        "description": "Request body for the program validation endpoint.",
+        "required": [
+          "program_code"
+        ],
+        "properties": {
+          "ir": {
+            "type": "boolean",
+            "description": "Return the program IR (dataflow) in the response. `false` by default;\nmost callers only need to know whether the program is valid."
+          },
+          "program_code": {
+            "type": "string",
+            "description": "SQL program code to validate."
+          },
+          "runtime_version": {
+            "type": "string",
+            "description": "Runtime version to compile with: a version tag (`vX.Y.Z`) or a\n40-character git SHA. If omitted, the platform's default runtime is used.",
+            "nullable": true
+          }
+        }
+      },
+      "ValidateProgramResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "Success"
+            ],
+            "properties": {
+              "Success": {
+                "type": "object",
+                "description": "Validation succeeded; `program_info` is the serialized `ProgramInfo` with\nthe Rust artifacts omitted (and the dataflow omitted unless `ir` was set).",
+                "required": [
+                  "program_info"
+                ],
+                "properties": {
+                  "program_info": {}
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "SqlError"
+            ],
+            "properties": {
+              "SqlError": {
+                "type": "object",
+                "description": "The SQL program failed to compile.",
+                "required": [
+                  "info"
+                ],
+                "properties": {
+                  "info": {
+                    "$ref": "#/components/schemas/SqlCompilationInfo"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "SystemError"
+            ],
+            "properties": {
+              "SystemError": {
+                "type": "object",
+                "description": "A system error prevented validation (e.g., the runtime-specific SQL\ncompiler could not be downloaded).",
+                "required": [
+                  "error"
+                ],
+                "properties": {
+                  "error": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "description": "Outcome of validating a SQL program."
       },
       "Version": {
         "type": "integer",

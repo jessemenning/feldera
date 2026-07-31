@@ -507,8 +507,20 @@ impl RootCircuit {
     where
         K: DBData,
     {
+        self.add_input_set_persistent(None)
+    }
+
+    /// Like [`Self::add_input_set`], but with a persistent id, so that the
+    /// input's integral can be checkpointed and restored.
+    pub fn add_input_set_persistent<K>(
+        &self,
+        persistent_id: Option<&str>,
+    ) -> (Stream<RootCircuit, OrdZSet<K>>, SetHandle<K>)
+    where
+        K: DBData,
+    {
         let factories = AddInputSetFactories::new::<K>();
-        let (stream, handle) = self.dyn_add_input_set_mono(None, &factories);
+        let (stream, handle) = self.dyn_add_input_set_mono(persistent_id, &factories);
 
         (stream.typed(), SetHandle::new(handle))
     }
@@ -594,8 +606,6 @@ impl RootCircuit {
     ///
     /// Retention conditions configured at logical time `t`
     /// are applied starting from logical time `t+1`.
-    ///
-    /// FIXME: see <https://github.com/feldera/feldera/issues/2669>
     // TODO: Add a version that takes a custom hash function.
     #[track_caller]
     pub fn add_input_map<K, V, U, PF>(

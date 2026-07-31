@@ -54,6 +54,14 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
     print("Adding new view v2")
     sql += """CREATE MATERIALIZED VIEW v2 AS SELECT COUNT(*) AS c FROM t1;
     """
+
+    # Preview the change via the /diff endpoint BEFORE modifying the pipeline.
+    # The baseline is the currently-configured program (which matches the
+    # checkpoint), so the preview must equal the approval_diff produced by the
+    # real bootstrap of the same change below.
+    endpoint_diff = pipeline.diff(program_code=sql)
+    print(f"Endpoint diff: {endpoint_diff}")
+
     pipeline.modify(sql=sql)
 
     try:
@@ -91,7 +99,7 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
 
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff["program_diff"] == {
         "added_tables": [],
@@ -101,6 +109,9 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
         "removed_tables": [],
         "removed_views": [],
     }
+
+    # The /diff endpoint must predict the same diff as the real bootstrap.
+    assert endpoint_diff == diff
 
     pipeline.approve()
 
@@ -128,11 +139,13 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
 CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
     """
     )
+    endpoint_diff = pipeline.diff(program_code=sql_with_new_table)
+    print(f"Endpoint diff: {endpoint_diff}")
     pipeline.modify(sql=sql_with_new_table)
 
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff["program_diff"] == {
         "added_tables": ["t2"],
@@ -142,6 +155,9 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
         "removed_tables": [],
         "removed_views": [],
     }
+
+    # The /diff endpoint must predict the same diff as the real bootstrap.
+    assert endpoint_diff == diff
 
     pipeline.approve()
 
@@ -169,11 +185,13 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
 CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
     """
     )
+    endpoint_diff = pipeline.diff(program_code=sql_with_new_table)
+    print(f"Endpoint diff: {endpoint_diff}")
     pipeline.modify(sql=sql_with_new_table)
 
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff["program_diff"] == {
         "added_tables": [],
@@ -183,6 +201,9 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
         "removed_tables": [],
         "removed_views": [],
     }
+
+    # The /diff endpoint must predict the same diff as the real bootstrap.
+    assert endpoint_diff == diff
 
     pipeline.approve()
 
@@ -215,11 +236,13 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
         + """CREATE TABLE t2(y int, s string) WITH ('materialized'='true');
     """
     )
+    endpoint_diff = pipeline.diff(program_code=sql_with_new_table)
+    print(f"Endpoint diff: {endpoint_diff}")
     pipeline.modify(sql=sql_with_new_table)
 
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff["program_diff"] == {
         "added_tables": [],
@@ -229,6 +252,9 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
         "removed_tables": [],
         "removed_views": ["v3"],
     }
+
+    # The /diff endpoint must predict the same diff as the real bootstrap.
+    assert endpoint_diff == diff
 
     pipeline.approve()
 
@@ -249,11 +275,13 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
     original_sql = sql
 
     sql_with_new_table = original_sql
+    endpoint_diff = pipeline.diff(program_code=sql_with_new_table)
+    print(f"Endpoint diff: {endpoint_diff}")
     pipeline.modify(sql=sql_with_new_table)
 
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff["program_diff"] == {
         "added_tables": [],
@@ -263,6 +291,9 @@ CREATE MATERIALIZED VIEW v3 AS SELECT MAX(y) AS m FROM t2;
         "removed_views": [],
         "removed_tables": ["t2"],
     }
+
+    # The /diff endpoint must predict the same diff as the real bootstrap.
+    assert endpoint_diff == diff
 
     pipeline.approve()
 
@@ -418,6 +449,152 @@ AS SELECT {view_expr} AS x FROM t1;
         expected_transmitted_records=expected_transmitted_records,
     )
     assert list(pipeline.query("SELECT COUNT(*) AS c FROM v1;")) == [{"c": 6}]
+    pipeline.checkpoint(True)
+    pipeline.stop(force=True)
+
+
+@enterprise_only
+@gen_pipeline_name
+def test_concurrent_bootstrap_enterprise(pipeline_name):
+    """
+    Enterprise: concurrent bootstrapping keeps the pre-existing view live while
+    the modified view backfills in the background, and emits the modified view's
+    full contents to its output connector at cutover.
+
+    This is the complement of silent bootstrapping: instead of suppressing the
+    backfilled output, concurrent bootstrapping transmits the full snapshot of
+    the modified view (the backfilled rows plus any live rows) once the new view
+    takes over.
+    """
+
+    output_path = os.path.join(
+        "/tmp", f"feldera_concurrent_bootstrap_{uuid.uuid4().hex}.json"
+    )
+
+    def sql_for_view(view_expr: str) -> str:
+        connectors = json.dumps(
+            [
+                {
+                    "name": "out",
+                    "transport": {
+                        "name": "file_output",
+                        "config": {"path": output_path},
+                    },
+                    "format": {"name": "json"},
+                }
+            ]
+        )
+        return f"""
+CREATE TABLE t1(x int) WITH ('materialized'='true');
+CREATE MATERIALIZED VIEW v1
+WITH ('connectors' = '{connectors}')
+AS SELECT {view_expr} AS x FROM t1;
+"""
+
+    def output_metrics():
+        return pipeline.output_connector_stats("v1", "out").metrics
+
+    def processed_records() -> int:
+        return output_metrics().total_processed_input_records or 0
+
+    def transmitted_records() -> int:
+        return output_metrics().transmitted_records or 0
+
+    def wait_for_output_progress(
+        min_processed_records: int, expected_transmitted_records: int
+    ):
+        wait_for_condition(
+            f"output connector reaches {min_processed_records} processed records",
+            lambda: processed_records() >= min_processed_records,
+            timeout_s=120.0,
+            poll_interval_s=1.0,
+        )
+        assert transmitted_records() == expected_transmitted_records
+
+    pipeline = PipelineBuilder(
+        TEST_CLIENT,
+        pipeline_name,
+        sql=sql_for_view("x"),
+        runtime_config=RuntimeConfig(
+            workers=FELDERA_TEST_NUM_WORKERS,
+            hosts=FELDERA_TEST_NUM_HOSTS,
+            fault_tolerance_model=None,
+        ),
+    ).create_or_replace()
+
+    pipeline.start()
+    pipeline.input_json("t1", [{"x": 1}, {"x": 2}, {"x": 3}])
+    # Three records ingested, three records sent.
+    wait_for_output_progress(min_processed_records=3, expected_transmitted_records=3)
+    expected_processed_records = 3
+    # The view holds the full backfilled contents (three rows so far).
+    backfilled_records = 3
+    expected_transmitted_records = 3
+    pipeline.checkpoint(True)
+    pipeline.stop(force=True)
+
+    # Concurrent bootstrap: the modified view backfills in the background while
+    # the pre-existing view stays live, then emits its full contents at cutover.
+    pipeline.modify(sql=sql_for_view("x + 1"))
+    pipeline.start(
+        bootstrap_policy=BootstrapPolicy.ALLOW,
+        concurrent_bootstrap=True,
+        timeout_s=300,
+    )
+    # At cutover the modified view re-emits its full contents (all backfilled
+    # rows), unlike silent bootstrap which suppresses them.
+    expected_transmitted_records += backfilled_records
+    wait_for_output_progress(
+        min_processed_records=expected_processed_records,
+        expected_transmitted_records=expected_transmitted_records,
+    )
+    assert list(pipeline.query("SELECT COUNT(*) AS c FROM v1;")) == [
+        {"c": backfilled_records}
+    ]
+
+    pipeline.input_json("t1", [{"x": 5}])
+    # One more record ingested, and one more record sent.
+    expected_processed_records += 1
+    expected_transmitted_records += 1
+    backfilled_records += 1
+    wait_for_output_progress(
+        min_processed_records=expected_processed_records,
+        expected_transmitted_records=expected_transmitted_records,
+    )
+    assert list(pipeline.query("SELECT COUNT(*) AS c FROM v1;")) == [
+        {"c": backfilled_records}
+    ]
+    pipeline.checkpoint(True)
+    pipeline.stop(force=True)
+
+    # A second concurrent bootstrap round re-emits the full (now larger) view
+    # contents again at cutover.
+    pipeline.modify(sql=sql_for_view("x + 2"))
+    pipeline.start(
+        bootstrap_policy=BootstrapPolicy.ALLOW,
+        concurrent_bootstrap=True,
+        timeout_s=300,
+    )
+    expected_transmitted_records += backfilled_records
+    wait_for_output_progress(
+        min_processed_records=expected_processed_records,
+        expected_transmitted_records=expected_transmitted_records,
+    )
+    assert list(pipeline.query("SELECT COUNT(*) AS c FROM v1;")) == [
+        {"c": backfilled_records}
+    ]
+
+    pipeline.input_json("t1", [{"x": 6}])
+    expected_processed_records += 1
+    expected_transmitted_records += 1
+    backfilled_records += 1
+    wait_for_output_progress(
+        min_processed_records=expected_processed_records,
+        expected_transmitted_records=expected_transmitted_records,
+    )
+    assert list(pipeline.query("SELECT COUNT(*) AS c FROM v1;")) == [
+        {"c": backfilled_records}
+    ]
     pipeline.checkpoint(True)
     pipeline.stop(force=True)
 
@@ -624,7 +801,7 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
 
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff == {
         "added_input_connectors": ["t1.unnamed-0", "t1.unnamed-1"],
@@ -673,7 +850,7 @@ CREATE MATERIALIZED VIEW v1 AS SELECT COUNT(*) AS c FROM t1;
     pipeline.start(bootstrap_policy=BootstrapPolicy.AWAIT_APPROVAL)
     assert pipeline.status() == PipelineStatus.AWAITINGAPPROVAL
 
-    diff = pipeline.deployment_runtime_status_details()
+    diff = pipeline.deployment_runtime_status_details()["approval_diff"]
     print(f"Pipeline diff: {diff}")
     assert diff == {
         "added_input_connectors": [],

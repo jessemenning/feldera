@@ -123,6 +123,13 @@ fn default_http_workers() -> usize {
         .unwrap_or(2)
 }
 
+/// Default timeout (in seconds) that the API server waits for the compiler to
+/// validate or compile a program when serving the `/validate_program` and
+/// `/diff` endpoints.
+fn default_sql_compilation_timeout_secs() -> u64 {
+    300
+}
+
 /// Override to inform the compiler where to locate the DBSP crates
 /// it needs for Rust compilation.
 fn default_dbsp_override_path() -> String {
@@ -219,6 +226,18 @@ pub struct CommonConfig {
     /// Port used by the compiler to both bind its HTTP server, and on which it can be reached.
     #[arg(long, long, default_value_t = 8085)]
     pub compiler_port: u16,
+
+    /// Maximum time in seconds the API server waits for the compiler to validate
+    /// or compile a program when serving the `/validate_program` and `/diff`
+    /// endpoints, before returning a timeout error. Prevents these requests from
+    /// hanging indefinitely when the compiler is slow or unresponsive; large
+    /// programs may require a higher value.
+    #[arg(
+        long,
+        default_value_t = default_sql_compilation_timeout_secs(),
+        env = "FELDERA_SQL_COMPILATION_TIMEOUT_SECS"
+    )]
+    pub sql_compilation_timeout_secs: u64,
 
     /// Host (hostname or IP address) at which the runner HTTP server can be reached by the others (e.g., API server).
     #[arg(long, default_value = "127.0.0.1")]
@@ -584,6 +603,7 @@ impl CommonConfig {
             api_port: 8080,
             compiler_host: "127.0.0.1".to_string(),
             compiler_port: 8085,
+            sql_compilation_timeout_secs: 120,
             runner_host: "127.0.0.1".to_string(),
             runner_port: 8089,
             platform_version: "v0".to_string(),
@@ -843,12 +863,26 @@ pub struct ApiServerConfig {
     #[arg(long, default_values_t = default_demos_dir())]
     pub demos_dir: Vec<String>,
 
-    /// Telemetry key.
+    /// PostHog telemetry key.
     ///
-    /// If a telemetry key is set, anonymous usage data will be collected
-    /// and sent to our telemetry service.
+    /// If a key is set, anonymous usage data will be collected
+    /// and sent to our PostHog telemetry service.
     #[arg(long, default_value = "", env = "FELDERA_TELEMETRY")]
     pub telemetry: String,
+
+    /// ConceptualHQ analytics key.
+    ///
+    /// If set, the WebConsole loads ConceptualHQ analytics to identify the
+    /// signed-in user and track sign-in events. Leave empty to disable.
+    #[arg(long, default_value = "", env = "FELDERA_CONCEPTUALHQ")]
+    pub conceptualhq: String,
+
+    /// Product Fruits workspace code.
+    ///
+    /// If set, the WebConsole loads Product Fruits for in-app onboarding
+    /// (tours, hints, surveys). Leave empty to disable.
+    #[arg(long, default_value = "", env = "FELDERA_PRODUCT_FRUITS")]
+    pub product_fruits: String,
 
     /// Support data collection frequency (in seconds).
     ///
@@ -945,6 +979,8 @@ impl ApiServerConfig {
             dev_mode: false,
             allowed_origins: None,
             telemetry: "test".to_string(),
+            conceptualhq: "".to_string(),
+            product_fruits: "".to_string(),
             demos_dir: vec!["demos".to_string()],
             dump_openapi: false,
             issuer_tenant: false,

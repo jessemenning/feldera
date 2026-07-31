@@ -1,6 +1,7 @@
 //! Logic to manage persistent checkpoints for a circuit.
 
 use crate::dynamic::{self, data::DataTyped};
+use crate::storage::dirlock::LockedDirectory;
 use crate::storage::file::SerializerInner;
 use crate::{Error, NumEntries, TypedBox};
 use enum_map::{Enum, EnumMap};
@@ -50,7 +51,7 @@ impl Checkpointer {
     /// Creates a new checkpointer for directory `storage_path`.  Deletes any
     /// unreferenced files in the directory.
     pub fn new(backend: Arc<dyn StorageBackend>) -> Result<Self, Error> {
-        let checkpoint_list = Self::read_checkpoints(&*backend)?;
+        let checkpoint_list = Self::read_checkpoints_at_startup(&*backend)?;
 
         let this = Checkpointer {
             backend,
@@ -120,6 +121,7 @@ impl Checkpointer {
         in_use_paths.insert(format!("{}.mut", STATUS_FILE).into(), SmallVec::new());
         in_use_paths.insert(DATAFUSION_TEMP_DIR.into(), SmallVec::new());
         in_use_paths.insert(ACTIVATION_MARKER_FILE.into(), SmallVec::new());
+        in_use_paths.insert(LockedDirectory::LOCKFILE_NAME.into(), SmallVec::new());
         for (checkpoint_index, cpm) in self.checkpoint_list.iter().enumerate() {
             in_use_paths
                 .entry(cpm.uuid.to_string().into())
@@ -430,14 +432,14 @@ impl Checkpointer {
         Ok(self.checkpoint_list.clone().into())
     }
 
-    /// Reads the list of checkpoints available through `backend`.
-    ///
-    /// A missing `checkpoints.feldera` is treated as "no checkpoints yet"
-    /// only when the storage directory holds no UUID-shaped subdirectories.
-    /// If UUID directories exist, the catalog has been lost while the
-    /// checkpoints themselves are likely still on disk; proceeding would
-    /// let `gc_startup` recursively delete them. Refuse to start instead.
-    pub fn read_checkpoints(
+    /// Reads the list of checkpoints available through `backend`.  This is like
+    /// [Self::read_checkpoints] except that, if `checkpoints.feldera` is
+    /// missing, we check whether the storage directory hold any UUID-shaped
+    /// subdirectories.  If UUID directories do exist, the catalog has been lost
+    /// while the checkpoints themselves are likely still on disk, and
+    /// proceeding would let `gc_startup` recursively delete them, so we refuse
+    /// to start instead.
+    fn read_checkpoints_at_startup(
         backend: &dyn StorageBackend,
     ) -> Result<VecDeque<CheckpointMetadata>, Error> {
         match backend.read_json(&StoragePath::from(CHECKPOINT_FILE_NAME)) {
@@ -462,10 +464,23 @@ impl Checkpointer {
                         path: Some(CHECKPOINT_FILE_NAME.to_string()),
                     }));
                 }
+
                 Ok(VecDeque::new())
             }
             Err(error) => Err(error)?,
         }
+    }
+
+    /// Reads the list of checkpoints available through `backend`.
+    pub fn read_checkpoints(
+        backend: &dyn StorageBackend,
+    ) -> Result<VecDeque<CheckpointMetadata>, Error> {
+        backend
+            .read_json(&StoragePath::from(CHECKPOINT_FILE_NAME))
+            .or_else(|error| match error.kind() {
+                ErrorKind::NotFound => Ok(VecDeque::new()),
+                _ => Err(error.into()),
+            })
     }
 
     fn update_checkpoint_file(&self) -> Result<(), Error> {

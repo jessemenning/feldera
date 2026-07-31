@@ -6,7 +6,7 @@ use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, Responder, Respo
 use bytemuck::NoUninit;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use serde_json::json;
 use std::fmt;
 use std::fmt::Display;
 use utoipa::ToSchema;
@@ -61,6 +61,14 @@ pub enum RuntimeStatus {
 
     /// The pipeline finished checkpointing and pausing.
     Suspended,
+
+    /// A concurrent bootstrap is in progress: the pre-existing views are live
+    /// and serving while new/modified views backfill in the background.
+    ConcurrentBootstrapping,
+
+    /// A concurrent bootstrap is in its cutover window: inputs are briefly
+    /// paused while the backfilled views are synchronized and brought online.
+    Synchronizing,
 }
 
 impl From<RuntimeDesiredStatus> for RuntimeStatus {
@@ -232,6 +240,14 @@ pub struct BootstrapConfig {
     /// Bootstrap the pipeline with output connectors disabled.
     #[serde(default)]
     pub silent_bootstrap: bool,
+    /// Bootstrap new and modified views concurrently, keeping the pre-existing
+    /// views live while the new ones backfill in the background.
+    ///
+    /// Mutually exclusive with `silent_bootstrap`. When set, a circuit that
+    /// cannot be bootstrapped concurrently fails the pipeline instead of
+    /// falling back to a stop-the-world bootstrap.
+    #[serde(default)]
+    pub concurrent_bootstrap: bool,
 }
 
 impl From<BootstrapPolicy> for BootstrapConfig {
@@ -239,6 +255,7 @@ impl From<BootstrapPolicy> for BootstrapConfig {
         Self {
             bootstrap_policy: Some(bootstrap_policy),
             silent_bootstrap: false,
+            concurrent_bootstrap: false,
         }
     }
 }
@@ -251,6 +268,30 @@ impl BootstrapConfig {
         }
     }
 
+    pub fn with_concurrent_bootstrap(self, concurrent_bootstrap: bool) -> Self {
+        Self {
+            concurrent_bootstrap,
+            ..self
+        }
+    }
+
+    /// Validates that the bootstrap options are mutually consistent.
+    ///
+    /// `silent_bootstrap` and `concurrent_bootstrap` cannot both be set:
+    /// silent bootstrap suppresses outputs during a stop-the-world bootstrap,
+    /// whereas concurrent bootstrap keeps the old views (and their outputs)
+    /// live, so the two requests contradict each other.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.silent_bootstrap && self.concurrent_bootstrap {
+            return Err(
+                "`silent_bootstrap` and `concurrent_bootstrap` are mutually exclusive; \
+                 set at most one"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Returns the bootstrap policy for an active deployment.
     pub fn active_bootstrap_policy(&self) -> BootstrapPolicy {
         self.bootstrap_policy
@@ -260,10 +301,10 @@ impl BootstrapConfig {
 
 /// Details about pipeline storage, which are returned as part of the regular runtime status polling
 /// by the runner.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct StorageStatusDetails {
     /// Present checkpoints.
-    pub checkpoints: VecDeque<CheckpointMetadata>,
+    pub checkpoints: Vec<CheckpointMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,4 +388,65 @@ impl ResponseError for ExtendedRuntimeStatusError {
     fn error_response(&self) -> HttpResponse<BoxBody> {
         HttpResponseBuilder::new(self.status_code()).json(self.error.clone())
     }
+}
+
+/// Details about the current runtime status. The fields in this struct should all be **optional**
+/// and set only by a runtime status when they are known. Otherwise, they can just be set `None`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default, Eq, ToSchema)]
+pub struct RuntimeStatusDetails {
+    /// Free form text giving an explanation why it is currently in this runtime status.
+    ///
+    /// Specifically useful for: `Unavailable`, `Initializing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
+    /// Statistics across all connectors.
+    ///
+    /// Specifically useful for: `Paused`, `Running`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_stats: Option<ConnectorStats>,
+
+    /// The diff which is awaiting approval.
+    ///
+    /// Specifically useful for: `AwaitingApproval`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_diff: Option<serde_json::Value>,
+    // Backward compatibility: in older versions, the approval diff was the runtime status details
+    // value itself. To distinguish between the old and new version, clients can check if the
+    // `program_diff` field (one of the fields within the `approval_diff`) is present if they
+    // expect there to be a diff (i.e., when the runtime status is `AwaitingApproval`). As such,
+    // `program_diff` is a reserved field name that cannot be added here in the future.
+}
+
+impl RuntimeStatusDetails {
+    pub fn new_only_reason(reason: &str) -> Self {
+        Self {
+            reason: Some(reason.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// Serializes the runtime status details to JSON. If the serialization errors, an error JSON
+    /// is returned instead. This makes sure this method does not panic unexpectedly and that the
+    /// error bubbles up. The details are only supplementary information, and as such are not
+    /// critical to operation.
+    pub fn serialize_guaranteed(self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|e| {
+            json!({
+                "reason": format!("unable to serialize runtime status details due to: {e}")
+            })
+        })
+    }
+}
+
+/// Statistics across all connectors.
+#[derive(Serialize, Deserialize, ToSchema, Eq, PartialEq, Debug, Clone)]
+pub struct ConnectorStats {
+    /// Total number of errors across all connectors.
+    ///
+    /// - `num_transport_errors` from all input connectors
+    /// - `num_parse_errors` from all input connectors
+    /// - `num_encode_errors` from all output connectors
+    /// - `num_transport_errors` from all output connectors
+    pub num_errors: u64,
 }

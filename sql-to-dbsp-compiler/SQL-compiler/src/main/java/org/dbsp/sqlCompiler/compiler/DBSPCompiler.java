@@ -166,6 +166,10 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
 
     public DBSPCompiler(CompilerOptions options) {
         this.options = options;
+        // The variant representation is process-global; start each
+        // compilation from the environment default (see VariantMode).
+        // TODO: remove when FlatVariant becomes the only representation.
+        VariantMode.reset();
         // Setting these first allows errors to be reported
         this.messages = new CompilerMessages(this);
         this.metadata = new ProgramMetadata();
@@ -881,7 +885,8 @@ public class DBSPCompiler implements IWritesLogs, ICompilerComponent, IErrorRepo
     @Nullable public DBSPCircuit getFinalCircuit(boolean temporary) {
         compileStartTime = System.currentTimeMillis();
         DBSPCircuit circuit = this.runAllCompilerStages();
-        this.postCompilationChecks();
+        if (circuit != null)
+            this.postCompilationChecks();
         Logger.INSTANCE.belowLevel(this, 1)
                 .append("Compilation time ")
                 .appendSupplier(() -> elapsedTimeInMs() + "ms")

@@ -101,6 +101,9 @@ import type {
   GetPipelineTimeSeriesStreamData,
   GetPipelineTimeSeriesStreamErrors,
   GetPipelineTimeSeriesStreamResponses,
+  GetRemoteCheckpointsData,
+  GetRemoteCheckpointsErrors,
+  GetRemoteCheckpointsResponses,
   HttpInputData,
   HttpInputErrors,
   HttpInputResponses,
@@ -164,9 +167,6 @@ import type {
   PostPipelineStopData,
   PostPipelineStopErrors,
   PostPipelineStopResponses,
-  PostPipelineTestingData,
-  PostPipelineTestingErrors,
-  PostPipelineTestingResponses,
   PostUpdateRuntimeData,
   PostUpdateRuntimeErrors,
   PostUpdateRuntimeResponses,
@@ -186,8 +186,9 @@ import type {
 
 export type Options<
   TData extends TDataShape = TDataShape,
-  ThrowOnError extends boolean = boolean
-> = Options2<TData, ThrowOnError> & {
+  ThrowOnError extends boolean = boolean,
+  TResponse = unknown
+> = Options2<TData, ThrowOnError, TResponse> & {
   /**
    * You can provide a client instance returned by `createClient()` instead of
    * individual options. This might be also useful if you want to implement a
@@ -696,6 +697,10 @@ export const getCheckpointStatus = <ThrowOnError extends boolean = true>(
  * Get the checkpoints for a pipeline
  *
  * Retrieve the current checkpoints made by a pipeline.
+ *
+ * **Stability note**: for multihost pipelines, this endpoint returns the
+ * combined checkpoint list from all hosts.  The shape of this response may
+ * change in a future release.
  */
 export const getCheckpoints = <ThrowOnError extends boolean = true>(
   options: Options<GetCheckpointsData, ThrowOnError>
@@ -709,6 +714,28 @@ export const getCheckpoints = <ThrowOnError extends boolean = true>(
     responseStyle: 'data',
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v0/pipelines/{pipeline_name}/checkpoints',
+    ...options
+  })
+
+/**
+ * List checkpoints in remote object storage
+ *
+ * Retrieve the list of checkpoints available in the configured remote object
+ * storage (e.g., S3).  Requires the pipeline to be running with a sync
+ * storage configuration.
+ */
+export const getRemoteCheckpoints = <ThrowOnError extends boolean = true>(
+  options: Options<GetRemoteCheckpointsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    GetRemoteCheckpointsResponses,
+    GetRemoteCheckpointsErrors,
+    ThrowOnError,
+    'data'
+  >({
+    responseStyle: 'data',
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/v0/pipelines/{pipeline_name}/checkpoints/remote',
     ...options
   })
 
@@ -1464,27 +1491,6 @@ export const postPipelineInputConnectorAction = <ThrowOnError extends boolean = 
     responseStyle: 'data',
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/v0/pipelines/{pipeline_name}/tables/{table_name}/connectors/{connector_name}/{action}',
-    ...options
-  })
-
-/**
- * Test Endpoint
- *
- * This endpoint is used as part of the test harness. Only available if the `testing`
- * unstable feature is enabled. Do not use in production.
- */
-export const postPipelineTesting = <ThrowOnError extends boolean = true>(
-  options: Options<PostPipelineTestingData, ThrowOnError>
-) =>
-  (options.client ?? client).post<
-    PostPipelineTestingResponses,
-    PostPipelineTestingErrors,
-    ThrowOnError,
-    'data'
-  >({
-    responseStyle: 'data',
-    security: [{ scheme: 'bearer', type: 'http' }],
-    url: '/v0/pipelines/{pipeline_name}/testing',
     ...options
   })
 

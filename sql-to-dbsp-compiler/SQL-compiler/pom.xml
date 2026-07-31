@@ -17,9 +17,9 @@
         <maven.compiler.target>19</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <calcite.version>1.43.0</calcite.version>
-        <jackson.version>2.22.0</jackson.version>
+        <jackson.version>2.22.1</jackson.version>
         <janino.version>3.1.12</janino.version>
-        <project.version>0.321.0</project.version>
+        <project.version>0.326.0</project.version>
         <avatica.version>1.28.0</avatica.version>
     </properties>
 
@@ -107,7 +107,10 @@
                                     <groupId>org.apache.calcite</groupId>
                                     <artifactId>calcite-core</artifactId>
                                     <type>jar</type>
-                                    <overWrite>true</overWrite>
+                                    <!-- overWrite=false: re-unpack only when the jar is newer,
+                                         so the template keeps a stable mtime and incremental
+                                         builds can skip parser regeneration. -->
+                                    <overWrite>false</overWrite>
                                     <outputDirectory>${project.build.directory}/</outputDirectory>
                                     <includes>**/Parser.jj</includes>
                                 </artifactItem>
@@ -160,8 +163,40 @@
                         </goals>
                         <configuration>
                             <cfgFile>${project.build.directory}/codegen/config.fmpp</cfgFile>
-                            <outputDirectory>target/generated-sources</outputDirectory>
+                            <!-- FMPP rewrites its outputs unconditionally, so it renders
+                                 into a staging directory; the antrun step below copies to
+                                 generated-sources only files whose content changed. -->
+                            <outputDirectory>target/fmpp-generated</outputDirectory>
                             <templateDirectory>${project.build.directory}/codegen/templates</templateDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Publish FMPP outputs, preserving the mtime of unchanged files.
+                 The JavaCC plugin skips grammars that are older than the parser
+                 generated from them, and the Java compiler skips compilation when
+                 no source changed; both checks work only if an unchanged Parser.jj
+                 keeps its mtime across builds. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>sync-fmpp-output</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <copy todir="${project.build.directory}/generated-sources" overwrite="true">
+                                    <fileset dir="${project.build.directory}/fmpp-generated">
+                                        <different targetdir="${project.build.directory}/generated-sources"
+                                                   ignoreFileTimes="true"/>
+                                    </fileset>
+                                </copy>
+                            </target>
                         </configuration>
                     </execution>
                 </executions>
@@ -314,6 +349,18 @@
                 <exclusion>
                     <groupId>com.fasterxml.jackson.core</groupId>
                     <artifactId>jackson-core</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.httpcomponents.client5</groupId>
+                    <artifactId>httpclient5</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.httpcomponents.core5</groupId>
+                    <artifactId>httpcore5-h2</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.httpcomponents.core5</groupId>
+                    <artifactId>httpcore5</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>

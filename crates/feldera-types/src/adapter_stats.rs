@@ -11,7 +11,7 @@ use crate::{
     coordination::Step,
     memory_pressure::MemoryPressure,
     suspend::{PermanentSuspendError, SuspendError},
-    transaction::{CommitProgressSummary, TransactionId},
+    transaction::{CommitProgressSummary, ConcurrentBootstrapPhase, TransactionId},
 };
 
 /// Pipeline state.
@@ -274,6 +274,12 @@ pub struct ExternalOutputEndpointMetrics {
     /// of this endpoint is equal to the output of the circuit after
     /// processing `total_processed_input_records` records.
     ///
+    /// The counter never runs ahead of the endpoint's output. It advances to a
+    /// value `N` only once the endpoint has processed every batch derived from
+    /// the first `N` records received by the pipeline, which means transmitting
+    /// the batch, or discarding it while silent bootstrapping suppresses the
+    /// endpoint's output.
+    ///
     /// In a multihost pipeline, this count reflects only the input records
     /// processed on the same host as the output endpoint, which is not usually
     /// meaningful.
@@ -361,6 +367,12 @@ pub struct ExternalGlobalControllerMetrics {
     /// Entities that initiated the current transaction.
     #[schema(value_type = TransactionInitiators)]
     pub transaction_initiators: ExternalTransactionInitiators,
+    /// Phase of a concurrent bootstrap, or `Inactive` if none is in progress.
+    pub concurrent_bootstrap_phase: ConcurrentBootstrapPhase,
+    /// Progress of the concurrent bootstrap's transaction commit, if a commit is
+    /// in progress: the backfill transaction during `ConcurrentBootstrapping` and
+    /// the synchronization transaction during `Synchronizing`.
+    pub concurrent_bootstrap_progress: Option<CommitProgressSummary>,
     /// Resident set size of the pipeline process, in bytes.
     pub rss_bytes: u64,
     /// Memory pressure.

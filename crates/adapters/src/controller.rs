@@ -36,7 +36,7 @@ use crate::server::{InitializationState, ServerState};
 use crate::transport::Step;
 use crate::transport::clock::now_endpoint_config;
 use crate::transport::{input_transport_config_to_endpoint, output_transport_config_to_endpoint};
-use crate::util::{LongOperationWarning, run_on_thread_pool};
+use crate::util::{LongOperationWarning, missing_pipeline_identity_message, run_on_thread_pool};
 use crate::{
     CircuitCatalog, Encoder, InputConsumer, OutputConsumer, OutputEndpoint, ParseError,
     PipelineError, PipelineState, TransportInputEndpoint,
@@ -53,10 +53,11 @@ use crossbeam::{
     sync::{Parker, ShardedLock, Unparker},
 };
 use datafusion::prelude::*;
-use dbsp::circuit::circuit_builder::BootstrapInfo;
+use dbsp::circuit::circuit_builder::{BootstrapInfo, ConcurrentRestoreOutcome};
 use dbsp::circuit::metrics::{
     COMPACTION_STALL_TIME_NANOSECONDS, DBSP_OPERATOR_COMMIT_LATENCY_MICROSECONDS, DBSP_STEP,
-    DBSP_STEP_LATENCY_MICROSECONDS, FILES_CREATED, FILES_DELETED, TOTAL_LATE_RECORDS,
+    DBSP_STEP_LATENCY_MICROSECONDS, DUPLICATE_EXCHANGE_MESSAGES_RECEIVED,
+    EXCHANGE_MESSAGES_RECEIVED, FILES_CREATED, FILES_DELETED, TOTAL_LATE_RECORDS,
 };
 use dbsp::circuit::tokio::TOKIO;
 use dbsp::circuit::{CheckpointCommitter, CircuitStorageConfig, Mode};
@@ -97,7 +98,9 @@ use feldera_types::runtime_status::BootstrapPolicy;
 use feldera_types::secret_resolver::resolve_secret_references_in_connector_config;
 use feldera_types::suspend::{PermanentSuspendError, SuspendError, TemporarySuspendError};
 use feldera_types::time_series::SampleStatistics;
-use feldera_types::transaction::{StartTransactionResponse, TransactionId};
+use feldera_types::transaction::{
+    ConcurrentBootstrapPhase, StartTransactionResponse, TransactionId,
+};
 use governor::DefaultDirectRateLimiter;
 use governor::Quota;
 use governor::RateLimiter;
@@ -144,7 +147,6 @@ use validate::validate_config;
 mod checkpoint;
 mod error;
 mod journal;
-mod pipeline_diff;
 #[cfg(target_os = "macos")]
 mod samply_spawn;
 mod stats;
@@ -170,12 +172,12 @@ pub use feldera_types::config::{
 };
 use feldera_types::config::{
     DEFAULT_MAX_WORKER_BATCH_SIZE, DevTweaks, FileBackendConfig, FtConfig, FtModel,
-    OutputBufferConfig, StorageBackendConfig, SyncConfig,
+    OutputBufferConfig, PipelineIdentity, StorageBackendConfig, SyncConfig,
 };
 use feldera_types::constants::{STATE_FILE, STEPS_FILE};
 use feldera_types::format::json::{JsonFlavor, JsonParserConfig, JsonUpdateFormat};
+pub use feldera_types::pipeline_diff::compute_pipeline_diff;
 use feldera_types::program_schema::{SqlIdentifier, canonical_identifier};
-pub use pipeline_diff::compute_pipeline_diff;
 pub use stats::{CompletionToken, ControllerStatus, ControllerStatusContext, InputEndpointStatus};
 
 /// Maximal number of concurrent API connections per circuit
@@ -297,7 +299,12 @@ impl ControllerBuilder {
     pub(crate) fn pull_once(&self, _sync: &SyncConfig) -> Result<(), ControllerError> {
         #[cfg(feature = "feldera-enterprise")]
         if let Some(storage) = &self.storage {
-            return sync::pull_once(storage, _sync, None);
+            let pipeline = self.config.pipeline_identity().ok_or_else(|| {
+                ControllerError::checkpoint_fetch_error(missing_pipeline_identity_message(
+                    "cannot pull checkpoint from object store",
+                ))
+            })?;
+            return sync::pull_once(storage, _sync, None, &pipeline);
         };
 
         Ok(())
@@ -310,7 +317,12 @@ impl ControllerBuilder {
     {
         #[cfg(feature = "feldera-enterprise")]
         if let Some(storage) = &self.storage {
-            sync::continuous_pull(storage, _is_activated, None)
+            let pipeline = self.config.pipeline_identity().ok_or_else(|| {
+                ControllerError::checkpoint_fetch_error(missing_pipeline_identity_message(
+                    "cannot pull checkpoint from object store",
+                ))
+            })?;
+            sync::continuous_pull(storage, _is_activated, None, &pipeline)
         } else {
             Err(ControllerError::InvalidStandby(
                 "standby mode requires storage configuration",
@@ -538,12 +550,22 @@ impl OutputEndpointControl {
     ///   checkpoint was taken. Ignored for newly added or modified connectors,
     ///   which should receive a fresh snapshot when `send_snapshot` is set.
     fn new(send_snapshot: bool, snapshot_already_sent: bool) -> Self {
-        // Treat the snapshot as already delivered when no initial snapshot
-        // is desired; also carry the checkpointed value through on restart.
-        let delivered = !send_snapshot || snapshot_already_sent;
         Self {
-            initial_snapshot_sent: AtomicBool::new(delivered),
+            initial_snapshot_sent: AtomicBool::new(!Self::snapshot_pending_at_startup(
+                send_snapshot,
+                snapshot_already_sent,
+            )),
         }
+    }
+
+    /// Whether an endpoint constructed from these settings starts out owing an
+    /// initial snapshot.
+    ///
+    /// Callers that must know this before the endpoint exists (the progress
+    /// counter seeding in `add_output_endpoint`) use this rather than
+    /// duplicating the rule.
+    fn snapshot_pending_at_startup(send_snapshot: bool, snapshot_already_sent: bool) -> bool {
+        send_snapshot && !snapshot_already_sent
     }
 
     /// Returns true if the next `push_output` should emit a snapshot for
@@ -568,6 +590,32 @@ impl OutputEndpointControl {
     }
 }
 
+/// Names the output endpoints whose relation the bootstrap re-emits.
+///
+/// The pipeline hands these endpoints output derived from records it processed
+/// before the restart, so they do not start out caught up with the pipeline's
+/// output. `add_output_endpoint` consults the result to seed
+/// `total_processed_input_records`.
+///
+/// The test is on the relation, not the connector. A connector whose own
+/// definition changed while its relation did not receives no re-emission and
+/// stays caught up with every input processed so far, which makes this set
+/// narrower than `ControllerInner::modified_output_endpoints`.
+fn bootstrapped_output_endpoints(
+    outputs: &BTreeMap<Cow<'static, str>, OutputEndpointConfig>,
+    pipeline_diff: Option<&PipelineDiff>,
+) -> HashSet<String> {
+    let Some(diff) = pipeline_diff else {
+        return HashSet::new();
+    };
+
+    outputs
+        .iter()
+        .filter(|(_, output_config)| diff.is_affected_relation(&output_config.stream))
+        .map(|(endpoint_name, _)| endpoint_name.to_string())
+        .collect()
+}
+
 impl Command {
     pub fn flush(self) {
         match self {
@@ -584,6 +632,33 @@ impl Command {
             Command::StartCompaction(callback) => callback(Err(ControllerError::ControllerExit)),
         }
     }
+}
+
+/// Returns a command's reply, or [ControllerError::ControllerExit] if the reply
+/// channel closed without one.
+///
+/// [Command::flush] answers every command the circuit thread can still see, but
+/// it cannot answer one it never sees:
+///
+/// - A command that arrives after `flush_commands_and_requests` has run sits in
+///   the channel until [CircuitThread] is dropped, which drops the command and
+///   with it the callback holding the reply channel.
+///
+/// - A circuit thread that unwinds on a panic drops its queued commands and
+///   pending checkpoint requests without flushing them at all.
+///
+/// Either way the caller is left holding a channel that will never produce an
+/// answer, so it must report that the controller is gone. Treating it as
+/// unreachable panics the waiter instead, and for `/suspend` that panic is
+/// swallowed by the task it runs in, leaving the pipeline with no outcome
+/// recorded at all.
+fn reply_or_controller_exit<T, E>(
+    reply: Result<Result<T, E>, oneshot::error::RecvError>,
+) -> Result<T, E>
+where
+    E: From<ControllerError>,
+{
+    reply.unwrap_or_else(|_| Err(E::from(ControllerError::ControllerExit)))
 }
 
 impl Controller {
@@ -1086,7 +1161,7 @@ impl Controller {
                 error!("checkpoint result could not be sent");
             }
         }));
-        receiver.await.unwrap()
+        reply_or_controller_exit(receiver.await)
     }
 
     pub async fn async_graph_profile(&self) -> Result<GraphProfile, ControllerError> {
@@ -1096,7 +1171,7 @@ impl Controller {
                 error!("`/dump_profile` result could not be sent");
             }
         }));
-        receiver.await.unwrap()
+        reply_or_controller_exit(receiver.await)
     }
 
     pub async fn async_json_profile(&self) -> Result<DbspProfile, ControllerError> {
@@ -1106,7 +1181,7 @@ impl Controller {
                 error!("`/dump_json_profile` result could not be sent");
             }
         }));
-        receiver.await.unwrap()
+        reply_or_controller_exit(receiver.await)
     }
 
     pub async fn async_samply_profile(
@@ -1286,7 +1361,7 @@ impl Controller {
                 }
             }),
         );
-        receiver.await.unwrap()
+        reply_or_controller_exit(receiver.await)
     }
 
     /// Checkpoints the pipeline.
@@ -1294,8 +1369,10 @@ impl Controller {
     /// This is a blocking wrapper around [Self::start_checkpoint].
     pub fn checkpoint(&self) -> Result<Checkpoint, Arc<ControllerError>> {
         let (sender, receiver) = oneshot::channel();
-        self.start_checkpoint(Box::new(move |result| sender.send(result).unwrap()));
-        receiver.blocking_recv().unwrap()
+        self.start_checkpoint(Box::new(move |result| {
+            let _ = sender.send(result);
+        }));
+        reply_or_controller_exit(receiver.blocking_recv())
     }
 
     /// Triggers a suspend operation. `cb` will be called when it completes.
@@ -1311,8 +1388,10 @@ impl Controller {
     /// This is a blocking wrapper around [Self::start_suspend].
     pub fn suspend(&self) -> Result<(), Arc<ControllerError>> {
         let (sender, receiver) = oneshot::channel();
-        self.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
-        receiver.blocking_recv().unwrap()
+        self.start_suspend(Box::new(move |result| {
+            let _ = sender.send(result);
+        }));
+        reply_or_controller_exit(receiver.blocking_recv())
     }
 
     pub async fn async_suspend(&self) -> Result<(), Arc<ControllerError>> {
@@ -1322,7 +1401,7 @@ impl Controller {
                 error!("suspend result could not be sent");
             }
         }));
-        receiver.await.unwrap()
+        reply_or_controller_exit(receiver.await)
     }
 
     /// Returns whether this pipeline supports suspend-and-resume.  The result
@@ -2024,6 +2103,19 @@ impl Controller {
                 }
             },
         );
+
+        metrics.counter(
+            "multihost_exchange_messages_received_total",
+            "Number of exchange messages received from other hosts.",
+            labels,
+            &EXCHANGE_MESSAGES_RECEIVED,
+        );
+        metrics.counter(
+            "multihost_duplicate_exchange_messages_received_total",
+            "The subset of `multihost_exchange_messages_received_total` that were duplicates.  Duplicates occur when a connection between hosts drops and is reestablished.  In a healthy pipeline, this value should be zero or a tiny fraction of `multihost_exchange_messages_received_total`.",
+            labels,
+            &DUPLICATE_EXCHANGE_MESSAGES_RECEIVED,
+        );
     }
 
     /// Execute a SQL query over materialized tables and views;
@@ -2082,7 +2174,7 @@ impl Controller {
                     error!("`/rebalance` result could not be sent");
                 }
             })));
-        receiver.await.unwrap()?;
+        reply_or_controller_exit(receiver.await)?;
         self.inner.request_step();
         Ok(())
     }
@@ -2096,7 +2188,7 @@ impl Controller {
                 }
             })));
         self.inner.circuit_thread_unparker.unpark();
-        receiver.await.unwrap()?;
+        reply_or_controller_exit(receiver.await)?;
         Ok(())
     }
 
@@ -2368,11 +2460,19 @@ struct CheckpointSyncThread {
     storage: Arc<dyn StorageBackend>,
     config: SyncConfig,
     host_info: Option<HostInfo>,
+    /// Identity of this pipeline, used to enforce S3 bucket ownership on push.
+    pipeline: PipelineIdentity,
 }
 
 impl CheckpointSyncThread {
     fn run(self) -> Result<(), Arc<ControllerError>> {
-        match SYNCHRONIZER.push(self.uuid, self.storage, self.config, self.host_info) {
+        match SYNCHRONIZER.push(
+            self.uuid,
+            self.storage,
+            self.config,
+            self.host_info,
+            self.pipeline,
+        ) {
             Err(err) => {
                 CHECKPOINT_SYNC_PUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
                 Err(Arc::new(ControllerError::checkpoint_push_error(
@@ -2419,6 +2519,17 @@ impl RunningCheckpointSync {
     }
 
     fn start(circuit: &mut CircuitThread, uuid: uuid::Uuid) -> Result<Self, Arc<ControllerError>> {
+        let pipeline = circuit
+            .controller
+            .status
+            .pipeline_config
+            .pipeline_identity()
+            .ok_or_else(|| {
+                Arc::new(ControllerError::checkpoint_push_error(
+                    missing_pipeline_identity_message("cannot push checkpoints to object store"),
+                ))
+            })?;
+
         let Some((_, options)) = circuit.controller.status.pipeline_config.storage() else {
             return Err(Arc::new(ControllerError::storage_error(
                 "cannot sync checkpoints when storage is disabled",
@@ -2459,6 +2570,7 @@ impl RunningCheckpointSync {
             ))?,
             config: sync.to_owned(),
             host_info: circuit.controller.layout.host_info(),
+            pipeline,
         };
         let unparker = circuit.parker.unparker().clone();
         let join_handle = std::thread::Builder::new()
@@ -2583,6 +2695,10 @@ struct CircuitThread {
 
     commit_updates: Option<CommitUpdates>,
 
+    /// Throttles concurrent-bootstrap progress logging/metric updates, reusing
+    /// the same cadence as regular transaction-commit progress.
+    concurrent_bootstrap_updates: Option<CommitUpdates>,
+
     /// Set to true on startup if the circuit requires bootstrapping.
     /// Cleared when the circuit completes bootstrapping.
     bootstrapping: bool,
@@ -2600,6 +2716,69 @@ struct CircuitThread {
     /// cursor (it must not advance on steps that only commit the open replay
     /// transaction).
     replay_consumed: bool,
+
+    /// Phase of an in-progress concurrent bootstrap.
+    ///
+    /// `Inactive` for a normal run or a classic stop-the-world bootstrap;
+    /// `Backfill` while new/modified views replay in the background and the
+    /// pre-existing views stay live; `Synchronize` during the brief
+    /// stop-the-world cutover window.
+    concurrent_phase: ConcurrentPhase,
+
+    /// Set when journal replay has just finished but the ad-hoc snapshot has not
+    /// yet been refreshed with the replayed state, so `restoring` must stay set
+    /// (the pipeline keeps reporting `Replaying` and rejecting ad-hoc queries)
+    /// until a step runs [Self::update_snapshot]. The step that exhausts the
+    /// journal is usually mid-transaction, so it cannot refresh the snapshot
+    /// itself; this defers clearing `restoring` to the next transaction-boundary
+    /// step. Analogous to the concurrent-bootstrap `Finalizing` phase.
+    replay_finalize: bool,
+}
+
+/// Phase of a concurrent bootstrap driven by [`CircuitThread`].
+///
+/// The engine's own `ConcurrentBootstrapPhase` is private, so the controller
+/// tracks its phase separately and drives the transitions off the boolean
+/// returned by [`DBSPHandle::step_bootstrap_circuit`].
+///
+/// ```text
+///               step until bootstrap                         step until sync
+///                transaction commits                         transaction commits
+///                    ┌────┐                                     ┌────┐
+//                     │    ▼                    primary circuit  │    ▼
+/// ┌────────┐       ┌─┴──────┐     ┌────────────┐  is idle     ┌─┴─────────┐     ┌───────────┐
+/// │Inactive├──────►│Backfill├────►│AwaitingSync├─────────────►│Synchronize├────►│Finalizing │
+/// └────────┘       └────────┘     └────────────┘              └───────────┘     └─────┬─────┘
+///     ▲                                                                               │
+///     └───────────────────────────────────────────────────────────────────────────────┘
+///                  extra transaction output full contents of modified views
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConcurrentPhase {
+    /// No concurrent bootstrap in progress.
+    Inactive,
+    /// New/modified views backfill in the background; pre-existing views live.
+    Backfill,
+    /// Backfill is done and inputs are paused; waiting for the primary circuit
+    /// to finish any in-flight transaction before starting synchronization
+    /// (`sync_concurrent_bootstrap` requires no open main transaction).
+    AwaitingSync,
+    /// Cutover window: inputs paused, draining recorded deltas into the new
+    /// views before the state transfer.
+    Synchronize,
+    /// State has been transferred but the pipeline is not yet reported as
+    /// `Running`: a post-cutover transaction must commit so the new views'
+    /// freshly swapped-in integrals are read into the ad-hoc snapshot. The new
+    /// views were excluded from the live schedule during the backfill, so until
+    /// then the snapshot still serves the empty pre-cutover view; reporting
+    /// `Running` before the transaction commits would let ad-hoc queries
+    /// observe the stale snapshot. The snapshot is refreshed only at a
+    /// transaction boundary (`update_snapshot` runs when `transaction_state`
+    /// returns to `None`), and that transaction can span several steps (e.g.
+    /// rebalancing), so this phase persists -- forcing steps via
+    /// `concurrent_active`, inputs paused -- until the commit. The analogue of
+    /// the `bootstrap_in_progress` off-by-one for a stop-the-world bootstrap.
+    Finalizing,
 }
 
 struct CommitUpdates {
@@ -2721,7 +2900,7 @@ impl CircuitThread {
         let ft_model = controller_init.pipeline_config.global.fault_tolerance.model;
         let ControllerInit {
             pipeline_config,
-            circuit_config,
+            mut circuit_config,
             processed_records,
             transaction_number,
             initial_start_time,
@@ -2738,6 +2917,22 @@ impl CircuitThread {
             .storage
             .as_ref()
             .map(|storage: &CircuitStorageConfig| storage.backend.clone());
+
+        // Concurrent bootstrap is opt-in via the startup `BootstrapConfig`.
+        // When requested, suppress the automatic stop-the-world restore so the
+        // controller can drive `start_concurrent_bootstrap` instead; the base
+        // checkpoint is the same one the automatic restore would have used.
+        let concurrent_bootstrap = state
+            .as_ref()
+            .map(|state| state.bootstrap_config().concurrent_bootstrap)
+            .unwrap_or(false);
+        let concurrent_base = circuit_config
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.init_checkpoint);
+        if concurrent_bootstrap && let Some(storage) = circuit_config.storage.as_mut() {
+            storage.defer_restore = true;
+        }
 
         let (mut circuit, catalog) = circuit_factory(circuit_config)?;
 
@@ -2803,6 +2998,52 @@ impl CircuitThread {
             }
         }
 
+        // Concurrent bootstrap: the automatic stop-the-world restore was
+        // suppressed (`defer_restore`), so we drive the restore ourselves. This
+        // also performs an ordinary restore when the checkpoint matches the
+        // circuit (`UpToDate`). A circuit that cannot be bootstrapped
+        // concurrently fails the pipeline (no fallback): the user restarts with
+        // `concurrent_bootstrap=false` for a stop-the-world bootstrap.
+        let mut concurrent_phase = ConcurrentPhase::Inactive;
+        if concurrent_bootstrap && let Some(base) = concurrent_base {
+            match circuit.start_concurrent_bootstrap(base.to_string().into())? {
+                ConcurrentRestoreOutcome::UpToDate => {}
+                ConcurrentRestoreOutcome::FellBack { reason, .. } => {
+                    return Err(ControllerError::BootstrapNotAllowed {
+                        error: format!(
+                            "the pipeline cannot be bootstrapped concurrently: {reason}. \
+                                 Restart with `concurrent_bootstrap=false` for a stop-the-world \
+                                 bootstrap."
+                        ),
+                    });
+                }
+                ConcurrentRestoreOutcome::Concurrent(info) => {
+                    // The non-materialized-table check (above) was skipped
+                    // because the deferred restore left `bootstrap_info()`
+                    // empty; run it now against the concurrent bootstrap's
+                    // own `BootstrapInfo`.
+                    if let Some(diff) = &pipeline_diff {
+                        let non_materialized_tables =
+                            non_materialized_replay_sources(&info, &pipeline_config, diff);
+                        if !non_materialized_tables.is_empty() {
+                            return Err(ControllerError::BootstrapNotAllowed {
+                                error: format!(
+                                    "- The following tables are not materialized, but some of the views that depend on these tables require bootstrapping: {}. We recommend materializing all tables in the program to avoid such errors in the future",
+                                    non_materialized_tables
+                                        .iter()
+                                        .map(|t| format!("'{t}'"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            });
+                        }
+                    }
+                    info!("Bootstrapping new and modified views concurrently.");
+                    concurrent_phase = ConcurrentPhase::Backfill;
+                }
+            }
+        }
+
         // Seek each input endpoint to its initial offset.
         //
         // If we're not restoring from a checkpoint, `input_metadata` will be empty so
@@ -2854,6 +3095,10 @@ impl CircuitThread {
         let (step_sender, step_receiver) =
             tokio::sync::watch::channel(StepStatus::new(step, StepAction::Idle, None));
         let (checkpoint_sender, checkpoint_receiver) = tokio::sync::watch::channel(None);
+
+        let bootstrapped_output_endpoints =
+            bootstrapped_output_endpoints(&pipeline_config.outputs, pipeline_diff.as_ref());
+
         let (parker, backpressure_thread, command_receiver, controller) = ControllerInner::new(
             pipeline_config,
             circuit.runtime(),
@@ -2866,6 +3111,7 @@ impl CircuitThread {
             &resume_info,
             &output_statistics,
             modified_output_endpoints,
+            bootstrapped_output_endpoints,
             step_receiver,
             checkpoint_receiver,
             incarnation_uuid,
@@ -2912,8 +3158,9 @@ impl CircuitThread {
                 // The above code ensures that replay and bootstrapping cannot happen at the same time.
                 assert!(!(ft.is_replaying() && bootstrapping));
 
-                // Disable journaling while we're bootstrapping the circuit.
-                if bootstrapping {
+                // Disable journaling while we're bootstrapping the circuit
+                // (stop-the-world or concurrent).
+                if bootstrapping || concurrent_phase == ConcurrentPhase::Backfill {
                     ft.disable();
                 }
 
@@ -2944,9 +3191,12 @@ impl CircuitThread {
             checkpoint_sender,
             input_metadata: input_metadata.unwrap_or_default(),
             commit_updates: None,
+            concurrent_bootstrap_updates: None,
             bootstrapping,
             pending_step_metadata: None,
             replay_consumed: false,
+            concurrent_phase,
+            replay_finalize: false,
         })
     }
 
@@ -2984,6 +3234,14 @@ impl CircuitThread {
 
         self.finish_replaying();
 
+        // If we came up into a concurrent backfill, reflect it in the status;
+        // the trigger keeps the loop stepping while it is active.
+        if self.concurrent_phase == ConcurrentPhase::Backfill {
+            self.controller
+                .status
+                .set_concurrent_bootstrap_phase(ConcurrentBootstrapPhase::ConcurrentBootstrapping);
+        }
+
         // Run a single step, which is probably empty, before reporting that
         // initialization is complete.  This is needed to make ad-hoc snapshots
         // up-to-date before making them available to the user.
@@ -3013,6 +3271,11 @@ impl CircuitThread {
             // checkpoint request can then terminate the pipeline, so check for
             // that right afterward.
             self.run_commands();
+            // Defer all checkpoints while a concurrent bootstrap is active: the
+            // engine blocks checkpoints until cutover. Scheduled checkpoints are
+            // already withheld by the trigger; this also defers command-driven
+            // ones (manual checkpoint / suspend), which are queued and processed
+            // after cutover.
             if self.checkpoint_requested() {
                 self.checkpoint();
             }
@@ -3063,12 +3326,18 @@ impl CircuitThread {
             match trigger.trigger(
                 self.last_checkpoint(),
                 self.last_checkpoint_sync(),
-                self.replaying(),
+                // `replay_finalize` keeps forcing steps after the journal is
+                // exhausted until a step refreshes the ad-hoc snapshot with the
+                // replayed state (see `step` and `clear_restoring`).
+                self.replaying() || self.replay_finalize,
                 // `status.bootstrap_in_progress` is cleared one transaction after circuit bootstrapping is complete,
                 // which is required to initialize the output snapshots.
                 // We want the trigger to trigger that extra transaction; therefore we pass `status.bootstrap_in_progress`
                 // rather than `self.bootstrapping` here.
                 self.controller.status.bootstrap_in_progress(),
+                // `Finalizing` keeps `concurrent_active` true for the analogous
+                // post-cutover snapshot-refresh step.
+                self.concurrent_phase != ConcurrentPhase::Inactive,
                 self.checkpoint_requested(),
                 self.sync_checkpoint_requested(),
                 self.next_step_inputs(coordination_request.as_ref()),
@@ -3076,8 +3345,16 @@ impl CircuitThread {
                 self.step,
             ) {
                 Action::Step => {
-                    if !self.step()? {
-                        break Ok(());
+                    // During the synchronize (cutover) window the main circuit
+                    // must not step: inputs are paused and the engine rejects
+                    // main transactions. Drive only the bootstrap circuit.
+                    if self.concurrent_phase == ConcurrentPhase::Synchronize {
+                        self.pump_concurrent_bootstrap()?;
+                    } else {
+                        if !self.step()? {
+                            break Ok(());
+                        }
+                        self.pump_concurrent_bootstrap()?;
                     }
                 }
                 Action::Checkpoint => self.checkpoint_requests.push(CheckpointRequest::Scheduled),
@@ -3090,6 +3367,189 @@ impl CircuitThread {
         }
     }
 
+    /// Advances an in-progress concurrent bootstrap by one increment.
+    ///
+    /// In `Backfill` this pumps one bounded chunk of the background replay while
+    /// the pre-existing views stay live, and -- once the backfill commits and
+    /// the main circuit is between transactions -- enters the synchronize
+    /// (cutover) window. In `Synchronize` it drains the recorded deltas into the
+    /// new views and cuts over. Any engine
+    /// error is fatal: the bootstrap circuit is torn down and the error is
+    /// propagated to fail the pipeline (there is no fallback).
+    fn pump_concurrent_bootstrap(&mut self) -> Result<(), ControllerError> {
+        let result = self.pump_concurrent_bootstrap_inner();
+        if result.is_err() {
+            // Fatal failure: tear down the bootstrap circuit best-effort (it
+            // sets the sticky `concurrent_bootstrap_aborted` flag that keeps
+            // checkpoints blocked) and clear our state before failing.
+            let _ = self.circuit.destroy_bootstrap_circuit();
+            self.concurrent_phase = ConcurrentPhase::Inactive;
+            self.controller
+                .status
+                .set_concurrent_bootstrap_phase(ConcurrentBootstrapPhase::Inactive);
+            self.clear_concurrent_bootstrap_progress();
+        }
+        result
+    }
+
+    fn pump_concurrent_bootstrap_inner(&mut self) -> Result<(), ControllerError> {
+        match self.concurrent_phase {
+            ConcurrentPhase::Inactive => {}
+            ConcurrentPhase::Backfill => {
+                self.report_concurrent_bootstrap_progress();
+                // Advance the background backfill on every step, interleaved
+                // with the primary circuit. The two circuits are independent
+                // (`step_bootstrap_circuit` does not depend on the main
+                // transaction state), so the backfill cannot be starved by a
+                // long-running primary transaction.
+                if self.circuit.step_bootstrap_circuit()? {
+                    // Backfill committed. Pause inputs and enter the cutover
+                    // window. The synchronization transaction itself
+                    // (`sync_concurrent_bootstrap`) requires no open main
+                    // transaction, so it is started from `AwaitingSync` once the
+                    // primary circuit has drained any in-flight transaction.
+                    self.controller
+                        .status
+                        .set_concurrent_bootstrap_phase(ConcurrentBootstrapPhase::Synchronizing);
+                    self.controller.unpark_backpressure();
+                    self.concurrent_phase = ConcurrentPhase::AwaitingSync;
+                    info!(
+                        "Concurrent bootstrap: backfill committed; pausing inputs and \
+                         awaiting an idle primary circuit before cutover (AwaitingSync)."
+                    );
+                }
+            }
+            ConcurrentPhase::AwaitingSync => {
+                self.report_concurrent_bootstrap_progress();
+                // Inputs are paused; the `step()` call that precedes this pump
+                // in the run loop drives the primary circuit to finish its
+                // in-flight transaction. Once it is idle, start the
+                // synchronization transaction.
+                if self.controller.get_transaction_state() == TransactionState::None {
+                    self.circuit.sync_concurrent_bootstrap()?;
+                    self.concurrent_phase = ConcurrentPhase::Synchronize;
+                    info!(
+                        "Concurrent bootstrap: primary circuit idle; synchronizing buffered \
+                         updates into the new views (Synchronize)."
+                    );
+                }
+            }
+            ConcurrentPhase::Synchronize => {
+                self.report_concurrent_bootstrap_progress();
+                // Drain the recorded deltas into the new views one chunk per
+                // invocation (not a tight loop), so the circuit thread returns
+                // to its command loop between chunks and keeps servicing
+                // requests such as profiling. The trigger keeps forcing steps
+                // while the concurrent bootstrap is active, so we are called
+                // again until the synchronization transaction commits.
+                if self.circuit.step_bootstrap_circuit()? {
+                    // Synchronization complete: state has been transferred to
+                    // the live circuit. Don't report `Running` yet: the new
+                    // views were excluded from the live schedule during the
+                    // backfill, so their queryable integrals are not yet in the
+                    // ad-hoc snapshot. Enter `Finalizing`, which keeps the
+                    // status non-`Running` and inputs paused
+                    // (`concurrent_synchronize_in_progress` stays set) for one
+                    // more step that refreshes the snapshot.
+                    self.circuit.complete_concurrent_bootstrap()?;
+                    self.concurrent_phase = ConcurrentPhase::Finalizing;
+                    info!(
+                        "Concurrent bootstrap: synchronization committed and cut over to the \
+                         live circuit; finalizing and refreshing query snapshots (Finalizing)."
+                    );
+                }
+            }
+            ConcurrentPhase::Finalizing => {
+                // Wait for the post-cutover transaction to COMMIT before
+                // reporting `Running`. The ad-hoc snapshot is refreshed by
+                // `update_snapshot`, which runs only at a transaction boundary
+                // (`transaction_state == None` in `step()`), not on every step;
+                // and a transaction can span several steps after the cutover
+                // (e.g. rebalancing the new views into the live circuit).
+                // `concurrent_active` keeps the trigger forcing steps and inputs
+                // stay paused until the transaction commits. Only then has the
+                // committing step run `update_snapshot` -- so the swapped-in
+                // integrals are now in the snapshot -- and `Running` is safe to
+                // report.
+                if self.controller.get_transaction_state() == TransactionState::None {
+                    self.concurrent_phase = ConcurrentPhase::Inactive;
+                    self.controller
+                        .status
+                        .set_concurrent_bootstrap_phase(ConcurrentBootstrapPhase::Inactive);
+                    self.controller.unpark_backpressure();
+                    self.clear_concurrent_bootstrap_progress();
+                    info!("Concurrent bootstrap complete; new views are live.");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Logs concurrent-bootstrap progress (throttled to every
+    /// [`COMMIT_DISPLAY_INTERVAL`]) and refreshes the
+    /// `concurrent_bootstrap_progress` metric (at the faster status cadence),
+    /// mirroring the regular transaction-commit progress reporting. The metric
+    /// holds the bootstrap circuit's commit progress while it is committing (the
+    /// backfill transaction, then the synchronization transaction) and is `None`
+    /// otherwise. The phase is reported separately, set atomically at each phase
+    /// transition (see [`GlobalControllerMetrics::concurrent_bootstrap_phase`]).
+    fn report_concurrent_bootstrap_progress(&mut self) {
+        let (update, display) = {
+            let updates = self.concurrent_bootstrap_updates.get_or_insert_default();
+            if updates.should_update_status() {
+                (true, updates.should_display_status())
+            } else {
+                (false, false)
+            }
+        };
+        if !update {
+            return;
+        }
+
+        // The bootstrap circuit is gone once we cut over, so its commit progress
+        // is only meaningful before `Finalizing`.
+        let commit_progress = match self.circuit.bootstrap_commit_progress() {
+            Ok(progress) => {
+                let summary = progress.summary();
+                // Report a commit summary only while a commit is actually in
+                // progress (the bootstrap transaction is otherwise still
+                // replaying its inputs).
+                if summary.completed + summary.in_progress + summary.remaining > 0 {
+                    Some(summary)
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                error!("Concurrent bootstrap: error retrieving commit progress ({e})");
+                None
+            }
+        };
+
+        if display {
+            let phase = self.controller.status.concurrent_bootstrap_phase();
+            match &commit_progress {
+                Some(progress) => info!(
+                    "Concurrent bootstrap in progress ({phase}: committing bootstrap transaction ({progress}))"
+                ),
+                None => info!("Concurrent bootstrap in progress ({phase})"),
+            }
+        }
+        self.controller
+            .status
+            .global_metrics
+            .set_concurrent_bootstrap_progress(commit_progress);
+    }
+
+    /// Resets concurrent-bootstrap progress logging state and clears the metric.
+    fn clear_concurrent_bootstrap_progress(&mut self) {
+        self.concurrent_bootstrap_updates = None;
+        self.controller
+            .status
+            .global_metrics
+            .set_concurrent_bootstrap_progress(None);
+    }
+
     fn finish(mut self) -> Result<(), ControllerError> {
         self.controller.status.set_state(PipelineState::Terminated);
         self.flush_commands_and_requests();
@@ -3098,10 +3558,24 @@ impl CircuitThread {
             .map_err(|_| ControllerError::dbsp_panic())
     }
 
+    /// Clears the `restoring` flag (so the pipeline reports `Running` and admits
+    /// ad-hoc queries) and starts the backpressure thread so input can flow.
+    /// Both operations are idempotent (`backpressure_thread.start` no-ops after
+    /// the first call), so this is safe to call every step.
+    fn clear_restoring(&mut self) {
+        self.controller.restoring.store(false, Ordering::Release);
+        self.backpressure_thread.start();
+    }
+
     fn finish_replaying(&mut self) {
-        if !self.replaying() {
-            self.controller.restoring.store(false, Ordering::Release);
-            self.backpressure_thread.start();
+        // Clear `restoring` (and release backpressure) once there is nothing
+        // left to replay, EXCEPT while `replay_finalize` is pending: after an
+        // actual replay we keep `restoring` set until a step refreshes the
+        // ad-hoc snapshot with the replayed state (see `step`); otherwise the
+        // pipeline would report `Running` and admit ad-hoc queries against the
+        // stale pre-replay snapshot.
+        if !self.replaying() && !self.replay_finalize {
+            self.clear_restoring();
         }
     }
 
@@ -3166,6 +3640,16 @@ impl CircuitThread {
                     .with_category("Step")
                     .with_tooltip(|| format!("update ad-hoc tables after step {}", self.step))
                     .in_scope(|| self.update_snapshot());
+
+                // If we just finished replaying, this transaction-boundary step
+                // has now refreshed the ad-hoc snapshot with the replayed state,
+                // so it is finally safe to clear `restoring` and admit ad-hoc
+                // queries. Deferred from the step that exhausted the journal,
+                // which is typically mid-transaction and skips `update_snapshot`.
+                if self.replay_finalize {
+                    self.replay_finalize = false;
+                    self.clear_restoring();
+                }
             }
 
             // If bootstrapping has completed, clear self.bootstrapping, but don't update the status flag
@@ -3207,7 +3691,15 @@ impl CircuitThread {
         self.push_output(processed_records);
         let replay_consumed = self.replay_consumed;
         if let Some(ft) = self.ft.as_mut() {
+            let was_replaying = ft.is_replaying();
             ft.next_step(replay_consumed)?;
+            // Replay just finished this step. Keep `restoring` set until a
+            // subsequent transaction-boundary step refreshes the ad-hoc
+            // snapshot with the replayed state (this step is typically
+            // mid-transaction and skipped `update_snapshot`).
+            if was_replaying && !ft.is_replaying() {
+                self.replay_finalize = true;
+            }
             self.finish_replaying();
         }
         self.controller.unpark_backpressure();
@@ -3565,17 +4057,15 @@ impl CircuitThread {
                 CheckpointRequest::Scheduled => (),
                 CheckpointRequest::CheckpointCommand(callback) => callback(result.clone()),
                 CheckpointRequest::SuspendCommand(callback) => {
-                    // Terminate the circuit only on a *successful* suspend. A
-                    // failed suspend leaves the circuit intact and running; the
-                    // `/suspend` handler reports it as `PipelinePhase::Failed`
-                    // and stops the pipeline. Not marking `Terminated` here is
-                    // what keeps `/status` from masking the failure as a clean
-                    // `Suspended` during teardown: `get_status` reads the live
-                    // controller state before the phase, so a terminated
-                    // controller with desired status `Suspended` always reads
-                    // back as `Suspended` (see `terminated_status`).
+                    // Terminate the circuit only on a *successful* suspend, and
+                    // record that the suspend is the reason: that is what lets
+                    // `/status` tell a completed suspend apart from a pipeline
+                    // that died (see `terminated_status`). A failed suspend
+                    // leaves the circuit intact and running; the `/suspend`
+                    // handler reports it as `PipelinePhase::Failed` and stops the
+                    // pipeline.
                     match &result {
-                        Ok(_) => self.controller.status.set_state(PipelineState::Terminated),
+                        Ok(_) => self.controller.status.set_suspended(),
                         Err(e) => self.controller.error(e.clone(), None),
                     }
                     callback(result.clone().map(|_| ()))
@@ -3686,7 +4176,14 @@ impl CircuitThread {
         self.replay_consumed = false;
         // No ingestion during bootstrap, while committing a transaction, or at a
         // replay transaction boundary.
+        // No ingestion during a stop-the-world bootstrap, a committing
+        // transaction, or the concurrent-bootstrap synchronize/finalize window
+        // (inputs flow normally during a concurrent backfill). The finalize
+        // step -- which refreshes the ad-hoc snapshot after cutover -- keeps the
+        // phase at `Synchronizing` so it runs empty here.
         if self.controller.status.bootstrap_in_progress()
+            || self.controller.status.concurrent_bootstrap_phase()
+                == ConcurrentBootstrapPhase::Synchronizing
             || self.controller.transaction_commit_in_progress()
             || self.replay_at_boundary()
         {
@@ -4732,15 +5229,18 @@ impl StepTrigger {
         last_sync: LastCheckpoint,
         replaying: bool,
         bootstrapping: bool,
+        concurrent_active: bool,
         checkpoint_requested: bool,
         sync_checkpoint_requested: bool,
         step_inputs: StepInputs,
         coordination_request: Option<StepRequest>,
         step: Step,
     ) -> Action {
-        // Time of the next checkpoint.
+        // Time of the next checkpoint. Suppressed while a concurrent bootstrap
+        // is active: the engine blocks checkpoints until cutover.
         let next_checkpoint = if let Some(checkpoint_interval) = self.checkpoint_interval
             && coordination_request.is_none()
+            && !concurrent_active
         {
             Some(last_checkpoint.timestamp + checkpoint_interval)
         } else {
@@ -4773,7 +5273,11 @@ impl StepTrigger {
                 }
                 _ => Some(Action::Park(None)),
             }
-        } else if replaying || self.controller.transaction_commit_requested() || bootstrapping {
+        } else if replaying
+            || self.controller.transaction_commit_requested()
+            || bootstrapping
+            || concurrent_active
+        {
             Some(Action::Step)
         } else if timer_expired(next_checkpoint, now) && !checkpoint_requested {
             Some(Action::Checkpoint)
@@ -4990,7 +5494,10 @@ impl ControllerInit {
 
         let storage = storage.with_init_checkpoint(circuit.map(|circuit| circuit.uuid));
 
-        let pipeline_diff = compute_pipeline_diff(&checkpoint_config, &config)?;
+        let pipeline_diff = compute_pipeline_diff(
+            &checkpoint_config.program_info_subset(),
+            &config.program_info_subset(),
+        )?;
 
         // Record which surviving output connectors changed across the
         // restart. The cumulative `transmitted_records` counter is preserved
@@ -5045,6 +5552,14 @@ impl ControllerInit {
             )
         }
 
+        if config.global.clock_timezone_offset != checkpoint_config.global.clock_timezone_offset {
+            warn!(
+                "`clock_timezone_offset` cannot be changed when resuming from a checkpoint; \
+                 keeping the checkpointed value {:?} and ignoring the new value {:?}",
+                checkpoint_config.global.clock_timezone_offset, config.global.clock_timezone_offset,
+            );
+        }
+
         // Merge `config` (the configuration provided by the pipeline manager)
         // with `checkpoint_config` (the configuration read from the
         // checkpoint).
@@ -5084,6 +5599,10 @@ impl ControllerInit {
                 max_buffering_delay_usecs: config.global.max_buffering_delay_usecs,
                 resources: config.global.resources,
                 clock_resolution_usecs: config.global.clock_resolution_usecs,
+                // `NOW()` values shifted by the offset are baked into
+                // journaled steps and materialized state; adopting a new
+                // offset on resume would make `NOW()` jump.
+                clock_timezone_offset: checkpoint_config.global.clock_timezone_offset,
                 pin_cpus: config.global.pin_cpus,
                 provisioning_timeout_secs: config.global.provisioning_timeout_secs,
                 max_parallel_connector_init: config.global.max_parallel_connector_init,
@@ -5215,15 +5734,22 @@ impl ControllerInit {
         if max_rss_mb.is_none()
             && let Some(memory_mb_max) = &pipeline_config.global.resources.memory_mb_max
         {
-            warn!(
-                "RSS memory limit ('max_rss_mb') is not set, but a Kubernetes memory limit \
+            if feldera_observability::system::running_in_kubernetes() {
+                warn!(
+                    "RSS memory limit ('max_rss_mb') is not set, but a Kubernetes pod memory limit \
 ('resources.memory_mb_max' = {memory_mb_max} MB) is configured. \
-Using the Kubernetes limit as the RSS memory limit."
-            );
+Using the pod limit as the RSS memory limit."
+                );
+            } else {
+                info!(
+                    "RSS memory limit ('max_rss_mb') is not set; using 'resources.memory_mb_max' \
+({memory_mb_max} MB) as the RSS memory limit."
+                );
+            }
             max_rss_mb = Some(*memory_mb_max);
         } else if max_rss_mb.is_none() && pipeline_config.global.resources.memory_mb_max.is_none() {
             warn!(
-                "RSS memory limit ('max_rss_mb') is not set, and no Kubernetes memory limit \
+                "RSS memory limit ('max_rss_mb') is not set, and no deployment memory limit \
 ('resources.memory_mb_max') is configured. We recommend configuring at least one of these settings to avoid out-of-memory failures."
             );
         } else if let Some(max_rss_mb) = max_rss_mb
@@ -5231,8 +5757,8 @@ Using the Kubernetes limit as the RSS memory limit."
             && max_rss_mb > *memory_mb_max
         {
             warn!(
-                "RSS memory limit ('max_rss_mb') is set to {max_rss_mb} MB exceeds the Kubernetes memory limit \
-('resources.memory_mb_max' = {memory_mb_max} MB) is configured. This will likely cause out-of-memory failures."
+                "RSS memory limit ('max_rss_mb' = {max_rss_mb} MB) exceeds the deployment memory limit \
+('resources.memory_mb_max' = {memory_mb_max} MB). This will likely cause out-of-memory failures."
             );
         }
 
@@ -5270,7 +5796,8 @@ Using the Kubernetes limit as the RSS memory limit."
             .with_pin_cpus(pipeline_config.global.pin_cpus.clone())
             .with_storage(storage)
             .with_mode(Mode::Persistent)
-            .with_dev_tweaks(dev_tweaks))
+            .with_dev_tweaks(dev_tweaks)
+            .with_allow_input_during_commit(false))
     }
 
     /// Create a new I/O controller using config in `self`.
@@ -5368,10 +5895,16 @@ impl BackpressureThread {
             };
 
             let bootstrap_in_progress = controller.status.bootstrap_in_progress();
+            // Inputs keep flowing during a concurrent backfill (old views stay
+            // live); they pause only during the brief synchronize/cutover
+            // window.
+            let concurrent_synchronize = controller.status.concurrent_bootstrap_phase()
+                == ConcurrentBootstrapPhase::Synchronizing;
 
             for (epid, ep) in controller.status.input_status().iter() {
                 let should_run = globally_running
                     && !bootstrap_in_progress
+                    && !concurrent_synchronize
                     && !ep.is_paused_by_user()
                     && !ep.is_full();
                 match should_run {
@@ -6354,6 +6887,12 @@ pub struct ControllerInner {
     /// without discarding the carried-over counters in
     /// `initial_statistics`.
     modified_output_endpoints: HashSet<String>,
+
+    /// Output endpoint names whose relation the bootstrap re-emits.
+    /// `add_output_endpoint` uses this to decide whether the endpoint starts
+    /// out caught up with the pipeline's output, which seeds its
+    /// `total_processed_input_records` counter.
+    bootstrapped_output_endpoints: HashSet<String>,
 }
 
 impl Drop for ControllerInner {
@@ -6376,6 +6915,7 @@ impl ControllerInner {
         resume_info: &HashMap<String, (JsonValue, CheckpointInputEndpointMetrics)>,
         output_statistics: &HashMap<String, CheckpointOutputEndpointMetrics>,
         modified_output_endpoints: HashSet<String>,
+        bootstrapped_output_endpoints: HashSet<String>,
         step_receiver: tokio::sync::watch::Receiver<StepStatus>,
         checkpoint_receiver: tokio::sync::watch::Receiver<Option<CheckpointCoordination>>,
         incarnation_uuid: Uuid,
@@ -6433,6 +6973,7 @@ impl ControllerInner {
                 checkpoint_delay_started: Mutex::new(None),
                 checkpoint_started: Mutex::new(None),
                 modified_output_endpoints,
+                bootstrapped_output_endpoints,
             }
         });
 
@@ -7023,6 +7564,36 @@ impl ControllerInner {
 
         let self_weak = Arc::downgrade(self);
 
+        // `connector_definition_changed` is true when the endpoint's config or
+        // associated relation changed across this checkpoint restart. It feeds
+        // the integrated-sink lifecycle decision (re-truncate vs reopen), the
+        // `send_snapshot` re-fire decision, and the progress counter seeding
+        // below.
+        let connector_definition_changed = self.modified_output_endpoints.contains(endpoint_name);
+
+        // Recover "snapshot already delivered" state from the checkpoint so a
+        // `send_snapshot: true` connector does not re-send its snapshot on a
+        // checkpoint restart. When the connector or its relation has changed
+        // across the restart, clear the flag so the fresh snapshot fires;
+        // cumulative counters in `initial_statistics` are preserved
+        // independently.
+        let snapshot_already_sent = !connector_definition_changed
+            && initial_statistics
+                .map(|stats| stats.snapshot_sent)
+                .unwrap_or(false);
+
+        // The endpoint starts out caught up with the pipeline's output unless it is
+        // still owed output derived from records the pipeline has already processed.
+        // Two cases owe such output: the bootstrap re-emits the endpoint's relation,
+        // and an initial snapshot is still pending. A changed connector definition
+        // owes nothing by itself, since an unchanged relation produces no new output
+        // for inputs already processed.
+        let caught_up = !self.bootstrapped_output_endpoints.contains(endpoint_name)
+            && !OutputEndpointControl::snapshot_pending_at_startup(
+                endpoint_config.connector_config.send_snapshot,
+                snapshot_already_sent,
+            );
+
         // Initialize endpoint stats early so that connectors can register
         // batch-progress counters (or other metrics) during construction.
         self.status.add_output(
@@ -7030,6 +7601,7 @@ impl ControllerInner {
             endpoint_name,
             endpoint_config,
             initial_statistics,
+            caught_up,
         );
 
         /// A guard to remove `endpoint` from `status` unless canceled.
@@ -7060,12 +7632,6 @@ impl ControllerInner {
             }
         }
         let guard = RemoveEndpointGuard::new(&self.status, endpoint_id);
-
-        // `connector_definition_changed` is true when the endpoint's config or
-        // associated relation changed across this checkpoint restart. It feeds
-        // both the integrated-sink lifecycle decision (re-truncate vs reopen)
-        // and the `send_snapshot` re-fire decision.
-        let connector_definition_changed = self.modified_output_endpoints.contains(endpoint_name);
 
         let (encoder, command_handler) = if let Some(mut endpoint) = endpoint {
             endpoint
@@ -7210,16 +7776,6 @@ impl ControllerInner {
         };
 
         let parker = Parker::new();
-        // Recover "snapshot already delivered" state from the checkpoint so a
-        // `send_snapshot: true` connector does not re-send its snapshot on a
-        // checkpoint restart. When the connector or its relation has changed
-        // across the restart, clear the flag so the fresh snapshot fires;
-        // cumulative counters in `initial_statistics` are preserved
-        // independently.
-        let snapshot_already_sent = !connector_definition_changed
-            && initial_statistics
-                .map(|stats| stats.snapshot_sent)
-                .unwrap_or(false);
         let endpoint_descr = OutputEndpointDescr::new(
             endpoint_name,
             &stream_name,
@@ -7851,7 +8407,7 @@ impl ControllerInner {
         if self.restoring.load(Ordering::Acquire) {
             temporary.push(TemporarySuspendError::Replaying);
         }
-        if self.status.bootstrap_in_progress() {
+        if self.status.bootstrap_in_progress() || self.status.concurrent_bootstrap_in_progress() {
             temporary.push(TemporarySuspendError::Bootstrapping);
         }
         if self.get_transaction_state() != TransactionState::None {
@@ -8046,7 +8602,7 @@ impl ControllerInner {
                 }
                 TransactionState::Started {
                     tid,
-                    start,
+                    start: _,
                     processed_records,
                 } if next.is_none() || next != open => {
                     // The next step belongs to a different transaction, or the

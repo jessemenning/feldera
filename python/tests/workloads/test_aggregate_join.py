@@ -2,6 +2,7 @@ import os
 import unittest
 from string import Template
 
+from feldera.runtime_config import Resources
 from feldera.testutils import run_workload, ViewSpec, unique_pipeline_name
 
 tables = {
@@ -94,7 +95,16 @@ views = [
 
 class TestAggregateJoin(unittest.TestCase):
     def test_aggregate_joins(self):
-        run_workload(unique_pipeline_name("aggregate-join-test"), tables, views)
+        run_workload(
+            unique_pipeline_name("aggregate-join-test"),
+            tables,
+            views,
+            # Peaks above 5 GB; an honest request keeps k8s from
+            # OOM-killing the pipeline mid-test. No memory_mb_max: it
+            # would cap the DataFusion pool at 5% and the big ad-hoc
+            # validation queries exhaust that.
+            resources=Resources(memory_mb_min=6000),
+        )
 
 
 if __name__ == "__main__":

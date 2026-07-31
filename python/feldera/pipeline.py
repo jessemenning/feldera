@@ -20,6 +20,7 @@ import pyarrow as pa
 
 from feldera._callback_runner import CallbackRunner
 from feldera._helpers import chunk_dataframe, ensure_dataframe_has_columns
+from feldera._long_operation_warning import LongOperationWarning
 from feldera.enums import (
     BootstrapPolicy,
     CheckpointStatus,
@@ -44,6 +45,8 @@ from feldera.rest.sql_view import SQLView
 from feldera.runtime_config import RuntimeConfig
 from feldera.stats import InputEndpointStatus, OutputEndpointStatus, PipelineStatistics
 from feldera.types import CheckpointMetadata
+
+logger = logging.getLogger(__name__)
 
 
 class Pipeline:
@@ -138,6 +141,8 @@ class Pipeline:
         if status not in [
             PipelineStatus.RUNNING,
             PipelineStatus.PAUSED,
+            PipelineStatus.CONCURRENTBOOTSTRAPPING,
+            PipelineStatus.SYNCHRONIZING,
         ]:
             raise RuntimeError("Pipeline must be running or paused to push data")
 
@@ -292,7 +297,12 @@ class Pipeline:
         :param view_name: The name of the view to listen to.
         """
 
-        if self.status() not in [PipelineStatus.PAUSED, PipelineStatus.RUNNING]:
+        if self.status() not in [
+            PipelineStatus.PAUSED,
+            PipelineStatus.RUNNING,
+            PipelineStatus.CONCURRENTBOOTSTRAPPING,
+            PipelineStatus.SYNCHRONIZING,
+        ]:
             raise RuntimeError("Pipeline must be running or paused to listen to output")
 
         handler = OutputHandler(self.client, self.name, view_name)
@@ -326,7 +336,12 @@ class Pipeline:
 
         """
 
-        if self.status() not in [PipelineStatus.RUNNING, PipelineStatus.PAUSED]:
+        if self.status() not in [
+            PipelineStatus.RUNNING,
+            PipelineStatus.PAUSED,
+            PipelineStatus.CONCURRENTBOOTSTRAPPING,
+            PipelineStatus.SYNCHRONIZING,
+        ]:
             raise RuntimeError("Pipeline must be running or paused to listen to output")
 
         event = Event()
@@ -366,10 +381,18 @@ class Pipeline:
             PipelineStatus.INITIALIZING,
             PipelineStatus.PROVISIONING,
             PipelineStatus.BOOTSTRAPPING,
+            PipelineStatus.CONCURRENTBOOTSTRAPPING,
+            PipelineStatus.SYNCHRONIZING,
         ]:
             raise RuntimeError("Pipeline must be running to wait for completion")
 
         start_time = time.monotonic()
+        long_op = LongOperationWarning(
+            logger,
+            lambda elapsed: f"still waiting for pipeline {self.name} to complete, "
+            f"waited {elapsed:.1f} seconds",
+            lambda elapsed: f"pipeline {self.name} completed after {elapsed:.1f} seconds",
+        )
 
         while True:
             if timeout_s is not None:
@@ -379,10 +402,6 @@ class Pipeline:
                         f"timeout ({timeout_s}s) reached while waiting for"
                         f" pipeline '{self.name}' to complete"
                     )
-                logging.debug(
-                    f"waiting for pipeline {self.name} to complete: elapsed"
-                    f" time {elapsed}s, timeout: {timeout_s}s"
-                )
 
             pipeline_complete: bool = self.is_complete()
             if pipeline_complete is None:
@@ -390,8 +409,10 @@ class Pipeline:
                     "received unknown metrics from the pipeline, pipeline_complete is None"
                 )
             elif pipeline_complete:
+                long_op.done()
                 break
 
+            long_op.check()
             time.sleep(1)
 
         if force_stop:
@@ -554,6 +575,7 @@ metrics"""
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -569,6 +591,10 @@ metrics"""
 
         :param bootstrap_policy: The bootstrap policy to use.
         :param silent_bootstrap: Set True to bootstrap the pipeline with output connectors disabled. False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         :param timeout_s: The maximum time (in seconds) to wait for the
             pipeline to start.
         :param wait: Set True to wait for the pipeline to start. True by default
@@ -581,6 +607,7 @@ metrics"""
             self.name,
             bootstrap_policy=bootstrap_policy,
             silent_bootstrap=silent_bootstrap,
+            concurrent_bootstrap=concurrent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -590,6 +617,7 @@ metrics"""
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -598,6 +626,11 @@ metrics"""
         Starts the pipeline in the paused state.
 
         :param bootstrap_policy: The bootstrap policy to use.
+        :param silent_bootstrap: Set True to bootstrap the pipeline with output connectors disabled. False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         :param wait: Set True to wait for the pipeline to start. True by default.
         :param timeout_s: The maximum time (in seconds) to wait for the
             pipeline to start (defaults to `None` = no timeout is enforced).
@@ -609,6 +642,7 @@ metrics"""
             self.name,
             bootstrap_policy=bootstrap_policy,
             silent_bootstrap=silent_bootstrap,
+            concurrent_bootstrap=concurrent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -618,6 +652,7 @@ metrics"""
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
@@ -626,6 +661,11 @@ metrics"""
         Starts the pipeline in the standby state.
 
         :param bootstrap_policy: The bootstrap policy to use.
+        :param silent_bootstrap: Set True to bootstrap the pipeline with output connectors disabled. False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         :param wait: Set True to wait for the pipeline to start. True by default.
         :param timeout_s: The maximum time (in seconds) to wait for the
             pipeline to start (defaults to `None` = no timeout is enforced).
@@ -637,6 +677,7 @@ metrics"""
             self.name,
             bootstrap_policy=bootstrap_policy,
             silent_bootstrap=silent_bootstrap,
+            concurrent_bootstrap=concurrent_bootstrap,
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
@@ -646,6 +687,7 @@ metrics"""
         self,
         bootstrap_policy: Optional[BootstrapPolicy] = None,
         silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
     ):
@@ -657,6 +699,11 @@ metrics"""
         the pipeline.
 
         :param bootstrap_policy: The bootstrap policy to use.
+        :param silent_bootstrap: Set True to bootstrap the pipeline with output connectors disabled. False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         :param timeout_s: The maximum time (in seconds) to wait for the
             pipeline to restart.
         :param dismiss_error: Set True to dismiss any deployment error before starting;
@@ -667,6 +714,7 @@ metrics"""
         self.start(
             bootstrap_policy=bootstrap_policy,
             silent_bootstrap=silent_bootstrap,
+            concurrent_bootstrap=concurrent_bootstrap,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
         )
@@ -711,7 +759,11 @@ metrics"""
 
         self.client.dismiss_error_pipeline(self.name)
 
-    def approve(self, silent_bootstrap: bool = False):
+    def approve(
+        self,
+        silent_bootstrap: bool = False,
+        concurrent_bootstrap: bool = False,
+    ):
         """
         Approves the pipeline to proceed with bootstrapping.
 
@@ -723,9 +775,17 @@ metrics"""
         :param silent_bootstrap: Set True to bootstrap with output connectors
             disabled, so no records are emitted during the bootstrap phase.
             False by default.
+        :param concurrent_bootstrap: Set True to bootstrap new and modified views
+            concurrently, keeping the pre-existing views live while the new ones
+            backfill in the background. Mutually exclusive with
+            `silent_bootstrap`. False by default.
         """
 
-        self.client.approve_pipeline(self.name, silent_bootstrap=silent_bootstrap)
+        self.client.approve_pipeline(
+            self.name,
+            silent_bootstrap=silent_bootstrap,
+            concurrent_bootstrap=concurrent_bootstrap,
+        )
 
     def resume(self, wait: bool = True, timeout_s: Optional[float] = None):
         """
@@ -765,6 +825,44 @@ metrics"""
         """
 
         return self.client.advance_clock(self.name, delta_ms)
+
+    def diff(
+        self,
+        program_code: Optional[str] = None,
+        runtime_version: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute the diff between this pipeline's current program and a proposed
+        new version, without modifying or restarting the pipeline.
+
+        The diff lists the tables, views, and connectors that would be added,
+        removed, or modified. It is the same diff shown when approving changes
+        during bootstrapping, so it lets you preview the effect of a change
+        before applying it.
+
+        The baseline is this pipeline's currently configured program compiled
+        with its runtime, not necessarily the program in the latest checkpoint
+        (which may have been produced by a different program or runtime).
+
+        :param program_code: New SQL program code to compare against. If
+            ``None`` (the default), the pipeline's current program code is used.
+
+        :param runtime_version: Runtime version to compile the new program with:
+            a version tag (``vX.Y.Z``) or a 40-character git SHA. If ``None``
+            (the default), the platform's default runtime is used.
+
+        :return: The pipeline diff as a dict (see the ``PipelineDiff`` schema).
+
+        :raises FelderaAPIError: If the current program is not compiled, the new
+            program fails to compile, the change cannot be bootstrapped, or the
+            compiler service is unavailable.
+        """
+
+        return self.client.pipeline_diff(
+            self.name,
+            program_code=program_code,
+            runtime_version=runtime_version,
+        )
 
     def start_transaction(self) -> int:
         """

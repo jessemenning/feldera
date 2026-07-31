@@ -8,51 +8,57 @@
 use crate::{
     NumEntries, WeakRuntime,
     circuit::{
-        GlobalNodeId, Host, LocalStoreMarker, OwnershipPreference, Runtime, Scope,
+        GlobalNodeId, Host, Layout, LocalStoreMarker, OwnershipPreference, Runtime, Scope,
         metadata::{
             BatchSizeStats, EXCHANGE_DESERIALIZATION_TIME_SECONDS, EXCHANGE_DESERIALIZED_BYTES,
             EXCHANGE_WAIT_TIME_SECONDS, INPUT_BATCHES_STATS, MetaItem, OUTPUT_BATCHES_STATS,
             OperatorLocation, OperatorMeta,
         },
+        metrics::{DUPLICATE_EXCHANGE_MESSAGES_RECEIVED, EXCHANGE_MESSAGES_RECEIVED},
         operator_traits::{Operator, OperatorName, SinkOperator, SourceOperator},
         runtime::{WorkerLocation, WorkerLocations},
         tokio::TOKIO,
     },
     circuit_cache_key,
-    storage::file::format::FixedLen,
 };
-use binrw::{BinRead, BinWrite};
+use binrw::{BinRead, BinResult, BinWrite};
 use crossbeam_utils::CachePadded;
+use enum_map::{Enum, EnumMap};
 use feldera_samply::Span;
 use feldera_storage::fbuf::FBuf;
+use futures::future::select;
 use itertools::Itertools;
 use rkyv::AlignedVec;
 use size_of::HumanBytes;
 use std::{
     borrow::Cow,
-    collections::HashMap,
-    fmt::Debug,
-    io::{Cursor, ErrorKind, IoSlice},
+    collections::{HashMap, VecDeque},
+    fmt::{Debug, Display},
+    io::{Cursor, IoSlice},
     iter::zip,
     marker::PhantomData,
     mem::MaybeUninit,
     net::SocketAddr,
     ops::Range,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{
         Arc, Mutex, MutexGuard, RwLock,
-        atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::{Notify, OnceCell, mpsc::error::SendError},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Notify, OnceCell, futures::OwnedNotified},
+    task::JoinHandle,
     time::sleep,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use typedmap::TypedMapKey;
 
 /// Current time in microseconds.
@@ -73,148 +79,71 @@ fn current_time_usecs() -> u64 {
 circuit_cache_key!(local ExchangeCacheId<T>(ExchangeId => Arc<Exchange<T>>));
 
 /// Header for data exchange from one host to another.
+///
+/// A complete exchange consists of [ExchangeHeader] followed by the payload for
+/// each receiving worker in order.  There is no padding or alignment (which is
+/// fine because we read and write each header and payload in a separate call).
 #[binrw::binrw]
 #[brw(little)]
+#[br(import(count: usize))]
 struct ExchangeHeader {
     /// The unique identifier for the exchange.
     exchange_id: ExchangeId,
+    /// Sequence number for the collection of messages.
+    sequence: u64,
+    #[bw(write_with = MessageType::write)]
+    #[br(parse_with = MessageType::read)]
+    message_type: MessageType,
     /// The sending worker.
     sender: u32,
-    /// The receiving worker.
-    ///
-    /// For a given exchange, when a given sender sends data to another host, it
-    /// sends the data for all the receivers together in sequential blocks, in
-    /// order.  Thus, this field counts up sequentially across the workers on
-    /// the destination.
-    receiver: u32,
-    /// The payload data is followed by zeros that align the data length to a
-    /// multiple of 16 bytes.
-    #[brw(align_after(16))]
-    data_len: u32,
-}
-
-impl FixedLen for ExchangeHeader {
-    const LEN: usize = 16;
+    /// The length of each payload.
+    #[br(count = count)]
+    payload_lens: Vec<u64>,
 }
 
 impl ExchangeHeader {
-    fn to_bytes(&self) -> [u8; Self::LEN] {
-        let mut cursor = Cursor::new([0; Self::LEN]);
+    /// Returns the number of bytes that `ExchangeHeader::to_bytes()` will
+    /// return for the given `count`.
+    fn len_for_count(count: usize) -> usize {
+        (4 + 8 + 1 + 4) + 8 * count
+    }
+
+    /// Serializes this header into a `Vec` that contains
+    /// `Self::len_for_count(count)` bytes, where `count` is
+    /// `self.payload_lens()`.
+    fn to_bytes(&self) -> Vec<u8> {
+        let len = Self::len_for_count(self.payload_lens.len());
+        let mut cursor = Cursor::new(Vec::with_capacity(len));
         self.write_le(&mut cursor).unwrap();
-        assert_eq!(cursor.position(), Self::LEN as u64);
+        assert_eq!(cursor.position(), len as u64);
         cursor.into_inner()
     }
 
-    fn from_bytes(bytes: &[u8; Self::LEN]) -> Self {
+    /// Deserializes an `ExchangeHeader` with `count` payload lengths from
+    /// `bytes`.  `bytes.len()` must equal `Self::len_for_count(count)`.
+    fn from_bytes(count: usize, bytes: &[u8]) -> Self {
+        debug_assert_eq!(bytes.len(), Self::len_for_count(count));
         let mut cursor = Cursor::new(bytes);
-        let this = Self::read_le(&mut cursor).unwrap();
-        assert_eq!(cursor.position(), Self::LEN as u64);
+        let this = Self::read_le_args(&mut cursor, (count,)).unwrap();
+        assert_eq!(cursor.position(), bytes.len() as u64);
         this
     }
 
-    async fn read<S>(stream: &mut S) -> std::io::Result<Option<Self>>
+    /// Reads an `ExchangeHeader` with `count` payload lengths from `stream`.
+    async fn read<S>(count: usize, stream: &mut S) -> std::io::Result<Option<Self>>
     where
+        Self: Sized,
         S: AsyncRead + Unpin,
     {
-        let mut buf = [0; Self::LEN];
+        let mut buf = vec![0; Self::len_for_count(count)];
         match stream.read(&mut buf).await? {
             0 => Ok(None),
             n => {
                 stream.read_exact(&mut buf[n..]).await?;
-                Ok(Some(ExchangeHeader::from_bytes(&buf)))
+                Ok(Some(Self::from_bytes(count, &buf)))
             }
         }
     }
-}
-
-/// A multi-producer, single-consumer channel sender for [ExchangeMessage], with
-/// the capacity of the channel limited by the number of bytes of messages.
-struct ByteBoundedSender {
-    tx: tokio::sync::mpsc::UnboundedSender<ExchangeMessage>,
-    bound: Arc<ByteBound>,
-}
-
-impl ByteBoundedSender {
-    /// Sends a message and returns:
-    ///
-    /// - `Ok(None)` if the message fit within the channel's bound.
-    ///
-    /// - `Ok(Some(bound))` if the message overfills the channel's bound.  The
-    ///   caller should call `bound.wait()` to wait for the channel to drain
-    ///   before sending another message.
-    ///
-    /// - `Err(error)` if there is no receiver left.
-    pub fn send(
-        &self,
-        message: ExchangeMessage,
-    ) -> Result<Option<Arc<ByteBound>>, SendError<ExchangeMessage>> {
-        let len = message.data.len().try_into().unwrap();
-        self.tx.send(message)?;
-        Ok(self.bound.reserve(len))
-    }
-}
-
-/// A multi-producer, single-consumer channel receiver for [ExchangeMessage],
-/// with the capacity of the channel limited by the number of bytes of messages.
-struct ByteBoundedReceiver {
-    rx: tokio::sync::mpsc::UnboundedReceiver<ExchangeMessage>,
-    bound: Arc<ByteBound>,
-}
-
-impl ByteBoundedReceiver {
-    /// Receives a message, or returns `None` if no senders are left.
-    pub async fn recv(&mut self) -> Option<ExchangeMessage> {
-        let message = self.rx.recv().await?;
-        let len = message.data.len().try_into().unwrap();
-        let before = self.bound.remaining.fetch_add(len, Ordering::AcqRel);
-        let after = before + len;
-        if before < 0 && after >= 0 {
-            self.bound.notify.notify_waiters();
-        }
-        Some(message)
-    }
-}
-
-pub struct ByteBound {
-    remaining: AtomicIsize,
-    notify: Notify,
-}
-
-impl ByteBound {
-    /// Subtracts `len` from the channel's remaining capacity.  If the channel
-    /// is overfilled, returns a clone of this `ByteBound` to allow the caller
-    /// to wait for it to drain.
-    fn reserve(self: &Arc<Self>, len: isize) -> Option<Arc<Self>> {
-        let remaining = self.remaining.fetch_sub(len, Ordering::AcqRel) - len;
-        (remaining < 0).then(|| self.clone())
-    }
-
-    /// Waits until this channel's capacity is no longer overfilled.
-    pub async fn wait(&self) {
-        while let notified = self.notify.notified()
-            && self.remaining.load(Ordering::Acquire) < 0
-        {
-            notified.await;
-        }
-    }
-}
-
-/// Returns a pair of multi-producer, single-consumer channel sender and
-/// receiver for [ExchangeMessage], with the capacity of the channel limited by
-/// the number of bytes of messages.
-fn byte_bounded_channel(limit: usize) -> (ByteBoundedSender, ByteBoundedReceiver) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let bound = Arc::new(ByteBound {
-        remaining: AtomicIsize::new(isize::try_from(limit).unwrap_or(isize::MAX)),
-        notify: Notify::new(),
-    });
-    (
-        ByteBoundedSender {
-            tx,
-            bound: bound.clone(),
-        },
-        ByteBoundedReceiver { rx, bound },
-    )
 }
 
 struct ExchangeMessage {
@@ -239,70 +168,252 @@ struct ExchangeMessage {
     data: Vec<FBuf>,
 }
 
+impl ExchangeMessage {
+    fn isize_len(&self) -> isize {
+        isize::try_from(self.data.len()).unwrap()
+    }
+}
+
+/// Distinguishes messages by size.
+///
+/// We segregate big and small messages into separate queues so that simple
+/// broadcast and consensus messages don't get delayed behind bigger messages.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Enum)]
+pub(crate) enum MessageSize {
+    /// A big message.
+    Big,
+
+    /// A small message.
+    Small,
+}
+
+impl MessageSize {
+    /// Constructs `MessageSize` from a count of `bytes`.
+    pub(crate) fn from_bytes(bytes: usize) -> Self {
+        if bytes <= 4096 {
+            Self::Small
+        } else {
+            Self::Big
+        }
+    }
+}
+
+/// Categorizes an [ExchangeMessage].
+///
+/// We segregate messages in different categories into different queues so that
+/// messages in one category do not delay those in other categories.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Enum)]
+pub(crate) enum MessageType {
+    /// Messages sent via synchronous exchange.
+    Synchronous(
+        /// Message size.
+        MessageSize,
+    ),
+    /// Messages sent via streaming exchange.
+    Streaming,
+}
+
+impl MessageType {
+    #[binrw::parser(reader)]
+    pub(crate) fn read() -> BinResult<Self> {
+        let byte = <u8>::read(reader)? as usize;
+        if byte < Self::LENGTH {
+            Ok(Self::from_usize(byte))
+        } else {
+            Err(binrw::Error::NoVariantMatch { pos: 0 })
+        }
+    }
+    #[binrw::writer(writer)]
+    pub(crate) fn write(value: &Self) -> BinResult<()> {
+        let byte = value.into_usize() as u8;
+        byte.write(writer)
+    }
+}
+
+struct ExchangeChannelInner {
+    /// Remaining capacity.  When this is negative, the channel is
+    /// oversubscribed and no more messages should be queued until the other end
+    /// acknowledges some of the messages that have been sent.
+    remaining: isize,
+
+    /// Signaled when `remaining` become nonnegative.
+    nonfull: Arc<Notify>,
+
+    /// Signaled when a message is added to `messages`.
+    nonempty: Arc<Notify>,
+
+    /// Queued messages.
+    messages: VecDeque<Arc<ExchangeMessage>>,
+
+    /// Sequence number of the first message in `messages`.
+    sequence: u64,
+}
+
+impl ExchangeChannelInner {
+    fn new(capacity: usize) -> Self {
+        Self {
+            remaining: capacity.try_into().unwrap(),
+            nonfull: Arc::new(Notify::new()),
+            nonempty: Arc::new(Notify::new()),
+            messages: VecDeque::new(),
+            sequence: 0,
+        }
+    }
+
+    fn get(&self, min_sequence: u64) -> Result<(Arc<ExchangeMessage>, u64), OwnedNotified> {
+        let index = min_sequence.saturating_sub(self.sequence);
+        match self.messages.get(index as usize) {
+            Some(message) => Ok((message.clone(), self.sequence + index)),
+            None => Err(self.nonempty.clone().notified_owned()),
+        }
+    }
+
+    fn drain(&mut self, next_sequence: u64) {
+        let before = self.remaining;
+        while self.sequence < next_sequence
+            && let Some(message) = self.messages.pop_front()
+        {
+            self.sequence += 1;
+            self.remaining += message.isize_len();
+        }
+        if before < 0 && self.remaining >= 0 {
+            self.nonfull.notify_waiters();
+        }
+    }
+
+    fn push(&mut self, message: ExchangeMessage) {
+        self.remaining -= message.isize_len();
+        self.messages.push_back(Arc::new(message));
+        self.nonempty.notify_waiters();
+    }
+
+    fn drain_waiter(&self) -> Option<OwnedNotified> {
+        (self.remaining < 0).then(|| self.nonfull.clone().notified_owned())
+    }
+}
+
+#[derive(Clone)]
+struct ExchangeChannel(Arc<Mutex<ExchangeChannelInner>>);
+
+impl ExchangeChannel {
+    pub fn new(capacity: usize) -> Self {
+        Self(Arc::new(Mutex::new(ExchangeChannelInner::new(capacity))))
+    }
+
+    fn inner(&self) -> MutexGuard<'_, ExchangeChannelInner> {
+        self.0.lock().unwrap()
+    }
+
+    /// If the channel contains a message with a sequence number greater than or
+    /// equal to `min_sequence`, returns it and its sequence number.  Otherwise,
+    /// returns an [OwnedNotified] for waiting until a message is queued.
+    pub fn get(&self, min_sequence: u64) -> Result<(Arc<ExchangeMessage>, u64), OwnedNotified> {
+        self.inner().get(min_sequence)
+    }
+
+    /// Drops all of the messages in the channel with sequence numbers less than
+    /// `next_sequence`.
+    pub fn drain(&self, next_sequence: u64) {
+        self.inner().drain(next_sequence)
+    }
+
+    /// Appends `message` to the queue.  If the channel is then overfull,
+    /// returns an [OwnedNotified] that can be used to wait for it to drain.
+    /// Otherwise, returns `None`.
+    pub fn push(&self, message: ExchangeMessage) -> Option<OwnedNotified> {
+        let mut inner = self.inner();
+        inner.push(message);
+        inner.drain_waiter()
+    }
+
+    /// If this channel is overfull, returns an [OwnedNotified] that can be used
+    /// to wait for it to drain.  Otherwise, returns `None`.
+    fn drain_waiter(&self) -> Option<OwnedNotified> {
+        self.inner().drain_waiter()
+    }
+}
+
 pub struct ExchangeClient {
-    tx: ByteBoundedSender,
+    channel: ExchangeChannel,
 }
 
 impl ExchangeClient {
-    async fn new(remote_address: SocketAddr, remote_workers: &Range<usize>) -> Self {
-        let (tx, rx) = byte_bounded_channel(10_000_000);
-        TOKIO.spawn(Self::run(remote_address, remote_workers.clone(), rx));
-        Self { tx }
+    async fn new(
+        message_type: MessageType,
+        remote_address: SocketAddr,
+        remote_workers: &Range<usize>,
+    ) -> Self {
+        let channel = ExchangeChannel::new(10_000_000);
+        TOKIO.spawn(Self::run(
+            message_type,
+            remote_address,
+            remote_workers.clone(),
+            channel.clone(),
+        ));
+        Self { channel }
     }
 
-    async fn run(
-        remote_address: SocketAddr,
+    async fn run_connection_rx(
+        mut rx: OwnedReadHalf,
+        channel: ExchangeChannel,
+    ) -> std::io::Result<()> {
+        loop {
+            channel.drain(rx.read_u64_le().await?);
+        }
+    }
+
+    async fn run_connection_tx(
+        mut tx: OwnedWriteHalf,
+        message_type: MessageType,
         remote_workers: Range<usize>,
-        mut rx: ByteBoundedReceiver,
-    ) {
-        let mut connection = loop {
-            match TcpStream::connect(remote_address).await {
-                Ok(stream) => break stream,
-                Err(error) => {
-                    info!("connection to {remote_address} failed ({error}), waiting to retry")
+        channel: ExchangeChannel,
+    ) -> std::io::Result<()> {
+        let mut min_sequence = 0;
+        loop {
+            // Get the next message to send.
+            let (message, sequence) = match channel.get(min_sequence) {
+                Ok(result) => result,
+                Err(notified) => {
+                    notified.await;
+                    continue;
                 }
-            }
-            sleep(std::time::Duration::from_millis(1000)).await;
-        };
-        connection.set_nodelay(true).unwrap();
-        connection.set_zero_linger().unwrap();
+            };
+            min_sequence = sequence + 1;
 
-        while let Some(message) = rx.recv().await {
-            // We want to write each data buffer preceded by a header and followed
-            // by padding.  To minimize the system calls required to do this, we
-            // assemble them into one big collection of IoSlices.  First, create the
-            // headers.
+            if inject_fault("connection failure") {
+                return Err(std::io::Error::other("simulated connection failure"));
+            }
+
+            // We want to write a header, followed by all the data buffers.  To
+            // minimize the system calls required to do this, we assemble them
+            // into a collection of IoSlices.  First, create the header.
             let n = remote_workers.len();
-            let mut headers = Vec::with_capacity(n);
-            for (data, receiver) in zip(&message.data, remote_workers.clone()) {
-                headers.push(
-                    ExchangeHeader {
-                        exchange_id: message.exchange_id,
-                        sender: message.sender as u32,
-                        receiver: receiver as u32,
-                        data_len: data.len().try_into().unwrap(),
-                    }
-                    .to_bytes(),
-                );
+            let header = ExchangeHeader {
+                exchange_id: message.exchange_id,
+                sequence,
+                sender: message.sender as u32,
+                message_type,
+                payload_lens: message
+                    .data
+                    .iter()
+                    .map(|message| message.len().try_into().unwrap())
+                    .collect(),
             }
+            .to_bytes();
 
-            let zeros = [0; 16];
-
-            // Now that we've got the headers, assemble the IoSlices.
-            let mut slices = Vec::with_capacity(n * 3);
-            let mut header = headers.iter();
+            // Assemble the IoSlices.
+            let mut slices = Vec::with_capacity(1 + n);
+            slices.push(IoSlice::new(&header));
             for data in &message.data {
-                slices.push(IoSlice::new(header.next().unwrap()));
                 if !data.is_empty() {
                     slices.push(IoSlice::new(data.as_slice()));
                 }
-                let pad = &zeros[..data.len().next_multiple_of(16) - data.len()];
-                if !pad.is_empty() {
-                    slices.push(IoSlice::new(pad));
-                }
+            }
+            if inject_fault("partial send failure") {
+                return Err(std::io::Error::other("simulated partial send failure"));
             }
 
-            // Finally, send the whole assembly.
+            // Send the assembly.
             let size = slices.iter().map(|slice| slice.len()).sum::<usize>();
             let mut bufs = slices.as_mut_slice();
             let _span = Span::new("send")
@@ -316,11 +427,57 @@ impl ExchangeClient {
                     )
                 });
             while !bufs.is_empty() {
-                let n = connection
-                    .write_vectored(bufs)
-                    .await
-                    .expect("lost connection to remote host");
+                let n = tx.write_vectored(bufs).await?;
                 IoSlice::advance_slices(&mut bufs, n);
+            }
+        }
+    }
+
+    async fn run_connection(
+        stream: TcpStream,
+        message_type: MessageType,
+        remote_workers: &Range<usize>,
+        channel: &ExchangeChannel,
+    ) -> std::io::Result<()> {
+        stream.set_nodelay(true)?;
+        stream.set_zero_linger()?;
+        let (rx, tx) = stream.into_split();
+
+        let rx = pin!(Self::run_connection_rx(rx, channel.clone()));
+        let tx = pin!(Self::run_connection_tx(
+            tx,
+            message_type,
+            remote_workers.clone(),
+            channel.clone()
+        ));
+        select(rx, tx).await.factor_first().0
+    }
+
+    async fn run(
+        message_type: MessageType,
+        remote_address: SocketAddr,
+        remote_workers: Range<usize>,
+        channel: ExchangeChannel,
+    ) {
+        let description = format!("{remote_address} for exchange with workers {remote_workers:?}");
+        loop {
+            let mut n_failures = 0u64;
+            let stream = loop {
+                let error = match TcpStream::connect(remote_address).await {
+                    Ok(stream) => break stream,
+                    Err(error) => error,
+                };
+                info!("connection to {description} failed ({error}), waiting to retry");
+                n_failures += 1;
+                sleep(backoff_time()).await;
+            };
+            if n_failures > 0 {
+                info!("connected to {description} after {n_failures} failures")
+            }
+            if let Err(error) =
+                Self::run_connection(stream, message_type, &remote_workers, &channel).await
+            {
+                warn!("connection to {description} dropped ({error}), waiting to retry")
             }
         }
     }
@@ -331,23 +488,27 @@ impl ExchangeClient {
         exchange_id: ExchangeId,
         sender: usize,
         data: Vec<FBuf>,
-    ) -> Option<Arc<ByteBound>> {
-        self.tx
-            .send(ExchangeMessage {
-                start: Instant::now(),
-                global_node_id,
-                exchange_id,
-                sender,
-                data,
-            })
-            .expect("remote exchange failed")
+    ) -> Option<OwnedNotified> {
+        self.channel.push(ExchangeMessage {
+            start: Instant::now(),
+            global_node_id,
+            exchange_id,
+            sender,
+            data,
+        })
+    }
+
+    pub async fn wait(&self) {
+        if let Some(waiter) = self.channel.drain_waiter() {
+            waiter.await;
+        }
     }
 }
 
 /// Uniquely identifies an `Exchange` or `ShardedAccumulator` within a circuit.
 pub type ExchangeId = u32;
 
-pub trait ExchangeDelivery {
+pub trait ExchangeDelivery: Send + Sync {
     fn name(&self) -> Arc<String>;
 
     fn received<'a>(
@@ -357,114 +518,379 @@ pub trait ExchangeDelivery {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
+/// Ensures that at most one connection at a time serves as the receiver for a
+/// given (sending host, message type) pair.
+///
+/// Multihost exchange spawns a new `serve` task per accepted connection, so a
+/// reconnection can leave the old connection's task running until it notices
+/// the socket is gone, overlapping with the new connection's task.  Since both
+/// would share the same per-host sequence number and deliver into the same
+/// single-slot mailboxes, an overlap can deliver messages out of order or
+/// concurrently.
+///
+/// Each connection identifies its sending host and message type from the
+/// first message it carries, then takes over the corresponding slot here,
+/// which cancels whatever connection previously held it and waits for that
+/// connection's task to fully exit before the new connection starts
+/// processing messages.  This guarantees at most one connection is ever
+/// actively delivering for a given (host, message type) pair.
+///
+/// Cancellation is cooperative rather than a forced [`JoinHandle::abort`]: the
+/// old connection's task only observes it while reading a message off the
+/// wire (see `ExchangeServer::read_message`), never once it has claimed a
+/// sequence number for that message.  A forced abort could land after a
+/// message's sequence number has been claimed but before it has been
+/// delivered, which would permanently drop that message (a retransmission
+/// would then be misclassified as an already-delivered duplicate) -- the same
+/// kind of out-of-order delivery this registry exists to prevent.  Reading a
+/// message is pure network I/O with no such side effect, so it can be
+/// abandoned at any point; that also matters because a connection can hang
+/// mid-read for a long time before TCP itself notices the peer is gone.
+#[derive(Clone, Default)]
+struct ConnectionRegistry {
+    /// Indexed by sending host and message type.  The index for the local
+    /// host is not used.
+    slots: Arc<
+        Vec<
+            EnumMap<
+                MessageType,
+                Mutex<Option<(CancellationToken, JoinHandle<std::io::Result<()>>)>>,
+            >,
+        >,
+    >,
+}
+
+impl ConnectionRegistry {
+    fn new(n_hosts: usize) -> Self {
+        Self {
+            slots: Arc::new(
+                (0..n_hosts)
+                    .map(|_| EnumMap::from_fn(|_| Mutex::new(None)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Registers `cancel`/`handle` as the connection serving
+    /// `sending_host_idx` and `message_type`, cancelling any previous
+    /// connection serving the same pair and waiting for it to fully exit
+    /// first.
+    async fn take_over(
+        &self,
+        sending_host_idx: usize,
+        message_type: MessageType,
+        cancel: CancellationToken,
+        handle: JoinHandle<std::io::Result<()>>,
+    ) {
+        let previous = self.slots[sending_host_idx][message_type]
+            .lock()
+            .unwrap()
+            .replace((cancel, handle));
+        if let Some((previous_cancel, previous_handle)) = previous {
+            previous_cancel.cancel();
+            let _ = previous_handle.await;
+        }
+    }
+}
+
 // Maps from an `exchange_id` to an object for delivering to the exchange.
 #[derive(Clone, Default)]
-pub struct ExchangeDirectory(
-    Arc<RwLock<HashMap<ExchangeId, Arc<dyn ExchangeDelivery + Send + Sync>>>>,
-);
+pub struct ExchangeDirectory {
+    /// The next sequence number to expect, indexed by sending host and type of
+    /// message.
+    ///
+    /// The index for the local host is not used.
+    next_sequence: Arc<Vec<EnumMap<MessageType, AtomicU64>>>,
+
+    /// The delivery closure for each exchange.
+    entries: Arc<RwLock<HashMap<ExchangeId, ExchangeDirectoryEntry>>>,
+
+    /// Ensures that only one connection at a time delivers for a given
+    /// (sending host, message type) pair.
+    connections: ConnectionRegistry,
+}
+
+struct ExchangeDirectoryEntry {
+    /// Delivery closure.
+    delivery: Arc<dyn ExchangeDelivery>,
+}
+
+impl ExchangeDirectoryEntry {
+    fn new(delivery: Arc<dyn ExchangeDelivery>) -> Self {
+        Self { delivery }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum ExchangeGetError {
+    /// No exchange with the given ID.
+    UnknownExchange(ExchangeId),
+    /// Received message with sequence number that is later than the next
+    /// sequence number we expect.
+    InvalidSequence {
+        /// Received sequence number.
+        sequence: u64,
+        /// Next expected sequence number.
+        next_sequence: u64,
+    },
+}
+
+pub struct ExchangeGet {
+    /// The delivery callback, if the data should be delivered to it, or `None`
+    /// if the data should be dropped because it is a duplicate.
+    delivery: Option<Arc<dyn ExchangeDelivery>>,
+    /// Next sequence number we expect to receive.
+    next_sequence: u64,
+}
 
 impl ExchangeDirectory {
     pub fn for_runtime(runtime: &Runtime) -> Self {
         runtime
             .local_store()
             .entry(DirectoryId)
-            .or_insert_with(|| Self(Arc::new(RwLock::new(HashMap::new()))))
+            .or_insert_with(|| Self {
+                next_sequence: Arc::new(
+                    (0..runtime.layout().n_hosts())
+                        .map(|_| EnumMap::from_fn(|_| AtomicU64::new(0)))
+                        .collect(),
+                ),
+                entries: Arc::new(RwLock::new(HashMap::new())),
+                connections: ConnectionRegistry::new(runtime.layout().n_hosts()),
+            })
             .clone()
     }
 
-    pub fn get(&self, exchange_id: ExchangeId) -> Option<Arc<dyn ExchangeDelivery + Send + Sync>> {
-        self.0.read().unwrap().get(&exchange_id).cloned()
-    }
-
-    pub fn insert(
+    pub fn get(
         &self,
         exchange_id: ExchangeId,
-        exchange: Arc<dyn ExchangeDelivery + Send + Sync>,
-    ) {
-        self.0
+        sending_host_idx: usize,
+        message_type: MessageType,
+        sequence: u64,
+    ) -> Result<ExchangeGet, ExchangeGetError> {
+        let map = self.entries.read().unwrap();
+        let entry = map
+            .get(&exchange_id)
+            .ok_or(ExchangeGetError::UnknownExchange(exchange_id))?;
+        match self.next_sequence[sending_host_idx][message_type].compare_exchange(
+            sequence,
+            sequence + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                // Correct sequence number.
+                Ok(ExchangeGet {
+                    delivery: Some(entry.delivery.clone()),
+                    next_sequence: sequence + 1,
+                })
+            }
+            Err(next_sequence) => {
+                if sequence < next_sequence {
+                    // Duplicate sequence number.
+                    Ok(ExchangeGet {
+                        delivery: None,
+                        next_sequence,
+                    })
+                } else {
+                    // Skipped sequence number.
+                    Err(ExchangeGetError::InvalidSequence {
+                        sequence,
+                        next_sequence,
+                    })
+                }
+            }
+        }
+    }
+
+    pub fn insert(&self, exchange_id: ExchangeId, delivery: Arc<dyn ExchangeDelivery>) {
+        self.entries
             .write()
             .unwrap()
             .entry(exchange_id)
             .and_modify(|_| panic!())
-            .or_insert_with(|| exchange);
+            .or_insert_with(|| ExchangeDirectoryEntry::new(delivery));
+    }
+
+    /// Registers `cancel`/`handle` as the connection serving
+    /// `sending_host_idx` and `message_type`, cancelling any previous
+    /// connection serving the same pair and waiting for it to fully exit
+    /// first.  See [`ConnectionRegistry`].
+    async fn take_over_connection(
+        &self,
+        sending_host_idx: usize,
+        message_type: MessageType,
+        cancel: CancellationToken,
+        handle: JoinHandle<std::io::Result<()>>,
+    ) {
+        self.connections
+            .take_over(sending_host_idx, message_type, cancel, handle)
+            .await
     }
 }
 
 struct ExchangeServer {
-    receivers: Range<usize>,
+    layout: Layout,
     directory: ExchangeDirectory,
     stream: TcpStream,
+
+    /// Cancelled by a subsequent connection that takes over this connection's
+    /// (host, message type) slot in the [`ConnectionRegistry`].  Checked only
+    /// while reading a message off the wire (see `read_message`), never once
+    /// a sequence number has been claimed for it.
+    cancel: CancellationToken,
+
+    /// This task's own join handle, used to register it with the directory's
+    /// [`ConnectionRegistry`] once the first message identifies which (host,
+    /// message type) pair it serves.  `None` after that registration happens.
+    self_handle: Option<JoinHandle<std::io::Result<()>>>,
 }
 
 impl ExchangeServer {
+    /// Reads one message (header and payloads) from `stream`, or `None` at
+    /// EOF.
+    ///
+    /// This is pure network I/O: it doesn't touch the sequence number or
+    /// deliver anything, so unlike the rest of message processing, it's safe
+    /// to abandon at any point (see `serve`'s use of `cancel`).
+    async fn read_message(
+        stream: &mut TcpStream,
+        n: usize,
+    ) -> std::io::Result<Option<(ExchangeHeader, Vec<AlignedVec>, usize)>> {
+        let Some(header) = ExchangeHeader::read(n, stream).await? else {
+            return Ok(None);
+        };
+        if inject_fault("server failure") {
+            return Err(std::io::Error::other("simulated server failure"));
+        }
+
+        let payload_lens = header.payload_lens.iter().copied().map(|len| len as usize);
+        let bytes = ExchangeHeader::len_for_count(n) + payload_lens.clone().sum::<usize>();
+        let mut data = Vec::with_capacity(n);
+        for len in payload_lens {
+            // Read the payload into an `AlignedVec` so that we can pass it
+            // to `rkyv` later without copying.
+            //
+            // # Safety
+            //
+            // [std::slice::from_raw_parts_mut] has 4 undefined behavior
+            // conditions which we satisfy as follows:
+            //
+            // - Our pointer is nonnull and valid for reads and writes
+            //   (because of MaybeUninit) and aligned properly (no
+            //   alignment is needed).
+            //
+            // - The data is initialized (because of MaybeUninit).
+            //
+            // - There's no aliasing.
+            //
+            // - The slice has limited size.
+            let mut payload = AlignedVec::with_capacity(len);
+            let pointer = payload.as_mut_ptr() as *mut MaybeUninit<u8>;
+            let mut slice = unsafe { std::slice::from_raw_parts_mut(pointer, len) };
+            while !slice.is_empty() {
+                stream.read_buf(&mut slice).await?;
+            }
+            unsafe { payload.set_len(len) };
+            data.push(payload);
+        }
+        Ok(Some((header, data, bytes)))
+    }
+
     async fn serve(mut self) -> std::io::Result<()> {
-        while let Some(header) = ExchangeHeader::read(&mut self.stream).await? {
+        self.stream.set_nodelay(true)?;
+        let receivers = self.layout.local_workers();
+        while let Some((header, data, bytes)) = tokio::select! {
+            result = Self::read_message(&mut self.stream, receivers.len()) => result?,
+            // Reading a message is pure I/O with no visible side effect, so
+            // it's safe to abandon here at any point -- unlike a forced task
+            // abort, this can never leave a sequence number claimed without a
+            // matching delivery.  Checking here (rather than only between
+            // messages) also lets a takeover respond promptly even if this
+            // connection is stuck mid-read on a socket that TCP hasn't yet
+            // noticed is dead.
+            () = self.cancel.cancelled() => return Ok(()),
+        } {
             let start = Instant::now();
             let exchange_id = header.exchange_id;
+            let sequence = header.sequence;
             let sender = header.sender as usize;
-            let mut bytes = self.receivers.len() * ExchangeHeader::LEN;
-            let mut header = Some(header);
-            let mut data = Vec::with_capacity(self.receivers.len());
-            for _ in self.receivers.clone() {
-                // Read the header (if we didn't already).
-                let header = if let Some(header) = header.take() {
-                    header
-                } else {
-                    ExchangeHeader::read(&mut self.stream)
-                        .await?
-                        .ok_or_else(|| std::io::Error::from(ErrorKind::UnexpectedEof))?
-                };
+            let n = receivers.len();
 
-                // Read the payload, which consists of `header.data_len`
-                // bytes followed by padding up to a multiple of 16 bytes.
-                //
-                // We read it into an `AlignedVec` so that we can pass it to
-                // `rkyv` later without copying.
-                //
-                // # Safety
-                //
-                // [std::slice::from_raw_parts_mut] has 4 undefined behavior
-                // conditions which we satisfy as follows:
-                //
-                // - Our pointer is nonnull and valid for reads and writes
-                //   (because of MaybeUninit) and aligned properly (no
-                //   alignment is needed).
-                //
-                // - The data is initialized (because of MaybeUninit).
-                //
-                // - There's no aliasing.
-                //
-                // - The slice has limited size.
-                let len = header.data_len as usize;
-                let padded_len = len.next_multiple_of(16);
-                let mut payload = AlignedVec::with_capacity(padded_len);
-                let pointer = payload.as_mut_ptr() as *mut MaybeUninit<u8>;
-                let mut slice = unsafe { std::slice::from_raw_parts_mut(pointer, padded_len) };
-                while !slice.is_empty() {
-                    self.stream.read_buf(&mut slice).await?;
-                }
-                unsafe { payload.set_len(len) };
-                data.push(payload);
-
-                bytes += padded_len;
+            let sending_host_idx = self
+                .layout
+                .worker_idx_to_host_idx(sender)
+                .expect("valid sender index");
+            if let Some(handle) = self.self_handle.take() {
+                // Identify this connection by the sender and message type of
+                // its first message, then take over its (host, message type)
+                // slot: if a previous connection is still delivering for the
+                // same pair (e.g. a reconnection whose old connection hasn't
+                // yet noticed its socket is dead), cancel it and wait for it
+                // to fully exit before processing any message on this
+                // connection, so the two can never overlap.
+                self.directory
+                    .take_over_connection(
+                        sending_host_idx,
+                        header.message_type,
+                        self.cancel.clone(),
+                        handle,
+                    )
+                    .await;
             }
 
-            let receiver = self
-                .directory
-                .get(exchange_id)
-                .expect("should have exchange for received data");
+            let ExchangeGet {
+                delivery,
+                next_sequence,
+            } = match self.directory.get(
+                exchange_id,
+                sending_host_idx,
+                header.message_type,
+                sequence,
+            ) {
+                Ok(get) => get,
+                Err(error @ ExchangeGetError::InvalidSequence { .. }) => {
+                    // I don't think this error should occur in practice.
+                    // However, distributed systems are tricky and I am not 100%
+                    // confident of that.  If it does occur in practice, it is
+                    // better to log it as an error and continue operating than
+                    // to fail.
+                    error!(
+                        "failed to deliver {sequence} from {sender} to {receivers:?}: {error:?}"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    panic!(
+                        "failed to deliver {sequence} from {sender} to {receivers:?}: {error:?}"
+                    );
+                }
+            };
             Span::new("receive")
                 .with_start(start)
                 .with_category("Exchange")
                 .with_tooltip(|| {
-                    format!(
-                        "{} receive {} from worker {sender}",
-                        receiver.name(),
-                        HumanBytes::from(bytes),
-                    )
+                    if let Some(delivery) = &delivery {
+                        format!(
+                            "{} receive {} seq {sequence} from worker {sender}",
+                            delivery.name(),
+                            HumanBytes::from(bytes),
+                        )
+                    } else {
+                        format!("receive duplicate seq {sequence} (expected {next_sequence}) from worker {sender}")
+                    }
                 })
                 .record();
-            receiver.received(sender, data).await;
+
+            EXCHANGE_MESSAGES_RECEIVED.fetch_add(n, Ordering::Relaxed);
+            if let Some(delivery) = delivery {
+                delivery.received(sender, data).await;
+            } else {
+                DUPLICATE_EXCHANGE_MESSAGES_RECEIVED.fetch_add(n, Ordering::Relaxed);
+            }
+
+            // Tell the client it can stop buffering this message.
+            self.stream.write_u64_le(next_sequence).await?;
         }
         Ok(())
     }
@@ -473,8 +899,8 @@ impl ExchangeServer {
 pub struct ExchangeClients {
     runtime: WeakRuntime,
 
-    /// Cached `runtime.layout().local_workers()`.
-    local_workers: Range<usize>,
+    /// Cached `runtime.layout()`.
+    layout: Layout,
 
     /// Listens for connections from other hosts.
     ///
@@ -484,9 +910,11 @@ pub struct ExchangeClients {
     /// tries to send data to one.
     listener: OnceCell<Option<ExchangeListener>>,
 
-    /// Maps from a range of worker IDs to the RPC client used to contact those
+    /// Maps from a range of worker IDs to the RPC clients used to contact those
     /// workers.  Only worker IDs for remote workers appear in the map.
-    clients: Vec<(Host, OnceCell<ExchangeClient>)>,
+    ///
+    /// We use one RPC client per [MessageType] per [Host].
+    clients: Vec<(Host, EnumMap<MessageType, OnceCell<ExchangeClient>>)>,
 }
 
 impl ExchangeClients {
@@ -503,20 +931,20 @@ impl ExchangeClients {
 
     fn new(runtime: &Runtime) -> ExchangeClients {
         Self {
-            local_workers: runtime.layout().local_workers(),
+            layout: runtime.layout().clone(),
             runtime: runtime.downgrade(),
             listener: Default::default(),
             clients: runtime
                 .layout()
                 .other_hosts()
-                .map(|host| (host.clone(), OnceCell::new()))
+                .map(|host| (host.clone(), Default::default()))
                 .collect(),
         }
     }
 
     /// Returns a client for `worker`, which must be a remote worker ID, first
     /// establishing a connection if there isn't one yet.
-    pub async fn connect(&self, worker: usize) -> &ExchangeClient {
+    pub async fn connect(&self, worker: usize, message_type: MessageType) -> &ExchangeClient {
         self.listener
             .get_or_init(|| async {
                 if let Some(runtime) = self.runtime.upgrade()
@@ -527,7 +955,7 @@ impl ExchangeClients {
                         local_address,
                         runtime.take_exchange_listener(),
                         directory,
-                        self.local_workers.clone(),
+                        self.layout.clone(),
                     ))
                 } else {
                     None
@@ -540,8 +968,19 @@ impl ExchangeClients {
             .iter()
             .find(|(host, _client)| host.workers.contains(&worker))
             .unwrap();
-        cell.get_or_init(|| ExchangeClient::new(host.address, &host.workers))
+        cell[message_type]
+            .get_or_init(|| ExchangeClient::new(message_type, host.address, &host.workers))
             .await
+    }
+
+    pub async fn wait(&self) {
+        for (_, clients) in &self.clients {
+            for client in clients.values() {
+                if let Some(client) = client.get() {
+                    client.wait().await;
+                }
+            }
+        }
     }
 }
 
@@ -703,6 +1142,9 @@ pub(crate) struct Exchange<T> {
 
     /// The number of bytes serialized.
     deserialized_bytes: AtomicUsize,
+
+    /// When the exchange is active.
+    activity: ExchangeActivity,
 }
 
 // Stop Rust from complaining about unused field.
@@ -714,7 +1156,7 @@ impl ExchangeListener {
         local_address: SocketAddr,
         exchange_listener: Option<std::net::TcpListener>,
         directory: ExchangeDirectory,
-        receivers: Range<usize>,
+        layout: Layout,
     ) -> Self {
         let token = CancellationToken::new();
         let drop = token.clone().drop_guard();
@@ -736,14 +1178,30 @@ impl ExchangeListener {
             } {
                 match stream {
                     Ok((stream, _address)) => {
-                        tokio::spawn(
+                        let layout = layout.clone();
+                        let directory = directory.clone();
+                        // `ExchangeServer` needs its own join handle to
+                        // register itself with the `ConnectionRegistry` (see
+                        // `ExchangeServer::serve`), which isn't available
+                        // until after `tokio::spawn` returns.  Send it in
+                        // through a oneshot channel; the task's first action
+                        // is to await it, so it can't race ahead of the send
+                        // below.
+                        let cancel = CancellationToken::new();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let handle = tokio::spawn(async move {
+                            let self_handle = rx.await.ok();
                             ExchangeServer {
-                                receivers: receivers.clone(),
-                                directory: directory.clone(),
+                                layout,
+                                directory,
                                 stream,
+                                cancel,
+                                self_handle,
                             }
-                            .serve(),
-                        );
+                            .serve()
+                            .await
+                        });
+                        let _ = tx.send(handle);
                     }
                     Err(error) => warn!("Error accepting connection: {error}"),
                 }
@@ -763,6 +1221,7 @@ where
         clients: Arc<ExchangeClients>,
         exchange_id: ExchangeId,
         directory: &ExchangeDirectory,
+        activity: ExchangeActivity,
     ) -> Arc<Self> {
         let npeers = Runtime::num_workers();
         let mailboxes: Vec<Mutex<Option<Mailbox<T>>>> =
@@ -788,6 +1247,13 @@ where
             mailboxes,
             deserialization_usecs: AtomicU64::new(0),
             deserialized_bytes: AtomicUsize::new(0),
+            activity: if runtime.dev_tweaks().optimize_input_during_commit()
+                && !runtime.allow_input_during_commit()
+            {
+                activity
+            } else {
+                ExchangeActivity::AllSteps
+            },
         });
 
         directory.insert(exchange_id, exchange.clone());
@@ -806,39 +1272,6 @@ where
         sender * self.npeers + receiver
     }
 
-    /// True if all `receiver`'s incoming mailboxes contain data.
-    ///
-    /// Once this function returns true, a subsequent `try_receive_all`
-    /// operation is guaranteed for `receiver`.
-    fn ready_to_receive(&self, receiver: usize) -> bool {
-        debug_assert!(receiver < self.npeers);
-        self.receiver_counters[receiver].load(Ordering::Acquire) == self.npeers
-    }
-
-    /// Register callback to be invoked whenever the `ready_to_receive`
-    /// condition becomes true.
-    ///
-    /// The callback can be setup at most once (e.g., when a scheduler attaches
-    /// to the circuit) and cannot be unregistered.  Notifications delivered
-    /// before the callback is registered are lost.  The client should call
-    /// `ready_to_receive` after installing the callback to check
-    /// the status.
-    ///
-    /// After the callback has been registered, notifications are delivered with
-    /// at-least-once semantics: a notification is generated whenever the
-    /// status changes from not ready to ready, but spurious notifications
-    /// can occur occasionally.  The user must check the status explicitly
-    /// by calling `ready_to_receive` or be prepared that `receive_all`
-    /// can fail.
-    pub(crate) fn register_receiver_callback<F>(&self, receiver: usize, cb: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        debug_assert!(receiver < self.npeers);
-
-        self.receiver_callbacks[receiver].set_callback(cb);
-    }
-
     /// Locks and returns the mailbox for the sender/receiver pair.
     fn mailbox(&self, sender: usize, receiver: usize) -> MutexGuard<'_, Option<Mailbox<T>>> {
         self.mailboxes[self.mailbox_index(sender, receiver)]
@@ -849,7 +1282,11 @@ where
     /// Create a new `Exchange` instance if an instance with the same id
     /// (created by another thread) does not yet exist within `runtime`.
     /// The number of peers will be set to `runtime.num_workers()`.
-    pub(crate) fn with_runtime(runtime: &Runtime, exchange_id: ExchangeId) -> Arc<Self> {
+    pub(crate) fn with_runtime(
+        runtime: &Runtime,
+        exchange_id: ExchangeId,
+        activity: ExchangeActivity,
+    ) -> Arc<Self> {
         // It's tempting to move the following calls to create the
         // `ExchangeDirectory` and `ExchangeClients` into `Exchange::new`, but
         // don't do it: all three of these access `runtime.local_store` and
@@ -859,7 +1296,7 @@ where
         runtime
             .local_store()
             .entry(ExchangeCacheId::new(exchange_id))
-            .or_insert_with(|| Exchange::new(runtime, clients, exchange_id, &directory))
+            .or_insert_with(|| Exchange::new(runtime, clients, exchange_id, &directory, activity))
             .value()
             .clone()
     }
@@ -987,16 +1424,19 @@ where
                         })
                         .collect_vec();
 
+                    let message_type = MessageType::Synchronous(MessageSize::from_bytes(
+                        items.iter().map(|fbuf| fbuf.len()).sum(),
+                    ));
+
                     // We discard the return value that could allow us to wait
                     // for the channel tx buffer to drain, because exchange is
                     // synchronous, meaning that it will drain before we send
                     // the next message.
-                    let _ = self.clients.connect(receivers.start).await.send(
-                        global_node_id.clone(),
-                        self.exchange_id,
-                        sender,
-                        items,
-                    );
+                    let _ = self
+                        .clients
+                        .connect(receivers.start, message_type)
+                        .await
+                        .send(global_node_id.clone(), self.exchange_id, sender, items);
                 }
             }
         }
@@ -1004,7 +1444,16 @@ where
 
     /// Read all incoming messages for this worker, waiting for data to arrive
     /// as needed.
-    pub(crate) async fn receive_all<D>(&self, deserialize: D) -> Vec<T>
+    ///
+    /// When the data is ready, but before reading it, this method swaps
+    /// `start_wait_usecs` with 0 and returns the old value along with the data.
+    /// This allows the caller to obtain the waiting time incurred just after it
+    /// became ready.
+    pub(crate) async fn receive_all<D>(
+        &self,
+        deserialize: D,
+        start_wait_usecs: Option<&AtomicU64>,
+    ) -> (Vec<T>, Option<u64>)
     where
         D: Fn(AlignedVec) -> T,
     {
@@ -1024,6 +1473,11 @@ where
             }
         }
 
+        let start_wait_usecs = start_wait_usecs.and_then(|v| {
+            let start_wait_usecs = v.swap(0, Ordering::Acquire);
+            (start_wait_usecs != 0).then_some(start_wait_usecs)
+        });
+
         let mut data = Vec::with_capacity(self.npeers);
         for sender in 0..self.npeers {
             let mailbox = self.mailbox(sender, receiver).take().unwrap();
@@ -1035,7 +1489,7 @@ where
             }
         }
 
-        data
+        (data, start_wait_usecs)
     }
 }
 
@@ -1059,6 +1513,19 @@ where
                 self.deliver(sender, receiver, Mailbox::Rx(data));
             }
         })
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    Active,
+    Flush,
+    Commit,
+}
+
+impl Phase {
+    fn is_inactive(&self, activity: ExchangeActivity) -> bool {
+        *self == Phase::Commit && activity == ExchangeActivity::InputOnly
     }
 }
 
@@ -1099,13 +1566,6 @@ where
 ///                       └───────┘      └───────┘
 ///                    ExchangeSender  ExchangeReceiver
 /// ```
-///
-/// `ExchangeSender` is an asynchronous operator., i.e.,
-/// [`ExchangeSender::is_async`] returns `true`.  It becomes schedulable
-/// ([`ExchangeSender::ready`] returns `true`) once all peers have retrieved
-/// values written by the operator in the previous clock cycle.  The scheduler
-/// should use [`ExchangeSender::register_ready_callback`] to get notified when
-/// the operator becomes schedulable.
 ///
 /// `ExchangeSender` doesn't have a public constructor and must be instantiated
 /// using the [`new_exchange_operators`] function, which creates an
@@ -1182,7 +1642,7 @@ where
 /// use dbsp::{
 ///     operator::{communication::new_exchange_operators, Generator},
 ///     circuit::{WorkerLocation, WorkerLocations},
-///     operator::communication::Mailbox,
+///     operator::communication::{ExchangeActivity, Mailbox},
 ///     Circuit, RootCircuit, Runtime,
 ///     storage::file::to_bytes_dyn,
 ///     trace::aligned_deserialize,
@@ -1218,6 +1678,7 @@ where
 ///             },
 ///             |data| aligned_deserialize(&data[..]),///             // Reassemble received values into a vector.
 ///             |v: &mut Vec<usize>, n| v.push(n),
+///             ExchangeActivity::AllSteps,
 ///         ).unwrap();
 ///
 ///         // Add exchange operators to the circuit.
@@ -1259,7 +1720,7 @@ where
     // Input batch sizes.
     input_batch_stats: BatchSizeStats,
 
-    flushed: bool,
+    phase: Phase,
 
     // The instant when the sender produced its outputs, and the
     // receiver starts waiting for all other workers to produce their
@@ -1286,7 +1747,7 @@ where
             outputs: Vec::with_capacity(Runtime::num_workers()),
             exchange,
             input_batch_stats: BatchSizeStats::new(),
-            flushed: false,
+            phase: Phase::Active,
             start_wait_usecs,
             phantom: PhantomData,
         }
@@ -1324,8 +1785,12 @@ where
         true
     }
 
+    fn start_transaction(&mut self) {
+        self.phase = Phase::Active;
+    }
+
     fn flush(&mut self) {
-        self.flushed = true;
+        self.phase = Phase::Flush;
     }
 }
 
@@ -1340,6 +1805,21 @@ where
     }
 
     async fn eval_owned(&mut self, input: D) {
+        if self.phase.is_inactive(self.exchange.activity) {
+            assert_eq!(
+                input.num_entries_deep(),
+                0,
+                "cannot process input received during commit (see [CircuitConfig::allow_input_during_commit] for more information)"
+            );
+            return;
+        };
+        let flushed = if self.phase == Phase::Flush {
+            self.phase = Phase::Commit;
+            true
+        } else {
+            false
+        };
+
         self.input_batch_stats.add_batch(input.num_entries_deep());
 
         debug_assert!(self.ready());
@@ -1350,16 +1830,14 @@ where
 
         let data = self.outputs.drain(..).map(|mailbox| match mailbox {
             Mailbox::Tx(mut data) => {
-                data.push(self.flushed as u8);
+                data.push(flushed as u8);
                 Mailbox::Tx(data)
             }
             Mailbox::Rx(_) => unreachable!(),
-            Mailbox::Plain(item) => Mailbox::Plain((item, self.flushed)),
+            Mailbox::Plain(item) => Mailbox::Plain((item, flushed)),
         });
 
         self.exchange.send_all(&self.global_node_id, data).await;
-
-        self.flushed = false;
     }
 
     fn input_preference(&self) -> OwnershipPreference {
@@ -1375,18 +1853,10 @@ where
 /// peer.
 ///
 /// See [`ExchangeSender`] documentation for details.
-///
-/// `ExchangeReceiver` is an asynchronous operator., i.e.,
-/// [`ExchangeReceiver::is_async`] returns `true`.  It becomes schedulable
-/// ([`ExchangeReceiver::ready`] returns `true`) once all peers have sent values
-/// for this worker in the current clock cycle.  The scheduler should use
-/// [`ExchangeReceiver::register_ready_callback`] to get notified when the
-/// operator becomes schedulable.
 pub struct ExchangeReceiver<IF, T, L, D>
 where
     T: Send + 'static + Clone,
 {
-    worker_index: usize,
     location: OperatorLocation,
     init: IF,
     deserialize: D,
@@ -1396,6 +1866,7 @@ where
     flush_complete: bool,
     start_wait_usecs: Arc<AtomicU64>,
     total_wait_time: Arc<AtomicU64>,
+    phase: Phase,
 
     // Output batch sizes.
     output_batch_stats: BatchSizeStats,
@@ -1406,7 +1877,6 @@ where
     T: Send + 'static + Clone + Debug,
 {
     pub(crate) fn new(
-        worker_index: usize,
         location: OperatorLocation,
         exchange: Arc<Exchange<(T, bool)>>,
         init: IF,
@@ -1414,10 +1884,7 @@ where
         deserialize: D,
         combine: L,
     ) -> Self {
-        debug_assert!(worker_index < Runtime::num_workers());
-
         Self {
-            worker_index,
             location,
             init,
             combine,
@@ -1428,11 +1895,8 @@ where
             output_batch_stats: BatchSizeStats::new(),
             start_wait_usecs,
             total_wait_time: Arc::new(AtomicU64::new(0)),
+            phase: Phase::Active,
         }
-    }
-
-    fn is_ready(&self) -> bool {
-        self.exchange.ready_to_receive(self.worker_index)
     }
 }
 
@@ -1464,50 +1928,12 @@ where
         });
     }
 
-    fn is_async(&self) -> bool {
-        true
-    }
-
-    fn register_ready_callback<F>(&mut self, cb: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        let start_wait_usecs = self.start_wait_usecs.clone();
-        let total_wait_time = self.total_wait_time.clone();
-        let exchange = self.exchange.clone();
-        let worker_index = self.worker_index;
-
-        let cb = move || {
-            if exchange.ready_to_receive(worker_index) {
-                // The callback can be invoked multiple times per step.
-                // Reset start_wait_usecs to 0 to make sure we don't double-count.
-                let start = start_wait_usecs.swap(0, Ordering::Acquire);
-                if start != 0 {
-                    let end = current_time_usecs();
-                    if end > start {
-                        let wait_time_usecs = end - start;
-                        // if worker_index == 0 {
-                        //     info!(
-                        //         "{worker_index}: {} +{wait_time_usecs}",
-                        //         exchange.exchange_id()
-                        //     );
-                        // }
-                        total_wait_time.fetch_add(wait_time_usecs, Ordering::AcqRel);
-                    }
-                }
-            }
-            cb()
-        };
-        self.exchange
-            .register_receiver_callback(self.worker_index, cb)
-    }
-
-    fn ready(&self) -> bool {
-        self.is_ready()
-    }
-
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
+    }
+
+    fn start_transaction(&mut self) {
+        self.phase = Phase::Active;
     }
 
     fn flush(&mut self) {
@@ -1542,7 +1968,10 @@ where
     D: Fn(AlignedVec) -> T + Send + Sync + 'static,
 {
     async fn eval(&mut self) -> O {
-        debug_assert!(self.ready());
+        if self.phase.is_inactive(self.exchange.activity) {
+            return (self.init)();
+        }
+
         let deserialize = |mut vec: AlignedVec| {
             let flushed = pop_flushed(&mut vec);
             let value = (self.deserialize)(vec);
@@ -1550,7 +1979,16 @@ where
         };
 
         let mut combined = (self.init)();
-        let res = self.exchange.receive_all(deserialize).await;
+        let (res, start_wait_usecs) = self
+            .exchange
+            .receive_all(deserialize, Some(&self.start_wait_usecs))
+            .await;
+        if let Some(start_wait_usecs) = start_wait_usecs {
+            self.total_wait_time.fetch_add(
+                current_time_usecs().saturating_sub(start_wait_usecs),
+                Ordering::Release,
+            );
+        }
         for (data, flushed) in res {
             if flushed {
                 self.flush_count += 1;
@@ -1566,6 +2004,7 @@ where
 
             self.flush_complete = true;
             self.flush_count = 0;
+            self.phase = Phase::Commit;
         }
 
         self.output_batch_stats
@@ -1586,6 +2025,28 @@ struct DirectoryId;
 
 impl TypedMapKey<LocalStoreMarker> for DirectoryId {
     type Value = ExchangeDirectory;
+}
+
+/// The microsteps during which an exchange is active.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExchangeActivity {
+    /// The exchange is active in every microstep.
+    ///
+    /// This includes pre-commit and commit microstep.
+    AllSteps,
+
+    /// The exchange is active only during pre-commit microsteps.
+    ///
+    /// This allows for optimizations for exchanges used for sharding data from
+    /// input operators, which don't exchange any data during commit.
+    ///
+    /// # Limitation
+    ///
+    /// The current implementation only works for operators that flush in the
+    /// same (micro)step in every worker.  This is true for input operators,
+    /// which flush as soon as the transaction starts committing, but it is not
+    /// necessarily true for other operators.
+    InputOnly,
 }
 
 /// Create an [`ExchangeSender`]/[`ExchangeReceiver`] operator pair.
@@ -1619,6 +2080,7 @@ pub fn new_exchange_operators<TI, TO, TE, IF, PL, CL, D>(
     partition: PL,
     deserialize: D,
     combine: CL,
+    activity: ExchangeActivity,
 ) -> Option<(ExchangeSender<TI, TE, PL>, ExchangeReceiver<IF, TE, CL, D>)>
 where
     TO: Clone,
@@ -1632,11 +2094,10 @@ where
         return None;
     }
     let runtime = Runtime::runtime().unwrap();
-    let worker_index = Runtime::worker_index();
 
     let exchange_id = runtime.sequence_next().try_into().unwrap();
     let start_wait_usecs = Arc::new(AtomicU64::new(0));
-    let exchange = Exchange::with_runtime(&runtime, exchange_id);
+    let exchange = Exchange::with_runtime(&runtime, exchange_id, activity);
     let sender = ExchangeSender::new(
         location,
         exchange.clone(),
@@ -1644,7 +2105,6 @@ where
         partition,
     );
     let receiver = ExchangeReceiver::new(
-        worker_index,
         location,
         exchange,
         init,
@@ -1653,6 +2113,34 @@ where
         combine,
     );
     Some((sender, receiver))
+}
+
+#[cfg(test)]
+fn inject_fault(kind: impl Display) -> bool {
+    use rand::Rng as _;
+
+    if rand::thread_rng().gen_range(0..100) == 0 {
+        warn!("injecting failure: {kind}");
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn inject_fault(_kind: impl Display) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn backoff_time() -> Duration {
+    use rand::Rng;
+    Duration::from_micros(rand::thread_rng().gen_range(0..1000))
+}
+
+#[cfg(not(test))]
+fn backoff_time() -> Duration {
+    Duration::from_millis(1000)
 }
 
 #[cfg(test)]
@@ -1670,10 +2158,11 @@ mod tests {
         },
         operator::{
             Generator,
-            communication::{Mailbox, new_exchange_operators},
+            communication::{ExchangeActivity, Mailbox, new_exchange_operators},
         },
         storage::file::{to_bytes, to_bytes_dyn},
         trace::aligned_deserialize,
+        utils::test::init_test_logger,
     };
     use std::{
         iter::{repeat, zip},
@@ -1691,7 +2180,8 @@ mod tests {
     // value `(sender, n)` to each receiver, where `sender` is the sender's
     // worker number in round `n`.
     fn circuit() {
-        let exchange = Exchange::with_runtime(&Runtime::runtime().unwrap(), 0);
+        let exchange =
+            Exchange::with_runtime(&Runtime::runtime().unwrap(), 0, ExchangeActivity::AllSteps);
         TOKIO.block_on(async {
             let sender = Runtime::worker_index();
             let n_workers = Runtime::num_workers();
@@ -1703,8 +2193,8 @@ mod tests {
                     })
                     .await;
 
-                let received = exchange
-                    .receive_all(|data| aligned_deserialize(&data[..]))
+                let (received, _) = exchange
+                    .receive_all(|data| aligned_deserialize(&data[..]), None)
                     .await;
 
                 let expected = (0..n_workers).map(|worker| (worker, round)).collect_vec();
@@ -1780,6 +2270,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn single_host() {
+        init_test_logger();
         for workers in [2, 4, 8] {
             test_circuit(workers, 1, circuit);
         }
@@ -1789,6 +2280,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn multihost() {
+        init_test_logger();
         for (workers, hosts) in [(2, 2), (4, 2), (8, 2), (3, 3), (4, 4), (16, 4)] {
             test_circuit(workers, hosts, circuit);
         }
@@ -1821,6 +2313,7 @@ mod tests {
                 },
                 |data| aligned_deserialize(&data[..]),
                 |v: &mut Vec<usize>, n| v.push(n),
+                ExchangeActivity::AllSteps,
             )
             .unwrap();
 
@@ -1868,12 +2361,14 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn operators_single_host_dynamic() {
+        init_test_logger();
         test_operators_single_host(operator_circuit::<DynamicScheduler>);
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn operators_multihost_dynamic() {
+        init_test_logger();
         test_operators_multihost(operator_circuit::<DynamicScheduler>);
     }
 }

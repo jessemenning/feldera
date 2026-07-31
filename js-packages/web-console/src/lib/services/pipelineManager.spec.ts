@@ -20,8 +20,10 @@ vi.mock('$lib/services/manager', async (importOriginal) => {
   }
 })
 
+import type { CombinedDesiredStatus, CombinedStatus } from '$lib/services/manager'
 import * as sdkManager from '$lib/services/manager'
 import {
+  consolidatePipelineStatus,
   getExtendedPipeline,
   getPipelines,
   getPipelineThumb,
@@ -115,5 +117,29 @@ describe('pipelineManager API error propagation', () => {
       const err = await catchRejection(call())
       expect(err).toBe(networkError)
     })
+  })
+})
+
+// A concurrent bootstrap keeps the pre-existing views live. Each phase surfaces
+// as its own status label rather than being folded into Running, so the user
+// sees the backfill and cutover progress in the main status pill.
+describe('consolidatePipelineStatus concurrent bootstrap phase', () => {
+  const consolidate = (deployment: CombinedStatus, desired: CombinedDesiredStatus) =>
+    consolidatePipelineStatus('Success', deployment, desired, null)
+
+  // The concurrent-bootstrap phases report their own status regardless of the desired
+  // status. The non-Running desired cases below would otherwise flip the status to
+  // Paused/Stopping, which would hide the ongoing bootstrap.
+  it.each([
+    { deployment: 'ConcurrentBootstrapping' as const, desired: 'Running' as const },
+    { deployment: 'ConcurrentBootstrapping' as const, desired: 'Paused' as const },
+    { deployment: 'ConcurrentBootstrapping' as const, desired: 'Stopped' as const },
+    { deployment: 'ConcurrentBootstrapping' as const, desired: 'Suspended' as const },
+    { deployment: 'Synchronizing' as const, desired: 'Running' as const },
+    { deployment: 'Synchronizing' as const, desired: 'Paused' as const },
+    { deployment: 'Synchronizing' as const, desired: 'Stopped' as const },
+    { deployment: 'Synchronizing' as const, desired: 'Suspended' as const }
+  ])('reads as $deployment (desired $desired)', ({ deployment, desired }) => {
+    expect(consolidate(deployment, desired).status).toBe(deployment)
   })
 })

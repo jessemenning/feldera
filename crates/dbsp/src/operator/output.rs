@@ -21,7 +21,8 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     mem::transmute,
-    sync::Arc,
+    ops::Range,
+    sync::{Arc, Mutex},
 };
 use typedmap::TypedMapKey;
 
@@ -109,7 +110,11 @@ where
         let (accumulated, enable_count) = self.accumulate().into_parts();
         let (output_handle, gid) = self
             .circuit()
-            .output_accumulated_stream_persistent_with_gid::<B>(&accumulated, persistent_id);
+            .output_accumulated_stream_persistent_with_gid::<B>(
+                &accumulated,
+                enable_count.clone(),
+                persistent_id,
+            );
 
         (output_handle, enable_count, gid)
     }
@@ -126,12 +131,13 @@ impl RootCircuit {
     pub fn output_accumulated_stream_persistent_with_gid<B>(
         &self,
         stream: &Stream<Self, Option<Spine<B>>>,
+        enable_count: EnableCount,
         persistent_id: Option<&str>,
     ) -> (OutputHandle<SpineSnapshot<B>>, GlobalNodeId)
     where
         B: Batch + Send,
     {
-        let (output, output_handle) = AccumulateOutput::<B>::new();
+        let (output, output_handle) = AccumulateOutput::<B>::new(enable_count);
 
         let gid = self.add_sink(output, stream);
         self.set_persistent_node_id(&gid, persistent_id);
@@ -198,6 +204,97 @@ where
     T: 'static,
 {
     type Value = OutputHandle<T>;
+}
+
+/// `TypedMapKey` entry used to share the pending-cohort slots of an
+/// [`AccumulateOutput`] operator across the workers of one host.
+struct CohortId<T> {
+    id: usize,
+    // `fn() -> T` keeps the key `Send + Sync` regardless of `T`: the key
+    // names a type but never holds a value of it.
+    _marker: PhantomData<fn() -> T>,
+}
+
+// Implement `Hash`, `Eq` manually to avoid `T: Hash` type bound.
+impl<T> Hash for CohortId<T> {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.id.hash(state);
+    }
+}
+
+impl<T> PartialEq for CohortId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<T> Eq for CohortId<T> {}
+
+impl<T> CohortId<T> {
+    fn new(id: usize) -> Self {
+        Self {
+            id,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> TypedMapKey<LocalStoreMarker> for CohortId<T>
+where
+    T: 'static,
+{
+    type Value = CohortSlots<T>;
+}
+
+/// Pending per-worker outputs for the transaction in progress.
+///
+/// Slot `i` stores the output of the host's `i`-th worker until every worker
+/// on this host has produced its output for the transaction. Remote workers
+/// have no slots: they cannot reach this host's store and publish through
+/// their own host's instance.
+struct CohortSlots<T>(Arc<Mutex<Vec<Option<T>>>>);
+
+impl<T> Clone for CohortSlots<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> CohortSlots<T> {
+    fn new(num_workers: usize) -> Self {
+        assert_ne!(num_workers, 0);
+        Self(Arc::new(Mutex::new(
+            (0..num_workers).map(|_| None).collect(),
+        )))
+    }
+
+    /// Store `value` in `slot` as its worker's output for the transaction in
+    /// progress.
+    ///
+    /// Returns the complete cohort, one value per slot in slot order, when
+    /// `value` fills the last empty slot; returns `None` otherwise.
+    fn put(&self, slot: usize, value: T) -> Option<Vec<T>> {
+        let mut pending = self.0.lock().unwrap();
+
+        // The upstream accumulator emits exactly once per transaction per
+        // worker, so the slot must be free.
+        debug_assert!(pending[slot].is_none());
+        pending[slot] = Some(value);
+
+        if pending.iter().all(Option::is_some) {
+            Some(
+                pending
+                    .iter_mut()
+                    .map(|slot| slot.take().unwrap())
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
 }
 
 struct OutputHandleInternal<T> {
@@ -479,34 +576,146 @@ where
     }
 }
 
+/// Sink operator that publishes an accumulated stream through an
+/// [`OutputHandle`].
+///
+/// Every worker's accumulator emits exactly once per transaction, but when a
+/// transaction commit spans several steps, workers can emit in different
+/// steps. Writing each emission to its mailbox immediately would let a reader
+/// observe a partial cross-worker output for a transaction. Instead, the
+/// operator parks emissions in [`CohortSlots`] shared by the workers of one
+/// host and publishes the whole cohort to the mailboxes when the last of
+/// these workers emits, so a reader sees either all of a transaction's
+/// outputs or none.
+///
+/// In a multihost runtime, the cohort covers one host: each host's workers
+/// share host-local [`CohortSlots`] and publish to host-local mailboxes,
+/// which remote workers cannot reach. A reader observes a host's outputs
+/// atomically; distinct hosts publish independently.
 pub struct AccumulateOutput<B>
 where
     B: Batch,
 {
     global_id: GlobalNodeId,
-    mailbox: Mailbox<Option<SpineSnapshot<B>>>,
+    handle: OutputHandle<SpineSnapshot<B>>,
+    /// Global indices of this host's workers: cohort slot `i` belongs to
+    /// worker `local_workers.start + i`.
+    local_workers: Range<usize>,
+    /// This worker's cohort slot: its offset within `local_workers`.
+    slot: usize,
+    pending: CohortSlots<SpineSnapshot<B>>,
     output_batch_stats: BatchSizeStats,
+
+    /// Enable count of the paired upstream [`Accumulator`](crate::operator::dynamic::accumulator::Accumulator).
+    ///
+    /// A concurrent bootstrap circuit (copy 2) has no output connector
+    /// attached, so its accumulators would be disabled and would discard the
+    /// view's contents.  Entering caching mode force-enables the accumulator
+    /// through this handle (see [`Self::start_bootstrap_output_caching`]).
+    enable_count: EnableCount,
+
+    /// `true` in a concurrent bootstrap circuit (copy 2): the view's
+    /// accumulated output is cached for transfer to the live circuit at
+    /// cutover instead of being published to the mailboxes (the bootstrap
+    /// circuit has no connector reading them).
+    caching: bool,
+
+    /// `true` once [`Self::start_bootstrap_output_caching`] has bumped
+    /// [`Self::enable_count`], so the bump happens exactly once.
+    bootstrap_enabled: bool,
+
+    /// The view's accumulated output, as a single snapshot.
+    ///
+    /// In a bootstrap circuit (copy 2) this collects the deltas flushed during
+    /// the backfill and synchronization transactions.  At cutover it is
+    /// swapped into the live circuit's operator (see [`Self::swap_state`]),
+    /// where the next committed transaction combines it with that
+    /// transaction's output and publishes the result.
+    cache: Option<SpineSnapshot<B>>,
 }
 
 impl<B> AccumulateOutput<B>
 where
     B: Batch + Send,
 {
-    pub fn new() -> (Self, OutputHandle<SpineSnapshot<B>>) {
+    pub fn new(enable_count: EnableCount) -> (Self, OutputHandle<SpineSnapshot<B>>) {
         let handle = OutputHandle::new();
-        let mailbox = handle.mailbox(Runtime::worker_index()).clone();
+
+        // The slots live in the host-local store, out of reach of remote
+        // workers, so the cohort covers only this host's workers.
+        let (local_workers, pending) = match Runtime::runtime() {
+            None => (0..1, CohortSlots::new(1)),
+            Some(runtime) => {
+                let local_workers = runtime.layout().local_workers();
+                let cohort_id = runtime.sequence_next();
+
+                let pending = runtime
+                    .local_store()
+                    .entry(CohortId::new(cohort_id))
+                    .or_insert_with(|| CohortSlots::new(local_workers.len()))
+                    .value()
+                    .clone();
+
+                (local_workers, pending)
+            }
+        };
 
         let output = Self {
             global_id: GlobalNodeId::root(),
-            mailbox,
+            handle: handle.clone(),
+            local_workers,
+            slot: Runtime::local_worker_offset(),
+            pending,
             output_batch_stats: BatchSizeStats::new(),
+            enable_count,
+            caching: false,
+            bootstrap_enabled: false,
+            cache: None,
         };
 
         (output, handle)
     }
 
+    /// Write this worker's output; publish the cohort if it is now complete.
+    ///
+    /// Only the worker that completes a cohort publishes it, so there is
+    /// never more than one publisher per cohort. Mailboxes are indexed by
+    /// global worker index, slots by local offset.
+    fn put_and_publish(&self, snapshot: SpineSnapshot<B>) {
+        if let Some(cohort) = self.pending.put(self.slot, snapshot) {
+            for (worker, snapshot) in self.local_workers.clone().zip(cohort) {
+                self.handle.mailbox(worker).set(Some(snapshot));
+            }
+        }
+    }
+
     fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
         base.child(format!("accumulate-output-{}.dat", persistent_id))
+    }
+
+    /// Merge `snapshot` into the cached accumulated output.
+    fn merge_into_cache(&mut self, snapshot: SpineSnapshot<B>) {
+        self.cache = Some(match self.cache.take() {
+            None => snapshot,
+            Some(cached) => SpineSnapshot::<B>::concat([&cached, &snapshot]),
+        });
+    }
+
+    /// Route the transaction's output `snapshot`.
+    fn deliver(&mut self, snapshot: SpineSnapshot<B>) {
+        if self.caching {
+            // Bootstrap circuit: accumulate the view's output across the
+            // backfill and synchronization transactions for transfer at
+            // cutover instead of publishing it.
+            self.merge_into_cache(snapshot);
+        } else if let Some(cached) = self.cache.take() {
+            // First committed transaction after a cutover swapped in the
+            // backfilled output: combine it with this transaction's output so
+            // the connector observes the full view as its first batch.
+            self.put_and_publish(SpineSnapshot::<B>::concat([&cached, &snapshot]));
+        } else {
+            self.put_and_publish(snapshot);
+        }
     }
 }
 
@@ -558,6 +767,29 @@ where
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
     }
+
+    fn start_bootstrap_output_caching(&mut self) {
+        self.caching = true;
+
+        // The bootstrap circuit has no connector reading this view, so its
+        // paired accumulator would otherwise stay disabled and discard the
+        // view's contents.  Force-enable it once. The bump is local to the
+        // bootstrap circuit's enable count and is harmless if the accumulator
+        // was already enabled.
+        if !self.bootstrap_enabled {
+            self.bootstrap_enabled = true;
+            self.enable_count.enable();
+        }
+    }
+
+    fn swap_state(&mut self, other: &mut Self) -> Result<(), Error> {
+        // Transfer the cached output from the bootstrap circuit (`other`) to
+        // this live operator.  Only the bootstrap circuit caches, so `self`'s
+        // cache is empty going in; afterwards this operator holds the
+        // backfilled output and `other`'s state is irrelevant (it is dropped).
+        std::mem::swap(&mut self.cache, &mut other.cache);
+        Ok(())
+    }
 }
 
 impl<B> SinkOperator<Option<Spine<B>>> for AccumulateOutput<B>
@@ -567,14 +799,16 @@ where
     async fn eval(&mut self, val: &Option<Spine<B>>) {
         if let Some(val) = val {
             self.output_batch_stats.add_batch(val.len());
-            self.mailbox.set(Some(val.ro_snapshot()));
+            // Deliver even empty outputs: cohort completion requires one
+            // emission per worker per transaction.
+            self.deliver(val.ro_snapshot());
         }
     }
 
     async fn eval_owned(&mut self, val: Option<Spine<B>>) {
         if let Some(val) = val {
             self.output_batch_stats.add_batch(val.len());
-            self.mailbox.set(Some(val.ro_snapshot()));
+            self.deliver(val.ro_snapshot());
         }
     }
 
@@ -687,7 +921,96 @@ where
 
 #[cfg(test)]
 mod test {
+    use super::CohortSlots;
     use crate::{Runtime, typed_batch::OrdZSet, utils::Tup2};
+
+    /// Parking releases a cohort only when every worker has contributed, and
+    /// the slots are reusable for the next cohort.
+    #[test]
+    fn test_cohort_slots() {
+        let slots = CohortSlots::new(3);
+
+        // Partial cohort: nothing is released.
+        assert_eq!(slots.put(0, "a0"), None);
+        assert_eq!(slots.put(2, "a2"), None);
+
+        // The last worker's output releases the whole cohort.
+        assert_eq!(slots.put(1, "a1"), Some(vec!["a0", "a1", "a2"]));
+
+        // The slots are empty again and serve the next cohort.
+        assert_eq!(slots.put(1, "b1"), None);
+        assert_eq!(slots.put(2, "b2"), None);
+        assert_eq!(slots.put(0, "b0"), Some(vec!["b0", "b1", "b2"]));
+    }
+
+    /// End-to-end: the accumulated output surfaces exactly once per
+    /// transaction, as a complete cohort with one output per worker, and
+    /// never mid-transaction or as a partial cohort mid-commit.
+    ///
+    /// Drives transactions with the manual `start_transaction` ->
+    /// `start_commit_transaction` -> `step` API so the handle can be
+    /// inspected after every step, including each step of a multi-step
+    /// commit; `DBSPHandle::transaction` would only return after the commit
+    /// completed, when the cohort is trivially complete.
+    #[test]
+    fn test_accumulate_output() {
+        use crate::trace::BatchReader;
+
+        const WORKERS: usize = 8;
+
+        let (mut dbsp, (input, output)) = Runtime::init_circuit(WORKERS, |circuit| {
+            let (zset, zset_handle) = circuit.add_input_zset::<u64>();
+            let output = zset.accumulate_output();
+
+            Ok((zset_handle, output))
+        })
+        .unwrap();
+
+        for round in 0..20u64 {
+            // Odd rounds run an empty transaction, which must still publish
+            // a complete, empty cohort.
+            let expected = if round % 2 == 0 { 20_000 } else { 0 };
+
+            dbsp.start_transaction().unwrap();
+
+            if expected > 0 {
+                let mut tuples = (round * 100_000..round * 100_000 + 20_000)
+                    .map(|k| Tup2(k, 1i64))
+                    .collect::<Vec<_>>();
+                input.append(&mut tuples);
+            }
+
+            // Steps inside an open transaction publish nothing.
+            dbsp.step().unwrap();
+            assert!(output.take_from_all().is_empty());
+            dbsp.step().unwrap();
+            assert!(output.take_from_all().is_empty());
+
+            dbsp.start_commit_transaction().unwrap();
+
+            // Every commit step yields either nothing or one complete
+            // cohort, and the whole transaction yields exactly one.
+            let mut cohorts = 0;
+            loop {
+                let committed = dbsp.step().unwrap();
+
+                let batches = output.take_from_all();
+                if !batches.is_empty() {
+                    assert_eq!(batches.len(), WORKERS);
+                    assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), expected);
+                    cohorts += 1;
+                }
+
+                if committed {
+                    break;
+                }
+            }
+            assert_eq!(cohorts, 1);
+            assert!(output.take_from_all().is_empty());
+        }
+
+        dbsp.kill().unwrap();
+    }
 
     #[test]
     fn test_output_handle() {

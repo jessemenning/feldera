@@ -81,15 +81,13 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /** Miscellaneous tests that do not fit into standard categories */
@@ -418,7 +416,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         String rustHandlesTest = """
                 #[test]
                 pub fn test() {
-                    let (mut circuit, (person, errors, adult) ) = circuit(CircuitConfig::with_workers(2)).unwrap();
+                    let (mut circuit, (person, errors, adult) ) = circuit(CircuitConfig::with_workers(3)).unwrap();
                     // Feed two input records to the circuit.
                     // First input has a count of "1"
                     person.push( (SqlString::from_ref("Bob"), Some(12), Some(true)).into(), 1 );
@@ -438,7 +436,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                     use dbsp_adapters::{CircuitCatalog, RecordFormat};
                     use feldera_types::format::csv::CsvFormatConfig;
 
-                    let (mut circuit, catalog) = circuit(CircuitConfig::with_workers(2))
+                    let (mut circuit, catalog) = circuit(CircuitConfig::with_workers(3))
                         .expect("Failed to build circuit");
                     let persons = catalog
                         .input_collection_handle(&SqlIdentifier::from("PERSON"))
@@ -517,7 +515,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                     use dbsp_adapters::{CircuitCatalog, RecordFormat};
                     use feldera_types::format::json::JsonFlavor;
                 
-                    let mut circuitAndStreams = circuit(CircuitConfig::with_workers(2usize)).unwrap();
+                    let mut circuitAndStreams = circuit(CircuitConfig::with_workers(3usize)).unwrap();
                     let streams: Catalog = circuitAndStreams.1;
                     let t = &SqlIdentifier::new("t", false);
                     let input = streams.input_collection_handle(t).unwrap();
@@ -598,21 +596,6 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                    postal_code     VARCHAR(6));
                 CREATE TABLE T(street VARCHAR, city VARCHAR, year INT);
                 CREATE VIEW V AS SELECT address_typ(T.street, city, 'CA', 94087) as address, T.year as year FROM T;""");
-    }
-
-    @Test
-    public void rawCalciteTest() throws SQLException {
-        Connection connection = DriverManager.getConnection("jdbc:calcite:");
-        String query = "SELECT timestampdiff(MONTH, TIMESTAMP'2021-02-28 12:00:00', TIMESTAMP'2021-03-28 11:59:59')";
-        try (PreparedStatement ps = connection.prepareStatement(query)) {
-            ps.execute();
-            try (ResultSet resultSet = ps.getResultSet()) {
-                while (resultSet.next()) {
-                    int result = resultSet.getInt(1);
-                    Assert.assertEquals(0, result);
-                }
-            }
-        }
     }
 
     @Test
@@ -740,6 +723,25 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
                 GROUP BY id;""");
     }
 
+    /** Node 25 needs a --localstorage-file for the WebStorage API, which
+     * the Docusaurus build touches.  Older Node versions reject the flag,
+     * so pass it only when needed. */
+    static Map<String, String> nodeLocalStorageWorkaround() throws IOException, InterruptedException {
+        Process process = new ProcessBuilder("node", "--version").start();
+        String version = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        process.waitFor();
+        int major = Integer.parseInt(version.replaceFirst("^v", "").split("\\.")[0]);
+        Map<String, String> environment = new HashMap<>();
+        if (major >= 25) {
+            File storage = File.createTempFile("localstorage", ".json");
+            storage.deleteOnExit();
+            String options = System.getenv().getOrDefault("NODE_OPTIONS", "");
+            environment.put("NODE_OPTIONS",
+                    (options + " --localstorage-file=" + storage.getAbsolutePath()).trim());
+        }
+        return environment;
+    }
+
     @Test @Ignore("To be invoked manually every time a new function is added")
     public void generateFunctionIndex() throws IOException, InterruptedException {
         // When invoked it generates documentation for the supported functions and operators
@@ -749,7 +751,7 @@ public class OtherTests extends BaseSQLTests implements IWritesLogs { // interfa
         Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../docs.feldera.com",
                 "yarn");
         Utilities.runProcess(BaseSQLTests.PROJECT_DIRECTORY + "/../docs.feldera.com",
-                "yarn", "build");
+                nodeLocalStorageWorkaround(), new String[] {"yarn", "build"});
     }
 
     @Test

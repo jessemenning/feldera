@@ -146,6 +146,42 @@ Use silent bootstrapping when the external sink already has the desired contents
 Do not use it if the sink needs to receive the full contents of newly
 added or modified views during bootstrap.
 
+## Concurrent bootstrapping
+
+:::warning Experimental
+Concurrent bootstrapping is an experimental Enterprise-only feature and is
+disabled by default.
+:::
+
+By default, bootstrapping is a **stop-the-world** operation: the pipeline ingests
+no input and existing views produce no output until every new and modified view has
+been recomputed (see [Bootstrapping](#bootstrapping) above).
+
+**Concurrent bootstrapping** removes this pause. The pipeline keeps serving and
+updating its existing views while the new and modified views bootstrap in the
+background, then atomically switches the new views in.
+
+Set `concurrent_bootstrap=true` on the [`/start`](/api/start-pipeline) or
+[`/approve`](/api/approve-bootstrap) request to opt into concurrent bootstrapping.
+
+### How it works
+
+Concurrent bootstrapping proceeds in two phases:
+
+* **Computing new and modified views**. The pipeline processes inputs and
+  incrementally updates existing views while computing the initial contents
+  of new and modified views from the pipeline's checkpointed state in the
+  background. During this phase the pipeline reports `ConcurrentBootstrapping`
+  runtime status.
+
+* **Synchronization**. The pipeline pauses input ingestion just long enough to bring
+  the new views up to date with the most recent changes, switches them in, emits the
+  full contents of new and modified views to input connectors, and returns to the
+  `Running` state. During this phase the pipeline reports `Synchronizing` runtime status.
+
+Concurrent bootstrapping is *mutually exclusive with `silent_bootstrap`**. Starting a
+pipeline with both `concurrent_bootstrap=true` and `silent_bootstrap=true` is rejected.
+
 ## Caveats and limitations
 
 ### Caveat 1: Feldera runtime upgrade can modify the pipeline
@@ -223,6 +259,10 @@ Feldera currently assumes that a UDF whose name and signature have not changed d
 If the user modifies the implementation of a UDF without changing its signature, they need to either clear the
 state of the pipeline or rename the UDF to trigger the bootstrapping of any views that depend on the modified UDF.
 
+### Limitation 5: Concurrent bootstrapping with modified tables is not yet supported
+
+Concurrent bootstrapping is rejected if the modified pipeline contains new or modified tables.
+
 ## API
 
 In this section we describe the REST API elements related to bootstrapping.
@@ -238,7 +278,13 @@ All of this functionality is also available via the Python SDK and the `fda` CLI
   to suppress output connector records during bootstrapping, as described in
   [Silent bootstrapping](#silent-bootstrapping).
 
-* Two runtime states reported by the [pipeline status endpoint](/api/get-pipeline) in the `deployment_runtime_status` field:
+* The `concurrent_bootstrap` argument to the [`/start` endpoint](/api/start-pipeline) and
+  [`/approve` endpoint](/api/approve-bootstrap). Set this argument to `true` to bootstrap
+  new and modified views concurrently, keeping the existing views live, as described in
+  [Concurrent bootstrapping](#concurrent-bootstrapping). It is mutually exclusive with
+  `silent_bootstrap`.
+
+* Runtime states reported by the [pipeline status endpoint](/api/get-pipeline) in the `deployment_runtime_status` field:
   * `AwaitingApproval` - When starting the pipeline with `bootstrap_policy=await_approval`, if the pipeline
     requires bootstrapping, it will stop in the `AwaitingApproval` state waiting for the user to approve the
     changes. While in this state, the `deployment_runtime_status_details` field lists added, modified, and removed
@@ -247,11 +293,119 @@ All of this functionality is also available via the Python SDK and the `fda` CLI
     or force-stops the pipeline with `/stop?force=true`.
   * `Bootstrapping` - In this state the pipeline evaluates new and modified views. Once bootstrapping completes,
     the pipeline automatically moves into the `Running` or `Paused` state.
+  * `ConcurrentBootstrapping` - When started with `concurrent_bootstrap=true`, the pipeline enters this state
+    while the existing views stay live and serving queries and the new and modified views backfill in the
+    background.
+  * `Synchronizing` - The brief cutover window at the end of a concurrent bootstrap, during which the pipeline
+    brings the new views up to date and switches them in before returning to the `Running` state.
 
 * The [`/approve` endpoint](/api/approve-bootstrap).
   Invoking this endpoint transitions the pipeline from the `AwaitingApproval` to `Bootstrapping` state.
   Use `/approve?silent_bootstrap=true` to approve the changes while suppressing
   output connector records produced during bootstrapping.
+
+### Previewing changes without restarting
+
+Use the [`/diff` endpoint](/api/compute-program-diff) to compute the diff between a
+pipeline's current program and a proposed new version without modifying or restarting the
+pipeline. It reports the same added, modified, and removed tables, views, and connectors
+that the `AwaitingApproval` state reports, formatted as JSON, so you can preview the effect
+of a change while editing.
+
+The request body has two optional fields:
+
+* `program_code`: the new SQL program to compare against. When omitted, the pipeline's
+  current program is used.
+* `runtime_version`: the runtime to compile the new program with (a `vX.Y.Z` tag or a git
+  SHA). When omitted, the runtime of the installed Feldera platform is used.
+
+The baseline for the diff is the pipeline's currently configured program compiled with the
+specified runtime, not the program stored in the latest checkpoint. The two usually match,
+but can differ when the last checkpoint was produced by a different program or runtime
+version (for example, an S3 checkpoint written by another pipeline).
+
+The endpoint requires the pipeline's current program to have compiled successfully. It
+returns `400 Bad Request` if the new program does not compile or the change cannot be
+bootstrapped, and `503`/`504` if the compiler is unavailable or does not respond in time.
+
+For example, if `my_pipeline` currently defines a table `t` and a view `v`, previewing the
+addition of a view `v2`:
+
+```bash
+curl -X POST http://localhost:8080/v0/pipelines/my_pipeline/diff \
+  -H 'Content-Type: application/json' \
+  -d '{"program_code": "CREATE TABLE t(x INT);
+                        CREATE MATERIALIZED VIEW v AS SELECT COUNT(*) AS c FROM t;
+                        CREATE MATERIALIZED VIEW v2 AS SELECT MAX(x) AS m FROM t;"}'
+```
+
+returns (HTTP `200`):
+
+```json
+{
+  "program_diff": {
+    "added_tables": [], "removed_tables": [], "modified_tables": [],
+    "added_views": ["v2"], "removed_views": [], "modified_views": []
+  },
+  "program_diff_error": null,
+  "added_input_connectors": [], "removed_input_connectors": [], "modified_input_connectors": [],
+  "added_output_connectors": [], "removed_output_connectors": [], "modified_output_connectors": []
+}
+```
+
+This functionality is also available via the Python SDK (`pipeline.diff(...)`) and the
+`fda` CLI (`fda diff <pipeline_name> [program.sql] [--runtime-version <version>]`).
+
+### Validating a program
+
+Use the [`/validate_program` endpoint](/api/validate-program) to validate a SQL program without creating
+or modifying a pipeline. The request body takes the SQL in
+`program_code`, an optional `runtime_version`, and an optional `ir` flag (default `false`)
+that, when `true`, also returns the program's IR (dataflow):
+
+```bash
+curl -X POST http://localhost:8080/v0/validate_program \
+  -H 'Content-Type: application/json' \
+  -d '{"program_code": "CREATE TABLE t(x INT); CREATE MATERIALIZED VIEW v AS SELECT COUNT(*) AS c FROM t;"}'
+```
+
+A valid program returns (HTTP `200`) the derived schema and connectors:
+
+```json
+{"Success": {"program_info": {"schema": {"inputs": [], "outputs": []},
+                              "input_connectors": {}, "output_connectors": {}, "dataflow": null}}}
+```
+
+Note that `/validate_program` returns HTTP `200` even when the program is invalid. Inspect
+the response body to determine the outcome: `Success`, `SqlError` (the program has SQL
+errors), or `SystemError` (validation could not run). For example, an invalid program:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/v0/validate_program \
+  -H 'Content-Type: application/json' \
+  -d '{"program_code": "CREATE MATERIALIZED VIEW v AS SELECT * FROM no_such_table;"}'
+# 200
+```
+
+still returns `200`, with the errors carried in the body:
+
+```json
+{"SqlError": {"info": {"exit_code": 1, "messages": [{"error": true, "message": "Object 'no_such_table' not found"}]}}}
+```
+
+This functionality is also available via the Python SDK (`client.validate_program(...)`) and
+the `fda` CLI (`fda validate-program [program.sql] [--ir] [--runtime-version <version>]`).
+
+Specifying a non-default `runtime_version` for either endpoint requires the `runtime_version`
+unstable feature to be enabled on the platform, via the [`unstableFeatures` Helm
+value](/get-started/enterprise/helm-chart-reference#miscellaneous) (or the
+`FELDERA_UNSTABLE_FEATURES` environment variable). If the feature is disabled, the request
+fails (`/validate_program` returns a `SystemError`). When it is enabled, the compiler downloads
+the matching SQL compiler on demand, which requires outbound network access (see [Custom Runtime
+Usage](/operations/required-domains#custom-runtime-usage-optional)); in a restricted or
+air-gapped environment (for example, behind a firewall) the download can fail and the request
+returns an error. The platform's default runtime is always available locally, needs no feature
+flag, and never triggers a download.
 
 ## WebConsole
 

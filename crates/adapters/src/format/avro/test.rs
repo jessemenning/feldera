@@ -21,7 +21,9 @@ use dbsp::trace::BatchReaderFactories;
 use dbsp::typed_batch::{DynSpineSnapshot, SpineSnapshot as TypedSpineSnapshot, TypedBatch};
 use dbsp::{DBData, IndexedZSetReader, OrdIndexedZSet, OrdZSet, ZWeight, utils::Tup2};
 use feldera_adapterlib::transport::OutputBatchType;
-use feldera_sqllib::{ByteArray, Date, SqlDecimal, Time, Timestamp, TimestampTz, Uuid, Variant};
+use feldera_sqllib::{
+    ByteArray, Date, FlatVariant, SqlDecimal, Time, Timestamp, TimestampTz, Uuid, Variant,
+};
 use feldera_types::{
     deserialize_table_record,
     format::avro::{AvroEncoderConfig, AvroEncoderKeyMode},
@@ -397,6 +399,97 @@ fn test_debezium_avro_parser() {
     );
 
     run_parser_test(vec![test_case])
+}
+
+/// Source row containing a Debezium logical field that is not declared in the
+/// destination table.
+#[derive(Debug, Clone)]
+struct IgnoredCoercedFieldSource {
+    id: i64,
+    timestamp: Option<String>,
+}
+
+serialize_table_record!(IgnoredCoercedFieldSource[2]{
+    r#id["id"]: i64,
+    r#timestamp["timestamp"]: Option<String>
+});
+
+/// Destination row intentionally omitting `timestamp`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IgnoredCoercedFieldRow {
+    id: i64,
+}
+
+deserialize_table_record!(IgnoredCoercedFieldRow["IgnoredCoercedField", Variant, 1] {
+    (r#id, "id", false, i64, |_| None)
+});
+
+/// Process a complete Debezium update whose omitted `ZonedTimestamp` field is
+/// NULL in `before` and populated in `after`. Neither value is relevant to the
+/// destination table, so both records must be accepted without coercion.
+#[test]
+fn test_debezium_ignored_coerced_field() {
+    let value_schema = r#"{
+        "type": "record",
+        "name": "IgnoredCoercedField",
+        "connect.name": "test_namespace.IgnoredCoercedField",
+        "fields": [
+            { "name": "id", "type": "long" },
+            {
+                "name": "timestamp",
+                "type": [
+                    "null",
+                    {
+                        "type": "string",
+                        "connect.name": "io.debezium.time.ZonedTimestamp"
+                    }
+                ],
+                "default": null
+            }
+        ]
+    }"#;
+    let envelope_str = debezium_avro_schema_str(value_schema, "IgnoredCoercedField");
+    let envelope_schema = AvroSchema::parse_str(&envelope_str).unwrap();
+    let resolved = ResolvedSchema::try_from(&envelope_schema).unwrap();
+    let serializer = AvroSchemaSerializer::new(&envelope_schema, resolved.get_names(), true);
+
+    let message = DebeziumMessage::new(
+        "u",
+        Some(IgnoredCoercedFieldSource {
+            id: 1,
+            timestamp: None,
+        }),
+        Some(IgnoredCoercedFieldSource {
+            id: 2,
+            timestamp: Some("2021-06-15T14:30:45.123+02:00".to_string()),
+        }),
+    );
+    let value = message
+        .serialize_with_context(serializer, &avro_ser_config())
+        .unwrap();
+
+    let test = TestCase {
+        relation_schema: Relation {
+            name: SqlIdentifier::new("IgnoredCoercedField", false),
+            fields: vec![Field::new("id".into(), ColumnType::bigint(false))],
+            materialized: false,
+            properties: BTreeMap::new(),
+            primary_key: None,
+        },
+        config: AvroParserConfig {
+            update_format: AvroUpdateFormat::Debezium,
+            schema: Some(envelope_str),
+            skip_schema_id: false,
+            registry_config: Default::default(),
+        },
+        input_batches: vec![(serialize_value(value, &envelope_schema), vec![])],
+        expected_output: vec![
+            MockUpdate::Delete(IgnoredCoercedFieldRow { id: 1 }),
+            MockUpdate::Insert(IgnoredCoercedFieldRow { id: 2 }),
+        ],
+    };
+
+    run_parser_test(vec![test]);
 }
 
 /// SQL table can have nullable columns that are not in the Avro schema.
@@ -816,6 +909,141 @@ fn test_issue4722_issue4837() {
     };
 
     run_parser_test(vec![test]);
+}
+
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    feldera_macros::IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+struct TestVariant {
+    v1: Variant,
+    v2: FlatVariant,
+}
+
+impl TestVariant {
+    pub fn avro_schema() -> &'static str {
+        r#"{
+            "type": "record",
+            "name": "TestVariant",
+            "connect.name": "test_namespace.TestVariant",
+            "fields": [
+                { "name": "v1", "type": "string" },
+                { "name": "v2", "type": "string" }
+            ]
+        }"#
+    }
+
+    pub fn relation_schema() -> Relation {
+        Relation {
+            name: SqlIdentifier::new("TestVariant", false),
+            fields: vec![
+                Field::new("v1".into(), ColumnType::variant(false)),
+                Field::new("v2".into(), ColumnType::variant(false)),
+            ],
+            materialized: false,
+            properties: BTreeMap::new(),
+            primary_key: None,
+        }
+    }
+
+    pub fn sample() -> Self {
+        let json = r#"{"a": 1, "b": ["x", null], "c": 2.5, "ok": true}"#;
+        TestVariant {
+            v1: serde_json::from_str::<Variant>(json).unwrap(),
+            v2: serde_json::from_str::<FlatVariant>(json).unwrap(),
+        }
+    }
+}
+
+serialize_table_record!(TestVariant[2]{
+    r#v1["v1"]: Variant,
+    r#v2["v2"]: FlatVariant
+});
+
+deserialize_table_record!(TestVariant["TestVariant", Variant, 2] {
+    (r#v1, "v1", false, Variant, |_| None),
+    (r#v2, "v2", false, FlatVariant, |_| None)
+});
+
+/// VARIANT columns (both runtime representations) parse from an Avro
+/// string field carrying JSON.
+#[test]
+fn test_parse_variant() {
+    let schema = AvroSchema::parse_str(TestVariant::avro_schema()).unwrap();
+    let vals = [TestVariant::sample()];
+    let input_batches = vals
+        .iter()
+        .map(|v| (serialize_record(v, &schema), vec![]))
+        .collect::<Vec<_>>();
+    let expected_output = vals
+        .iter()
+        .map(|v| MockUpdate::Insert(v.clone()))
+        .collect::<Vec<_>>();
+
+    let test = TestCase {
+        relation_schema: TestVariant::relation_schema(),
+        config: AvroParserConfig {
+            update_format: AvroUpdateFormat::Raw,
+            schema: Some(TestVariant::avro_schema().to_string()),
+            skip_schema_id: false,
+            registry_config: Default::default(),
+        },
+        input_batches,
+        expected_output,
+    };
+
+    run_parser_test(vec![test]);
+}
+
+/// VARIANT columns (both runtime representations) round-trip through the
+/// Avro encoder as JSON strings.
+#[test]
+fn test_variant_avro_output() {
+    let config = AvroEncoderConfig {
+        schema: Some(TestVariant::avro_schema().to_string()),
+        ..Default::default()
+    };
+    let schema = AvroSchema::parse_str(config.schema.as_ref().unwrap()).unwrap();
+    let consumer = MockOutputConsumer::new();
+    let consumer_data = consumer.data.clone();
+    let mut encoder = AvroEncoder::create(
+        "avro_test_endpoint",
+        &None,
+        &Relation::empty(),
+        Box::new(consumer),
+        config,
+        None,
+        false,
+    )
+    .unwrap();
+    let zset = OrdZSet::from_keys((), vec![Tup2(TestVariant::sample(), 1)]);
+    let zset = Arc::new(<SerBatchImpl<_, TestVariant, ()>>::new(zset)) as Arc<dyn SerBatch>;
+    encoder.consumer().batch_start(0, OutputBatchType::Delta);
+    encoder.encode(zset.arc_as_batch_reader()).unwrap();
+    encoder.consumer().batch_end();
+
+    let decoded = consumer_data
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_k, v, _headers)| {
+            let val = from_avro_datum(&schema, &mut &v.as_ref().unwrap()[5..], None).unwrap();
+            from_avro_value::<TestVariant, Variant>(&val, &schema, &HashMap::new(), &None).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, vec![TestVariant::sample()]);
 }
 
 #[derive(

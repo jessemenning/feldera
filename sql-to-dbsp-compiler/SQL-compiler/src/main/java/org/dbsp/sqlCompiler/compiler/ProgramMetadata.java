@@ -15,6 +15,7 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPBoolLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPIntLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPNullLiteral;
+import org.dbsp.sqlCompiler.ir.expression.literal.DBSPStringLiteral;
 import org.dbsp.util.IJson;
 import org.dbsp.util.Utilities;
 
@@ -46,7 +47,8 @@ public class ProgramMetadata implements IJson {
     static final Set<String> reserved = Set.of(
             DBSPCompiler.WARNINGS_ARE_ERRORS.toLowerCase(Locale.ENGLISH),
             ProgramMetadata.AVOID_STAR_JOINS.toLowerCase(Locale.ENGLISH),
-            ProgramMetadata.ENFORCE_POSITIVE_INPUTS.toLowerCase(Locale.ENGLISH)
+            ProgramMetadata.ENFORCE_POSITIVE_INPUTS.toLowerCase(Locale.ENGLISH),
+            ProgramMetadata.USE_FLAT_VARIANT.toLowerCase(Locale.ENGLISH)
     );
 
     private boolean known(String variable) {
@@ -71,6 +73,11 @@ public class ProgramMetadata implements IJson {
                             " does not control any known settings");
         }
         this.variables.put(variable, value);
+        // The variant representation must be fixed before any expression of
+        // the program is compiled to Rust names; SET statements precede other
+        // statements, so updating the global mode here is early enough.
+        if (variable.equals(USE_FLAT_VARIANT.toLowerCase(Locale.ENGLISH)))
+            VariantMode.set(!this.isFalsy(variable));
     }
 
     public boolean hasValue(String variable) {
@@ -91,6 +98,13 @@ public class ProgramMetadata implements IJson {
             Boolean value = expression.to(DBSPBoolLiteral.class).value;
             if (value == null) return true;
             return !value;
+        } else if (expression.is(DBSPStringLiteral.class)) {
+            // Quoted SET values: 'off', 'false', and '0' disable a feature,
+            // matching the unquoted keywords.
+            String value = expression.to(DBSPStringLiteral.class).value;
+            if (value == null) return true;
+            return value.equalsIgnoreCase("off") || value.equalsIgnoreCase("false")
+                    || value.equals("0") || value.isEmpty();
         } else {
             return expression.is(DBSPNullLiteral.class);
         }
@@ -114,9 +128,26 @@ public class ProgramMetadata implements IJson {
     /** When set to {@code true}, inserts a weight-validation check after every
      * input table that has no primary key. */
     public static final String ENFORCE_POSITIVE_INPUTS = "ENFORCE_POSITIVE_INPUTS";
+    /** When set to {@code true}, VARIANT columns use the flat-buffer
+     * {@code FlatVariant} runtime type instead of the enum {@code Variant}.
+     * Programs that cast or index VARIANT values cannot enable this yet:
+     * the runtime cast/index function grid still operates on the enum. */
+    public static final String USE_FLAT_VARIANT = "FELDERA_FLAT_VARIANT";
 
     public boolean noStarJoins() {
         return this.isExplicitlyOn(AVOID_STAR_JOINS);
+    }
+
+    /** Returns {@code true} if VARIANT columns should use the flat-buffer
+     * {@code FlatVariant} runtime type.
+     *
+     * Programs opt in with {@code SET feldera_flat_variant = 'on'}. The
+     * {@code FELDERA_FLAT_VARIANT} environment variable sets the default for
+     * every program compiled by this process, so a whole test suite can run
+     * against FlatVariant without editing each test; an explicit SET statement
+     * still wins over the environment. See {@link VariantMode}. */
+    public boolean useFlatVariant() {
+        return VariantMode.isEnabled();
     }
 
     /** Returns {@code true} if weight validation should be inserted after

@@ -78,6 +78,7 @@ class RuntimeConfig:
         max_buffering_delay_usecs: int = 0,
         min_batch_size_records: int = 0,
         clock_resolution_usecs: Optional[int] = None,
+        clock_timezone_offset: Optional[str] = None,
         provisioning_timeout_secs: Optional[int] = None,
         resources: Optional[Resources] = None,
         fault_tolerance_model: Optional[FaultToleranceModel] = None,
@@ -85,15 +86,20 @@ class RuntimeConfig:
         dev_tweaks: Optional[dict] = None,
         env: Optional[dict[str, str]] = None,
         logging: Optional[str] = None,
+        datafusion_memory_mb: Optional[int] = None,
+        max_rss_mb: Optional[int] = None,
     ):
         self.workers = workers
         self.hosts = hosts
+        self.datafusion_memory_mb = datafusion_memory_mb
+        self.max_rss_mb = max_rss_mb
         self.tracing = tracing
         self.tracing_endpoint_jaeger = tracing_endpoint_jaeger
         self.cpu_profiler = cpu_profiler
         self.max_buffering_delay_usecs = max_buffering_delay_usecs
         self.min_batch_size_records = min_batch_size_records
         self.clock_resolution_usecs = clock_resolution_usecs
+        self.clock_timezone_offset = clock_timezone_offset
         self.provisioning_timeout_secs = provisioning_timeout_secs
         if fault_tolerance_model is not None:
             self.fault_tolerance = {

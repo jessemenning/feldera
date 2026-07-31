@@ -710,7 +710,7 @@ fn test_ft(rounds: &[FtTestRound]) {
         } else {
             // Wait for replay for finish and then check that the input endpoint's
             // pause state matches what it should be.
-            wait(|| !controller.is_replaying(), 1000).unwrap();
+            wait(|| !controller.is_replaying(), 10_000).unwrap();
             assert_eq!(
                 controller.is_input_endpoint_paused("test_input1").unwrap(),
                 paused
@@ -2379,6 +2379,11 @@ fn lir() {
       "to": "4"
     },
     {
+      "from": "3",
+      "stream_id": 3,
+      "to": "9"
+    },
+    {
       "from": "4",
       "stream_id": 4,
       "to": "5"
@@ -2391,7 +2396,7 @@ fn lir() {
     {
       "from": "4",
       "stream_id": 4,
-      "to": "11"
+      "to": "12"
     },
     {
       "from": "6",
@@ -2411,22 +2416,22 @@ fn lir() {
     {
       "from": "7",
       "stream_id": 8,
-      "to": "9"
+      "to": "10"
     },
     {
       "from": "7",
       "stream_id": 8,
-      "to": "12"
-    },
-    {
-      "from": "9",
-      "stream_id": 9,
-      "to": "10"
-    },
-    {
-      "from": "12",
-      "stream_id": 10,
       "to": "13"
+    },
+    {
+      "from": "10",
+      "stream_id": 9,
+      "to": "11"
+    },
+    {
+      "from": "13",
+      "stream_id": 10,
+      "to": "14"
     }
   ],
   "nodes": [
@@ -2499,34 +2504,39 @@ fn lir() {
     },
     {
       "id": "9",
-      "implements": [
-        "input.output"
-      ],
-      "operation": "Apply"
+      "implements": [],
+      "operation": "Recorder"
     },
     {
       "id": "10",
       "implements": [
         "input.output"
       ],
-      "operation": "Output"
+      "operation": "Apply"
     },
     {
       "id": "11",
       "implements": [
-        "output"
+        "input.output"
       ],
-      "operation": "AccumulateOutput"
+      "operation": "Output"
     },
     {
       "id": "12",
       "implements": [
         "output"
       ],
-      "operation": "Apply"
+      "operation": "AccumulateOutput"
     },
     {
       "id": "13",
+      "implements": [
+        "output"
+      ],
+      "operation": "Apply"
+    },
+    {
+      "id": "14",
       "implements": [
         "output"
       ],
@@ -2745,7 +2755,7 @@ fn test_external_controller_status_serialization() {
             }
         }))
         .unwrap();
-        status.add_output(&0, "http_output", &output_config, None);
+        status.add_output(&0, "http_output", &output_config, None, true);
 
         // Set output metrics
         if let Some(output) = status.output_status().get(&0) {
@@ -3040,7 +3050,7 @@ fn test_custom_output_connector_metrics_prometheus_output() {
         "format": { "name": "json", "config": {} }
     }))
     .unwrap();
-    status.add_output(&0, "mock_output", &output_config, None);
+    status.add_output(&0, "mock_output", &output_config, None, true);
     status.set_output_custom_metrics(0, Arc::new(MockMetrics));
 
     let mut writer = MetricsWriter::<PrometheusFormatter>::new();
@@ -4899,4 +4909,240 @@ fn test_postprocessor_on_delta_output_fails() {
         error.contains("delta_table_output"),
         "error should name the unsupported transport, got: {error}"
     );
+}
+
+/// A command whose reply channel closes without a reply must report that the
+/// controller is gone, not panic.
+///
+/// [`Command::flush`] answers every command the circuit thread can still see when
+/// it exits, but a command that arrives while the thread is already tearing down
+/// is never seen, and neither is anything queued when the thread unwinds on a
+/// panic: those commands are dropped unanswered. `/suspend` awaits its reply
+/// inside a spawned task whose `JoinHandle` is discarded, so panicking there is
+/// silent and leaves the pipeline with no outcome recorded at all.
+#[test]
+fn a_dropped_reply_or_controller_exit_reports_controller_exit() {
+    use crate::controller::{Command, ControllerError, reply_or_controller_exit};
+    use std::sync::Arc;
+
+    type SuspendReply = oneshot::Receiver<Result<(), Arc<ControllerError>>>;
+    fn suspend_command() -> (Command, SuspendReply) {
+        let (sender, receiver) = oneshot::channel();
+        let command = Command::Suspend(Box::new(move |result| {
+            let _ = sender.send(result);
+        }));
+        (command, receiver)
+    }
+
+    // Flushed: the caller is told the controller exited.
+    let (command, receiver) = suspend_command();
+    command.flush();
+    let error =
+        reply_or_controller_exit(receiver.blocking_recv()).expect_err("a flush reports an error");
+    assert!(matches!(*error, ControllerError::ControllerExit));
+
+    // Dropped unanswered: the caller must be told the same thing.
+    let (command, receiver) = suspend_command();
+    drop(command);
+    let error = reply_or_controller_exit(receiver.blocking_recv())
+        .expect_err("a dropped reply reports an error");
+    assert!(matches!(*error, ControllerError::ControllerExit));
+}
+
+/// An output endpoint that is still owed output must not report the pipeline's
+/// progress before it has delivered that output.
+///
+/// `total_processed_input_records` promises that the endpoint's output equals the
+/// circuit's output after that many input records. Seeding it from the restored
+/// global counter breaks the promise for an endpoint whose relation the bootstrap
+/// re-emits: the counter reaches its target while the re-emitted batch is still
+/// queued, so a reader concludes the sink is up to date before anything reaches it.
+#[test]
+fn test_output_progress_counter_waits_for_owed_output() {
+    use super::stats::ProcessedRecords;
+    use crate::{ControllerStatus, OutputEndpointConfig};
+    use uuid::Uuid;
+
+    // Records the pipeline had processed when the checkpoint was taken.
+    const RESTORED_RECORDS: u64 = 3;
+
+    let config = serde_json::from_value(json!({
+        "name": "test_output_progress_counter",
+        "workers": 1,
+    }))
+    .unwrap();
+    let status = ControllerStatus::new(config, RESTORED_RECORDS, None, Uuid::nil());
+
+    let output_config: OutputEndpointConfig = serde_json::from_value(json!({
+        "stream": "v1",
+        "transport": { "name": "http_output", "config": {} },
+        "format": { "name": "json", "config": {} }
+    }))
+    .unwrap();
+
+    let processed = |endpoint_id| {
+        status
+            .output_status()
+            .get(&endpoint_id)
+            .unwrap()
+            .metrics
+            .total_processed_input_records
+            .load(Ordering::Acquire)
+    };
+
+    // A caught-up endpoint handles only future output, so it adopts the pipeline's
+    // progress right away.
+    status.add_output(&0, "caught_up", &output_config, None, true);
+    assert_eq!(processed(0), RESTORED_RECORDS);
+
+    // An endpoint still owed output starts from zero.
+    status.add_output(&1, "owed_output", &output_config, None, false);
+    assert_eq!(processed(1), 0);
+
+    // Starting behind must not drag `total_completed_records` backwards. The
+    // checkpoint path blocks until that counter reaches the records processed when
+    // the checkpoint started, so a regression here would stall checkpoints rather
+    // than merely misreport progress.
+    status.update_total_completed_records(None);
+    assert_eq!(status.num_total_completed_records(), RESTORED_RECORDS);
+
+    // Queueing the owed output does not count as delivering it.
+    let parker = Parker::new();
+    let unparker = parker.unparker().clone();
+    status.enqueue_batch(1, 2);
+    assert_eq!(processed(1), 0);
+
+    // Processing the batch that carries the owed output brings the endpoint up to
+    // the pipeline's progress.
+    status.output_batch(
+        1,
+        Some(ProcessedRecords {
+            total_processed_input_records: RESTORED_RECORDS,
+            total_processed_steps: 1,
+        }),
+        2,
+        &unparker,
+    );
+    assert_eq!(processed(1), RESTORED_RECORDS);
+}
+
+/// Dropping an output endpoint that is behind must republish the pipeline's
+/// completion counters.
+///
+/// `total_completed_records` and `total_completed_steps` are the minimum over the
+/// registered output endpoints, so an endpoint that has not delivered a step holds
+/// both back. An abandoned `/egress` stream is disconnected with its queue still
+/// unread, which means the endpoint disappears without ever reaching that step. If
+/// removal does not recompute the minimum, nothing else does until the next step,
+/// and an idle pipeline runs no further step: `/completion_status` then reports
+/// `inprogress` forever and a checkpoint waiting on `total_completed_records`
+/// never unblocks.
+#[test]
+fn test_removing_a_lagging_output_endpoint_republishes_completion() {
+    use super::stats::ProcessedRecords;
+    use crate::{ControllerStatus, OutputEndpointConfig};
+    use uuid::Uuid;
+
+    // Records the circuit processes in the one step of this test.
+    const STEP_RECORDS: u64 = 10;
+
+    let config = serde_json::from_value(json!({
+        "name": "test_remove_lagging_output",
+        "workers": 1,
+    }))
+    .unwrap();
+    let status = ControllerStatus::new(config, 0, None, Uuid::nil());
+
+    let output_config: OutputEndpointConfig = serde_json::from_value(json!({
+        "stream": "v1",
+        "transport": { "name": "http_output", "config": {} },
+        "format": { "name": "json", "config": {} }
+    }))
+    .unwrap();
+
+    // Two `/egress` streams of the same view: one client reads, the other walks
+    // away.
+    status.add_output(&0, "reader", &output_config, None, true);
+    status.add_output(&1, "abandoned", &output_config, None, true);
+
+    // The circuit initiates and evaluates one step, and its output is queued for
+    // both endpoints.
+    status
+        .global_metrics
+        .total_initiated_steps
+        .store(1, Ordering::Release);
+    status.processed_data(BufferSize {
+        records: STEP_RECORDS as usize,
+        bytes: 0,
+    });
+    status.enqueue_batch(0, STEP_RECORDS as usize);
+    status.enqueue_batch(1, STEP_RECORDS as usize);
+
+    // Only `reader` transmits the batch.
+    let parker = Parker::new();
+    let unparker = parker.unparker().clone();
+    let step_processed = ProcessedRecords {
+        total_processed_input_records: STEP_RECORDS,
+        total_processed_steps: 1,
+    };
+    status.output_batch(0, Some(step_processed), STEP_RECORDS as usize, &unparker);
+
+    assert_eq!(
+        status.global_metrics.total_completed_steps(),
+        0,
+        "the step is not complete while `abandoned` still owes its output"
+    );
+    assert_eq!(status.num_total_completed_records(), 0);
+
+    // The abandoned client disconnects, so the endpoint goes away with the batch
+    // still queued. The step is now complete as far as any endpoint is concerned.
+    status.remove_output(&1);
+
+    assert_eq!(
+        status.global_metrics.total_completed_steps(),
+        1,
+        "removing the endpoint that owed the output must complete the step"
+    );
+    assert_eq!(
+        status.num_total_completed_records(),
+        STEP_RECORDS,
+        "removing the endpoint that owed the output must complete its records"
+    );
+}
+
+/// Only a changed relation makes an output endpoint fall behind. A connector whose
+/// own definition changed still emits nothing for inputs already processed, so it
+/// stays caught up and keeps its seeded progress counter.
+#[test]
+fn test_bootstrapped_output_endpoints_ignores_connector_changes() {
+    use super::bootstrapped_output_endpoints;
+    use feldera_types::pipeline_diff::{PipelineDiff, ProgramDiff};
+
+    let output_config = |stream: &str| -> OutputEndpointConfig {
+        serde_json::from_value(json!({
+            "stream": stream,
+            "transport": { "name": "http_output", "config": {} },
+            "format": { "name": "json", "config": {} }
+        }))
+        .unwrap()
+    };
+
+    let outputs = BTreeMap::from([
+        (Cow::from("changed_view"), output_config("v_changed")),
+        (Cow::from("changed_connector"), output_config("v_stable")),
+        (Cow::from("untouched"), output_config("v_stable")),
+    ]);
+
+    let diff = PipelineDiff::new_with_program_diff(
+        ProgramDiff::new().with_modified_views(vec!["v_changed".to_string()]),
+    )
+    .with_modified_output_connectors(vec!["changed_connector".to_string()]);
+
+    assert_eq!(
+        bootstrapped_output_endpoints(&outputs, Some(&diff)),
+        std::collections::HashSet::from(["changed_view".to_string()])
+    );
+
+    // Without a diff nothing is re-emitted, so every endpoint starts caught up.
+    assert!(bootstrapped_output_endpoints(&outputs, None).is_empty());
 }

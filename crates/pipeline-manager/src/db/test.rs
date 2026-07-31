@@ -50,7 +50,7 @@ use proptest_derive::Arbitrary;
 use serde_json::json;
 use std::borrow::BorrowMut;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -325,6 +325,13 @@ fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::V
                 namespace: val.val14,
             },
             clock_resolution_usecs: val.val15,
+            // Varies so the proptest exercises the "cannot edit unless
+            // storage is cleared" restriction on this field.
+            clock_timezone_offset: match val.val0 % 3 {
+                0 => None,
+                1 => Some("+05:30".parse().unwrap()),
+                _ => Some("-08:00".parse().unwrap()),
+            },
             pin_cpus: Vec::new(),
             provisioning_timeout_secs: val.val16,
             max_parallel_connector_init: None,
@@ -617,8 +624,8 @@ fn limited_optional_storage_status_details() -> impl Strategy<Value = Option<ser
         if v.0 {
             None
         } else {
-            let mut checkpoints = VecDeque::new();
-            checkpoints.push_back(CheckpointMetadata {
+            let mut checkpoints = Vec::new();
+            checkpoints.push(CheckpointMetadata {
                 uuid: Default::default(),
                 identifier: None,
                 fingerprint: 0,
@@ -1285,6 +1292,7 @@ async fn pipeline_versioning() {
             namespace: None,
         },
         clock_resolution_usecs: None,
+        clock_timezone_offset: None,
         pin_cpus: Vec::new(),
         provisioning_timeout_secs: None,
         max_parallel_connector_init: None,
@@ -1970,7 +1978,7 @@ async fn pipeline_deployment() {
             RuntimeDesiredStatus::Paused,
             Some(
                 serde_json::to_value(&StorageStatusDetails {
-                    checkpoints: VecDeque::new(),
+                    checkpoints: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -1989,7 +1997,7 @@ async fn pipeline_deployment() {
             RuntimeDesiredStatus::Running,
             Some(
                 serde_json::to_value(&StorageStatusDetails {
-                    checkpoints: VecDeque::new(),
+                    checkpoints: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -2007,7 +2015,7 @@ async fn pipeline_deployment() {
     );
     let storage_status_details = Some(
         serde_json::to_value(&StorageStatusDetails {
-            checkpoints: VecDeque::new(),
+            checkpoints: Vec::new(),
         })
         .unwrap(),
     );
@@ -2036,14 +2044,14 @@ async fn pipeline_deployment() {
     );
     let storage_status_details = Some(
         serde_json::to_value(&StorageStatusDetails {
-            checkpoints: VecDeque::from([CheckpointMetadata {
+            checkpoints: vec![CheckpointMetadata {
                 uuid: Default::default(),
                 identifier: None,
                 fingerprint: 456,
                 size: None,
                 steps: None,
                 processed_records: None,
-            }]),
+            }],
         })
         .unwrap(),
     );
@@ -2077,14 +2085,14 @@ async fn pipeline_deployment() {
         .unwrap();
     let storage_status_details = Some(
         serde_json::to_value(&StorageStatusDetails {
-            checkpoints: VecDeque::from([CheckpointMetadata {
+            checkpoints: vec![CheckpointMetadata {
                 uuid: Default::default(),
                 identifier: None,
                 fingerprint: 123,
                 size: None,
                 steps: None,
                 processed_records: None,
-            }]),
+            }],
         })
         .unwrap(),
     );
@@ -2201,7 +2209,7 @@ async fn pipeline_deployment() {
             RuntimeDesiredStatus::Paused,
             Some(
                 serde_json::to_value(&StorageStatusDetails {
-                    checkpoints: VecDeque::new(),
+                    checkpoints: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -2650,6 +2658,7 @@ async fn pipeline_provision_version_guard() {
                     max_buffering_delay_usecs: 0,
                     resources: Default::default(),
                     clock_resolution_usecs: None,
+                    clock_timezone_offset: None,
                     pin_cpus: Vec::new(),
                     provisioning_timeout_secs: None,
                     max_parallel_connector_init: None,
@@ -4417,6 +4426,16 @@ impl ModelHelpers for Mutex<DbModel> {
                         .map(|v| v.get("storage_class"))
                 {
                     not_allowed.push("`runtime_config.resources.storage_class`");
+                }
+                if runtime_config
+                    .get("clock_timezone_offset")
+                    .filter(|v| !v.is_null())
+                    != pipeline
+                        .runtime_config
+                        .get("clock_timezone_offset")
+                        .filter(|v| !v.is_null())
+                {
+                    not_allowed.push("`runtime_config.clock_timezone_offset`");
                 }
             }
             if !not_allowed.is_empty() {

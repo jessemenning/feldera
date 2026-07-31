@@ -87,14 +87,15 @@ CREATE TABLE bronze_clickstream_events (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_clickstream_events",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_clickstream_events",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -115,14 +116,15 @@ CREATE TABLE bronze_orders (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_orders",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_orders",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -139,14 +141,15 @@ CREATE TABLE bronze_order_items (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_order_items",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_order_items",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -167,14 +170,15 @@ CREATE TABLE bronze_products (
     'skip_unused_columns' = 'true',
     'connectors' = '
     [{
+        "name": "bronze_products",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_products",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -191,14 +195,15 @@ CREATE TABLE bronze_inventory_events (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_inventory_events",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_inventory_events",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -215,14 +220,15 @@ CREATE TABLE bronze_customers (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_customers",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_customers",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -237,14 +243,15 @@ CREATE TABLE bronze_suppliers (
 ) WITH (
     'skip_unused_columns' = 'true',
     'connectors' = '[{
+        "name": "bronze_suppliers",
         "transport": {
             "name": "delta_table_input",
             "config": {
                 "uri": "s3://feldera-demos/ecommerce-cdc-0-01/snapshot/bronze_suppliers",
                 "mode": "snapshot",
-"aws_skip_signature": "true",
-"aws_region": "us-west-1",
-"transaction_mode": "catchup"
+                "aws_skip_signature": "true",
+                "aws_region": "us-west-1",
+                "transaction_mode": "catchup"
             }
         }
     }]'
@@ -671,18 +678,6 @@ FROM
         SELECT
             product_id,
             SUM(quantity) AS units_sold,
-            -- avg_daily_units must be a genuine per-day rate. SUM(quantity) spans
-            -- the entire history of silver_confirmed_order_items (there is no date
-            -- filter), so dividing by a hard-coded 30 is only correct when the data
-            -- happens to hold exactly 30 days of orders: with 90 days it overstates
-            -- the rate 3x, with 10 days it understates it 3x, which miscalibrates
-            -- the CRITICAL / WARNING / OK scoring below against a fictitious
-            -- denominator. Dividing by the number of distinct days actually observed
-            -- yields a correct rate regardless of the dataset's span or age.
-            -- (The alternative -- WHERE order_created_at > NOW() - INTERVAL '30' DAY,
-            -- then divide by 30 -- is avoided here because the demo loads a historical
-            -- snapshot whose orders may all predate a 30-day window, which would leave
-            -- this view, and the alerts derived from it, empty.)
             CAST(SUM(quantity) AS DECIMAL(38, 6)) / NULLIF(
                 COUNT(DISTINCT DATE_TRUNC(order_created_at, DAY)),
                 0

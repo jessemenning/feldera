@@ -68,6 +68,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
     isPipelineShutdown
   } from '$lib/functions/pipelines/status'
   import { resolve } from '$lib/functions/svelte'
+  import { captureEvent } from '$lib/services/analytics'
   import type { PipelineAction } from '$lib/services/pipelineManager'
   import type { Snippet } from '$lib/types/svelte'
 
@@ -191,7 +192,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_storage_indicator',
         '_more'
       ])
-      .with('Running', () => [
+      .with('Running', 'ConcurrentBootstrapping', () => [
         ...stopButtons,
         '_pause',
         '_saveFile',
@@ -239,7 +240,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
         '_storage_indicator',
         '_more'
       ])
-      .with('Replaying', () => [
+      .with('Replaying', 'Synchronizing', () => [
         '_kill',
         '_spinner',
         '_saveFile',
@@ -849,7 +850,11 @@ groups related actions into multi-action dropdowns when multiple options are ava
         class="block pt-2 underline"
         href="https://calendly.com/d/cqnj-p63-mbq/feldera-demo"
         target="_blank"
-        rel="noreferrer">Upgrade</a
+        rel="noreferrer"
+        onclick={() =>
+          captureEvent('calendly_opened', {
+            url: 'https://calendly.com/d/cqnj-p63-mbq/feldera-demo'
+          })}>Upgrade</a
       >
     </Popover>
   {/if}

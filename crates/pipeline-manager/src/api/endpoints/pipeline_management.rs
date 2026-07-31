@@ -3,6 +3,8 @@ use crate::api::examples;
 use crate::api::main::ServerState;
 #[cfg(not(feature = "feldera-enterprise"))]
 use crate::common_error::CommonError;
+use crate::compiler::{ProgramValidationRequest, ValidateProgramResponse};
+use crate::config::CommonConfig;
 use crate::db::error::DBError;
 use crate::db::storage::Storage;
 use crate::db::types::combined_status::{combine_since, CombinedDesiredStatus, CombinedStatus};
@@ -10,7 +12,9 @@ use crate::db::types::pipeline::{
     ClientMetadata, ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PatchClientMetadata,
     PipelineDescr, PipelineId,
 };
-use crate::db::types::program::{ProgramConfig, ProgramError, ProgramStatus};
+use crate::db::types::program::{
+    ProgramConfig, ProgramError, ProgramInfo, ProgramStatus, RuntimeSelector,
+};
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
@@ -30,16 +34,17 @@ use chrono::{DateTime, Utc};
 use feldera_types::adapter_stats::PipelineStatsErrorsResponse;
 use feldera_types::config::{InputEndpointConfig, OutputEndpointConfig, RuntimeConfig};
 use feldera_types::error::ErrorResponse;
+use feldera_types::pipeline_diff::{compute_pipeline_diff, PipelineDiff};
 use feldera_types::program_schema::ProgramSchema;
 use feldera_types::runtime_status::{
-    BootstrapConfig, BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus,
+    BootstrapConfig, BootstrapPolicy, ConnectorStats, RuntimeDesiredStatus, RuntimeStatus,
+    RuntimeStatusDetails, StorageStatusDetails,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-#[cfg(feature = "feldera-enterprise")]
 use std::time::Duration;
 use tracing::{debug, error, info};
 use utoipa::{IntoParams, ToSchema};
@@ -74,22 +79,6 @@ fn remove_large_fields_from_program_info(
     program_info
 }
 
-/// Aggregated connector error statistics.
-///
-/// This structure contains the sum of all error counts across all input and output connectors
-/// for a pipeline.
-#[derive(Serialize, Deserialize, ToSchema, Eq, PartialEq, Debug, Clone)]
-pub struct ConnectorStats {
-    /// Total number of errors across all connectors.
-    ///
-    /// This is the sum of:
-    /// - `num_transport_errors` from all input connectors
-    /// - `num_parse_errors` from all input connectors
-    /// - `num_encode_errors` from all output connectors
-    /// - `num_transport_errors` from all output connectors
-    pub num_errors: u64,
-}
-
 /// Pipeline information.
 /// It both includes fields which are user-provided and system-generated.
 #[derive(Serialize, ToSchema, PartialEq, Debug, Clone)]
@@ -116,7 +105,7 @@ pub struct PipelineInfo {
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
-    pub storage_status_details: Option<serde_json::Value>,
+    pub storage_status_details: Option<StorageStatusDetails>,
     pub deployment_id: Option<Uuid>,
     pub deployment_initial: Option<RuntimeDesiredStatus>,
     pub deployment_status: CombinedStatus,
@@ -129,7 +118,7 @@ pub struct PipelineInfo {
     pub deployment_resources_desired_status: ResourcesDesiredStatus,
     pub deployment_resources_desired_status_since: DateTime<Utc>,
     pub deployment_runtime_status: Option<RuntimeStatus>,
-    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_details: Option<RuntimeStatusDetails>,
     pub deployment_runtime_status_since: Option<DateTime<Utc>>,
     pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
     pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
@@ -139,8 +128,9 @@ pub struct PipelineInfo {
 ///
 /// This is the struct that is actually serialized when a response body type
 /// is [`PipelineInfo`] according to the OpenAPI specification.
-/// The difference are the types of `runtime_config`, `program_config` and
-/// `program_info` fields, which are JSON values rather than their actual ones.
+/// The difference are the types of `runtime_config`, `program_config`,
+/// `program_info`, `storage_status_details` and `deployment_runtime_status_details` fields,
+/// which are JSON values rather than their actual ones.
 /// This ensures that even when a backward incompatible change occurred for
 /// any of these fields, the API still works (i.e., able to serialize them in
 /// order to return pipeline(s)).
@@ -237,7 +227,9 @@ impl PipelineInfoInternal {
             deployment_resources_desired_status_since: extended_pipeline
                 .deployment_resources_desired_status_since,
             deployment_runtime_status: extended_pipeline.deployment_runtime_status,
-            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_details: backward_compatible_runtime_status_details(
+                extended_pipeline.deployment_runtime_status_details,
+            ),
             deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
             deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
             deployment_runtime_desired_status_since: extended_pipeline
@@ -280,7 +272,7 @@ pub struct PipelineSelectedInfo {
     pub deployment_error: Option<ErrorResponse>,
     pub refresh_version: Version,
     pub storage_status: StorageStatus,
-    pub storage_status_details: Option<serde_json::Value>,
+    pub storage_status_details: Option<StorageStatusDetails>,
     pub deployment_id: Option<Uuid>,
     pub deployment_initial: Option<RuntimeDesiredStatus>,
     pub deployment_status: CombinedStatus,
@@ -294,7 +286,7 @@ pub struct PipelineSelectedInfo {
     pub deployment_resources_desired_status: ResourcesDesiredStatus,
     pub deployment_resources_desired_status_since: DateTime<Utc>,
     pub deployment_runtime_status: Option<RuntimeStatus>,
-    pub deployment_runtime_status_details: Option<serde_json::Value>,
+    pub deployment_runtime_status_details: Option<RuntimeStatusDetails>,
     pub deployment_runtime_status_since: Option<DateTime<Utc>>,
     pub deployment_runtime_desired_status: Option<RuntimeDesiredStatus>,
     pub deployment_runtime_desired_status_since: Option<DateTime<Utc>>,
@@ -417,7 +409,9 @@ impl PipelineSelectedInfoInternal {
             deployment_resources_desired_status_since: extended_pipeline
                 .deployment_resources_desired_status_since,
             deployment_runtime_status: extended_pipeline.deployment_runtime_status,
-            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_details: backward_compatible_runtime_status_details(
+                extended_pipeline.deployment_runtime_status_details,
+            ),
             deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
             deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
             deployment_runtime_desired_status_since: extended_pipeline
@@ -477,7 +471,9 @@ impl PipelineSelectedInfoInternal {
             deployment_resources_desired_status_since: extended_pipeline
                 .deployment_resources_desired_status_since,
             deployment_runtime_status: extended_pipeline.deployment_runtime_status,
-            deployment_runtime_status_details: extended_pipeline.deployment_runtime_status_details,
+            deployment_runtime_status_details: backward_compatible_runtime_status_details(
+                extended_pipeline.deployment_runtime_status_details,
+            ),
             deployment_runtime_status_since: extended_pipeline.deployment_runtime_status_since,
             deployment_runtime_desired_status: extended_pipeline.deployment_runtime_desired_status,
             deployment_runtime_desired_status_since: extended_pipeline
@@ -541,6 +537,7 @@ pub enum PipelineFieldSelector {
     /// - `deployment_runtime_desired_status_since`
     /// - `bootstrap_policy`
     /// - `silent_bootstrap`
+    /// - `concurrent_bootstrap`
     All,
     /// Select only the fields required to know the status of a pipeline.
     ///
@@ -577,6 +574,7 @@ pub enum PipelineFieldSelector {
     /// - `deployment_runtime_desired_status_since`
     /// - `bootstrap_policy`
     /// - `silent_bootstrap`
+    /// - `concurrent_bootstrap`
     Status,
     /// Select the fields included in `Status` plus aggregated connector error statistics.
     ///
@@ -720,6 +718,10 @@ pub struct PostStartPipelineParameters {
     /// Bootstrap the pipeline with output connectors disabled.
     #[serde(default)]
     silent_bootstrap: bool,
+    /// Bootstrap new and modified views concurrently, keeping the pre-existing
+    /// views live while the new ones backfill in the background.
+    #[serde(default)]
+    concurrent_bootstrap: bool,
     #[serde(default = "default_pipeline_start_dismiss_error")]
     dismiss_error: bool,
 }
@@ -737,6 +739,40 @@ pub struct PostStopPipelineParameters {
     /// (`force=false`, which is the default).
     #[serde(default = "default_pipeline_stop_force")]
     force: bool,
+}
+
+/// Converts old runtime status details to the new strongly typed one.
+fn backward_compatible_runtime_status_details(
+    details: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    details.map(|details| match details {
+        serde_json::Value::Null => RuntimeStatusDetails::default().serialize_guaranteed(),
+        serde_json::Value::Bool(b) => {
+            RuntimeStatusDetails::new_only_reason(&format!("Boolean: {b}")).serialize_guaranteed()
+        }
+        serde_json::Value::Number(n) => {
+            RuntimeStatusDetails::new_only_reason(&format!("Number: {n}")).serialize_guaranteed()
+        }
+        serde_json::Value::String(s) => {
+            RuntimeStatusDetails::new_only_reason(&s).serialize_guaranteed()
+        }
+        serde_json::Value::Array(a) => {
+            RuntimeStatusDetails::new_only_reason(&format!("Array: {a:?}")).serialize_guaranteed()
+        }
+        serde_json::Value::Object(obj) => {
+            if obj.get("program_diff").is_some() {
+                // Backward compatibility: the entire runtime status details is actually the approval
+                // diff, as such it must be restructured.
+                RuntimeStatusDetails {
+                    approval_diff: Some(serde_json::Value::Object(obj)),
+                    ..Default::default()
+                }
+                .serialize_guaranteed()
+            } else {
+                serde_json::Value::Object(obj)
+            }
+        }
+    })
 }
 
 /// List Pipelines
@@ -798,13 +834,8 @@ pub(crate) async fn list_pipelines(
                     let tenant_id = *tenant_id;
                     let pipeline_name = pipeline.name.clone();
                     async move {
-                        fetch_connector_error_stats(
-                            &state,
-                            tenant_id,
-                            &pipeline_name,
-                            pipeline.deployment_runtime_status,
-                        )
-                        .await
+                        fetch_connector_error_stats(&state, tenant_id, &pipeline_name, pipeline)
+                            .await
                     }
                 })
                 .collect();
@@ -838,11 +869,28 @@ async fn fetch_connector_error_stats(
     state: &WebData<ServerState>,
     tenant_id: TenantId,
     pipeline_name: &str,
-    deployment_runtime_status: Option<RuntimeStatus>,
+    pipeline: &ExtendedPipelineDescrMonitoring,
 ) -> Option<ConnectorStats> {
+    // First attempt to retrieve the connector statistics from the runtime status details if they
+    // are available there. The fetching afterward is added for backward compatibility. Once the
+    // runtime status details changes are sufficiently long present and the user base has migrated
+    // past it, then the HTTP fetching can be removed.
+    let details = backward_compatible_runtime_status_details(
+        pipeline.deployment_runtime_status_details.clone(),
+    );
+    if let Some(value) = details {
+        if let Ok(details) = serde_json::from_value::<RuntimeStatusDetails>(value) {
+            if let Some(connector_stats) = details.connector_stats {
+                return Some(connector_stats);
+            }
+        }
+    };
+
     // Only forward the request if the pipeline is in a valid runtime status
-    match deployment_runtime_status {
+    match pipeline.deployment_runtime_status {
         Some(RuntimeStatus::Bootstrapping)
+        | Some(RuntimeStatus::ConcurrentBootstrapping)
+        | Some(RuntimeStatus::Synchronizing)
         | Some(RuntimeStatus::Replaying)
         | Some(RuntimeStatus::Running)
         | Some(RuntimeStatus::Paused) => {
@@ -976,13 +1024,8 @@ pub(crate) async fn get_pipeline(
                 .await
                 .get_pipeline_for_monitoring(*tenant_id, &pipeline_name)
                 .await?;
-            let connector_stats = fetch_connector_error_stats(
-                &state,
-                *tenant_id,
-                &pipeline_name,
-                pipeline.deployment_runtime_status,
-            )
-            .await;
+            let connector_stats =
+                fetch_connector_error_stats(&state, *tenant_id, &pipeline_name, &pipeline).await;
             PipelineSelectedInfoInternal::new_status_with_connectors(pipeline, connector_stats)
         }
     };
@@ -1300,6 +1343,311 @@ pub(crate) async fn post_update_runtime(
         .json(returned_pipeline))
 }
 
+/// Request body for the pipeline diff endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PipelineDiffRequest {
+    /// New SQL program code to compare against. If omitted, the pipeline's
+    /// current program code is used.
+    #[serde(default)]
+    pub program_code: Option<String>,
+
+    /// Runtime version to compile the new program with: a version tag
+    /// (`vX.Y.Z`) or a 40-character git SHA. If omitted, the platform's default
+    /// runtime is used.
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+}
+
+/// Validate a program on the compiler service and return its raw response.
+///
+/// Only transport-level failures produce an error (`CompilerUnavailable`); SQL
+/// and system errors are carried in the returned [`ValidateProgramResponse`], so
+/// each caller can decide how to surface them. `ir` requests the program IR
+/// (needed for computing a diff, unnecessary for plain validation).
+async fn call_compiler_validate(
+    common_config: &CommonConfig,
+    program_config: serde_json::Value,
+    program_code: String,
+    ir: bool,
+) -> Result<ValidateProgramResponse, ApiError> {
+    let protocol = if common_config.enable_https {
+        "https"
+    } else {
+        "http"
+    };
+    let url = format!(
+        "{protocol}://{}:{}/validate_program",
+        common_config.compiler_host, common_config.compiler_port
+    );
+    let client = common_config.reqwest_client().await;
+    let response = client
+        .post(&url)
+        .timeout(Duration::from_secs(
+            common_config.sql_compilation_timeout_secs,
+        ))
+        .json(&ProgramValidationRequest {
+            program_config,
+            program_code,
+            ir,
+        })
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                ApiError::CompilerTimeout {
+                    timeout_secs: common_config.sql_compilation_timeout_secs,
+                }
+            } else {
+                ApiError::CompilerUnavailable {
+                    reason: format!("failed to reach the compiler service: {e}"),
+                }
+            }
+        })?;
+    if !response.status().is_success() {
+        return Err(ApiError::CompilerUnavailable {
+            reason: format!("compiler service returned status {}", response.status()),
+        });
+    }
+    response
+        .json::<ValidateProgramResponse>()
+        .await
+        .map_err(|e| ApiError::CompilerUnavailable {
+            reason: format!("invalid response from the compiler service: {e}"),
+        })
+}
+
+/// Compute Program Diff
+///
+/// Compute the diff between the pipeline's current program and a proposed new
+/// version, without modifying or restarting the pipeline.
+///
+/// The diff lists the tables, views, and connectors that would be added,
+/// removed, or modified. It is the same diff shown when approving changes during
+/// bootstrapping, letting you preview the effect of a change before applying it.
+///
+/// The baseline is the pipeline's currently configured program compiled with its
+/// runtime, not necessarily the program in the latest checkpoint (which may have
+/// been produced by a different program or runtime version).
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+    ),
+    request_body(
+        content = PipelineDiffRequest,
+        description = "The proposed new SQL program and/or runtime version (both optional)"
+    ),
+    responses(
+        (status = OK
+            , description = "Diff successfully computed"
+            , body = PipelineDiff),
+        (status = NOT_FOUND
+            , description = "Pipeline does not exist or its current program has not been compiled"
+            , body = ErrorResponse),
+        (status = BAD_REQUEST
+            , description = "The new program failed to compile or the change cannot be bootstrapped"
+            , body = ErrorResponse),
+        (status = SERVICE_UNAVAILABLE
+            , description = "The compiler service is unavailable"
+            , body = ErrorResponse),
+        (status = GATEWAY_TIMEOUT
+            , description = "The compiler did not respond within the configured timeout"
+            , body = ErrorResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/pipelines/{pipeline_name}/diff")]
+pub(crate) async fn post_pipeline_diff(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<String>,
+    body: web::Json<PipelineDiffRequest>,
+) -> Result<HttpResponse, ManagerError> {
+    let pipeline_name = path.into_inner();
+    let request = body.into_inner();
+
+    // Load the pipeline together with its compiled program info.
+    let pipeline = state
+        .db
+        .lock()
+        .await
+        .get_pipeline(*tenant_id, &pipeline_name)
+        .await?;
+
+    // The current program must be successfully compiled and carry a dataflow IR.
+    if pipeline.program_status != ProgramStatus::Success {
+        return Err(ApiError::ProgramNotCompiled { pipeline_name }.into());
+    }
+    let Some(program_info_value) = &pipeline.program_info else {
+        return Err(ApiError::ProgramNotCompiled { pipeline_name }.into());
+    };
+    let old_program_info: ProgramInfo = serde_json::from_value(program_info_value.clone())
+        .map_err(|e| ApiError::InvalidProgramInfo {
+            error: format!("failed to parse the current program info: {e}"),
+        })?;
+    if old_program_info.dataflow.is_none() {
+        return Err(ApiError::ProgramInfoMissesDataflow { pipeline_name }.into());
+    }
+    let old_subset = old_program_info.to_pipeline_config_program_info();
+
+    // Determine the new SQL program and runtime version.
+    let new_program_code = request
+        .program_code
+        .unwrap_or_else(|| pipeline.program_code.clone());
+    let runtime_version = match request.runtime_version {
+        None => None,
+        Some(selector) => Some(
+            RuntimeSelector::try_from(selector)
+                .map_err(|error| ApiError::InvalidRuntimeVersion { error })?,
+        ),
+    };
+    let program_config = ProgramConfig {
+        profile: None,
+        cache: false,
+        runtime_version,
+        use_platform_compiler: false,
+    };
+    let program_config = serde_json::to_value(&program_config).map_err(|e| {
+        ApiError::NewProgramCompilationFailed {
+            error: format!("failed to serialize program configuration: {e}"),
+        }
+    })?;
+
+    // Validate the new program on the compiler service, requesting the IR
+    // (`ir = true`) because the diff is computed from it.
+    let new_program_info_value =
+        match call_compiler_validate(&state.common_config, program_config, new_program_code, true)
+            .await?
+        {
+            ValidateProgramResponse::Success { program_info } => program_info,
+            ValidateProgramResponse::SqlError { info } => {
+                return Err(ApiError::InvalidNewProgramSql {
+                    error: serde_json::to_string_pretty(&info.messages).unwrap_or_default(),
+                }
+                .into());
+            }
+            ValidateProgramResponse::SystemError { error } => {
+                return Err(ApiError::NewProgramCompilationFailed { error }.into());
+            }
+        };
+    let new_program_info: ProgramInfo =
+        serde_json::from_value(new_program_info_value).map_err(|e| {
+            ApiError::InvalidProgramInfo {
+                error: format!("failed to parse the new program info: {e}"),
+            }
+        })?;
+    let new_subset = new_program_info.to_pipeline_config_program_info();
+
+    // Compute the diff between the current and the proposed program.
+    let diff: PipelineDiff = compute_pipeline_diff(&old_subset, &new_subset).map_err(|e| {
+        ApiError::BootstrapNotAllowed {
+            error: e.to_string(),
+        }
+    })?;
+
+    info!(
+        pipeline = %pipeline_name,
+        tenant = %tenant_id.0,
+        "Computed pipeline diff"
+    );
+    Ok(HttpResponse::Ok()
+        .insert_header(CacheControl(vec![CacheDirective::NoCache]))
+        .json(diff))
+}
+
+/// Request body for the program validation endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ValidateProgramRequest {
+    /// SQL program code to validate.
+    pub program_code: String,
+
+    /// Runtime version to compile with: a version tag (`vX.Y.Z`) or a
+    /// 40-character git SHA. If omitted, the platform's default runtime is used.
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+
+    /// Return the program IR (dataflow) in the response. `false` by default;
+    /// most callers only need to know whether the program is valid.
+    #[serde(default)]
+    pub ir: bool,
+}
+
+/// Validate Program
+///
+/// Validate a SQL program by compiling it, without creating a pipeline or
+/// building the pipeline binary. Reports SQL errors and warnings and the derived
+/// schema and connectors. Set `ir` to also return the program IR (dataflow).
+///
+/// Note that this endpoint returns HTTP 200, regardless of whether validation
+/// succeeds or fails. The validation result, including any compiler warnings and errors,
+/// is encoded in the `ValidateProgramResponse` response body.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    request_body(
+        content = ValidateProgramRequest,
+        description = "The SQL program to validate, an optional runtime version, and whether to return the IR"
+    ),
+    responses(
+        (status = OK
+            , description = "Validation completed; the body reports success, SQL errors, or a system error"
+            , body = ValidateProgramResponse),
+        (status = BAD_REQUEST
+            , description = "The requested runtime version is invalid"
+            , body = ErrorResponse),
+        (status = SERVICE_UNAVAILABLE
+            , description = "The compiler service is unavailable"
+            , body = ErrorResponse),
+        (status = GATEWAY_TIMEOUT
+            , description = "The compiler did not respond within the configured timeout"
+            , body = ErrorResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Pipeline Lifecycle"
+)]
+#[post("/validate_program")]
+pub(crate) async fn post_validate_program(
+    state: WebData<ServerState>,
+    tenant_id: ReqData<TenantId>,
+    body: web::Json<ValidateProgramRequest>,
+) -> Result<HttpResponse, ManagerError> {
+    let request = body.into_inner();
+
+    let runtime_version = match request.runtime_version {
+        None => None,
+        Some(selector) => Some(
+            RuntimeSelector::try_from(selector)
+                .map_err(|error| ApiError::InvalidRuntimeVersion { error })?,
+        ),
+    };
+    let program_config = ProgramConfig {
+        profile: None,
+        cache: false,
+        runtime_version,
+        use_platform_compiler: false,
+    };
+    let program_config = serde_json::to_value(&program_config).map_err(|e| {
+        ApiError::NewProgramCompilationFailed {
+            error: format!("failed to serialize program configuration: {e}"),
+        }
+    })?;
+
+    let response = call_compiler_validate(
+        &state.common_config,
+        program_config,
+        request.program_code,
+        request.ir,
+    )
+    .await?;
+
+    info!(tenant = %tenant_id.0, "Validated program");
+    Ok(HttpResponse::Ok()
+        .insert_header(CacheControl(vec![CacheDirective::NoCache]))
+        .json(response))
+}
+
 /// Delete Pipeline
 ///
 /// Delete an existing pipeline by name.
@@ -1395,13 +1743,18 @@ pub(crate) async fn post_pipeline_start(
         initial,
         bootstrap_policy,
         silent_bootstrap,
+        concurrent_bootstrap,
         dismiss_error,
     } = query.into_inner();
 
     let bootstrap_config = BootstrapConfig {
         bootstrap_policy: Some(bootstrap_policy),
         silent_bootstrap,
+        concurrent_bootstrap,
     };
+    bootstrap_config
+        .validate()
+        .map_err(|reason| ApiError::InvalidBootstrapConfig { reason })?;
 
     let pipeline_id = match initial.as_str() {
         "standby" => {
@@ -1804,4 +2157,63 @@ pub(crate) async fn post_pipeline_testing(
     }
 
     Ok(HttpResponse::Ok().finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::endpoints::pipeline_management::backward_compatible_runtime_status_details;
+    use feldera_types::runtime_status::{ConnectorStats, RuntimeStatusDetails};
+    use serde_json::json;
+
+    #[test]
+    fn test_backward_compatible_runtime_status_details() {
+        for (input, expected) in [
+            (None, None),
+            (Some(json!(null)), Some(json!({}))),
+            (
+                Some(json!(false)),
+                Some(json!({"reason": "Boolean: false"})),
+            ),
+            (Some(json!(123)), Some(json!({"reason": "Number: 123"}))),
+            (Some(json!("abc")), Some(json!({"reason": "abc"}))),
+            (
+                Some(json!([1, 2, 3])),
+                Some(json!({"reason": "Array: [Number(1), Number(2), Number(3)]"})),
+            ),
+            (Some(json!({"abc": "def"})), Some(json!({"abc": "def"}))),
+            (
+                Some(json!({"program_diff": "xyz"})),
+                Some(json!({"approval_diff": { "program_diff": "xyz" }})),
+            ),
+            (
+                Some(RuntimeStatusDetails::default().serialize_guaranteed()),
+                Some(json!({})),
+            ),
+            (
+                Some(RuntimeStatusDetails::new_only_reason("abc").serialize_guaranteed()),
+                Some(json!({"reason": "abc"})),
+            ),
+            (
+                Some(
+                    RuntimeStatusDetails {
+                        reason: Some("abc".to_string()),
+                        connector_stats: Some(ConnectorStats { num_errors: 123 }),
+                        approval_diff: Some(json!({"a": "b"})),
+                    }
+                    .serialize_guaranteed(),
+                ),
+                Some(json!({
+                    "reason": "abc",
+                    "connector_stats": {
+                        "num_errors": 123
+                    },
+                    "approval_diff": {
+                        "a": "b"
+                    }
+                })),
+            ),
+        ] {
+            assert_eq!(backward_compatible_runtime_status_details(input), expected);
+        }
+    }
 }

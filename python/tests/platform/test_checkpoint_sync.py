@@ -1,10 +1,15 @@
+import json
+import logging
+import platform
 import random
 import sys
 import time
 import warnings
 from typing import Optional
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
+from feldera import Pipeline
 from feldera.enums import FaultToleranceModel, PipelineStatus
 from feldera.runtime_config import RuntimeConfig, Storage
 from feldera.testutils import (
@@ -17,11 +22,58 @@ from tests.shared_test_pipeline import SharedTestPipeline
 from tests.utils import (
     MINIO_BUCKET,
     MINIO_ENDPOINT,
+    MINIO_PROVIDER,
     MINIO_REGION,
     required_env,
 )
 
 from .helper import wait_for_condition
+
+
+LOGGER = logging.getLogger(__name__)
+_CHECKPOINT_SYNC_BUCKET_ARCH = platform.machine().lower()
+
+
+def checkpoint_sync_bucket(pipeline_name: str) -> str:
+    return f"{MINIO_BUCKET}/{_CHECKPOINT_SYNC_BUCKET_ARCH}/{pipeline_name}"
+
+
+def checkpoint_sync_owner(bucket_name: str) -> Optional[dict]:
+    """Read the checkpoint-sync owner file from S3 if Python can access S3."""
+    try:
+        import pyarrow.fs as pafs
+
+        endpoint = MINIO_ENDPOINT.rstrip("/")
+        parsed = urlparse(endpoint)
+        s3 = pafs.S3FileSystem(  # type: ignore[attr-defined]
+            access_key=required_env("CI_K8S_MINIO_ACCESS_KEY_ID"),
+            secret_key=required_env("CI_K8S_MINIO_SECRET_ACCESS_KEY"),
+            endpoint_override=parsed.netloc,
+            scheme=parsed.scheme,
+            region=MINIO_REGION,
+        )
+        owner_path = f"{checkpoint_sync_bucket(bucket_name)}/owner.json"
+        info = s3.get_file_info(owner_path)
+    except Exception as e:
+        print(
+            f"S3 is not accessible from the Python SDK; skipping owner.json check: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+    if not info.is_file:
+        raise AssertionError(f"checkpoint ownership file not found: {owner_path}")
+
+    with s3.open_input_file(owner_path) as f:
+        owner = json.loads(f.read().decode("utf-8"))
+
+    LOGGER.debug(
+        "read checkpoint ownership file from S3: bucket=%s path=%s pipeline_name=%s",
+        checkpoint_sync_bucket(bucket_name),
+        owner_path,
+        owner.get("pipeline_name"),
+    )
+    return owner
 
 
 def storage_cfg(
@@ -51,10 +103,10 @@ def storage_cfg(
     secret_key = required_env("CI_K8S_MINIO_SECRET_ACCESS_KEY")
 
     sync: dict = {
-        "bucket": f"{MINIO_BUCKET}/{pipeline_name}",
+        "bucket": checkpoint_sync_bucket(pipeline_name),
         "access_key": access_key,
         "secret_key": secret_key if not auth_err else secret_key + "extra",
-        "provider": "Minio",
+        "provider": MINIO_PROVIDER,
         "endpoint": endpoint or MINIO_ENDPOINT,
         "region": MINIO_REGION,
         "start_from_checkpoint": start_from_checkpoint,
@@ -136,14 +188,21 @@ class TestCheckpointSync(SharedTestPipeline):
                 )
             time.sleep(0.1)
 
-        got_before = list(self.pipeline.query("SELECT * FROM v0"))
+        # The processed counter updates before the step's output becomes
+        # visible to ad-hoc queries; retry briefly instead of comparing a
+        # single racy snapshot.
+        start = time.monotonic()
+        while True:
+            got_before = list(self.pipeline.query("SELECT * FROM v0"))
+            if len(got_before) == processed:
+                break
+            if time.monotonic() - start > 10:
+                raise RuntimeError(
+                    f"adhoc query returned {len(got_before)} but {processed} records "
+                    f"were processed: {got_before}"
+                )
+            time.sleep(0.2)
         print(f"{self.pipeline.name}: records: {total}, {got_before}", file=sys.stderr)
-
-        if len(got_before) != processed:
-            raise RuntimeError(
-                f"adhoc query returned {len(got_before)} but {processed} records were "
-                f"processed: {got_before}"
-            )
 
         return processed, got_before
 
@@ -457,6 +516,118 @@ class TestCheckpointSync(SharedTestPipeline):
 
         with self.assertRaisesRegex(RuntimeError, "SignatureDoesNotMatch|Forbidden"):
             self._restart_from_checkpoint("latest", auth_err=True, strict=False)
+
+    @enterprise_only
+    def test_bucket_owner_lock_rejects_other_pipeline(self):
+        # Two different pipelines intentionally point at the same remote bucket.
+        # The first one claims ownership when it syncs a checkpoint; the second
+        # must fail before writing anything to that bucket.
+        ft = FaultToleranceModel.AtLeastOnce
+
+        owner = self.new_pipeline_with_suffix("owner")
+        intruder = self.new_pipeline_with_suffix("intruder")
+        shared_storage = Storage(config=storage_cfg(owner.name))
+
+        owner.set_runtime_config(
+            RuntimeConfig(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=ft,
+                storage=shared_storage,
+            )
+        )
+        owner.start()
+        owner.input_json("t0", [{"c0": i, "c1": f"owner_{i}"} for i in range(1, 6)])
+        owner.wait_for_completion()
+        owner.checkpoint(wait=True)
+        owner.sync_checkpoint(wait=True)
+
+        intruder.set_runtime_config(
+            RuntimeConfig(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=ft,
+                storage=shared_storage,
+            )
+        )
+        intruder.start()
+        intruder.input_json(
+            "t0", [{"c0": i, "c1": f"intruder_{i}"} for i in range(6, 11)]
+        )
+        intruder.wait_for_completion()
+        intruder.checkpoint(wait=True)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "S3 checkpoint bucket is already owned by [\\s\\S]*id: pipeline-[^,)]+[\\s\\S]*"
+            "Current pipeline is [\\s\\S]*id: pipeline-[^,)]+[\\s\\S]*"
+            "Refusing to write checkpoint data",
+        ):
+            intruder.sync_checkpoint(wait=True)
+
+        # The failed intruder write must not disturb the legitimate owner.
+        owner.input_json(
+            "t0", [{"c0": i, "c1": f"owner_again_{i}"} for i in range(11, 16)]
+        )
+        owner.wait_for_completion()
+        owner.checkpoint(wait=True)
+        owner.sync_checkpoint(wait=True)
+
+        intruder.stop(force=True)
+        owner.stop(force=True)
+        intruder.clear_storage()
+        owner.clear_storage()
+
+    @enterprise_only
+    def test_owner_lock_allows_renamed_pipeline(self):
+        # Renaming a pipeline changes the user-visible name, but keeps the
+        # system-generated pipeline name used for bucket ownership.
+        old_name = self.pipeline.name
+        pipeline_id = self.pipeline.id()
+        system_name = f"pipeline-{pipeline_id}"
+        bucket_name = f"{old_name}-{pipeline_id}"
+        self.pipeline.set_runtime_config(
+            RuntimeConfig(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
+                storage=Storage(
+                    config=storage_cfg(bucket_name, start_from_checkpoint="latest")
+                ),
+            )
+        )
+        self.pipeline.start()
+        _, got_before = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        self.pipeline.sync_checkpoint(wait=True)
+        owner_before = checkpoint_sync_owner(bucket_name)
+        if owner_before is not None:
+            self.assertEqual(owner_before["pipeline_name"], system_name)
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+        new_name = f"{old_name[:50]}-{uuid4().hex[:8]}"
+        self.client.http.patch(f"/pipelines/{old_name}", {"name": new_name})
+        self.p = Pipeline.get(new_name, self.client)
+
+        self.pipeline.start()
+        got_after = list(self.pipeline.query("SELECT * FROM v0"))
+        print(
+            f"{self.pipeline.name}: after rename: {len(got_after)}, {got_after}",
+            file=sys.stderr,
+        )
+        self.assertCountEqual(got_before, got_after)
+
+        self.pipeline.input_json("t0", [{"c0": 42, "c1": "after_rename"}])
+        self.pipeline.wait_for_completion()
+        self.pipeline.checkpoint(wait=True)
+        self.pipeline.sync_checkpoint(wait=True)
+        owner_after = checkpoint_sync_owner(bucket_name)
+        if owner_after is not None:
+            self.assertEqual(owner_after["pipeline_name"], system_name)
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
 
     @enterprise_only
     @single_host_only
@@ -791,7 +962,7 @@ class TestCheckpointSync(SharedTestPipeline):
         uuid = source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: start the main pipeline with an empty bucket and read_bucket
         # pointing at the source.
@@ -879,7 +1050,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: push a checkpoint to the main pipeline's own bucket.
         storage_config = storage_cfg(self.pipeline.name)
@@ -930,7 +1101,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.clear_storage()
 
     @enterprise_only
-    def test_standby_bucket_takes_over_from_read_bucket(self):
+    def test_standby_takes_over_from_read_bucket(self):
         # In standby mode, when bucket is initially empty the pipeline falls back
         # to read_bucket. Once the main pipeline pushes a newer checkpoint to
         # bucket, standby picks it up on the next poll.
@@ -955,7 +1126,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: start the main pipeline; it will push newer checkpoints to
         # its own bucket during the test.
@@ -1139,7 +1310,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: main pipeline takes a LOCAL-ONLY checkpoint (never synced).
         # Its own S3 bucket stays empty, ensuring the only remote source of data
@@ -1198,7 +1369,7 @@ class TestCheckpointSync(SharedTestPipeline):
 
     @enterprise_only
     @single_host_only
-    def test_local_priority_over_read_bucket_from_uuid(self):
+    def test_local_priority_over_read_bucket_uuid(self):
         # UUID variant of test_local_priority_over_read_bucket.
         # When a specific UUID exists only in local storage (bucket empty,
         # read_bucket has a different checkpoint), local must win.
@@ -1224,7 +1395,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: main pipeline takes a LOCAL-ONLY checkpoint (never synced).
         # Main bucket stays empty; source_bucket (read_bucket) has a checkpoint
@@ -1338,7 +1509,9 @@ class TestCheckpointSync(SharedTestPipeline):
         ft = FaultToleranceModel.AtLeastOnce
 
         # A bucket path with no checkpoints.
-        empty_read_bucket = f"{MINIO_BUCKET}/{self.pipeline.name}_read_bucket_empty"
+        empty_read_bucket = checkpoint_sync_bucket(
+            f"{self.pipeline.name}_read_bucket_empty"
+        )
 
         storage_config = storage_cfg(
             self.pipeline.name,
@@ -1359,7 +1532,7 @@ class TestCheckpointSync(SharedTestPipeline):
 
     @enterprise_only
     @single_host_only
-    def test_bucket_preferred_over_read_bucket_from_uuid(self):
+    def test_bucket_preferred_over_read_bucket_uuid(self):
         # When start_from_checkpoint is a specific UUID, the primary bucket is
         # still preferred over read_bucket.
         ft = FaultToleranceModel.AtLeastOnce
@@ -1382,7 +1555,7 @@ class TestCheckpointSync(SharedTestPipeline):
         source.sync_checkpoint(wait=True)
         source.stop(force=True)
 
-        source_bucket = f"{MINIO_BUCKET}/{source.name}"
+        source_bucket = checkpoint_sync_bucket(source.name)
 
         # Step 2: main pipeline creates and syncs its own checkpoint.
         storage_config = storage_cfg(self.pipeline.name)

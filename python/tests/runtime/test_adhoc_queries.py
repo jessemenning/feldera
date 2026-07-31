@@ -498,8 +498,8 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
         """``VARIANT`` is a dynamically-typed JSON-shaped value. The
         DataFusion ad-hoc layer rejects ``CAST(.. AS VARIANT)`` in
         ``INSERT`` literals, so we populate via the JSON ingress path
-        and verify the value comes out over Arrow IPC as the canonical
-        JSON string.
+        and verify the value comes out over Arrow IPC and parquet as
+        the canonical JSON string.
         """
         self.pipeline.start()
 
@@ -512,6 +512,26 @@ class TestAdhocQueriesArrow(SharedTestPipeline):
         # Arrow surfaces VARIANT as a UTF-8 string carrying the JSON
         # representation; whitespace is normalised by the encoder.
         assert rows[0]["v"] == '{"a":1,"b":[2,3]}'
+
+        # Parquet output carries the same JSON string.
+        import pyarrow.parquet as pq
+
+        pf = tempfile.NamedTemporaryFile(
+            prefix="adhoc_variant_", suffix=".parquet", delete=False
+        )
+        pf.close()
+        try:
+            TEST_CLIENT.query_as_parquet(
+                self.pipeline.name, "SELECT * FROM has_variant", pf.name[:-8]
+            )
+            table = pq.read_table(pf.name[:-8] + ".parquet")
+            assert table.to_pylist() == [{"v": '{"a":1,"b":[2,3]}'}]
+        finally:
+            for p in (pf.name, pf.name[:-8] + ".parquet"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     @sql(
         """CREATE TABLE floats (
@@ -594,7 +614,7 @@ class TestAdhocReadAfterWrite(SharedTestPipeline):
           id INT NOT NULL PRIMARY KEY
         ) WITH ('materialized' = 'true');"""
     )
-    def test_multi_statement_query_during_open_transaction_pk(self):
+    def test_multi_statement_query_open_transaction_pk(self):
         """An ad-hoc request running inside a user transaction must observe the state before the transaction started."""
         self.pipeline.start()
 
@@ -628,8 +648,8 @@ class TestAdhocReadAfterWrite(SharedTestPipeline):
           id INT
         ) WITH ('materialized' = 'true');"""
     )
-    def test_multi_statement_query_during_open_transaction_no_pk(self):
-        """Same as test_multi_statement_query_during_open_transaction_pk, but for a table without a primary key."""
+    def test_multi_statement_query_open_transaction_no_pk(self):
+        """Same as test_multi_statement_query_open_transaction_pk, but for a table without a primary key."""
         self.pipeline.start()
 
         # Seed one row outside the transaction as the baseline.

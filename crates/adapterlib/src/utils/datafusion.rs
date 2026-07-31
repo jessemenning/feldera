@@ -219,11 +219,16 @@ where
         );
     let session_config = customize_config(session_config);
 
-    let state = SessionStateBuilder::new()
+    let mut state = SessionStateBuilder::new()
         .with_config(session_config)
         .with_runtime_env(runtime_env)
         .with_default_features()
         .build();
+    // JSON functions for querying VARIANT columns, which reach DataFusion
+    // as JSON-encoded strings. Note: the crate's `->` and `?` operators do
+    // not parse in the default (generic) SQL dialect; `->>` works.
+    datafusion_functions_json::register_all(&mut state)
+        .expect("registering JSON functions on a fresh session state cannot fail");
     SessionContext::from(state)
 }
 
@@ -362,6 +367,35 @@ pub fn columns_referenced_by_order_by(order_by: &str) -> Result<BTreeSet<String>
         collect_referenced_columns(&key.expr, &mut columns);
     }
     Ok(columns)
+}
+
+/// Takes a column name from an external table schema and returns a quoted
+/// string that can be used in datafusion queries like `select "foo""bar" from my_table`.
+pub fn quote_sql_identifier<S: AsRef<str>>(ident: S) -> String {
+    format!("\"{}\"", ident.as_ref().replace("\"", "\"\""))
+}
+
+/// A set of column names compared case-insensitively. External table schemas
+/// (Delta, Iceberg) carry no case-sensitivity information, so names are stored
+/// and probed in lowercased form.
+///
+/// SQL is case-sensitive for quoted column names, but an external table cannot
+/// hold two columns with the same lowercase form, so collapsing to a single
+/// canonical form is safe here.
+#[derive(Default)]
+pub struct ColumnNameSet {
+    lowercase: BTreeSet<String>,
+}
+
+impl ColumnNameSet {
+    pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
+        let lowercase = names.into_iter().map(|c| c.to_lowercase()).collect();
+        Self { lowercase }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.lowercase.contains(&name.to_lowercase())
+    }
 }
 
 /// Convert a value of the timestamp column returned by a SQL query into a valid
@@ -702,6 +736,40 @@ mod tests {
             c.set_usize("datafusion.execution.target_partitions", 99)
         });
         assert_eq!(ctx.copied_config().target_partitions(), 99);
+    }
+
+    /// Every context built here must provide the JSON function family.
+    #[test]
+    fn create_session_context_registers_json_functions() {
+        let storage = TempStorage::new("feldera-datafusion-create-session-context-json-test");
+        let cfg = pipeline_config(
+            RuntimeConfig {
+                workers: 1,
+                ..Default::default()
+            },
+            Some(storage.path()),
+        );
+        let env = create_runtime_env(&cfg).unwrap();
+        let ctx = create_session_context(&cfg, env);
+        let state = ctx.state();
+        for function in [
+            "json_get",
+            "json_get_str",
+            "json_get_int",
+            "json_get_float",
+            "json_get_bool",
+            "json_get_json",
+            "json_get_array",
+            "json_as_text",
+            "json_contains",
+            "json_length",
+            "json_object_keys",
+        ] {
+            assert!(
+                state.scalar_functions().contains_key(function),
+                "JSON function '{function}' is not registered"
+            );
+        }
     }
 
     /// Tripwire: `clean_stale_scratch_entries` refuses to walk a directory

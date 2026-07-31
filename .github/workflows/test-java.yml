@@ -6,12 +6,12 @@ on:
 
 env:
   RUSTC_WRAPPER: sccache
-  SCCACHE_CACHE_SIZE: ${{ vars.SCCACHE_CACHE_SIZE }}
-  SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
-  SCCACHE_ENDPOINT: ${{ vars.SCCACHE_ENDPOINT }}
-  SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
-  AWS_ACCESS_KEY_ID: "${{ secrets.CI_K8S_MINIO_ACCESS_KEY_ID }}"
-  AWS_SECRET_ACCESS_KEY: "${{ secrets.CI_K8S_MINIO_SECRET_ACCESS_KEY }}"
+  # sccache: native GCS backend, credentials come from the runner pod via
+  # Workload Identity (no secrets).
+  SCCACHE_GCS_BUCKET: ${{ vars.SCCACHE_GCS_BUCKET }}
+  SCCACHE_GCS_RW_MODE: READ_WRITE
+  AWS_ACCESS_KEY_ID: "${{ secrets.CI_GCS_HMAC_ACCESS_KEY_ID }}"
+  AWS_SECRET_ACCESS_KEY: "${{ secrets.CI_GCS_HMAC_SECRET_ACCESS_KEY }}"
   RUST_MIN_STACK: 8388608
   # sccache cannot cache rustc invocations when incremental is on.
   CARGO_INCREMENTAL: 0
@@ -31,37 +31,35 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: [k8s-runners-amd64]
-          - runner: [k8s-runners-arm64]
+          - runner: [gke-runners-amd64]
+          - runner: [gke-runners-arm64]
     runs-on: ${{ matrix.runner }}
 
     container:
       image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
     steps:
-      - name: Show Kubernetes node
-        if: always()
-        run: |
-          echo "K8S node: ${K8S_NODE_NAME}"
-
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Cache Cargo registry
-        uses: ./.github/actions/feldera-minio-cache
+        uses: ./.github/actions/feldera-gcs-cache
         with:
           # Crate downloads only, NOT target/: caching the multi-GB target/
           # trees never paid off, and sccache already caches compiled crates.
           # registry/src is excluded, cargo regenerates it from registry/cache.
           path: |
-            ~/.cargo/registry/cache
-            ~/.cargo/registry/index
-            ~/.cargo/git/db
+            # Absolute paths: CARGO_HOME is /home/ubuntu/.cargo (feldera-dev image
+            # env), while ~ expands to the runner's HOME (/github/home in container
+            # jobs), so tilde paths would cache a directory cargo never writes.
+            /home/ubuntu/.cargo/registry/cache
+            /home/ubuntu/.cargo/registry/index
+            /home/ubuntu/.cargo/git/db
           key: test-java-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             test-java-cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache JVM build dependencies
-        uses: ./.github/actions/feldera-minio-cache
+        uses: ./.github/actions/feldera-gcs-cache
         with:
           path: |
             /home/ubuntu/.gradle

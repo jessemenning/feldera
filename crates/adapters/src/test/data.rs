@@ -6,7 +6,7 @@ use arrow::datatypes::{DataType, Schema, TimeUnit};
 use dbsp::utils::Tup2;
 use feldera_macros::IsNone;
 use feldera_sqllib::{
-    ByteArray, Date, F32, F64, SqlDecimal, SqlString, Time, Timestamp, Uuid, Variant,
+    ByteArray, Date, F32, F64, SqlDecimal, SqlString, Time, Timestamp, TimestampTz, Uuid, Variant,
 };
 use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
 use feldera_types::{
@@ -784,6 +784,7 @@ pub struct IcebergTestStruct {
     //pub uuid: ByteArray,
     pub fixed: ByteArray,
     pub varbin: ByteArray,
+    pub tstz: TimestampTz,
 }
 
 impl Arbitrary for IcebergTestStruct {
@@ -808,6 +809,8 @@ impl Arbitrary for IcebergTestStruct {
                 0u64..24 * 3600 * 1_000_000_000,
                 // Generate timestamps within a 1-year range
                 1704070800i64..1735693200,
+                // Generate timestamptz within a 1-year range (microseconds since epoch)
+                1704070800_000_000i64..1735693200_000_000,
             ),
             // String in the range "0".."1000"
             (
@@ -822,10 +825,10 @@ impl Arbitrary for IcebergTestStruct {
         )
             .prop_map(
                 |(
-                    (b, i, l, r, d, dec_num, dec_scale, dt, tm, ts),
+                    (b, i, l, r, d, dec_num, dec_scale, dt, tm, ts, tstz),
                     (s, /*uuid,*/ fixed, varbin),
                 ): (
-                    (bool, i32, i64, f32, f64, i128, u32, i32, u64, i64),
+                    (bool, i32, i64, f32, f64, i128, u32, i32, u64, i64, i64),
                     (i32, /*Vec<u8>,*/ Vec<u8>, Vec<u8>),
                 )| {
                     IcebergTestStruct {
@@ -842,6 +845,7 @@ impl Arbitrary for IcebergTestStruct {
                         // uuid: ByteArray::from_vec(uuid),
                         fixed: ByteArray::from_vec(fixed),
                         varbin: ByteArray::new(&varbin),
+                        tstz: TimestampTz::from_microseconds(tstz),
                     }
                 },
             )
@@ -869,6 +873,11 @@ impl IcebergTestStruct {
             // arrow::datatypes::Field::new("uuid", DataType::FixedSizeBinary(16), false),
             arrow::datatypes::Field::new("fixed", DataType::FixedSizeBinary(5), false),
             arrow::datatypes::Field::new("varbin", DataType::Binary, false),
+            arrow::datatypes::Field::new(
+                "tstz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
         ]))
     }
 
@@ -887,6 +896,7 @@ impl IcebergTestStruct {
             // Field::new("uuid".into(), ColumnType::fixed(16, false)),
             Field::new("fixed".into(), ColumnType::fixed(5, false)),
             Field::new("varbin".into(), ColumnType::varbinary(false)),
+            Field::new("tstz".into(), ColumnType::timestamp_tz(false)),
         ]
     }
 
@@ -906,6 +916,7 @@ impl IcebergTestStruct {
             // Field::new("uuid".into(), ColumnType::fixed(16, false)),
             Field::new("fixed".into(), ColumnType::fixed(5, false)),
             Field::new("varbin".into(), ColumnType::varbinary(false)),
+            Field::new("tstz".into(), ColumnType::timestamp_tz(false)),
         ];
 
         fields
@@ -922,7 +933,7 @@ impl IcebergTestStruct {
     }
 }
 
-serialize_table_record!(IcebergTestStruct[12]{
+serialize_table_record!(IcebergTestStruct[13]{
     b["b"]: bool,
     i["i"]: i32,
     l["l"]: i64,
@@ -935,10 +946,11 @@ serialize_table_record!(IcebergTestStruct[12]{
     s["s"]: String,
     // uuid["uuid"]: ByteArray,
     fixed["fixed"]: ByteArray,
-    varbin["varbin"]: ByteArray
+    varbin["varbin"]: ByteArray,
+    tstz["tstz"]: TimestampTz
 });
 
-deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 12] {
+deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 13] {
     (b, "b", false, bool, |_| None),
     (i, "i", false, i32, |_| None),
     (l, "l", false, i64, |_| None),
@@ -951,7 +963,8 @@ deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 12] {
     (s, "s", false, String, |_| None),
     // (uuid, "uuid", false, ByteArray, None),
     (fixed, "fixed", false, ByteArray, |_| None),
-    (varbin, "varbin", false, ByteArray, |_| None)
+    (varbin, "varbin", false, ByteArray, |_| None),
+    (tstz, "tstz", false, TimestampTz, |_| None)
 });
 
 /// Records in the Amazon S3 Tables integration-test table (`dev.test_table`).
@@ -1001,6 +1014,57 @@ deserialize_table_record!(S3TablesTestStruct["S3TablesTestStruct", Variant, 3] {
     (id, "id", false, i64, |_| None),
     (name, "name", true, Option<String>, |_| Some(None)),
     (created_at, "created_at", true, Option<Timestamp>, |_| Some(None))
+});
+
+/// SQL table that declares a subset of [`IcebergTestStruct`]'s columns, for
+/// testing that the Iceberg connector only reads declared columns.
+///
+/// `l` is nullable and marked unused, so the connector skips it (and the
+/// deserializer NULL-fills it) when the `skip_unused_columns` table property
+/// is set.
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct IcebergSubsetTestStruct {
+    pub i: i32,
+    pub s: String,
+    pub l: Option<i64>,
+}
+
+impl IcebergSubsetTestStruct {
+    pub fn schema() -> Vec<Field> {
+        vec![
+            Field::new("i".into(), ColumnType::int(false)),
+            Field::new("s".into(), ColumnType::varchar(false)),
+            Field::new("l".into(), ColumnType::bigint(true)).with_unused(true),
+        ]
+    }
+}
+
+serialize_table_record!(IcebergSubsetTestStruct[3]{
+    i["i"]: i32,
+    s["s"]: String,
+    l["l"]: Option<i64>
+});
+
+deserialize_table_record!(IcebergSubsetTestStruct["IcebergSubsetTestStruct", Variant, 3] {
+    (i, "i", false, i32, |_| None),
+    (s, "s", false, String, |_| None),
+    (l, "l", false, Option<i64>, |_| Some(None))
 });
 
 /// Struct will all types supported by the DeltaLake connector.

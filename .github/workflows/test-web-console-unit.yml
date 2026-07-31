@@ -7,7 +7,7 @@ on:
 jobs:
   web-console-unit-tests:
     name: Web Console Unit Tests
-    runs-on: [k8s-runners-amd64]
+    runs-on: [gke-runners-amd64]
 
     container:
       image: mcr.microsoft.com/playwright:v1.58.2-noble
@@ -28,8 +28,11 @@ jobs:
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: bun run test-unit
         working-directory: js-packages/web-console
+        env:
+          VITEST_MAX_WORKERS: "4"
 
-      - name: Show Kubernetes node
-        if: always()
-        run: |
-          echo "K8S node: ${K8S_NODE_NAME}"
+      - name: Run profiler-layout vitest unit & component tests
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: bun run test-unit
+        working-directory: js-packages/profiler-layout
+

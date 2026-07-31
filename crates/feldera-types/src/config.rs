@@ -9,7 +9,7 @@ use crate::postprocess::PostprocessorConfig;
 use crate::preprocess::PreprocessorConfig;
 use crate::secret_resolver::default_secrets_directory;
 use crate::transport::adhoc::AdHocInputConfig;
-use crate::transport::clock::ClockConfig;
+use crate::transport::clock::{ClockConfig, ClockTimezoneOffset};
 use crate::transport::datagen::DatagenInputConfig;
 use crate::transport::delta_table::{DeltaTableReaderConfig, DeltaTableWriterConfig};
 use crate::transport::dynamodb::DynamoDBWriterConfig;
@@ -65,6 +65,25 @@ pub struct ProgramIr {
     pub mir: HashMap<MirNodeId, MirNode>,
     /// Program schema.
     pub program_schema: serde_json::Value,
+}
+
+/// Identity of a pipeline, used to record and check ownership of an S3
+/// checkpoint bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineIdentity {
+    /// System-generated name of the pipeline (format `pipeline-<uuid>`).
+    pub name: String,
+    /// Name given to the pipeline by the tenant.
+    pub given_name: Option<String>,
+}
+
+impl Display for PipelineIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.given_name {
+            Some(given_name) => write!(f, "{given_name} (id: {})", self.name),
+            None => write!(f, "{}", self.name),
+        }
+    }
 }
 
 /// Pipeline deployment configuration.
@@ -137,6 +156,16 @@ impl PipelineConfig {
         )
     }
 
+    /// Extract the compiler-generated subset of the configuration (connectors
+    /// and program IR) used to compute pipeline diffs.
+    pub fn program_info_subset(&self) -> PipelineConfigProgramInfo {
+        PipelineConfigProgramInfo {
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
+            program_ir: self.program_ir.clone(),
+        }
+    }
+
     pub fn with_storage(self, storage: Option<(StorageConfig, StorageOptions)>) -> Self {
         let (storage_config, storage_options) = storage.unzip();
         Self {
@@ -153,6 +182,17 @@ impl PipelineConfig {
         let storage_options = self.global.storage.as_ref();
         let storage_config = self.storage_config.as_ref();
         storage_config.zip(storage_options)
+    }
+
+    /// Returns this pipeline's [`PipelineIdentity`], used to identify the
+    /// pipeline that owns an S3 checkpoint bucket.
+    ///
+    /// Returns `None` when the pipeline has no system-generated [`name`](Self::name).
+    pub fn pipeline_identity(&self) -> Option<PipelineIdentity> {
+        self.name.as_ref().map(|name| PipelineIdentity {
+            name: name.clone(),
+            given_name: self.given_name.clone(),
+        })
     }
 
     /// Returns `self.secrets_dir`, or the default secrets directory if it isn't
@@ -903,6 +943,19 @@ pub struct RuntimeConfig {
     /// It is set to 1 second (1,000,000 microseconds) by default.
     pub clock_resolution_usecs: Option<u64>,
 
+    /// Fixed timezone offset for the SQL `NOW()` clock.
+    ///
+    /// An ISO-8601 UTC offset, for example `"+05:30"` or `"-08:00"`, that the
+    /// clock connector adds to every `NOW()` value it emits, so `NOW()`
+    /// returns local time in that fixed timezone instead of UTC.
+    ///
+    /// The offset is baked into the pipeline's checkpointed state and cannot
+    /// be changed when the pipeline resumes from a checkpoint: the value from
+    /// the checkpoint stays in effect, and a differing new value is ignored
+    /// with a warning in the pipeline log.
+    #[schema(value_type = Option<String>, example = "+05:30")]
+    pub clock_timezone_offset: Option<ClockTimezoneOffset>,
+
     /// Optionally, a list of CPU numbers for CPUs to which the pipeline may pin
     /// its worker threads.  Specify at least twice as many CPU numbers as
     /// workers.  CPUs are generally numbered starting from 0.  The pipeline
@@ -1115,6 +1168,7 @@ impl Default for RuntimeConfig {
             max_buffering_delay_usecs: 0,
             resources: ResourceConfig::default(),
             clock_resolution_usecs: { Some(DEFAULT_CLOCK_RESOLUTION_USECS) },
+            clock_timezone_offset: None,
             pin_cpus: Vec::new(),
             provisioning_timeout_secs: None,
             max_parallel_connector_init: None,
@@ -1210,9 +1264,42 @@ impl Default for FtConfig {
 mod test {
     use super::deserialize_fault_tolerance;
     use crate::config::{
-        DEFAULT_DATAFUSION_MEMORY_MB_CEILING, FtConfig, FtModel, ResourceConfig, RuntimeConfig,
+        DEFAULT_DATAFUSION_MEMORY_MB_CEILING, FtConfig, FtModel, PipelineConfig, ResourceConfig,
+        RuntimeConfig,
     };
     use serde::{Deserialize, Serialize};
+
+    fn config_with_name(name: Option<&str>) -> PipelineConfig {
+        PipelineConfig {
+            global: RuntimeConfig::default(),
+            multihost: None,
+            name: name.map(str::to_string),
+            given_name: None,
+            storage_config: None,
+            secrets_dir: None,
+            inputs: Default::default(),
+            outputs: Default::default(),
+            program_ir: None,
+        }
+    }
+
+    #[test]
+    fn pipeline_identity_uses_system_and_given_names() {
+        let mut config = config_with_name(Some("pipeline-018f6f57-4e15-7438-91af-3fd21ff2a8d3"));
+        config.given_name = Some("my-pipeline".to_string());
+
+        let metadata = config.pipeline_identity().unwrap();
+        assert_eq!(
+            metadata.name,
+            "pipeline-018f6f57-4e15-7438-91af-3fd21ff2a8d3"
+        );
+        assert_eq!(metadata.given_name.as_deref(), Some("my-pipeline"));
+    }
+
+    #[test]
+    fn pipeline_identity_is_none_without_system_name() {
+        assert_eq!(config_with_name(None).pipeline_identity(), None);
+    }
 
     #[test]
     fn resolved_datafusion_memory_explicit_passes_through() {

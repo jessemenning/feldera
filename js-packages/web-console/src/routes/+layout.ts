@@ -26,8 +26,11 @@ import {
   setSelectedTenant,
   triggerOidcLogin
 } from '$lib/services/auth'
+import { initConceptualHq } from '$lib/services/conceptualHq'
 import type { Configuration, SessionInfo } from '$lib/services/manager'
 import { client } from '$lib/services/manager/client.gen'
+import { initPosthog } from '$lib/services/posthog'
+import { initProductFruits } from '$lib/services/productFruits'
 import type { AuthDetails } from '$lib/types/auth'
 import type { LayoutLoad } from './$types'
 
@@ -81,18 +84,6 @@ export const trailingSlash = 'always'
  * double-fetching page-level resources, so be careful when adding new
  * branches that call `invalidateAll()` unconditionally.
  */
-
-const initPosthog = async (config: Configuration) => {
-  if (!config.telemetry) {
-    return
-  }
-  posthog.init(config.telemetry, {
-    api_host: 'https://us.i.posthog.com',
-    person_profiles: 'identified_only',
-    capture_pageview: false,
-    capture_pageleave: false
-  })
-}
 
 export type LayoutData = {
   auth: AuthDetails
@@ -442,15 +433,9 @@ function buildLayoutData(
  */
 function initializeConfigDependencies(auth: AuthDetails, config: Configuration) {
   if (typeof auth === 'object' && 'logout' in auth) {
-    initPosthog(config).then(() => {
-      if (auth.profile.email) {
-        posthog.identify(auth.profile.email, {
-          email: auth.profile.email,
-          name: auth.profile.name,
-          auth_id: auth.profile.id
-        })
-      }
-    })
+    initPosthog(config, auth.profile)
+    initProductFruits(config, auth.profile)
+    initConceptualHq(config, auth.profile)
   }
 
   {

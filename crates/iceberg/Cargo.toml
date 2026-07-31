@@ -15,7 +15,9 @@ feldera-types = { workspace = true }
 feldera-adapterlib = { workspace = true }
 dbsp = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
-tokio = { workspace = true, features = ["sync", "rt"] }
+atomic = { workspace = true }
+bytemuck = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 datafusion = { workspace = true }
 log = { workspace = true }
 iceberg = { workspace = true }
@@ -26,5 +28,6 @@ iceberg-catalog-s3tables = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 futures-util = { workspace = true }

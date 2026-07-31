@@ -7,7 +7,7 @@ use crate::SchedulerError;
 use crate::circuit::checkpointer::Checkpointer;
 use crate::circuit::dbsp_handle::StepSize;
 use crate::error::Error as DbspError;
-use crate::operator::communication::Exchange;
+use crate::operator::communication::{Exchange, ExchangeActivity};
 use crate::storage::backend::StorageBackend;
 use crate::storage::file::format::Compression;
 use crate::storage::file::writer::Parameters;
@@ -79,6 +79,10 @@ pub enum Error {
     IncompatibleStorage,
     /// Error deserializing checkpointed state.
     CheckpointParseError(String),
+    /// A bootstrap-circuit command was issued in the wrong state, e.g.,
+    /// stepping a bootstrap circuit that does not exist or creating one
+    /// while another exists.
+    BootstrapCircuit(String),
     Terminated,
 }
 
@@ -90,6 +94,7 @@ impl DetailedError for Error {
             Self::Terminated => Cow::from("Terminated"),
             Self::IncompatibleStorage => Cow::from("IncompatibleStorage"),
             Self::CheckpointParseError(_) => Cow::from("CheckpointParseError"),
+            Self::BootstrapCircuit(_) => Cow::from("BootstrapCircuit"),
         }
     }
 }
@@ -115,6 +120,9 @@ impl Display for Error {
             }
             Self::CheckpointParseError(error) => {
                 write!(f, "Error deserializing checkpointed state: {error}")
+            }
+            Self::BootstrapCircuit(error) => {
+                write!(f, "Bootstrap circuit error: {error}")
             }
         }
     }
@@ -267,6 +275,7 @@ struct RuntimeInner {
     layout: Layout,
     mode: Mode,
     step_size: StepSize,
+    allow_input_during_commit: bool,
     dev_tweaks: DevTweaks,
 
     /// User-configured process memory limit.
@@ -496,6 +505,7 @@ impl RuntimeInner {
             layout: config.layout,
             mode: config.mode,
             step_size: config.step_size,
+            allow_input_during_commit: config.allow_input_during_commit,
             dev_tweaks: config.dev_tweaks,
             max_rss: config.max_rss_bytes,
             process_rss: AtomicU64::new(process_rss_bytes().unwrap_or_default()),
@@ -1070,8 +1080,20 @@ impl Runtime {
         self.inner().mode
     }
 
-    pub fn get_step_size(&self) -> StepSize {
+    pub fn step_size(&self) -> StepSize {
         self.inner().step_size
+    }
+
+    pub fn allow_input_during_commit(&self) -> bool {
+        self.inner().allow_input_during_commit
+    }
+
+    /// Whether adaptive (dynamically balanced) joins are enabled, per
+    /// `dev_tweaks.adaptive_joins`. Unlike [`Self::with_dev_tweaks`], this reads the
+    /// runtime's configured tweaks, so it is valid off the worker threads (e.g. on
+    /// the thread that owns the `DBSPHandle`).
+    pub fn adaptive_joins(&self) -> bool {
+        self.inner().dev_tweaks.adaptive_joins()
     }
 
     /// Returns the worker index as a string.
@@ -1344,11 +1366,36 @@ impl Runtime {
     pub(crate) fn take_exchange_listener(&self) -> Option<TcpListener> {
         self.inner().exchange_listener.lock().unwrap().take()
     }
+
+    /// Returns [DevTweaks] for this `Runtime`.
+    ///
+    /// Use [Runtime::with_dev_tweaks] if there's not a `Runtime` handy already.
+    pub fn dev_tweaks(&self) -> &DevTweaks {
+        &self.inner().dev_tweaks
+    }
 }
 
-/// A synchronization primitive that allows multiple threads within a runtime to agree
-/// when a condition is satisfied.
-pub(crate) struct Consensus(Broadcast<bool>);
+/// A synchronization primitive that allows multiple threads within a runtime to
+/// agree when a condition is satisfied.
+///
+/// Each worker submits a local vote via [`check`](Self::check); the call
+/// returns `true` only when every worker in the runtime votes `true`.  It is
+/// the building block for combining per-worker termination decisions (for
+/// example, per-worker fixed-point status) into a single, runtime-wide
+/// decision when driving a nested circuit built on
+/// [`Circuit::iterate`](super::circuit_builder::Circuit::iterate).
+///
+/// # Correctness
+///
+/// Callers must respect the following invariants:
+///
+/// 1. Every worker must call [`check`](Self::check) the same number of times
+///    and in the same order relative to other ongoing `Consensus` in the same
+///    subcircuit. A worker that skips a call to [`check`](Self::check) will
+///    stop its peers from making progress.
+/// 2. [`Consensus`] must be constructed once per logical decision and reused
+///    across clock ticks.
+pub struct Consensus(Broadcast<bool>);
 
 impl Consensus {
     pub fn new(name: impl Display) -> Self {
@@ -1383,7 +1430,8 @@ where
         match Runtime::runtime() {
             Some(runtime) if Runtime::num_workers() > 1 => {
                 let exchange_id = runtime.sequence_next().try_into().unwrap();
-                let exchange = Exchange::with_runtime(&runtime, exchange_id);
+                let exchange =
+                    Exchange::with_runtime(&runtime, exchange_id, ExchangeActivity::AllSteps);
                 let identifier = Arc::new(format!("broadcast {name} (exchange {exchange_id})"));
 
                 Self::MultiThreaded {
@@ -1426,8 +1474,9 @@ where
                             .await;
 
                         exchange
-                            .receive_all(|data| serde_json::from_slice(&data).unwrap())
+                            .receive_all(|data| serde_json::from_slice(&data).unwrap(), None)
                             .await
+                            .0
                     })
                     .await
                     .ok_or(SchedulerError::Killed)

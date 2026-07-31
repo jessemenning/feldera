@@ -6,32 +6,39 @@ Feldera.  These limitations are tracked in our [GitHub issue
 tracker](https://github.com/feldera/feldera/issues) and may be
 resolved in future releases.
 
+## Aggregate functions
+
+The following aggregate functions are not supported:
+`PERCENTILE_DISC`, `PERCENTILE_CONT`, `MODE`, `CORR`, `COVAR_POP`,
+`COVAR_SAMP`, `REGR_SLOPE`, `REGR_INTERCEPT`, `REGR_R2`, `JSON_AGG`,
+`JSON_OBJECT_AGG`, `LISTAGG`.
+
 ## Window functions (`OVER` clause)
 
-### `NTILE` and `NTH_VALUE` are not supported
+### Statistics window functions
 
-The `NTILE()` and `NTH_VALUE()` window functions are not yet implemented.
+`NTILE`, `NTH_VALUE`, `PERCENT_RANK`, and `CUME_DIST` window
+functions are not yet implemented.
 
 ### `FIRST_VALUE` and `LAST_VALUE` limited to unbounded range
 
-`FIRST_VALUE()` and `LAST_VALUE()` are only supported for windows with
-an unbounded range (e.g., `RANGE BETWEEN UNBOUNDED PRECEDING AND
-CURRENT ROW`).  Custom `RANGE` bounds or `ROWS` frames are not yet
+`FIRST_VALUE()` and `LAST_VALUE()` are only supported for frames whose
+bounds are `UNBOUNDED PRECEDING`, `CURRENT ROW`, or `UNBOUNDED
+FOLLOWING` (with `RANGE` or `ROWS`): `FIRST_VALUE` requires the frame
+to start at `UNBOUNDED PRECEDING`, and `LAST_VALUE` requires the frame
+to end at `UNBOUNDED FOLLOWING`.  Numeric bounds are not yet
 supported.
 See [#3918](https://github.com/feldera/feldera/issues/3918).
 
 ### No `STRING` or `DOUBLE` types in `OVER` ordering
 
-Window functions using `ORDER BY` on `VARCHAR`/`STRING`,
-`DOUBLE`/`FLOAT` or `VARBINARY` columns are not yet supported.
+Windowed aggregate functions with frames (e.g., `SUM(x) OVER (...
+RANGE BETWEEN ...)`) do not yet support `ORDER BY` on
+`VARCHAR`/`STRING`, `DOUBLE`/`FLOAT`, or `VARBINARY` columns.  Plain
+window functions such as `ROW_NUMBER`, `RANK`, and `DENSE_RANK`
+support these types.
 See [#457](https://github.com/feldera/feldera/issues/457).
 
-### `ROWS` frame type not supported
-
-The `ROWS` frame specification in window functions is not yet
-supported.  Only `RANGE` frames are currently accepted.  See
-[#457](https://github.com/feldera/feldera/issues/457).  This
-limitation affects TPC-DS query q51.
 
 ### `EXCLUDE` clause not supported
 
@@ -40,8 +47,9 @@ See [#457](https://github.com/feldera/feldera/issues/457).
 
 ### Multi-column `ORDER BY` in windows not supported
 
-Window functions with `ORDER BY` on multiple columns are not yet
-supported.
+Windowed aggregate functions with frames require `ORDER BY` on
+exactly one column.  Plain window functions such as `RANK` and
+`DENSE_RANK` support `ORDER BY` on multiple columns.
 See [#457](https://github.com/feldera/feldera/issues/457).
 
 ### Constant Window Boundaries
@@ -49,7 +57,7 @@ See [#457](https://github.com/feldera/feldera/issues/457).
 Window boundaries must be constant expressions. For example, `RANGE
 BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW` is valid. But `RANGE
 BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW` is not, because a
-month is a not a constant time interval.
+month is not a constant time interval.
 
 ## Correlated subqueries
 
@@ -117,12 +125,9 @@ The `MULTISET` data type is not currently supported.
 Session windows (grouping events into sessions based on a gap in
 activity) are not yet supported.
 
-## Timezone support
+## `TIME` with timezone
 
-`TIME`, and `TIMESTAMP` types have no time zone.  There is no
-`TIMESTAMP WITH TIME ZONE` type, and timezone conversion functions are
-not available.  See the [datetime documentation](datetime.md#timezones)
-for details.
+The type `TIME WITH TIME ZONE` is not supported.
 
 ## Performance caveats
 
@@ -138,7 +143,8 @@ details.
 ### Use `NOW()` with caution
 
 The `NOW()` function returns the current timestamp and is updated at
-every processing step (every 100ms by default).
+every processing step (every 1 second by default, configurable via
+`clock_resolution_usecs`).
 
 - **In filters**: `NOW()` in `WHERE` clauses for temporal filtering
   (e.g., `WHERE ts >= NOW() - INTERVAL 1 DAY`) is efficient and

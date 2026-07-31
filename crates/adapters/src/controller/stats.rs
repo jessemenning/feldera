@@ -67,7 +67,7 @@ use feldera_types::{
     memory_pressure::MemoryPressure,
     suspend::{PermanentSuspendError, SuspendError},
     time_series::SampleStatistics,
-    transaction::CommitProgressSummary,
+    transaction::{CommitProgressSummary, ConcurrentBootstrapPhase},
 };
 use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
@@ -173,12 +173,31 @@ pub struct GlobalControllerMetrics {
     /// State of the pipeline: running, paused, or terminating.
     state: Atomic<PipelineState>,
 
+    /// Whether [PipelineState::Terminated] means "a suspend completed
+    /// successfully" rather than "the pipeline died".
+    ///
+    /// The state alone does not say why the circuit stopped, and the two cases
+    /// need opposite reports: a completed suspend is the outcome the user asked
+    /// for, while any other termination is a failure.
+    suspended: AtomicBool,
+
     /// The pipeline has been resumed from a checkpoint and is currently bootstrapping
     /// new and modified views.
     bootstrap_in_progress: AtomicBool,
 
+    /// Phase of the concurrent bootstrap, or `Inactive` when none is in
+    /// progress. Updated atomically at each phase transition. Old views stay
+    /// live and inputs keep flowing during `ConcurrentBootstrapping`; inputs are
+    /// paused during `Synchronizing` (the cutover window).
+    concurrent_bootstrap_phase: Atomic<ConcurrentBootstrapPhase>,
+
     /// Transaction commit progress, if a transaction is committing.
     pub commit_progress: Mutex<Option<CommitProgressSummary>>,
+
+    /// Progress of the concurrent bootstrap's transaction commit, if a commit is
+    /// in progress (the backfill transaction, then the synchronization
+    /// transaction). Updated periodically; `None` when no commit is in progress.
+    pub concurrent_bootstrap_progress: Mutex<Option<CommitProgressSummary>>,
 
     /// Time at which the pipeline process started, in seconds since the epoch.
     pub start_time: DateTime<Utc>,
@@ -299,8 +318,11 @@ impl GlobalControllerMetrics {
         let initial_start_time = initial_start_time.unwrap_or(start_time);
         Self {
             state: Atomic::new(PipelineState::Paused),
+            suspended: AtomicBool::new(false),
             bootstrap_in_progress: AtomicBool::new(false),
+            concurrent_bootstrap_phase: Atomic::new(ConcurrentBootstrapPhase::Inactive),
             commit_progress: Mutex::new(None),
+            concurrent_bootstrap_progress: Mutex::new(None),
             start_time,
             incarnation_uuid,
             initial_start_time,
@@ -326,6 +348,22 @@ impl GlobalControllerMetrics {
 
     pub fn get_state(&self) -> PipelineState {
         self.state.load(Ordering::Acquire)
+    }
+
+    /// Whether the pipeline reached [PipelineState::Terminated] because a
+    /// suspend completed successfully.
+    pub fn suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Terminates the pipeline because a suspend completed successfully.
+    ///
+    /// Records the reason before the state, so that an observer that sees
+    /// [PipelineState::Terminated] also sees why.
+    fn set_suspended(&self) {
+        self.suspended.store(true, Ordering::Release);
+        self.state
+            .store(PipelineState::Terminated, Ordering::Release);
     }
 
     fn input_batch(&self, amt: BufferSize) -> u64 {
@@ -409,12 +447,29 @@ impl GlobalControllerMetrics {
             .store(bootstrap_in_progress, Ordering::Release);
     }
 
+    fn concurrent_bootstrap_phase(&self) -> ConcurrentBootstrapPhase {
+        self.concurrent_bootstrap_phase.load(Ordering::Acquire)
+    }
+
+    fn set_concurrent_bootstrap_phase(&self, phase: ConcurrentBootstrapPhase) {
+        self.concurrent_bootstrap_phase
+            .store(phase, Ordering::Release);
+    }
+
+    fn concurrent_bootstrap_in_progress(&self) -> bool {
+        self.concurrent_bootstrap_phase() != ConcurrentBootstrapPhase::Inactive
+    }
+
     fn set_step_requested(&self) -> bool {
         self.step_requested.swap(true, Ordering::AcqRel)
     }
 
     pub fn set_commit_progress(&self, commit_progress: Option<CommitProgressSummary>) {
         *self.commit_progress.lock().unwrap() = commit_progress;
+    }
+
+    pub fn set_concurrent_bootstrap_progress(&self, progress: Option<CommitProgressSummary>) {
+        *self.concurrent_bootstrap_progress.lock().unwrap() = progress;
     }
 
     pub fn update_output_stall_start(&self, stalled: bool) {
@@ -655,23 +710,44 @@ impl ControllerStatus {
 
     pub fn remove_output(&self, endpoint_id: &EndpointId) {
         self.outputs.write().remove(endpoint_id);
+
+        // `total_completed_records` and `total_completed_steps` are the minimum
+        // over the registered output endpoints, and this endpoint may have been
+        // the one holding them back: it is dropped along with everything still
+        // queued for it, so it will never report the progress the others
+        // already have. Republish the counters now, since the only other
+        // refresh happens on a step or an output batch, and an idle pipeline
+        // produces neither.
+        self.update_total_completed_records(None);
     }
 
     /// Initialize stats for a new output endpoint.
+    ///
+    /// `caught_up` is true when the endpoint's output already agrees with the
+    /// output the pipeline has produced so far, so the endpoint only has to
+    /// handle future output. It is false when the endpoint is still owed output
+    /// derived from records the pipeline has already processed, such as a
+    /// bootstrap re-emission or a pending initial snapshot.
     pub fn add_output(
         &self,
         endpoint_id: &EndpointId,
         endpoint_name: &str,
         config: &OutputEndpointConfig,
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
+        caught_up: bool,
     ) {
-        // Initialize the `total_processed_input_records` counter on the new endpoint to `total_processed_records`:
-        // logically the new endpoint is up to speed with the outputs produced by the pipeline so far and only needs to
-        // process any future outputs.
-        let total_processed_records = self
-            .global_metrics
-            .total_processed_records
-            .load(Ordering::Acquire);
+        // Seeding `total_processed_input_records` to `total_processed_records` claims the
+        // endpoint has already delivered the output derived from those records. That holds
+        // only for an endpoint that is caught up. An endpoint still owed output starts at
+        // zero and reaches `total_processed_records` once it has processed the batch
+        // carrying that output, keeping the counter from running ahead of the sink.
+        let total_processed_records = if caught_up {
+            self.global_metrics
+                .total_processed_records
+                .load(Ordering::Acquire)
+        } else {
+            0
+        };
         self.outputs.write().insert(
             *endpoint_id,
             OutputEndpointStatus::new(
@@ -730,6 +806,12 @@ impl ControllerStatus {
         self.global_metrics.unset_step_requested()
     }
 
+    /// Terminates the pipeline because a suspend completed successfully; see
+    /// `GlobalControllerMetrics::suspended()`.
+    pub fn set_suspended(&self) {
+        self.global_metrics.set_suspended();
+    }
+
     pub fn bootstrap_in_progress(&self) -> bool {
         self.global_metrics.bootstrap_in_progress()
     }
@@ -737,6 +819,18 @@ impl ControllerStatus {
     pub fn set_bootstrap_in_progress(&self, bootstrap_in_progress: bool) {
         self.global_metrics
             .set_bootstrap_in_progress(bootstrap_in_progress);
+    }
+
+    pub fn concurrent_bootstrap_phase(&self) -> ConcurrentBootstrapPhase {
+        self.global_metrics.concurrent_bootstrap_phase()
+    }
+
+    pub fn set_concurrent_bootstrap_phase(&self, phase: ConcurrentBootstrapPhase) {
+        self.global_metrics.set_concurrent_bootstrap_phase(phase);
+    }
+
+    pub fn concurrent_bootstrap_in_progress(&self) -> bool {
+        self.global_metrics.concurrent_bootstrap_in_progress()
     }
 
     pub fn request_step(&self, circuit_thread_unparker: &Unparker) {
@@ -1355,6 +1449,13 @@ impl ControllerStatus {
                 0
             },
             commit_progress: self.global_metrics.commit_progress.lock().unwrap().clone(),
+            concurrent_bootstrap_phase: self.global_metrics.concurrent_bootstrap_phase(),
+            concurrent_bootstrap_progress: self
+                .global_metrics
+                .concurrent_bootstrap_progress
+                .lock()
+                .unwrap()
+                .clone(),
             transaction_initiators: ctx.transaction_info.initiators.to_api_type(),
             start_time: self.global_metrics.start_time,
             incarnation_uuid: self.global_metrics.incarnation_uuid,
@@ -2365,6 +2466,12 @@ pub struct OutputEndpointMetrics {
     /// This metric tracks the end-to-end progress of the pipeline: the output
     /// of this endpoint is equal to the output of the circuit after
     /// processing `total_processed_input_records` records.
+    ///
+    /// The counter never runs ahead of the endpoint's output. It advances to a
+    /// value `N` only once the endpoint has processed every batch derived from
+    /// the first `N` records received by the pipeline, which means transmitting
+    /// the batch, or discarding it while silent bootstrapping suppresses the
+    /// endpoint's output.
     ///
     /// In a multihost pipeline, this count reflects only the input records
     /// processed on the same host as the output endpoint, which is not usually

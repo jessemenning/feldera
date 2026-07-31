@@ -19,6 +19,7 @@ use super::schema::{OptionalField, schema_unwrap_optional};
 pub fn avro_ser_config() -> SqlSerdeConfig {
     SqlSerdeConfig::default()
         .with_timestamp_format(TimestampFormat::MicrosSinceEpoch)
+        .with_timestamp_tz_format(TimestampFormat::MicrosSinceEpoch)
         .with_time_format(TimeFormat::Micros)
         .with_date_format(DateFormat::DaysSinceEpoch)
         .with_decimal_format(DecimalFormat::I128)
@@ -551,6 +552,7 @@ impl<'a> Serializer for AvroSchemaSerializer<'a> {
         serialize_maybe_optional(self.schema, |schema| match schema {
             AvroSchema::Long if v < i64::MAX as u64 => Ok(AvroValue::Long(v as i64)),
             AvroSchema::Long => Err(AvroSerializerError::out_of_bounds(&v, "u64", schema)),
+            AvroSchema::String => Ok(AvroValue::String(v.to_string())),
             AvroSchema::TimeMicros => Ok(AvroValue::TimeMicros(v as i64)),
             AvroSchema::TimeMillis => Ok(AvroValue::TimeMillis((v / 1000) as i32)),
             _ => Err(AvroSerializerError::incompatible("u64", schema)),
@@ -808,7 +810,7 @@ mod test {
         Decimal, Schema as AvroSchema, from_avro_datum, to_avro_datum, types::Value as AvroValue,
     };
     use dbsp::algebra::{F32, F64};
-    use feldera_sqllib::{Date, SqlDecimal, Timestamp};
+    use feldera_sqllib::{Date, SqlDecimal, Timestamp, TimestampTz};
     use feldera_types::{serde_with_context::SerializeWithContext, serialize_table_record};
     use num_bigint::BigInt;
     use serde::Serialize;
@@ -880,6 +882,39 @@ mod test {
     ]
   }"#;
 
+    #[derive(Serialize)]
+    struct TestUBigInt {
+        value: u64,
+    }
+
+    serialize_table_record!(TestUBigInt[1] {
+        value["value"]: u64
+    });
+
+    const SCHEMA_UBIGINT: &str = r#"{
+      "type": "record",
+      "name": "UBigInt",
+      "fields": [
+        { "name": "value", "type": "string" }
+      ]
+    }"#;
+
+    struct TestTimestampTz {
+        ts: TimestampTz,
+    }
+
+    serialize_table_record!(TestTimestampTz[1] {
+        ts["ts"]: TimestampTz
+    });
+
+    const SCHEMA_TIMESTAMP_TZ: &str = r#"{
+      "type": "record",
+      "name": "TimestampTz",
+      "fields": [
+        { "name": "ts", "type": { "type": "long", "logicalType": "timestamp-micros" } }
+      ]
+    }"#;
+
     macro_rules! serializer_test {
         ($schema: expr_2021, $record: ident, $avro: ident) => {
             let schema = serde_json::Value::from_str($schema).unwrap();
@@ -898,6 +933,18 @@ mod test {
             let parsed_val = from_avro_datum::<&[u8]>(&schema, &mut avro.as_ref(), None).unwrap();
             assert_eq!(val, parsed_val);
         };
+    }
+
+    #[test]
+    fn test_avro_serializer_timestamp_tz() {
+        let micros = 1_713_597_703_000_123;
+        let record = TestTimestampTz {
+            ts: TimestampTz::from_microseconds(micros),
+        };
+        let expected =
+            AvroValue::Record(vec![("ts".to_string(), AvroValue::TimestampMicros(micros))]);
+
+        serializer_test!(SCHEMA_TIMESTAMP_TZ, record, expected);
     }
 
     #[test]
@@ -1059,5 +1106,16 @@ mod test {
             record_numeric_1,
             avro_numeric_1_optional
         );
+    }
+
+    #[test]
+    fn test_avro_serializer_ubigint() {
+        let record = TestUBigInt { value: u64::MAX };
+        let expected = AvroValue::Record(vec![(
+            "value".to_string(),
+            AvroValue::String(u64::MAX.to_string()),
+        )]);
+
+        serializer_test!(SCHEMA_UBIGINT, record, expected);
     }
 }

@@ -190,6 +190,8 @@ It contains the following fields:
         endpoints::pipeline_management::put_pipeline,
         endpoints::pipeline_management::patch_pipeline,
         endpoints::pipeline_management::post_update_runtime,
+        endpoints::pipeline_management::post_pipeline_diff,
+        endpoints::pipeline_management::post_validate_program,
         endpoints::pipeline_management::delete_pipeline,
         endpoints::pipeline_management::post_pipeline_start,
         endpoints::pipeline_management::post_pipeline_stop,
@@ -283,7 +285,9 @@ It contains the following fields:
         feldera_types::runtime_status::RuntimeStatus,
         feldera_types::runtime_status::RuntimeDesiredStatus,
         feldera_types::runtime_status::BootstrapPolicy,
-        crate::api::endpoints::pipeline_management::ConnectorStats,
+        feldera_types::runtime_status::RuntimeStatusDetails,
+        feldera_types::runtime_status::StorageStatusDetails,
+        feldera_types::runtime_status::ConnectorStats,
         crate::api::endpoints::pipeline_management::PipelineInfo,
         crate::api::endpoints::pipeline_management::PipelineSelectedInfo,
         crate::api::endpoints::pipeline_management::PipelineFieldSelector,
@@ -291,6 +295,9 @@ It contains the following fields:
         crate::api::endpoints::pipeline_management::PostPutPipeline,
         crate::api::endpoints::pipeline_management::PatchPipeline,
         crate::api::endpoints::pipeline_management::PostStopPipelineParameters,
+        crate::api::endpoints::pipeline_management::PipelineDiffRequest,
+        crate::api::endpoints::pipeline_management::ValidateProgramRequest,
+        crate::compiler::ValidateProgramResponse,
         crate::db::types::monitor::PipelineMonitorEventId,
         crate::api::endpoints::pipeline_management::pipeline_events::PipelineMonitorEventSelectedInfo,
         crate::api::endpoints::pipeline_management::pipeline_events::PipelineMonitorEventFieldSelector,
@@ -416,6 +423,7 @@ It contains the following fields:
         feldera_types::transport::iceberg::RestCatalogConfig,
         feldera_types::transport::iceberg::GlueCatalogConfig,
         feldera_types::transport::iceberg::S3TablesCatalogConfig,
+        feldera_types::transport::iceberg::IcebergTransactionMode,
         feldera_types::transport::postgres::PostgresReaderConfig,
         feldera_types::transport::postgres::PostgresCdcReaderConfig,
         feldera_types::transport::postgres::PostgresWriterConfig,
@@ -457,6 +465,7 @@ It contains the following fields:
         feldera_types::postprocess::PostprocessorConfig,
         feldera_types::transaction::StartTransactionResponse,
         feldera_types::transaction::CommitProgressSummary,
+        feldera_types::transaction::ConcurrentBootstrapPhase,
         feldera_types::transport::clock::ClockAdvanceRequest,
         feldera_types::transport::clock::ClockAdvanceResponse,
         feldera_types::time_series::TimeSeries,
@@ -658,6 +667,8 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_management::patch_pipeline)
         .service(endpoints::pipeline_management::post_pipeline_testing)
         .service(endpoints::pipeline_management::post_update_runtime)
+        .service(endpoints::pipeline_management::post_pipeline_diff)
+        .service(endpoints::pipeline_management::post_validate_program)
         .service(endpoints::pipeline_management::delete_pipeline)
         .service(endpoints::pipeline_management::post_pipeline_start)
         .service(endpoints::pipeline_management::post_pipeline_stop)

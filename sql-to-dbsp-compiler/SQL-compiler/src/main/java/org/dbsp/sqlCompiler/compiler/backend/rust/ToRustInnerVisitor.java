@@ -25,6 +25,7 @@ package org.dbsp.sqlCompiler.compiler.backend.rust;
 
 import org.apache.calcite.util.TimeString;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
+import org.dbsp.sqlCompiler.compiler.VariantMode;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.InputColumnMetadata;
@@ -823,10 +824,11 @@ public class ToRustInnerVisitor extends InnerVisitor {
         this.push(expression);
         if (expression.getType().mayBeNull)
             this.builder.append("Some(");
+        boolean fv = VariantMode.isEnabled();
         if (expression.isSqlNull) {
-            this.builder.append("Variant::SqlNull");
+            this.builder.append(fv ? "FlatVariant::sql_null()" : "Variant::SqlNull");
         } else {
-            this.builder.append("Variant::from(");
+            this.builder.append(fv ? "FlatVariant::from(" : "Variant::from(");
             expression.value.accept(this);
             this.builder.append(")");
         }
@@ -841,7 +843,8 @@ public class ToRustInnerVisitor extends InnerVisitor {
         if (literal.mayBeNull())
             this.builder.append("Some(");
         this.push(literal);
-        this.builder.append("Variant::VariantNull");
+        this.builder.append(VariantMode.isEnabled()
+                ? "FlatVariant::variant_null()" : "Variant::VariantNull");
         if (literal.mayBeNull())
             this.builder.append(")");
         this.pop(literal);
@@ -1187,7 +1190,26 @@ public class ToRustInnerVisitor extends InnerVisitor {
                         .append(": &Option<Variant>| Some(");
                 IDBSPInnerNode defaultValue = CreateRuntimeErrorWrappers.wrapCasts(this.compiler, meta.defaultValue);
                 defaultValue = rw.apply(defaultValue);
-                defaultValue.accept(this);
+                // Connector metadata is always built by the adapters as the
+                // enum Variant, so the default expression uses the enum
+                // function grid even under FlatVariant. A VARIANT column then
+                // needs one conversion at the column boundary; every other
+                // column type is produced directly by the enum casts.
+                boolean flatVariant = VariantMode.isEnabled();
+                // The field's Rust type may wrap the column type in Option
+                // (nullable column of a nullable type).
+                DBSPType columnType = isOption ? user.typeArgs[0] : field.type;
+                boolean convert = flatVariant && columnType.is(DBSPTypeVariant.class);
+                if (convert)
+                    this.builder.append(columnType.mayBeNull ? "variant_to_fvN(" : "variant_to_fv(");
+                VariantMode.set(false);
+                try {
+                    defaultValue.accept(this);
+                } finally {
+                    VariantMode.set(flatVariant);
+                }
+                if (convert)
+                    this.builder.append(")");
                 this.builder.append(".into())");
             }
 
@@ -1736,7 +1758,7 @@ public class ToRustInnerVisitor extends InnerVisitor {
             }
             case VARIANT_INDEX: {
                 DBSPType indexType = expression.right.getType();
-                this.builder.append("indexV")
+                this.builder.append(VariantMode.isEnabled() ? "indexFV" : "indexV")
                         .append(expression.left.getType().nullableUnderlineSuffix())
                         .append(indexType.nullableUnderlineSuffix())
                         .append("(");

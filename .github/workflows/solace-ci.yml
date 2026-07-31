@@ -41,6 +41,23 @@ jobs:
       - name: Check adapters crate with Solace feature
         run: cargo check --locked -p dbsp_adapters --no-default-features --features with-solace
 
+      # Solace connector config unit tests (validation, serde defaults, smf_url
+      # scheme). These live in feldera-types and build cleanly.
+      - name: Test Solace config types
+        run: cargo test --locked -p feldera-types --lib transport::solace
+
+      # Solace transport unit tests (RGMID dedup cache, deferred-ack draining,
+      # message disposition, topic templating).
+      #
+      # NOTE: currently disabled. The dbsp_adapters *test* target does not
+      # build on this branch because shared test infra (src/test/data.rs) mixes
+      # rand 0.8 (`Standard`/`Distribution`) with proptest's rand 0.9 `Rng` —
+      # a pre-existing conflict from an upstream proptest bump, unrelated to the
+      # Solace connector. Re-enable once the crate's test build is fixed; the
+      # tests themselves are in transport::solace and are ready to run.
+      # - name: Test Solace transport
+      #   run: cargo test --locked -p dbsp_adapters --no-default-features --features with-solace --lib transport::solace
+
   build-image:
     name: Build and Push Docker Image
     # Only push on direct pushes — not PRs (PRs from forks don't have GITHUB_TOKEN write access)

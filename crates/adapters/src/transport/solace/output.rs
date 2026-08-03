@@ -1,10 +1,13 @@
 use anyhow::Result as AnyResult;
+use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
 use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::message::{DeliveryMode, DestinationType, MessageDestination, OutboundMessageBuilder};
-use solace_rs::{Context, SolaceLogLevel};
-use tracing::{info, warn};
+use solace_rs::session::SessionEvent;
+use solace_rs::{Context, SessionError, SolaceLogLevel};
+use tokio::sync::oneshot;
+use tracing::{debug, info, warn};
 
 use super::output_config::{OutputDeliveryMode, SolaceOutputConfig};
 
@@ -35,6 +38,10 @@ pub struct SolaceOutputEndpoint {
     /// True when the topic has no `{field}` placeholders, so every record
     /// publishes to the same destination.
     static_topic: bool,
+    /// In-flight broker acknowledgments for `Persistent` delivery, awaiting
+    /// resolution. Drained at each `batch_end` and whenever the count reaches
+    /// `config.max_inflight_acks`.
+    pending_acks: Vec<oneshot::Receiver<Result<(), SessionError>>>,
 }
 
 struct SolaceConnection {
@@ -60,6 +67,7 @@ impl SolaceOutputEndpoint {
             config,
             conn: None,
             static_topic: is_static,
+            pending_acks: Vec::new(),
         })
     }
 
@@ -70,39 +78,86 @@ impl SolaceOutputEndpoint {
         }
     }
 
-    fn publish(&self, topic: &str, payload: &[u8]) -> AnyResult<()> {
-        let conn = self
-            .conn
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("output endpoint not connected"))?;
+    /// Resolve the destination topic for a record. Static topics return an
+    /// owned copy of the configured topic (no template scan); dynamic topics
+    /// substitute `{field}` placeholders from the record.
+    fn topic_for(&self, buffer: &[u8]) -> String {
+        if self.static_topic {
+            self.config.topic.clone()
+        } else {
+            resolve_topic(&self.config.topic, buffer)
+        }
+    }
 
-        let dest = MessageDestination::new(DestinationType::Topic, topic)
-            .map_err(|e| anyhow::anyhow!("invalid topic '{topic}': {e:?}"))?;
-
+    fn publish(&mut self, topic: &str, payload: &[u8]) -> AnyResult<()> {
         let msg = OutboundMessageBuilder::new()
-            .destination(dest)
+            .destination(
+                MessageDestination::new(DestinationType::Topic, topic)
+                    .map_err(|e| anyhow::anyhow!("invalid topic '{topic}': {e:?}"))?,
+            )
             .delivery_mode(self.delivery_mode())
             .payload(payload.to_vec())
             .build()
             .map_err(|e| anyhow::anyhow!("message build: {e:?}"))?;
 
-        conn.session
-            .publish(msg)
-            .map_err(|e| anyhow::anyhow!("publish to '{topic}': {e:?}"))?;
+        match self.config.delivery_mode {
+            OutputDeliveryMode::Direct => {
+                // Fire-and-forget: no per-message broker acknowledgment.
+                let conn = self
+                    .conn
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("output endpoint not connected"))?;
+                conn.session
+                    .publish(msg)
+                    .map_err(|e| anyhow::anyhow!("publish to '{topic}': {e:?}"))?;
+            }
+            OutputDeliveryMode::Persistent => {
+                // Windowed acknowledgment: publish_with_ack returns a oneshot
+                // that resolves when the broker persists (or rejects) the
+                // message. Collect the receivers and drain them at the batch
+                // boundary, bounding in-flight acks so a slow broker applies
+                // backpressure instead of growing memory without limit.
+                let rx = {
+                    let conn = self
+                        .conn
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("output endpoint not connected"))?;
+                    conn.session
+                        .publish_with_ack(msg)
+                        .map_err(|e| anyhow::anyhow!("publish to '{topic}': {e:?}"))?
+                };
+                self.pending_acks.push(rx);
+                if self.pending_acks.len() >= self.config.max_inflight_acks {
+                    self.drain_pending_acks()?;
+                }
+            }
+        }
+        Ok(())
+    }
 
+    /// Block until every in-flight persistent publish has been acknowledged by
+    /// the broker. A rejected or lost acknowledgment is a hard error so the
+    /// controller does not treat unpersisted data as delivered.
+    fn drain_pending_acks(&mut self) -> AnyResult<()> {
+        for rx in self.pending_acks.drain(..) {
+            match rx.blocking_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}"));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Solace ack channel closed before broker acknowledgment"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
 
 impl OutputEndpoint for SolaceOutputEndpoint {
-    fn connect(&mut self, _async_error_callback: AsyncErrorCallback) -> AnyResult<()> {
-        // NOTE: async delivery errors (broker rejections, connection-down) are
-        // not yet surfaced through `_async_error_callback`.  Draining the
-        // session event channel from a sync `OutputEndpoint` requires
-        // `AsyncSession::take_event_receiver`, a pending change in the
-        // solace-rs fork.  Until it lands, only synchronous publish errors
-        // reach the controller; persistent-mode broker ACKs accumulate in the
-        // session event channel.  See the connector improvement plan, P0.4.
+    fn connect(&mut self, async_error_callback: AsyncErrorCallback) -> AnyResult<()> {
         let context = Context::new(solace_log_level(self.config.log_level))
             .map_err(|e| anyhow::anyhow!("Solace context init: {e:?}"))?;
 
@@ -122,7 +177,7 @@ impl OutputEndpoint for SolaceOutputEndpoint {
         if let Some(dir) = &self.config.ssl_trust_store_dir {
             builder = builder.ssl_trust_store_dir(dir.clone());
         }
-        let session = builder
+        let mut session = builder
             .build()
             .map_err(|e| anyhow::anyhow!("Solace session: {e:?}"))?;
 
@@ -132,6 +187,14 @@ impl OutputEndpoint for SolaceOutputEndpoint {
             self.config.vpn,
             self.config.topic
         );
+
+        // Drain session events so they cannot accumulate unboundedly, and route
+        // connection-level failures to the controller via the async error
+        // callback. Tracked `publish_with_ack` acknowledgments are resolved by
+        // the SDK before reaching this channel (see publish/drain_pending_acks),
+        // so only untracked events arrive here.
+        let event_rx = session.take_event_receiver();
+        TOKIO.spawn(drain_session_events(event_rx, async_error_callback));
 
         // Both _context and session must live together — context must outlive session.
         // Fields are dropped in declaration order, so _context is dropped after session.
@@ -147,13 +210,8 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     }
 
     fn push_buffer(&mut self, buffer: &[u8]) -> AnyResult<()> {
-        if self.static_topic {
-            // No template to resolve — publish straight to the fixed topic.
-            self.publish(&self.config.topic, buffer)
-        } else {
-            let topic = resolve_topic(&self.config.topic, buffer);
-            self.publish(&topic, buffer)
-        }
+        let topic = self.topic_for(buffer);
+        self.publish(&topic, buffer)
     }
 
     fn push_key(
@@ -163,12 +221,8 @@ impl OutputEndpoint for SolaceOutputEndpoint {
         _headers: &[(&str, Option<&[u8]>)],
     ) -> AnyResult<()> {
         if let Some(bytes) = val {
-            if self.static_topic {
-                self.publish(&self.config.topic, bytes)?;
-            } else {
-                let topic = resolve_topic(&self.config.topic, bytes);
-                self.publish(&topic, bytes)?;
-            }
+            let topic = self.topic_for(bytes);
+            self.publish(&topic, bytes)?;
         }
         Ok(())
     }
@@ -178,12 +232,48 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     }
 
     fn batch_end(&mut self) -> AnyResult<()> {
-        Ok(())
+        // Persistent mode: block until the broker has acknowledged every
+        // message in this batch before the step is reported complete, so a
+        // downstream reader never sees data the broker has not persisted.
+        // Direct mode leaves pending_acks empty, so this is a no-op.
+        self.drain_pending_acks()
     }
 
     fn is_fault_tolerant(&self) -> bool {
         false
     }
+}
+
+/// Consume untracked session events for the lifetime of the session, reporting
+/// connection-level failures through the controller's async error callback.
+/// Returns when the session is dropped and the event channel closes.
+async fn drain_session_events(
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    error_callback: AsyncErrorCallback,
+) {
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            SessionEvent::DownError => error_callback(
+                true,
+                anyhow::anyhow!("Solace session down"),
+                Some("solace_output_down"),
+            ),
+            SessionEvent::ConnectFailedError => error_callback(
+                true,
+                anyhow::anyhow!("Solace connection failed"),
+                Some("solace_output_connect_failed"),
+            ),
+            SessionEvent::RejectedMsgError => error_callback(
+                false,
+                anyhow::anyhow!("Solace rejected a published message"),
+                Some("solace_output_rejected"),
+            ),
+            // Reconnect notices, up-notice, can-send, and any stray
+            // acknowledgments are informational.
+            other => debug!("Solace output session event: {other:?}"),
+        }
+    }
+    debug!("Solace output session event channel closed");
 }
 
 impl Drop for SolaceOutputEndpoint {

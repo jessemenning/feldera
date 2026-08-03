@@ -943,8 +943,6 @@ fn publish_schema(
         schema_type: SchemaType::Avro,
         schema: serde_json::to_string(schema).unwrap(),
         references: vec![],
-        properties: None,
-        tags: None,
     };
 
     /*let name = supplied_schema

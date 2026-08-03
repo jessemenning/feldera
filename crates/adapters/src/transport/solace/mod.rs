@@ -50,6 +50,9 @@ pub mod input;
 pub mod output;
 pub mod output_config;
 
+#[cfg(all(test, feature = "solace-integration-test"))]
+mod test;
+
 pub use config::SolaceInputConfig;
 pub use input::SolaceInputEndpoint;
 pub use output::SolaceOutputEndpoint;

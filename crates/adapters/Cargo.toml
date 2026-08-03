@@ -58,6 +58,9 @@ with-solace = ["dep:solace-rs"]
 # Run delta table tests against an S3 bucket.  Requires S3 authentication key
 # to be provided via an environment variable.
 delta-s3-test = []
+# Run Solace connector integration tests against a live broker.
+# The broker must be running. See `transport/solace/test.rs`.
+solace-integration-test = ["with-solace"]
 # Run Pub/Sub connector tests agains an emulator.
 # The emulator must be running. See `pubsub/test.rs`.
 pubsub-emulator-test = []

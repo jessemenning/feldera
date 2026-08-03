@@ -41,22 +41,28 @@ jobs:
       - name: Check adapters crate with Solace feature
         run: cargo check --locked -p dbsp_adapters --no-default-features --features with-solace
 
+      # Compile (but do not run) the broker-gated integration tests so they
+      # cannot rot: running them needs a live Solace Platform broker
+      # (see transport/solace/test.rs).
+      - name: Check Solace integration tests compile
+        run: cargo check --locked -p dbsp_adapters --no-default-features --features solace-integration-test --tests
+
       # Solace connector config unit tests (validation, serde defaults, smf_url
       # scheme). These live in feldera-types and build cleanly.
       - name: Test Solace config types
         run: cargo test --locked -p feldera-types --lib transport::solace
 
       # Solace transport unit tests (RGMID dedup cache, deferred-ack draining,
-      # message disposition, topic templating).
+      # message disposition, error classification, topic templating).
       #
-      # NOTE: currently disabled. The dbsp_adapters *test* target does not
-      # build on this branch because shared test infra (src/test/data.rs) mixes
-      # rand 0.8 (`Standard`/`Distribution`) with proptest's rand 0.9 `Rng` —
-      # a pre-existing conflict from an upstream proptest bump, unrelated to the
-      # Solace connector. Re-enable once the crate's test build is fixed; the
-      # tests themselves are in transport::solace and are ready to run.
-      # - name: Test Solace transport
-      #   run: cargo test --locked -p dbsp_adapters --no-default-features --features with-solace --lib transport::solace
+      # This step requires codegen of the `dbsp` crate, which ICEs on rustc
+      # 1.97.x (`instantiate_and_check_impossible_predicates` on
+      # StarJoinFuncTrait) — the toolchain pinned above (1.94.1) is known good.
+      # The broker-gated integration tests (`--features solace-integration-test`,
+      # see transport/solace/test.rs) are NOT run here: they need a live
+      # Solace Platform broker.
+      - name: Test Solace transport
+        run: cargo test --locked -p dbsp_adapters --no-default-features --features with-solace --lib transport::solace
 
   build-image:
     name: Build and Push Docker Image

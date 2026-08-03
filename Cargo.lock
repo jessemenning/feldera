@@ -1929,7 +1929,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -1947,7 +1947,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -1965,7 +1965,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2656,7 +2656,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6659,7 +6659,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "system-configuration 0.6.1",
  "tokio",
  "tower-service",
@@ -7429,7 +7429,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.53.5",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -9976,7 +9976,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -12044,7 +12044,7 @@ dependencies = [
 [[package]]
 name = "solace-rs"
 version = "0.9.1"
-source = "git+https://github.com/jessemenning/solace-rs?rev=2f7c899#2f7c89965420a2cb45862e6501e12f61f6c51a5d"
+source = "git+https://github.com/jessemenning/solace-rs?rev=9787d31#9787d31c71c206c2d9e09b51935b52d66df260a5"
 dependencies = [
  "enum_primitive",
  "futures-core",
@@ -12058,7 +12058,7 @@ dependencies = [
 [[package]]
 name = "solace-rs-sys"
 version = "1.1.0"
-source = "git+https://github.com/jessemenning/solace-rs?rev=2f7c899#2f7c89965420a2cb45862e6501e12f61f6c51a5d"
+source = "git+https://github.com/jessemenning/solace-rs?rev=9787d31#9787d31c71c206c2d9e09b51935b52d66df260a5"
 dependencies = [
  "bindgen 0.66.1",
  "cfg-if",
@@ -14300,7 +14300,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

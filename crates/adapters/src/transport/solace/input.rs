@@ -1,8 +1,10 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result as AnyResult;
 use chrono::Utc;
+use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::ConnectorMetadata;
 use feldera_adapterlib::format::Parser;
 use feldera_adapterlib::transport::{
@@ -14,13 +16,16 @@ use feldera_types::coordination::Completion;
 use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use feldera_types::program_schema::Relation;
 use serde_json::Value as JsonValue;
-use solace_rs::async_support::{AsyncSessionBuilder, OwnedAsyncFlow};
-use solace_rs::flow::{AckMode, MessageOutcome};
+use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder, OwnedAsyncFlow};
+use solace_rs::flow::{AckMode, FlowEvent, MessageOutcome};
 use solace_rs::message::{InboundMessage, Message};
+use solace_rs::session::SessionEvent;
 use solace_rs::{Context, SolaceLogLevel};
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tokio::time::{Instant, MissedTickBehavior};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::config::SolaceInputConfig;
 
@@ -79,24 +84,11 @@ impl TransportInputEndpoint for SolaceInputEndpoint {
 
         let config = Arc::clone(&self.config);
 
-        // connector-init threads are plain OS threads (not Tokio tasks), so
-        // Handle::current() panics.  Use try_current(): if a runtime is active
-        // (e.g. in tests) use it; otherwise spin up a dedicated single-threaded
-        // runtime on a new OS thread to host the background task.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(background_task(config, consumer, parser, cmd_rx));
-            }
-            Err(_) => {
-                std::thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("solace-input: failed to build Tokio runtime")
-                        .block_on(background_task(config, consumer, parser, cmd_rx));
-                });
-            }
-        }
+        // Connector-init threads are plain OS threads with no ambient Tokio
+        // runtime, so spawn onto the shared adapter runtime (as the NATS input
+        // and the Solace output do).
+        let span = info_span!("solace_input", queue = %config.queue, host = %config.host);
+        TOKIO.spawn(background_task(config, consumer, parser, cmd_rx).instrument(span));
 
         Ok(Box::new(SolaceInputReader { cmd_tx }))
     }
@@ -253,9 +245,173 @@ async fn wait_completion(source: &mut Option<CompletionSource>) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Connection lifecycle
+// ---------------------------------------------------------------------------
+
+/// Polling interval for buffered flow events (bind failures, reconnect
+/// notices).
+///
+/// `OwnedAsyncFlow::recv()` and `recv_event()` both take `&mut self`, so the
+/// message and event channels cannot be selected on concurrently.  Instead
+/// the event channel is drained non-blockingly on this tick (and after every
+/// received message).  The interval bounds the detection latency for a dead
+/// flow on an idle or paused queue.
+const FLOW_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A live broker connection.
+///
+/// `flow` must be dropped before `session.disconnect()`: the session refuses
+/// to disconnect while flows hold a reference to it (see [`teardown`]).
+struct Connection {
+    session: AsyncSession,
+    flow: OwnedAsyncFlow,
+}
+
+/// Failure classification for connection attempts.
+///
+/// Classification errs toward `Retryable`: a wrong `Fatal` permanently kills
+/// the endpoint, while a wrong `Retryable` merely retries noisily.
+enum ConnectorError {
+    /// Authentication, authorization, or configuration failure that a retry
+    /// cannot fix.
+    Fatal(anyhow::Error),
+    /// Transient failure (network, timeout, broker restart); retried with a
+    /// fresh session after `retry_interval_secs`.
+    Retryable(anyhow::Error),
+}
+
+/// Reports whether an SDK error text indicates a permanent failure.
+///
+/// solace-rs surfaces C SDK subcodes as strings, so classification is
+/// substring matching against a deliberately short list; anything
+/// unrecognized is treated as retryable.
+fn is_fatal_error_text(text: &str) -> bool {
+    const FATAL_MARKERS: &[&str] = &[
+        "login failure",  // bad credentials
+        "unauthorized",   // authorization failure
+        "acl denied",     // client ACL profile rejects the connection
+        "unknown queue",  // queue does not exist on the broker
+        "queue not found",
+    ];
+    let lower = text.to_lowercase();
+    FATAL_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Classifies a connection-attempt failure as fatal or retryable.
+fn classify_connect_failure(err: anyhow::Error) -> ConnectorError {
+    if is_fatal_error_text(&format!("{err:#}")) {
+        ConnectorError::Fatal(err)
+    } else {
+        ConnectorError::Retryable(err)
+    }
+}
+
+/// Flow events that invalidate the connection.
+///
+/// `Reconnecting`/`Reconnected` are the SDK handling a blip within its own
+/// `reconnect_retries` budget and are logged only.
+fn is_flow_failure(event: FlowEvent) -> bool {
+    matches!(
+        event,
+        FlowEvent::DownError | FlowEvent::BindFailedError | FlowEvent::SessionDown
+    )
+}
+
+/// Session events that invalidate the connection.
+///
+/// `DownError` is emitted after the SDK's own `reconnect_retries` are
+/// exhausted; from there recovery needs a fresh session.
+fn is_session_failure(event: SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::DownError | SessionEvent::ConnectFailedError
+    )
+}
+
+/// Builds a session and queue flow.  Blocks on the C SDK connect, so callers
+/// run it via [`connect`] inside `spawn_blocking`.
+fn connect_blocking(
+    config: &SolaceInputConfig,
+    context: &Context,
+) -> Result<Connection, ConnectorError> {
+    let mut builder = AsyncSessionBuilder::new(context)
+        .host_name(config.smf_url())
+        .vpn_name(config.vpn.clone())
+        .username(config.username.clone())
+        .password(config.password.clone())
+        .reconnect_retries(config.reconnect_retries)
+        .reconnect_retry_wait_ms(config.reconnect_retry_wait_ms)
+        .connect_timeout_ms(config.connect_timeout_secs.saturating_mul(1000))
+        .generate_rcv_timestamps(true);
+    if let Some(name) = &config.client_name {
+        builder = builder.client_name(name.clone());
+    }
+    if let Some(dir) = &config.ssl_trust_store_dir {
+        builder = builder.ssl_trust_store_dir(dir.clone());
+    }
+
+    let session = builder
+        .build()
+        .map_err(|e| classify_connect_failure(anyhow::anyhow!("session connect: {e}")))?;
+
+    // The flow is created stopped; it is started on `Extend`.
+    let flow = session
+        .create_flow(
+            &config.queue,
+            AckMode::Client,
+            config.window_size,
+            config.max_unacked,
+        )
+        .map_err(|e| {
+            classify_connect_failure(anyhow::anyhow!(
+                "flow bind to queue {}: {e}",
+                config.queue
+            ))
+        })?;
+
+    Ok(Connection { session, flow })
+}
+
+/// Runs [`connect_blocking`] off the async thread.
+async fn connect(
+    config: Arc<SolaceInputConfig>,
+    context: Context,
+) -> Result<Connection, ConnectorError> {
+    tokio::task::spawn_blocking(move || connect_blocking(&config, &context))
+        .await
+        .unwrap_or_else(|e| {
+            Err(ConnectorError::Retryable(anyhow::anyhow!(
+                "connect task failed: {e}"
+            )))
+        })
+}
+
+/// Drops a connection off the async thread (disconnect can block on network
+/// I/O).  The flow drops before `disconnect()`, or the session would report
+/// `ActiveFlowsOnDisconnect` and leak.
+async fn teardown(conn: Connection) {
+    let result = tokio::task::spawn_blocking(move || {
+        let Connection { session, flow } = conn;
+        drop(flow);
+        if let Err(e) = session.disconnect() {
+            warn!("Solace disconnect error: {e}");
+        }
+    })
+    .await;
+    if result.is_err() {
+        warn!("Solace teardown task failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background task
 // ---------------------------------------------------------------------------
 
+/// The controller-visible run state.  Connectivity is tracked separately (an
+/// `Option<Connection>` in [`background_task`]): pause/run is what the
+/// controller asked for, connected/retrying is what the broker allows, and
+/// the two vary independently — a disconnect while paused must not cancel
+/// the pause, and a pause while retrying must survive the reconnect.
 #[derive(Debug, PartialEq)]
 enum State {
     Paused,
@@ -275,52 +431,7 @@ async fn background_task(
     let context = match Context::new(solace_log_level(config.log_level)) {
         Ok(c) => c,
         Err(e) => {
-            consumer.error(true, anyhow::anyhow!("{e:?}"), Some("solace-context"));
-            return;
-        }
-    };
-
-    let mut builder = AsyncSessionBuilder::new(&context)
-        .host_name(config.smf_url())
-        .vpn_name(config.vpn.clone())
-        .username(config.username.clone())
-        .password(config.password.clone())
-        .reconnect_retries(config.reconnect_retries)
-        .reconnect_retry_wait_ms(config.reconnect_retry_wait_ms)
-        .connect_timeout_ms(config.connect_timeout_secs.saturating_mul(1000))
-        .generate_rcv_timestamps(true);
-    if let Some(name) = &config.client_name {
-        builder = builder.client_name(name.clone());
-    }
-    if let Some(dir) = &config.ssl_trust_store_dir {
-        builder = builder.ssl_trust_store_dir(dir.clone());
-    }
-
-    let mut session = match builder.build() {
-        Ok(s) => s,
-        Err(e) => {
-            consumer.error(true, anyhow::anyhow!("{e:?}"), Some("solace-session"));
-            return;
-        }
-    };
-
-    info!(
-        "Connected to Solace {} vpn={} queue={}",
-        config.smf_url(),
-        config.vpn,
-        config.queue
-    );
-
-    let mut flow = match session.create_flow(
-        &config.queue,
-        AckMode::Client,
-        config.window_size,
-        config.max_unacked,
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            consumer.error(true, anyhow::anyhow!("{e:?}"), Some("solace-flow"));
-            let _ = session.disconnect();
+            consumer.error(true, anyhow::anyhow!("{e}"), Some("solace-context"));
             return;
         }
     };
@@ -345,113 +456,176 @@ async fn background_task(
     // records).  In a normal pipeline the completion watcher is always present.
     let defer_acks = completion.is_some();
 
+    let retry_interval = Duration::from_secs(config.retry_interval_secs);
+    let mut event_tick = tokio::time::interval(FLOW_EVENT_POLL_INTERVAL);
+    event_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut state = State::Paused;
+    // `None` while disconnected.  Starting disconnected with an expired retry
+    // timer routes the initial connection through the same retry path as a
+    // reconnect, so a broker that is down at pipeline start is retried rather
+    // than fatal.
+    let mut connection: Option<Connection> = None;
+    let mut next_retry_at = Instant::now();
 
     loop {
-        match state {
-            State::Done => break,
+        if state == State::Done {
+            break;
+        }
 
-            State::Paused => {
-                tokio::select! {
-                    biased;
+        let Some(conn) = connection.as_mut() else {
+            // ---- Disconnected: wait for the retry timer or a command ----
+            tokio::select! {
+                biased;
 
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(InputReaderCommand::Queue { .. }) => {
-                                handle_queue_command(
-                                    &queue, &*consumer, &flow,
-                                    &mut pending, &mut step, defer_acks,
-                                );
-                            }
-                            Some(c) => handle_non_queue_command(c, &mut state, &flow, &*consumer),
-                            None => break,
-                        }
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(InputReaderCommand::Queue { .. }) => {
+                        handle_queue_command(
+                            &queue, &*consumer, None,
+                            &mut pending, &mut step, defer_acks,
+                        );
                     }
-
-                    completed = wait_completion(&mut completion) => {
-                        match completed {
-                            Some(c) => ack_completed(&mut pending, c, &flow),
-                            None => { completion = None; flush_all_acks(&mut pending, &flow); }
-                        }
+                    Some(c) => {
+                        // No flow exists, so this only records the state; the
+                        // flow is started on reconnect when the state is
+                        // Running.
+                        let _ = handle_non_queue_command(c, &mut state, None);
                     }
-                }
-            }
+                    None => state = State::Done,
+                },
 
-            State::Running => {
-                tokio::select! {
-                    biased;
-
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(InputReaderCommand::Queue { .. }) => {
-                                handle_queue_command(
-                                    &queue, &*consumer, &flow,
-                                    &mut pending, &mut step, defer_acks,
-                                );
-                            }
-                            Some(c) => handle_non_queue_command(c, &mut state, &flow, &*consumer),
-                            None => break,
-                        }
-                    }
-
-                    completed = wait_completion(&mut completion) => {
-                        match completed {
-                            Some(c) => ack_completed(&mut pending, c, &flow),
-                            None => { completion = None; flush_all_acks(&mut pending, &flow); }
-                        }
-                    }
-
-                    maybe_msg = flow.recv() => {
-                        match maybe_msg {
-                            Some(msg) => {
-                                match process_message(msg, &queue, &*consumer, &mut parser, &mut rgmids, &config) {
-                                    MsgDisposition::Queued => {}
-                                    MsgDisposition::AckNow(id) => {
-                                        if let Err(e) = flow.ack(id) {
-                                            warn!("flow.ack({id}) failed: {e:?}");
-                                        }
-                                    }
-                                    MsgDisposition::SettleRejected(id) => {
-                                        if let Err(e) = flow.settle(id, MessageOutcome::Rejected) {
-                                            warn!("flow.settle({id}, Rejected) failed: {e:?}");
-                                        }
-                                    }
-                                    MsgDisposition::Skip => {}
+                () = tokio::time::sleep_until(next_retry_at) => {
+                    match connect(Arc::clone(&config), context.clone()).await {
+                        Ok(conn) => {
+                            if state == State::Running {
+                                if let Err(e) = conn.flow.start() {
+                                    warn!(
+                                        "flow.start after reconnect failed: {e}; \
+                                         retrying in {retry_interval:?}"
+                                    );
+                                    teardown(conn).await;
+                                    next_retry_at = Instant::now() + retry_interval;
+                                    continue;
                                 }
-                                // Drain low-volume flow events (bind/reconnect
-                                // notices) so their channel cannot grow.
-                                drain_flow_events(&mut flow);
                             }
-                            None => {
-                                error!("Solace flow channel closed unexpectedly");
-                                consumer.error(
-                                    false,
-                                    anyhow::anyhow!("flow channel closed"),
-                                    Some("solace-flow-closed"),
-                                );
-                                break;
-                            }
+                            info!(
+                                "Connected to Solace {} vpn={} queue={}",
+                                config.smf_url(),
+                                config.vpn,
+                                config.queue
+                            );
+                            connection = Some(conn);
                         }
-                    }
-
-                    maybe_event = session.recv_event() => {
-                        match maybe_event {
-                            Some(event) => debug!("Solace session event: {event:?}"),
-                            None => debug!("Solace session event channel closed"),
+                        Err(ConnectorError::Fatal(e)) => {
+                            error!("Solace connection failed fatally: {e:#}");
+                            consumer.error(true, e, Some("solace-connect"));
+                            state = State::Done;
+                        }
+                        Err(ConnectorError::Retryable(e)) => {
+                            warn!(
+                                "Solace connection failed: {e:#}; \
+                                 retrying in {retry_interval:?}"
+                            );
+                            consumer.error(false, e, Some("solace-connect"));
+                            next_retry_at = Instant::now() + retry_interval;
                         }
                     }
                 }
             }
+            continue;
+        };
+
+        // ---- Connected (Paused or Running) ----
+        //
+        // Every branch evaluates to the error that invalidated the
+        // connection, or `None` to stay connected.
+        let trigger: Option<anyhow::Error> = tokio::select! {
+            biased;
+
+            cmd = cmd_rx.recv() => match cmd {
+                Some(InputReaderCommand::Queue { .. }) => {
+                    handle_queue_command(
+                        &queue, &*consumer, Some(&conn.flow),
+                        &mut pending, &mut step, defer_acks,
+                    );
+                    None
+                }
+                Some(c) => handle_non_queue_command(c, &mut state, Some(&conn.flow)),
+                None => {
+                    state = State::Done;
+                    None
+                }
+            },
+
+            completed = wait_completion(&mut completion) => {
+                match completed {
+                    Some(c) => ack_completed(&mut pending, c, &conn.flow),
+                    None => {
+                        completion = None;
+                        flush_all_acks(&mut pending, &conn.flow);
+                    }
+                }
+                None
+            },
+
+            maybe_msg = conn.flow.recv(), if state == State::Running => match maybe_msg {
+                Some(msg) => {
+                    match process_message(msg, &queue, &*consumer, &mut parser, &mut rgmids, &config) {
+                        MsgDisposition::Queued => {}
+                        MsgDisposition::AckNow(id) => {
+                            if let Err(e) = conn.flow.ack(id) {
+                                warn!("flow.ack({id}) failed: {e}");
+                            }
+                        }
+                        MsgDisposition::SettleRejected(id) => {
+                            if let Err(e) = conn.flow.settle(id, MessageOutcome::Rejected) {
+                                warn!("flow.settle({id}, Rejected) failed: {e}");
+                            }
+                        }
+                        MsgDisposition::Skip => {}
+                    }
+                    // Drain low-volume flow events (bind/reconnect notices)
+                    // so their channel cannot grow between poll ticks.
+                    drain_flow_events(&mut conn.flow)
+                }
+                None => Some(anyhow::anyhow!("flow message channel closed")),
+            },
+
+            maybe_event = conn.session.recv_event() => match maybe_event {
+                Some(event) if is_session_failure(event) => {
+                    Some(anyhow::anyhow!("session failure event: {event}"))
+                }
+                Some(event) => {
+                    debug!("Solace session event: {event}");
+                    None
+                }
+                None => Some(anyhow::anyhow!("session event channel closed")),
+            },
+
+            _ = event_tick.tick() => drain_flow_events(&mut conn.flow),
+        };
+
+        if let Some(err) = trigger {
+            warn!(
+                "Solace connection lost: {err:#}; reconnecting in {retry_interval:?}"
+            );
+            consumer.error(false, err, Some("solace-connection-lost"));
+            // Pending msg_ids belong to the dead flow and cannot be acked on
+            // the new one.  Drop them: the broker redelivers unacked messages
+            // on the new flow, and the RGMID cache drops those already
+            // ingested.
+            pending.clear();
+            let conn = connection.take().expect("connected arm holds a connection");
+            teardown(conn).await;
+            next_retry_at = Instant::now() + retry_interval;
         }
     }
 
     // Ack anything still pending on a clean shutdown so the broker window is
     // released rather than waiting for redelivery.
-    flush_all_acks(&mut pending, &flow);
-
-    drop(flow);
-    if let Err(e) = session.disconnect() {
-        warn!("Solace disconnect error: {e:?}");
+    if let Some(conn) = connection.take() {
+        flush_all_acks(&mut pending, &conn.flow);
+        teardown(conn).await;
     }
     info!("Solace background task exiting");
 }
@@ -459,15 +633,19 @@ async fn background_task(
 /// Flush the input queue into the circuit and route the flushed messages'
 /// broker IDs to the ack path.
 ///
-/// Used by both the Paused and Running states.  The controller sends exactly
-/// one `Queue` per step to every endpoint regardless of pause state, so both
-/// arms must flush (and never drop the returned msg_ids) or acks would leak
-/// while the connector is backpressured.  `step` is incremented on every call
-/// so it always mirrors the controller's step number.
+/// The controller sends exactly one `Queue` per step to every endpoint
+/// regardless of pause or connection state, so every caller must flush (and
+/// account for the returned msg_ids) or acks would leak while the connector
+/// is backpressured.  `step` is incremented on every call so it always
+/// mirrors the controller's step number.
+///
+/// With `flow: None` (disconnected) the msg_ids are discarded: they belong to
+/// a dead flow and cannot be acked, so the broker redelivers those messages
+/// on the next flow and the RGMID cache drops the ones already ingested.
 fn handle_queue_command(
     queue: &Arc<InputQueue<u64>>,
     consumer: &dyn InputConsumer,
-    flow: &OwnedAsyncFlow,
+    flow: Option<&OwnedAsyncFlow>,
     pending: &mut PendingAcks,
     step: &mut u64,
     defer_acks: bool,
@@ -477,15 +655,23 @@ fn handle_queue_command(
     consumer.extended(buffer_size, None, vec![]);
 
     let msg_ids: Vec<u64> = aux_vec.into_iter().map(|(_, id)| id).collect();
-    if defer_acks {
-        if !msg_ids.is_empty() {
-            pending.push_back((*step, msg_ids));
+    match flow {
+        None => {
+            if !msg_ids.is_empty() {
+                debug!("Discarding {} ack(s) for a closed flow", msg_ids.len());
+            }
         }
-    } else {
-        // No completion source: ack on hand-off (at-most-once fallback).
-        for id in msg_ids {
-            if let Err(e) = flow.ack(id) {
-                warn!("flow.ack({id}) failed: {e:?}");
+        Some(_) if defer_acks => {
+            if !msg_ids.is_empty() {
+                pending.push_back((*step, msg_ids));
+            }
+        }
+        Some(flow) => {
+            // No completion source: ack on hand-off (at-most-once fallback).
+            for id in msg_ids {
+                if let Err(e) = flow.ack(id) {
+                    warn!("flow.ack({id}) failed: {e}");
+                }
             }
         }
     }
@@ -498,7 +684,7 @@ fn ack_completed(pending: &mut PendingAcks, completed: u64, flow: &OwnedAsyncFlo
     let n = ready.len();
     for id in ready {
         if let Err(e) = flow.ack(id) {
-            warn!("flow.ack({id}) failed: {e:?}");
+            warn!("flow.ack({id}) failed: {e}");
         }
     }
     if n > 0 {
@@ -511,16 +697,28 @@ fn flush_all_acks(pending: &mut PendingAcks, flow: &OwnedAsyncFlow) {
     for (_, ids) in pending.drain(..) {
         for id in ids {
             if let Err(e) = flow.ack(id) {
-                warn!("flow.ack({id}) failed: {e:?}");
+                warn!("flow.ack({id}) failed: {e}");
             }
         }
     }
 }
 
-/// Drain and log any buffered flow events without blocking.
-fn drain_flow_events(flow: &mut OwnedAsyncFlow) {
-    while let Ok(event) = flow.try_recv_event() {
-        debug!("Solace flow event: {event:?}");
+/// Drains buffered flow events without blocking.
+///
+/// Returns the error to treat as a lost connection when an event (or a
+/// closed event channel) invalidates the flow; `None` otherwise.
+fn drain_flow_events(flow: &mut OwnedAsyncFlow) -> Option<anyhow::Error> {
+    loop {
+        match flow.try_recv_event() {
+            Ok(event) if is_flow_failure(event) => {
+                return Some(anyhow::anyhow!("flow failure event: {event}"));
+            }
+            Ok(event) => debug!("Solace flow event: {event}"),
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                return Some(anyhow::anyhow!("flow event channel closed"));
+            }
+        }
     }
 }
 
@@ -658,46 +856,60 @@ fn build_metadata(msg: &InboundMessage, config: &SolaceInputConfig) -> Option<Co
 // ---------------------------------------------------------------------------
 
 /// Handles all commands except Queue (which is handled inline in the main loop).
+///
+/// Returns the error to treat as a lost connection when a flow operation the
+/// command requires fails; `None` otherwise.  With `flow: None`
+/// (disconnected) state changes are recorded only — the flow is started on
+/// reconnect when the recorded state is `Running`.
 fn handle_non_queue_command(
     command: InputReaderCommand,
     state: &mut State,
-    flow: &OwnedAsyncFlow,
-    consumer: &dyn InputConsumer,
-) {
+    flow: Option<&OwnedAsyncFlow>,
+) -> Option<anyhow::Error> {
     match command {
         InputReaderCommand::Queue { .. } => {
             // Unreachable — caller dispatches Queue to handle_queue_command.
             warn!("handle_non_queue_command received Queue — this is a bug");
+            None
         }
 
         InputReaderCommand::Replay { .. } => {
             warn!("Replay issued to non-FT Solace connector — ignoring");
+            None
         }
 
         InputReaderCommand::Extend => {
             debug!("Extend — starting flow");
-            if let Err(e) = flow.start() {
-                consumer.error(
-                    false,
-                    anyhow::anyhow!("flow.start: {e:?}"),
-                    Some("solace-flow-start"),
-                );
-            }
             *state = State::Running;
+            if let Some(flow) = flow {
+                if let Err(e) = flow.start() {
+                    return Some(anyhow::anyhow!("flow.start: {e}"));
+                }
+            }
+            None
         }
 
         InputReaderCommand::Pause => {
             debug!("Pause — stopping flow");
-            if let Err(e) = flow.stop() {
-                warn!("flow.stop: {e:?}");
-            }
             *state = State::Paused;
+            if let Some(flow) = flow {
+                // A failed stop leaves the broker pushing messages that the
+                // paused loop no longer drains, so treat it as a lost
+                // connection rather than ignoring it.
+                if let Err(e) = flow.stop() {
+                    return Some(anyhow::anyhow!("flow.stop: {e}"));
+                }
+            }
+            None
         }
 
         InputReaderCommand::Disconnect => {
             debug!("Disconnect");
-            let _ = flow.stop();
+            if let Some(flow) = flow {
+                let _ = flow.stop();
+            }
             *state = State::Done;
+            None
         }
     }
 }
@@ -710,8 +922,14 @@ fn handle_non_queue_command(
 mod tests {
     use feldera_types::config::FtModel;
     use feldera_types::transport::solace::SolaceInputConfig;
+    use solace_rs::flow::FlowEvent;
+    use solace_rs::session::SessionEvent;
 
-    use super::{InputEndpoint, PendingAcks, RgmidCache, SolaceInputEndpoint, State, acks_ready};
+    use super::{
+        ConnectorError, InputEndpoint, PendingAcks, RgmidCache, SolaceInputEndpoint, State,
+        acks_ready, classify_connect_failure, is_fatal_error_text, is_flow_failure,
+        is_session_failure,
+    };
 
     fn make_config() -> SolaceInputConfig {
         SolaceInputConfig {
@@ -797,5 +1015,62 @@ mod tests {
         // A stale, lower completion count must not release a later step.
         assert!(acks_ready(&mut pending, 5).is_empty());
         assert_eq!(acks_ready(&mut pending, 6), vec![1]);
+    }
+
+    #[test]
+    fn fatal_error_texts_are_recognized() {
+        // Case-insensitive substring matches on SDK error strings.
+        assert!(is_fatal_error_text("subcode: 3 string: Login Failure"));
+        assert!(is_fatal_error_text("401 Unauthorized"));
+        assert!(is_fatal_error_text("Client ACL Denied"));
+        assert!(is_fatal_error_text("Unknown Queue"));
+        assert!(is_fatal_error_text("queue not found: my-queue"));
+    }
+
+    #[test]
+    fn ambiguous_error_texts_default_to_retryable() {
+        // A wrong Fatal permanently kills the endpoint, so anything not on
+        // the explicit list must classify as retryable.
+        assert!(!is_fatal_error_text("Connection refused"));
+        assert!(!is_fatal_error_text("Unresolved host"));
+        assert!(!is_fatal_error_text("Timeout while connecting"));
+        assert!(!is_fatal_error_text(""));
+    }
+
+    #[test]
+    fn classify_connect_failure_splits_fatal_and_retryable() {
+        assert!(matches!(
+            classify_connect_failure(anyhow::anyhow!("session connect: Login Failure")),
+            ConnectorError::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_connect_failure(anyhow::anyhow!("session connect: Unresolved host")),
+            ConnectorError::Retryable(_)
+        ));
+    }
+
+    #[test]
+    fn flow_failure_events_trigger_reconnect() {
+        assert!(is_flow_failure(FlowEvent::DownError));
+        assert!(is_flow_failure(FlowEvent::BindFailedError));
+        assert!(is_flow_failure(FlowEvent::SessionDown));
+        // The SDK handles these itself; they must not tear the flow down.
+        assert!(!is_flow_failure(FlowEvent::UpNotice));
+        assert!(!is_flow_failure(FlowEvent::Reconnecting));
+        assert!(!is_flow_failure(FlowEvent::Reconnected));
+        assert!(!is_flow_failure(FlowEvent::Active));
+        assert!(!is_flow_failure(FlowEvent::Inactive));
+    }
+
+    #[test]
+    fn session_failure_events_trigger_reconnect() {
+        assert!(is_session_failure(SessionEvent::DownError));
+        assert!(is_session_failure(SessionEvent::ConnectFailedError));
+        // Blip-handling and publish-side events must not tear the session down.
+        assert!(!is_session_failure(SessionEvent::UpNotice));
+        assert!(!is_session_failure(SessionEvent::ReconnectingNotice));
+        assert!(!is_session_failure(SessionEvent::ReconnectedNotice));
+        assert!(!is_session_failure(SessionEvent::Acknowledgement));
+        assert!(!is_session_failure(SessionEvent::RejectedMsgError));
     }
 }

@@ -17,6 +17,23 @@
 //! them as `ConnectorMetadata` fields — table columns can be populated from
 //! topic levels without requiring publishers to embed them in the payload.
 //!
+//! ## Connection lifecycle
+//!
+//! The input connector owns a reconnect loop.  Short network blips are
+//! handled inside the Solace C SDK (`reconnect_retries` /
+//! `reconnect_retry_wait_ms`); when the SDK gives up (session `DownError`,
+//! flow `DownError`/`BindFailedError`/`SessionDown`, or a closed message
+//! channel), the connector tears the session down and rebuilds it every
+//! `retry_interval_secs` until the broker returns.  Authentication,
+//! authorization, and unknown-queue failures are fatal and stop the
+//! endpoint; ambiguous failures default to retryable.  Unacknowledged
+//! in-flight messages are redelivered by the broker on the new flow and
+//! dropped by the RGMID cache when already ingested (with
+//! `dedup_history_size = 0` a reconnect can therefore duplicate rows).
+//!
+//! There is no application-level inactivity probe: the Solace C SDK runs
+//! protocol keepalives, and session/flow events are the health signal.
+//!
 //! # Output (`SolaceOutputEndpoint`)
 //!
 //! Publishes serialized view records to a Solace topic. The destination topic

@@ -978,11 +978,14 @@ mod tests {
         let mut cache = RgmidCache::new(2);
         assert!(cache.insert("a"));
         assert!(cache.insert("b"));
-        // Inserting "c" evicts "a" (the oldest).
+        // Inserting "c" evicts "a" (the oldest); "b" and "c" remain.
         assert!(cache.insert("c"));
+        assert!(!cache.insert("b"), "b is still cached");
+        assert!(!cache.insert("c"), "c is still cached");
+        // "a" fell out of the window, so it reads as new again — and adding it
+        // evicts "b", the now-oldest entry.
         assert!(cache.insert("a"), "evicted id is treated as new again");
-        // "b" is still present.
-        assert!(!cache.insert("b"));
+        assert!(cache.insert("b"), "b was evicted when a was re-added");
     }
 
     #[test]

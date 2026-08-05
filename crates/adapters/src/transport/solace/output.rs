@@ -1,6 +1,8 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result as AnyResult, bail};
+use anyhow::{Error as AnyError, Result as AnyResult, bail};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
 use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
@@ -44,12 +46,19 @@ pub struct SolaceOutputEndpoint {
     /// resolution. Drained at each `batch_end` and whenever the count reaches
     /// `config.max_inflight_acks`.
     pending_acks: Vec<oneshot::Receiver<Result<(), SessionError>>>,
+    /// The controller's error callback, stored at `connect` so session
+    /// rebuilds can wire a fresh event drainer (see [`ensure_connected`]).
+    error_cb: Option<Arc<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>>,
 }
 
 struct SolaceConnection {
     /// Kept alive so the session's C-SDK context pointer remains valid.
     _context: Context,
     session: solace_rs::async_support::AsyncSession,
+    /// Set by the session-event drainer when the SDK reports a
+    /// connection-level failure (its own reconnect budget exhausted).  The
+    /// next publish rebuilds the session instead of failing forever.
+    poisoned: Arc<AtomicBool>,
 }
 
 impl SolaceOutputEndpoint {
@@ -70,7 +79,43 @@ impl SolaceOutputEndpoint {
             conn: None,
             static_topic: is_static,
             pending_acks: Vec::new(),
+            error_cb: None,
         })
+    }
+
+    /// Ensure a healthy session, rebuilding after a connection-level failure.
+    ///
+    /// The session-event drainer marks the connection poisoned when the SDK
+    /// reports `DownError`/`ConnectFailedError` (its own reconnect budget is
+    /// exhausted).  Rather than failing the endpoint permanently, the next
+    /// publish tears the dead session down and builds a fresh one.  In-flight
+    /// persistent acks belong to the dead session and can never resolve, so
+    /// the rebuild drops them and fails the current batch with an error; the
+    /// controller logs it, and the next batch proceeds on the new session.
+    fn ensure_connected(&mut self) -> AnyResult<()> {
+        let healthy = self
+            .conn
+            .as_ref()
+            .is_some_and(|c| !c.poisoned.load(Ordering::Acquire));
+        if healthy {
+            return Ok(());
+        }
+        if let Some(conn) = self.conn.take() {
+            warn!("Solace output session lost; rebuilding");
+            if let Err(e) = conn.session.disconnect() {
+                debug!("Disconnect of poisoned Solace session: {e:?}");
+            }
+        }
+        let inflight = self.pending_acks.len();
+        self.pending_acks.clear();
+        self.build_connection()?;
+        if inflight > 0 {
+            bail!(
+                "Solace session was rebuilt with {inflight} unacknowledged persistent \
+                 publish(es); their delivery is unconfirmed"
+            );
+        }
+        Ok(())
     }
 
     fn delivery_mode(&self) -> DeliveryMode {
@@ -92,6 +137,7 @@ impl SolaceOutputEndpoint {
     }
 
     fn publish(&mut self, topic: &str, payload: &[u8]) -> AnyResult<()> {
+        self.ensure_connected()?;
         let msg = OutboundMessageBuilder::new()
             .destination(
                 MessageDestination::new(DestinationType::Topic, topic)
@@ -187,8 +233,17 @@ impl SolaceOutputEndpoint {
     }
 }
 
-impl OutputEndpoint for SolaceOutputEndpoint {
-    fn connect(&mut self, async_error_callback: AsyncErrorCallback) -> AnyResult<()> {
+impl SolaceOutputEndpoint {
+    /// Build a session (plus its event drainer) and install it as the live
+    /// connection.  Used for both the initial `connect` and rebuilds after a
+    /// connection-level failure.
+    fn build_connection(&mut self) -> AnyResult<()> {
+        let error_cb = self
+            .error_cb
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("output endpoint not connected"))?
+            .clone();
+
         let context = Context::new(solace_log_level(self.config.log_level))
             .map_err(|e| anyhow::anyhow!("Solace context init: {e:?}"))?;
 
@@ -223,17 +278,32 @@ impl OutputEndpoint for SolaceOutputEndpoint {
         // connection-level failures to the controller via the async error
         // callback. Tracked `publish_with_ack` acknowledgments are resolved by
         // the SDK before reaching this channel (see publish/drain_pending_acks),
-        // so only untracked events arrive here.
+        // so only untracked events arrive here.  The poisoned flag is scoped
+        // to this session: a drainer for a torn-down session cannot poison
+        // its replacement.
+        let poisoned = Arc::new(AtomicBool::new(false));
         let event_rx = session.take_event_receiver();
-        TOKIO.spawn(drain_session_events(event_rx, async_error_callback));
+        TOKIO.spawn(drain_session_events(
+            event_rx,
+            error_cb,
+            Arc::clone(&poisoned),
+        ));
 
         // Both _context and session must live together — context must outlive session.
         // Fields are dropped in declaration order, so _context is dropped after session.
         self.conn = Some(SolaceConnection {
             _context: context,
             session,
+            poisoned,
         });
         Ok(())
+    }
+}
+
+impl OutputEndpoint for SolaceOutputEndpoint {
+    fn connect(&mut self, async_error_callback: AsyncErrorCallback) -> AnyResult<()> {
+        self.error_cb = Some(Arc::from(async_error_callback));
+        self.build_connection()
     }
 
     fn max_buffer_size_bytes(&self) -> usize {
@@ -283,22 +353,35 @@ however the Solace transport does not support this representation."
 /// Consume untracked session events for the lifetime of the session, reporting
 /// connection-level failures through the controller's async error callback.
 /// Returns when the session is dropped and the event channel closes.
+///
+/// Connection-level failures are reported as *non-fatal* and mark the session
+/// poisoned instead: the endpoint rebuilds the session on the next publish
+/// (see `ensure_connected`), so a broker outage that outlives the SDK's own
+/// reconnect budget degrades to failed batches rather than killing the
+/// endpoint permanently.
 async fn drain_session_events(
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
-    error_callback: AsyncErrorCallback,
+    error_callback: Arc<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>,
+    poisoned: Arc<AtomicBool>,
 ) {
     while let Some(event) = event_rx.recv().await {
         match event {
-            SessionEvent::DownError => error_callback(
-                true,
-                anyhow::anyhow!("Solace session down"),
-                Some("solace_output_down"),
-            ),
-            SessionEvent::ConnectFailedError => error_callback(
-                true,
-                anyhow::anyhow!("Solace connection failed"),
-                Some("solace_output_connect_failed"),
-            ),
+            SessionEvent::DownError => {
+                poisoned.store(true, Ordering::Release);
+                error_callback(
+                    false,
+                    anyhow::anyhow!("Solace session down; rebuilding on the next publish"),
+                    Some("solace_output_down"),
+                );
+            }
+            SessionEvent::ConnectFailedError => {
+                poisoned.store(true, Ordering::Release);
+                error_callback(
+                    false,
+                    anyhow::anyhow!("Solace connection failed; rebuilding on the next publish"),
+                    Some("solace_output_connect_failed"),
+                );
+            }
             SessionEvent::RejectedMsgError => error_callback(
                 false,
                 anyhow::anyhow!("Solace rejected a published message"),

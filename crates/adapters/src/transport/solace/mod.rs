@@ -49,6 +49,17 @@
 //! supports `{field}` placeholders resolved from the JSON record, including
 //! Feldera's `insert_delete` wrapper format.
 //!
+//! ## Connection lifecycle
+//!
+//! The output recovers differently from the input: it is a synchronous
+//! endpoint driven per batch, so instead of a background reconnect loop it
+//! rebuilds on demand.  When the SDK exhausts its own reconnect budget, the
+//! session-event drainer marks the session poisoned and the next publish
+//! tears it down and builds a fresh one; batches that raced the failure
+//! surface as (non-fatal) transport errors.  `persistent` delivery bounds
+//! each batch-boundary ack wait with `ack_timeout_secs`, so a broker that
+//! stops acknowledging fails the batch rather than stalling the pipeline.
+//!
 //! # Feature flag
 //!
 //! Enable with `--features with-solace`. Requires the Solace C SDK installed

@@ -225,7 +225,10 @@ impl Semp {
     /// Enables or disables message delivery from `queue` (bounces consumer
     /// flows without deleting the queue).
     fn set_queue_egress(&self, queue: &str, enabled: bool) {
-        self.patch_config(&format!("queues/{queue}"), json!({ "egressEnabled": enabled }));
+        self.patch_config(
+            &format!("queues/{queue}"),
+            json!({ "egressEnabled": enabled }),
+        );
     }
 
     /// Force-disconnects one client by its client name (SEMP action API).
@@ -435,13 +438,7 @@ struct WatchedConsumer {
 impl WatchedConsumer {
     /// Returns the consumer plus the senders that drive its frontiers; the
     /// checkpoint sender is `Some` iff `strict`.
-    fn new(
-        strict: bool,
-    ) -> (
-        Self,
-        watch::Sender<Completion>,
-        Option<watch::Sender<u64>>,
-    ) {
+    fn new(strict: bool) -> (Self, watch::Sender<Completion>, Option<watch::Sender<u64>>) {
         let (completion_tx, completion_rx) = watch::channel(Completion::default());
         let (checkpoint_tx, checkpoint_rx) = if strict {
             let (tx, rx) = watch::channel(0u64);
@@ -555,12 +552,7 @@ fn watched_input_pipeline(
     .unwrap()
     .unwrap();
     let reader = endpoint
-        .open(
-            Box::new(consumer.clone()),
-            Box::new(parser),
-            relation,
-            None,
-        )
+        .open(Box::new(consumer.clone()), Box::new(parser), relation, None)
         .unwrap();
 
     (reader, zset, consumer, completion_tx, checkpoint_tx)
@@ -590,12 +582,11 @@ fn input_end_to_end_acks_all_messages() {
         .semp
         .wait_for_backlog(&broker.queue, 10, Duration::from_secs(10));
 
-    let (endpoint, _consumer, _parser, zset) =
-        mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_json::from_value(broker.input_pipeline_config()).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap();
+    let (endpoint, _consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
+        serde_json::from_value(broker.input_pipeline_config()).unwrap(),
+        Relation::empty(),
+    )
+    .unwrap();
     endpoint.extend();
 
     wait_for_output_unordered(&zset, &data, || endpoint.queue(false));
@@ -615,12 +606,11 @@ fn input_pause_resume_no_loss() {
     let broker = TestBroker::provision("pause");
     let publisher = TestPublisher::connect(&broker.host);
 
-    let (endpoint, _consumer, _parser, zset) =
-        mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_json::from_value(broker.input_pipeline_config()).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap();
+    let (endpoint, _consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
+        serde_json::from_value(broker.input_pipeline_config()).unwrap(),
+        Relation::empty(),
+    )
+    .unwrap();
     endpoint.extend();
 
     let data = test_batches(0, 5, 10);
@@ -660,12 +650,11 @@ fn input_recovers_from_flow_loss() {
     let broker = TestBroker::provision("recover");
     let publisher = TestPublisher::connect(&broker.host);
 
-    let (endpoint, _consumer, _parser, zset) =
-        mock_input_pipeline::<TestStruct, TestStruct>(
-            serde_json::from_value(broker.input_pipeline_config()).unwrap(),
-            Relation::empty(),
-        )
-        .unwrap();
+    let (endpoint, _consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
+        serde_json::from_value(broker.input_pipeline_config()).unwrap(),
+        Relation::empty(),
+    )
+    .unwrap();
     endpoint.extend();
 
     let data = test_batches(0, 5, 10);

@@ -24,6 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.1"
+          components: clippy, rustfmt
 
       - name: Cache Cargo registry and index
         uses: actions/cache@v4
@@ -35,11 +36,39 @@ jobs:
           restore-keys: |
             cargo-solace-${{ runner.os }}-
 
+      # Formatting of the Solace connector files (scoped: the wider repo is
+      # formatted by its own tooling and pre-commit hooks).
+      - name: Check formatting of Solace files
+        run: |
+          rustfmt --check --edition 2024 \
+            crates/adapters/src/transport/solace/*.rs \
+            crates/feldera-types/src/transport/solace.rs
+
       # solace-rs auto-downloads the Solace C SDK for Linux x64 at build time.
       # --no-default-features avoids pulling in native deps (rdkafka, postgres-cdc, etc.)
       # that are not available on a stock ubuntu runner.
       - name: Check adapters crate with Solace feature
         run: cargo check --locked -p dbsp_adapters --no-default-features --features with-solace
+
+      # Lint gate.  Denies warnings so collapsible-ifs and friends cannot
+      # accumulate in the connector code.
+      - name: Clippy (with-solace)
+        run: cargo clippy --locked -p dbsp_adapters --no-default-features --features with-solace --lib -- -D warnings
+
+      # Default-feature check: catches breakage in code paths that the
+      # --no-default-features builds above never compile (an avro break
+      # shipped through exactly this hole).  Needs the native deps that
+      # rdkafka/postgres pull in.
+      - name: Install system dependencies for default features
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libssl-dev pkg-config libclang-dev \
+            libsasl2-dev libzstd-dev zlib1g-dev \
+            cmake build-essential
+
+      - name: Check adapters crate with default features
+        run: cargo check --locked -p dbsp_adapters
 
       # Compile (but do not run) the broker-gated integration tests so they
       # cannot rot: running them needs a live Solace Platform broker

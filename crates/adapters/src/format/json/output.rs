@@ -99,11 +99,11 @@ impl OutputFormat for JsonOutputFormat {
         //
         // A static topic (no `{`) publishes every record to the same
         // destination, so it keeps normal batching for throughput.
-        if let TransportConfig::SolaceOutput(solace_config) = &config.transport {
-            if solace_config.topic.contains('{') {
-                json_config.buffer_size_records = 1;
-                json_config.array = false;
-            }
+        if let TransportConfig::SolaceOutput(solace_config) = &config.transport
+            && solace_config.topic.contains('{')
+        {
+            json_config.buffer_size_records = 1;
+            json_config.array = false;
         }
 
         let key_separator = match &config.transport {

@@ -544,7 +544,10 @@ mod tests {
 
     #[test]
     fn input_smf_url_custom_port() {
-        assert_eq!(input_cfg("localhost", 1234).smf_url(), "tcp://localhost:1234");
+        assert_eq!(
+            input_cfg("localhost", 1234).smf_url(),
+            "tcp://localhost:1234"
+        );
     }
 
     #[test]
@@ -587,7 +590,10 @@ mod tests {
     fn input_validate_trust_store_requires_tls() {
         let mut cfg = input_cfg("h", 55555);
         cfg.ssl_trust_store_dir = Some("/certs".into());
-        assert!(cfg.validate().is_err(), "trust store without tls is invalid");
+        assert!(
+            cfg.validate().is_err(),
+            "trust store without tls is invalid"
+        );
         cfg.tls = true;
         assert!(cfg.validate().is_ok());
     }
@@ -649,7 +655,10 @@ mod tests {
     fn output_validate_dedup_window_bounds() {
         let mut cfg = output_cfg("h", 55555);
         cfg.dedup_window_ms = Some(0);
-        assert!(cfg.validate().is_err(), "0 ms is not a window; omit to disable");
+        assert!(
+            cfg.validate().is_err(),
+            "0 ms is not a window; omit to disable"
+        );
         cfg.dedup_window_ms = Some(1);
         assert!(cfg.validate().is_ok());
         cfg.dedup_window_ms = None;

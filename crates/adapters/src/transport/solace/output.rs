@@ -7,7 +7,9 @@ use anyhow::{Error as AnyError, Result as AnyResult, bail};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
 use solace_rs::async_support::AsyncSessionBuilder;
-use solace_rs::message::{DeliveryMode, DestinationType, MessageDestination, OutboundMessageBuilder};
+use solace_rs::message::{
+    DeliveryMode, DestinationType, MessageDestination, OutboundMessageBuilder,
+};
 use solace_rs::session::SessionEvent;
 use solace_rs::{Context, SessionError};
 use tokio::sync::oneshot;
@@ -678,7 +680,10 @@ mod tests {
         let mut dedup = DedupState::new(WINDOW);
         let now = Instant::now();
         assert!(dedup.should_send("t/a", b"1", now));
-        assert!(dedup.should_send("t/b", b"1", now), "topics throttle independently");
+        assert!(
+            dedup.should_send("t/b", b"1", now),
+            "topics throttle independently"
+        );
     }
 
     #[test]
@@ -690,7 +695,11 @@ mod tests {
         assert!(!dedup.should_send("t", b"3", start + Duration::from_secs(2)));
 
         // Nothing flushes before the window expires.
-        assert!(dedup.take_expired(start + Duration::from_secs(2)).is_empty());
+        assert!(
+            dedup
+                .take_expired(start + Duration::from_secs(2))
+                .is_empty()
+        );
 
         // After expiry, exactly one message per topic, carrying the latest value.
         let flushed = dedup.take_expired(start + WINDOW);
@@ -813,10 +822,7 @@ mod tests {
     #[test]
     fn same_placeholder_repeated() {
         let buf = br#"{"region":"us-east"}"#;
-        assert_eq!(
-            resolve_topic("{region}/{region}", buf),
-            "us-east/us-east"
-        );
+        assert_eq!(resolve_topic("{region}/{region}", buf), "us-east/us-east");
     }
 
     #[test]

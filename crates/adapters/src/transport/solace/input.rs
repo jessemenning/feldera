@@ -16,11 +16,11 @@ use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
 use serde_json::{Value as JsonValue, json};
+use solace_rs::Context;
 use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder, OwnedAsyncFlow};
 use solace_rs::flow::{AckMode, FlowEvent, MessageOutcome};
 use solace_rs::message::{InboundMessage, Message};
 use solace_rs::session::SessionEvent;
-use solace_rs::Context;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::watch;
@@ -114,6 +114,13 @@ impl InputReader for SolaceInputReader {
 // RGMID dedup cache
 // ---------------------------------------------------------------------------
 
+/// A replication-group message ID in the broker's raw 16-byte wire form.
+///
+/// `Copy`, allocation-free, and cheaper to hash and store than the SDK's
+/// `rmid1:…` string rendering (which costs ~50 heap bytes per entry — at the
+/// 100k default cap the string form held roughly 15 MB per connector).
+type Rgmid = [u8; 16];
+
 /// Bounded FIFO set of replication-group message IDs seen this session.
 ///
 /// The broker redelivers guaranteed messages that were received but not yet
@@ -124,13 +131,6 @@ impl InputReader for SolaceInputReader {
 /// unbounded set would grow without limit.  A redelivery of a message older
 /// than `cap` distinct messages falls out of the window and would re-ingest,
 /// which is acceptable under at-least-once semantics.
-/// A replication-group message ID in the broker's raw 16-byte wire form.
-///
-/// `Copy`, allocation-free, and cheaper to hash and store than the SDK's
-/// `rmid1:…` string rendering (which costs ~50 heap bytes per entry — at the
-/// 100k default cap the string form held roughly 15 MB per connector).
-type Rgmid = [u8; 16];
-
 struct RgmidCache {
     seen: HashSet<Rgmid>,
     order: VecDeque<Rgmid>,
@@ -245,7 +245,9 @@ impl CompletionSource {
         if let Some(rx) = consumer.checkpoint_watcher() {
             Some(CompletionSource::Checkpoint(rx))
         } else {
-            consumer.completion_watcher().map(CompletionSource::Completion)
+            consumer
+                .completion_watcher()
+                .map(CompletionSource::Completion)
         }
     }
 
@@ -333,10 +335,10 @@ enum ConnectorError {
 /// unrecognized is treated as retryable.
 fn is_fatal_error_text(text: &str) -> bool {
     const FATAL_MARKERS: &[&str] = &[
-        "login failure",  // bad credentials
-        "unauthorized",   // authorization failure
-        "acl denied",     // client ACL profile rejects the connection
-        "unknown queue",  // queue does not exist on the broker
+        "login failure", // bad credentials
+        "unauthorized",  // authorization failure
+        "acl denied",    // client ACL profile rejects the connection
+        "unknown queue", // queue does not exist on the broker
         "queue not found",
     ];
     let lower = text.to_lowercase();
@@ -697,9 +699,7 @@ async fn background_task(
         };
 
         if let Some(err) = trigger {
-            warn!(
-                "Solace connection lost: {err:#}; reconnecting in {retry_interval:?}"
-            );
+            warn!("Solace connection lost: {err:#}; reconnecting in {retry_interval:?}");
             consumer.error(false, err, Some("solace-connection-lost"));
             // Pending msg_ids belong to the dead flow and cannot be acked on
             // the new one.  Drop them: the broker redelivers unacked messages
@@ -1166,9 +1166,9 @@ mod tests {
     use feldera_sqllib::{SqlString, Timestamp, Variant};
 
     use super::{
-        ConnectorError, InputEndpoint, MetadataSpec, PendingAcks, RgmidCache,
-        SolaceInputEndpoint, State, acks_ready, classify_connect_failure, is_fatal_error_text,
-        is_flow_failure, is_session_failure, metadata_from_fields, split_acks_on_close,
+        ConnectorError, InputEndpoint, MetadataSpec, PendingAcks, RgmidCache, SolaceInputEndpoint,
+        State, acks_ready, classify_connect_failure, is_fatal_error_text, is_flow_failure,
+        is_session_failure, metadata_from_fields, split_acks_on_close,
     };
 
     fn make_config() -> SolaceInputConfig {
@@ -1240,7 +1240,10 @@ mod tests {
     fn rgmid_cache_zero_cap_disables_dedup() {
         let mut cache = RgmidCache::new(0);
         assert!(cache.insert(rgmid(1)));
-        assert!(cache.insert(rgmid(1)), "dedup disabled: every message is new");
+        assert!(
+            cache.insert(rgmid(1)),
+            "dedup disabled: every message is new"
+        );
     }
 
     #[test]
@@ -1283,7 +1286,10 @@ mod tests {
 
         // Frontier passes key 0: both key-0 entries release, key-5 does not.
         assert_eq!(acks_ready(&mut pending, 1), vec![10, 11]);
-        assert!(acks_ready(&mut pending, 5).is_empty(), "key 5 not yet passed");
+        assert!(
+            acks_ready(&mut pending, 5).is_empty(),
+            "key 5 not yet passed"
+        );
         assert_eq!(acks_ready(&mut pending, 6), vec![12]);
     }
 
@@ -1298,7 +1304,10 @@ mod tests {
         let (ready, dropped) = split_acks_on_close(&mut pending, 1, true);
         assert_eq!(ready, vec![10, 11]);
         assert_eq!(dropped, 1);
-        assert!(pending.is_empty(), "uncovered entries are cleared, not kept");
+        assert!(
+            pending.is_empty(),
+            "uncovered entries are cleared, not kept"
+        );
     }
 
     #[test]
@@ -1403,8 +1412,7 @@ mod tests {
     #[test]
     fn metadata_topic_and_pattern_captures() {
         let spec = spec(true, false, Some("demo/events/{region}/{event_type}")).unwrap();
-        let meta =
-            metadata_from_fields(&spec, Some("demo/events/us-east/order"), None).unwrap();
+        let meta = metadata_from_fields(&spec, Some("demo/events/us-east/order"), None).unwrap();
         assert_eq!(
             meta.get_by_name("solace_topic"),
             Some(&string_variant("demo/events/us-east/order"))
@@ -1443,7 +1451,11 @@ mod tests {
         let spec = spec(false, false, Some("{}/mid/{tail}")).unwrap();
         let meta = metadata_from_fields(&spec, Some("val/mid/end"), None).unwrap();
         assert_eq!(meta.get_by_name(""), None, "empty capture name is skipped");
-        assert_eq!(meta.get_by_name("mid"), None, "static segment captures nothing");
+        assert_eq!(
+            meta.get_by_name("mid"),
+            None,
+            "static segment captures nothing"
+        );
         assert_eq!(meta.get_by_name("tail"), Some(&string_variant("end")));
     }
 

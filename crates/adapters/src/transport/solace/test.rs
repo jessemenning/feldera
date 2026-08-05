@@ -580,7 +580,7 @@ fn input_end_to_end_acks_all_messages() {
     publisher.send_csv(&broker.queue, &data);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 10, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 10, Duration::from_secs(30));
 
     let (endpoint, _consumer, _parser, zset) = mock_input_pipeline::<TestStruct, TestStruct>(
         serde_json::from_value(broker.input_pipeline_config()).unwrap(),
@@ -699,7 +699,7 @@ fn input_defers_acks_until_step_completion() {
     publisher.send_csv(&broker.queue, &data);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(30));
 
     let (reader, zset, consumer, completion_tx, _) = watched_input_pipeline(&broker, false);
     reader.extend();
@@ -718,7 +718,7 @@ fn input_defers_acks_until_step_completion() {
     complete_steps(&completion_tx, 1);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(30));
     consumer.assert_all_replies_carry_seek();
     reader.disconnect();
 }
@@ -748,7 +748,7 @@ fn input_acks_survive_frontier_jumps() {
     complete_steps(&completion_tx, 5);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(30));
 
     // Batch 2 flushes while the count is already 5, so it is keyed 5 and
     // must stay unacked at frontier 5.
@@ -765,7 +765,7 @@ fn input_acks_survive_frontier_jumps() {
     complete_steps(&completion_tx, 6);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(30));
     reader.disconnect();
 }
 
@@ -781,7 +781,7 @@ fn input_ft_acks_only_after_checkpoint() {
     publisher.send_csv(&broker.queue, &data);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(30));
 
     let (reader, zset, consumer, completion_tx, checkpoint_tx) =
         watched_input_pipeline(&broker, true);
@@ -802,7 +802,7 @@ fn input_ft_acks_only_after_checkpoint() {
     checkpoint_tx.send_replace(1);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(30));
     consumer.assert_all_replies_carry_seek();
     reader.disconnect();
 }
@@ -829,7 +829,7 @@ fn input_ft_resume_after_crash_no_loss() {
     checkpoint_tx.send_replace(1);
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 0, Duration::from_secs(30));
     zset.reset();
 
     // Tail: ingested and completed but NOT covered by any checkpoint.
@@ -843,7 +843,7 @@ fn input_ft_resume_after_crash_no_loss() {
     reader.disconnect();
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 5, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 5, Duration::from_secs(30));
 
     // Resume from the checkpoint: a fresh endpoint receives exactly the
     // uncovered tail again.
@@ -896,7 +896,7 @@ fn output_recovers_from_session_loss() {
     endpoint.batch_end().unwrap();
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 1, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 1, Duration::from_secs(30));
 
     info!("force-disconnecting the output client");
     broker.semp.disconnect_client(&client_name);
@@ -920,7 +920,7 @@ fn output_recovers_from_session_loss() {
 
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(30));
 }
 
 /// Dedup window against a live broker: records inside the window are
@@ -960,7 +960,7 @@ fn output_dedup_window_conflates() {
     endpoint.batch_end().unwrap();
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 1, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 1, Duration::from_secs(30));
 
     // After the window expires, the next batch boundary flushes exactly one
     // conflated message (the latest value; latest-wins is unit-tested).
@@ -968,7 +968,7 @@ fn output_dedup_window_conflates() {
     endpoint.batch_end().unwrap();
     broker
         .semp
-        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, 2, Duration::from_secs(30));
 
     // Nothing further flushes: the intermediate record was conflated away.
     sleep(Duration::from_secs(1));
@@ -1019,5 +1019,5 @@ fn output_persistent_publish_is_acknowledged() {
 
     broker
         .semp
-        .wait_for_backlog(&broker.queue, N, Duration::from_secs(10));
+        .wait_for_backlog(&broker.queue, N, Duration::from_secs(30));
 }

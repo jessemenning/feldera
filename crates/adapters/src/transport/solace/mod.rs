@@ -65,15 +65,28 @@
 //! Enable with `--features with-solace`. Requires the Solace C SDK installed
 //! on the build host (see `solace-rs` for installation instructions).
 
+use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
+use solace_rs::SolaceLogLevel;
+
 pub mod config;
 pub mod input;
 pub mod output;
-pub mod output_config;
 
 #[cfg(all(test, feature = "solace-integration-test"))]
 mod test;
 
-pub use config::SolaceInputConfig;
 pub use input::SolaceInputEndpoint;
 pub use output::SolaceOutputEndpoint;
-pub use output_config::SolaceOutputConfig;
+
+/// Map the connector's log-level config to the Solace SDK enum, defaulting to
+/// `Warning` when unset.
+fn solace_log_level(cfg: Option<ConfigLogLevel>) -> SolaceLogLevel {
+    match cfg {
+        Some(ConfigLogLevel::Critical) => SolaceLogLevel::Critical,
+        Some(ConfigLogLevel::Error) => SolaceLogLevel::Error,
+        Some(ConfigLogLevel::Warning) | None => SolaceLogLevel::Warning,
+        Some(ConfigLogLevel::Notice) => SolaceLogLevel::Notice,
+        Some(ConfigLogLevel::Info) => SolaceLogLevel::Info,
+        Some(ConfigLogLevel::Debug) => SolaceLogLevel::Debug,
+    }
+}

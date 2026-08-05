@@ -1,5 +1,7 @@
-// Config struct lives in feldera-types so it appears in the OpenAPI schema.
-pub use feldera_types::transport::solace::SolaceInputConfig;
+// Config structs live in feldera-types so they appear in the OpenAPI schema.
+pub use feldera_types::transport::solace::{
+    OutputDeliveryMode, SolaceInputConfig, SolaceOutputConfig,
+};
 
 /// Extract named captures from a Solace destination topic using a pattern.
 ///

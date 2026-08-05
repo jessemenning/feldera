@@ -14,14 +14,13 @@ use feldera_adapterlib::transport::{
 use feldera_sqllib::{SqlString, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
-use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use feldera_types::program_schema::Relation;
 use serde_json::{Value as JsonValue, json};
 use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder, OwnedAsyncFlow};
 use solace_rs::flow::{AckMode, FlowEvent, MessageOutcome};
 use solace_rs::message::{InboundMessage, Message};
 use solace_rs::session::SessionEvent;
-use solace_rs::{Context, SolaceLogLevel};
+use solace_rs::Context;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::watch;
@@ -29,6 +28,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use super::config::SolaceInputConfig;
+use super::solace_log_level;
 
 // ---------------------------------------------------------------------------
 // Endpoint
@@ -46,20 +46,6 @@ impl SolaceInputEndpoint {
         Ok(Self {
             config: Arc::new(config),
         })
-    }
-}
-
-/// Map the connector's log-level config to the Solace SDK enum, defaulting to
-/// `Warning` when unset (a future change can derive this from the global
-/// `log` crate level, matching the Kafka connector).
-fn solace_log_level(cfg: Option<ConfigLogLevel>) -> SolaceLogLevel {
-    match cfg {
-        Some(ConfigLogLevel::Critical) => SolaceLogLevel::Critical,
-        Some(ConfigLogLevel::Error) => SolaceLogLevel::Error,
-        Some(ConfigLogLevel::Warning) | None => SolaceLogLevel::Warning,
-        Some(ConfigLogLevel::Notice) => SolaceLogLevel::Notice,
-        Some(ConfigLogLevel::Info) => SolaceLogLevel::Info,
-        Some(ConfigLogLevel::Debug) => SolaceLogLevel::Debug,
     }
 }
 

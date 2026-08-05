@@ -33,9 +33,16 @@ fn default_dedup_history_size() -> usize {
     100_000
 }
 
+/// Maximum flow window size accepted by the Solace C SDK
+/// (`FLOW_PROP_WINDOWSIZE` is limited to 1..=255).
+const MAX_WINDOW_SIZE: u32 = 255;
+
+/// Upper bound on the RGMID dedup cache to keep its memory footprint sane
+/// (each entry costs roughly 150 bytes, so the cap is ~1.5 GB).
+const MAX_DEDUP_HISTORY_SIZE: usize = 10_000_000;
+
 /// Solace C SDK log level, mirrored here so the connector configuration does
-/// not depend on the `solace-rs` crate.  `None` lets the connector derive the
-/// level from the global `log` crate level.
+/// not depend on the `solace-rs` crate.  `None` defaults to `Warning`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SolaceLogLevel {
@@ -47,16 +54,16 @@ pub enum SolaceLogLevel {
     Debug,
 }
 
-/// Connection settings shared by the Solace input and output connectors.
+/// Validates the connection settings shared by the Solace input and output
+/// connectors.
 ///
-/// Kept as a distinct helper so both configs validate the same way and the
-/// FSM/reconnect knobs stay in one place.  The fields are also spelled out
-/// inline in each config (flat serde keys) for backward compatibility, so
-/// this struct is used only for shared validation logic.
+/// A free function rather than a struct: the fields are spelled out inline in
+/// each config (flat serde keys) for backward compatibility, so only the
+/// validation logic is shared.
 fn validate_common(
     host: &str,
     connect_timeout_secs: u64,
-    retry_interval_secs: u64,
+    reconnect_retries: i64,
     tls: bool,
     ssl_trust_store_dir: &Option<String>,
 ) -> Result<(), String> {
@@ -66,8 +73,8 @@ fn validate_common(
     if connect_timeout_secs == 0 {
         return Err("connect_timeout_secs must be >= 1".into());
     }
-    if retry_interval_secs == 0 {
-        return Err("retry_interval_secs must be >= 1".into());
+    if reconnect_retries < -1 {
+        return Err("reconnect_retries must be >= 0, or -1 to retry forever".into());
     }
     if ssl_trust_store_dir.is_some() && !tls {
         return Err("ssl_trust_store_dir requires tls = true".into());
@@ -83,9 +90,10 @@ fn scheme(tls: bool) -> &'static str {
 ///
 /// Binds to a durable Solace queue over the native SMF protocol (port 55555).
 /// Messages are acknowledged to the broker only after the circuit step that
-/// ingested them has been fully processed (`AckMode::Client` gated on the
-/// completion watcher), giving at-least-once delivery with in-session RGMID
-/// deduplication.
+/// ingested them has been fully processed — or, in a fault-tolerant pipeline,
+/// durably checkpointed — giving at-least-once delivery with in-session RGMID
+/// deduplication.  The queue itself is the resume cursor: on restart the
+/// broker redelivers every unacknowledged message.
 ///
 /// ## Topic decomposition
 ///
@@ -199,7 +207,7 @@ pub struct SolaceInputConfig {
     #[serde(default = "default_retry_interval_secs")]
     pub retry_interval_secs: u64,
 
-    /// Solace SDK log level. `None` derives it from the global `log` level.
+    /// Solace SDK log level (default: `warning`).
     #[serde(default)]
     pub log_level: Option<SolaceLogLevel>,
 }
@@ -242,8 +250,24 @@ impl SolaceInputConfig {
 
     /// Validate the configuration, returning a human-readable error.
     pub fn validate(&self) -> Result<(), String> {
-        if self.window_size == 0 {
-            return Err("window_size must be >= 1".into());
+        if self.window_size == 0 || self.window_size > MAX_WINDOW_SIZE {
+            // Enforced here so an out-of-range window is a config error, not
+            // a bind failure at runtime (the C SDK caps the flow window).
+            return Err(format!("window_size must be in 1..={MAX_WINDOW_SIZE}"));
+        }
+        if let Some(max_unacked) = self.max_unacked {
+            if max_unacked != -1 && max_unacked <= 0 {
+                return Err("max_unacked must be > 0, or -1 for no limit".into());
+            }
+        }
+        if self.dedup_history_size > MAX_DEDUP_HISTORY_SIZE {
+            return Err(format!(
+                "dedup_history_size must be <= {MAX_DEDUP_HISTORY_SIZE} \
+                 (each entry costs roughly 150 bytes of memory)"
+            ));
+        }
+        if self.retry_interval_secs == 0 {
+            return Err("retry_interval_secs must be >= 1".into());
         }
         if self.username.trim().is_empty() {
             return Err("username must not be empty".into());
@@ -254,7 +278,7 @@ impl SolaceInputConfig {
         validate_common(
             &self.host,
             self.connect_timeout_secs,
-            self.retry_interval_secs,
+            self.reconnect_retries,
             self.tls,
             &self.ssl_trust_store_dir,
         )
@@ -355,7 +379,7 @@ pub struct SolaceOutputConfig {
     #[serde(default = "default_reconnect_retry_wait_ms")]
     pub reconnect_retry_wait_ms: u64,
 
-    /// Solace SDK log level. `None` derives it from the global `log` level.
+    /// Solace SDK log level (default: `warning`).
     #[serde(default)]
     pub log_level: Option<SolaceLogLevel>,
 }
@@ -411,12 +435,15 @@ impl SolaceOutputConfig {
         if self.ack_timeout_secs == 0 {
             return Err("ack_timeout_secs must be >= 1".into());
         }
+        if self.max_inflight_acks == 0 {
+            // 0 would silently degrade to one blocking broker round-trip per
+            // message — a latency cliff, not a meaningful configuration.
+            return Err("max_inflight_acks must be >= 1".into());
+        }
         validate_common(
             &self.host,
             self.connect_timeout_secs,
-            // Output has no connector-level retry loop; reuse connect timeout
-            // as the retry sentinel so the shared check passes.
-            self.connect_timeout_secs,
+            self.reconnect_retries,
             self.tls,
             &self.ssl_trust_store_dir,
         )
@@ -522,10 +549,70 @@ mod tests {
     }
 
     #[test]
+    fn input_validate_rejects_oversized_window() {
+        // The C SDK caps FLOW_PROP_WINDOWSIZE at 255; larger values must be a
+        // config error, not a bind failure at runtime.
+        let mut cfg = input_cfg("h", 55555);
+        cfg.window_size = 256;
+        assert!(cfg.validate().is_err());
+        cfg.window_size = 255;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn input_validate_max_unacked_bounds() {
+        let mut cfg = input_cfg("h", 55555);
+        cfg.max_unacked = Some(-1);
+        assert!(cfg.validate().is_ok(), "-1 means no limit");
+        cfg.max_unacked = Some(100);
+        assert!(cfg.validate().is_ok());
+        cfg.max_unacked = Some(0);
+        assert!(cfg.validate().is_err());
+        cfg.max_unacked = Some(-5);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn input_validate_rejects_oversized_dedup_history() {
+        let mut cfg = input_cfg("h", 55555);
+        cfg.dedup_history_size = 10_000_001;
+        assert!(cfg.validate().is_err());
+        cfg.dedup_history_size = 0;
+        assert!(cfg.validate().is_ok(), "0 disables dedup");
+    }
+
+    #[test]
+    fn validate_rejects_bad_reconnect_retries() {
+        let mut input = input_cfg("h", 55555);
+        input.reconnect_retries = -5;
+        assert!(input.validate().is_err(), "-5 is not a retry count");
+        input.reconnect_retries = -1;
+        assert!(input.validate().is_ok(), "-1 means retry forever");
+
+        let mut output = output_cfg("h", 55555);
+        output.reconnect_retries = -5;
+        assert!(output.validate().is_err());
+    }
+
+    #[test]
     fn output_validate_rejects_empty_topic() {
         let mut cfg = output_cfg("h", 55555);
         cfg.topic = "".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn output_validate_rejects_zero_ack_knobs() {
+        let mut cfg = output_cfg("h", 55555);
+        cfg.ack_timeout_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = output_cfg("h", 55555);
+        cfg.max_inflight_acks = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "0 would mean one blocking round-trip per message"
+        );
     }
 
     // --- serde defaults ---

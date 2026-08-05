@@ -5,28 +5,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Error as AnyError, Result as AnyResult, bail};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
-use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use solace_rs::async_support::AsyncSessionBuilder;
 use solace_rs::message::{DeliveryMode, DestinationType, MessageDestination, OutboundMessageBuilder};
 use solace_rs::session::SessionEvent;
-use solace_rs::{Context, SessionError, SolaceLogLevel};
+use solace_rs::{Context, SessionError};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use super::output_config::{OutputDeliveryMode, SolaceOutputConfig};
-
-/// Map the connector's log-level config to the Solace SDK enum (default
-/// `Warning`).
-fn solace_log_level(cfg: Option<ConfigLogLevel>) -> SolaceLogLevel {
-    match cfg {
-        Some(ConfigLogLevel::Critical) => SolaceLogLevel::Critical,
-        Some(ConfigLogLevel::Error) => SolaceLogLevel::Error,
-        Some(ConfigLogLevel::Warning) | None => SolaceLogLevel::Warning,
-        Some(ConfigLogLevel::Notice) => SolaceLogLevel::Notice,
-        Some(ConfigLogLevel::Info) => SolaceLogLevel::Info,
-        Some(ConfigLogLevel::Debug) => SolaceLogLevel::Debug,
-    }
-}
+use super::config::{OutputDeliveryMode, SolaceOutputConfig};
+use super::solace_log_level;
 
 // ---------------------------------------------------------------------------
 // Endpoint

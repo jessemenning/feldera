@@ -55,21 +55,6 @@ jobs:
       - name: Clippy (with-solace)
         run: cargo clippy --locked -p dbsp_adapters --no-default-features --features with-solace --lib -- -D warnings
 
-      # Default-feature check: catches breakage in code paths that the
-      # --no-default-features builds above never compile (an avro break
-      # shipped through exactly this hole).  Needs the native deps that
-      # rdkafka/postgres pull in.
-      - name: Install system dependencies for default features
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libssl-dev pkg-config libclang-dev \
-            libsasl2-dev libzstd-dev zlib1g-dev \
-            cmake build-essential
-
-      - name: Check adapters crate with default features
-        run: cargo check --locked -p dbsp_adapters
-
       # Compile (but do not run) the broker-gated integration tests so they
       # cannot rot: running them needs a live Solace Platform broker
       # (see transport/solace/test.rs).
@@ -92,6 +77,30 @@ jobs:
       # Solace Platform broker.
       - name: Test Solace transport
         run: cargo test --locked -p dbsp_adapters --no-default-features --features with-solace --lib transport::solace
+
+      # Default-feature check: catches breakage in code paths that the
+      # --no-default-features builds above never compile (an avro break
+      # shipped through exactly this hole).  Needs the native deps that
+      # rdkafka/postgres pull in.
+      #
+      # Runs LAST and on stable, not the 1.94.1 pin: the postgres-cdc etl
+      # crates require rustc >= 1.95, and the dbsp ICE that forces the pin
+      # only affects `cargo test` codegen (backend-mode), never
+      # `cargo check`.  Installing stable changes the default toolchain, so
+      # every 1.94.1 step must come before this one.
+      - name: Install system dependencies for default features
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libssl-dev pkg-config libclang-dev \
+            libsasl2-dev libzstd-dev zlib1g-dev \
+            cmake build-essential
+
+      - name: Install Rust stable (default-feature check only)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check adapters crate with default features
+        run: cargo +stable check --locked -p dbsp_adapters
 
   build-image:
     name: Build and Push Docker Image

@@ -4,12 +4,21 @@
 //!
 //! Binds to a durable Solace queue via `solace-rs` (Solace C SDK wrapper).
 //! Uses `AckMode::Client`: a message is acknowledged to the broker only after
-//! the circuit step that ingested it has been fully processed, tracked via
-//! `checkpoint_watcher()` when the pipeline is fault-tolerant, otherwise
-//! `completion_watcher()`. This gives at-least-once delivery — a crash before
+//! the circuit step that ingested it has been fully processed.  The release
+//! frontier is the checkpoint watcher in a fault-tolerant pipeline (acks wait
+//! for a durable checkpoint covering the step) and the in-memory completion
+//! watcher otherwise.  This gives at-least-once delivery — a crash before
 //! step completion leaves the message unacked, so the broker redelivers it —
 //! with in-session RGMID deduplication of those redeliveries. Acks are drained
 //! from a dedicated task branch so they never block the circuit's step loop.
+//!
+//! The endpoint declares `FtModel::AtLeastOnce`: the durable queue is the
+//! resume cursor, so checkpoint/suspend/resume need no seek metadata — on
+//! resume the broker redelivers every unacked message.  Redeliveries of
+//! messages that were ingested but not yet acked at suspend time appear as
+//! duplicates after a resume (the RGMID cache is session-scoped); a future
+//! enhancement could persist a bounded RGMID tail in the checkpoint to
+//! suppress them.
 //!
 //! Hierarchical topic decomposition: configure `topic_pattern` (e.g.
 //! `"demo/events/{region}/{event_type}"`) and the connector automatically

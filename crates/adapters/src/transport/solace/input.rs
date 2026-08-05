@@ -8,14 +8,15 @@ use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::ConnectorMetadata;
 use feldera_adapterlib::format::Parser;
 use feldera_adapterlib::transport::{
-    InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand, TransportInputEndpoint,
+    InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand, Resume,
+    TransportInputEndpoint,
 };
 use feldera_sqllib::{SqlString, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
 use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
 use feldera_types::program_schema::Relation;
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder, OwnedAsyncFlow};
 use solace_rs::flow::{AckMode, FlowEvent, MessageOutcome};
 use solace_rs::message::{InboundMessage, Message};
@@ -63,12 +64,15 @@ fn solace_log_level(cfg: Option<ConfigLogLevel>) -> SolaceLogLevel {
 }
 
 impl InputEndpoint for SolaceInputEndpoint {
-    /// No fault tolerance is declared yet: the connector does not participate
-    /// in checkpoint/replay.  Delivery is at-least-once relative to circuit
-    /// step completion (see [`background_task`]); a future phase may return
-    /// `Some(FtModel::AtLeastOnce)` once resume metadata is wired through.
+    /// At-least-once: the durable queue is the resume cursor.  Messages are
+    /// acked only after the step that ingested them is complete (or, in a
+    /// fault-tolerant pipeline, durably checkpointed — see
+    /// [`background_task`]), so a crash or suspend leaves the unacked tail on
+    /// the broker for redelivery.  Redeliveries of already-ingested messages
+    /// can appear as duplicates after a resume, which at-least-once permits.
+    /// Exactly-once is not supported: the connector cannot replay a step.
     fn fault_tolerance(&self) -> Option<FtModel> {
-        None
+        Some(FtModel::AtLeastOnce)
     }
 }
 
@@ -78,6 +82,10 @@ impl TransportInputEndpoint for SolaceInputEndpoint {
         consumer: Box<dyn InputConsumer>,
         parser: Box<dyn Parser>,
         _schema: Relation,
+        // Deliberately unused: a durable queue has no seekable offset — the
+        // queue itself is the cursor.  On resume the broker redelivers every
+        // unacked message to the fresh flow, so there is no position to
+        // restore from checkpoint metadata.
         _resume_info: Option<JsonValue>,
     ) -> AnyResult<Box<dyn InputReader>> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -172,18 +180,20 @@ impl RgmidCache {
 
 /// Message acknowledgments awaiting circuit-step completion.
 ///
-/// Each entry is `(step, msg_ids)`: the broker message IDs handed to the
-/// circuit in step `step`.  They are acked once the step is fully processed
-/// (see [`acks_ready`]).
+/// Each entry is `(step_at_flush, msg_ids)`: the broker message IDs flushed
+/// to the circuit while the completed-step count was `step_at_flush`.  The
+/// flushed data lands in a step that completes only after that count is
+/// exceeded, so the IDs are acked once the release frontier passes it (see
+/// [`acks_ready`]).
 type PendingAcks = VecDeque<(u64, Vec<u64>)>;
 
 /// Removes and returns the msg_ids whose ingesting step is now complete.
 ///
-/// A record ingested in step `s` is fully processed once the completion
-/// count exceeds `s` (`total_completed_steps` is a count, so the last
-/// complete step is `completed - 1`).  Entries are ordered by step, so this
-/// pops from the front while the front step is complete.  Pure function to
-/// keep the drain logic unit-testable.
+/// An entry keyed `s` was flushed when the completed-step count was `s`, so
+/// its data landed in a step that completes only once the frontier exceeds
+/// `s`.  Entries are keyed in non-decreasing order (the count is monotonic),
+/// so this pops from the front while the front key is passed.  Pure function
+/// to keep the drain logic unit-testable.
 fn acks_ready(pending: &mut PendingAcks, completed: u64) -> Vec<u64> {
     let mut ready = Vec::new();
     while let Some((step, _)) = pending.front() {
@@ -197,11 +207,41 @@ fn acks_ready(pending: &mut PendingAcks, completed: u64) -> Vec<u64> {
     ready
 }
 
-/// Source of the "steps completed" signal used to release deferred acks.
+/// Partitions pending acks at close time (clean shutdown or lost watcher).
 ///
-/// Prefers the checkpoint watcher (durable) when the pipeline is
-/// fault-tolerant; otherwise falls back to the completion watcher (in-memory
-/// step completion).
+/// Non-strict (step-completion) mode releases everything: there is no durable
+/// state to resume from, so holding acks back only forces pointless
+/// redelivery.  Strict (checkpoint) mode releases only the entries covered by
+/// the last durable checkpoint (`frontier`); the rest are dropped *unacked*
+/// so the broker redelivers them after a resume from that checkpoint — acking
+/// them would lose their data if the pipeline resumes from an older state.
+///
+/// Returns the IDs to ack and the count left unacked.  Pure function to keep
+/// the close logic unit-testable.
+fn split_acks_on_close(
+    pending: &mut PendingAcks,
+    frontier: u64,
+    strict: bool,
+) -> (Vec<u64>, usize) {
+    if strict {
+        let ready = acks_ready(pending, frontier);
+        let dropped = pending.iter().map(|(_, ids)| ids.len()).sum();
+        pending.clear();
+        (ready, dropped)
+    } else {
+        (pending.drain(..).flat_map(|(_, ids)| ids).collect(), 0)
+    }
+}
+
+/// Source of the release frontier used to free deferred acks.
+///
+/// A fault-tolerant pipeline supplies a checkpoint watcher; acks are then
+/// released only once a durable checkpoint covers the ingesting step, so a
+/// resume from that checkpoint cannot lose acked messages.  Otherwise the
+/// completion watcher (in-memory step completion) releases acks as soon as
+/// the step's outputs are fully processed.  Both watchers carry the same
+/// units — a count of steps, where value `n` covers steps `0..n` — so
+/// [`acks_ready`]'s comparison works unchanged for either.
 enum CompletionSource {
     Checkpoint(watch::Receiver<u64>),
     Completion(watch::Receiver<Completion>),
@@ -214,6 +254,14 @@ impl CompletionSource {
         } else {
             consumer.completion_watcher().map(CompletionSource::Completion)
         }
+    }
+
+    /// Whether acks are gated on durable checkpoints rather than in-memory
+    /// step completion.  Strict mode changes close-time behavior: uncovered
+    /// acks are dropped for redelivery instead of flushed (see
+    /// [`split_acks_on_close`]).
+    fn is_strict(&self) -> bool {
+        matches!(self, CompletionSource::Checkpoint(_))
     }
 
     fn completed(&self) -> u64 {
@@ -298,8 +346,14 @@ fn is_fatal_error_text(text: &str) -> bool {
 }
 
 /// Classifies a connection-attempt failure as fatal or retryable.
-fn classify_connect_failure(err: anyhow::Error) -> ConnectorError {
-    if is_fatal_error_text(&format!("{err:#}")) {
+///
+/// Only the SDK error text is matched, never `context`: context strings embed
+/// operator-supplied names (e.g. the queue name), and a queue named
+/// "queue-not-found-test" must not turn every bind failure fatal.
+fn classify_connect_failure(context: String, sdk_error: String) -> ConnectorError {
+    let fatal = is_fatal_error_text(&sdk_error);
+    let err = anyhow::anyhow!("{context}: {sdk_error}");
+    if fatal {
         ConnectorError::Fatal(err)
     } else {
         ConnectorError::Retryable(err)
@@ -352,7 +406,7 @@ fn connect_blocking(
 
     let session = builder
         .build()
-        .map_err(|e| classify_connect_failure(anyhow::anyhow!("session connect: {e}")))?;
+        .map_err(|e| classify_connect_failure("session connect".into(), format!("{e}")))?;
 
     // The flow is created stopped; it is started on `Extend`.
     let flow = session
@@ -363,10 +417,10 @@ fn connect_blocking(
             config.max_unacked,
         )
         .map_err(|e| {
-            classify_connect_failure(anyhow::anyhow!(
-                "flow bind to queue {}: {e}",
-                config.queue
-            ))
+            classify_connect_failure(
+                format!("flow bind to queue {}", config.queue),
+                format!("{e}"),
+            )
         })?;
 
     Ok(Connection { session, flow })
@@ -449,8 +503,19 @@ async fn background_task(
     // the circuit could never fire.  Replying to Queue immediately and acking
     // asynchronously avoids that deadlock.
     let mut pending: PendingAcks = PendingAcks::new();
-    let mut step: u64 = 0;
     let mut completion = CompletionSource::from_consumer(&*consumer);
+    // Whether close-time acks are gated on durable checkpoints (see
+    // `split_acks_on_close`).  Captured once: the source's kind never changes.
+    let strict_acks = completion.as_ref().is_some_and(CompletionSource::is_strict);
+    // The last frontier observed from the completion source, used to release
+    // covered acks at close when the source itself is already gone.
+    let mut last_frontier: u64 = completion.as_ref().map_or(0, CompletionSource::completed);
+    // Snapshot source for keying pending acks at flush time.  This is always
+    // the step-completion count, even when the *release* frontier is the
+    // checkpoint watcher: pending entries are keyed by the step they were
+    // ingested in, and released when the frontier (completed or checkpointed
+    // steps — same units) passes that step.
+    let step_rx = consumer.completion_watcher();
     // Without a completion source we cannot know when a step is done, so fall
     // back to acking immediately after hand-off (at-most-once for in-flight
     // records).  In a normal pipeline the completion watcher is always present.
@@ -482,7 +547,7 @@ async fn background_task(
                     Some(InputReaderCommand::Queue { .. }) => {
                         handle_queue_command(
                             &queue, &*consumer, None,
-                            &mut pending, &mut step, defer_acks,
+                            &mut pending, step_rx.as_ref(), defer_acks,
                         );
                     }
                     Some(c) => {
@@ -546,7 +611,7 @@ async fn background_task(
                 Some(InputReaderCommand::Queue { .. }) => {
                     handle_queue_command(
                         &queue, &*consumer, Some(&conn.flow),
-                        &mut pending, &mut step, defer_acks,
+                        &mut pending, step_rx.as_ref(), defer_acks,
                     );
                     None
                 }
@@ -559,10 +624,26 @@ async fn background_task(
 
             completed = wait_completion(&mut completion) => {
                 match completed {
-                    Some(c) => ack_completed(&mut pending, c, &conn.flow),
+                    Some(c) => {
+                        last_frontier = c;
+                        ack_completed(&mut pending, c, &conn.flow);
+                    }
                     None => {
-                        completion = None;
-                        flush_all_acks(&mut pending, &conn.flow);
+                        // Watcher sender dropped: the pipeline is shutting
+                        // down.  Read the final frontier and release only
+                        // what it covers (everything, in non-strict mode).
+                        if let Some(src) = completion.take() {
+                            last_frontier = src.completed();
+                        }
+                        let (ready, dropped) =
+                            split_acks_on_close(&mut pending, last_frontier, strict_acks);
+                        ack_ids(ready, &conn.flow);
+                        if dropped > 0 {
+                            info!(
+                                "Leaving {dropped} message(s) unacked beyond the last \
+                                 checkpoint; the broker redelivers them after resume"
+                            );
+                        }
                     }
                 }
                 None
@@ -621,10 +702,23 @@ async fn background_task(
         }
     }
 
-    // Ack anything still pending on a clean shutdown so the broker window is
-    // released rather than waiting for redelivery.
+    // On a clean shutdown, ack what the release frontier covers so the broker
+    // window is freed rather than waiting for redelivery.  In strict mode the
+    // uncovered tail stays unacked: those messages are not yet in a durable
+    // checkpoint, and a resume from the last checkpoint must be able to
+    // re-ingest them.
     if let Some(conn) = connection.take() {
-        flush_all_acks(&mut pending, &conn.flow);
+        if let Some(src) = &completion {
+            last_frontier = src.completed();
+        }
+        let (ready, dropped) = split_acks_on_close(&mut pending, last_frontier, strict_acks);
+        ack_ids(ready, &conn.flow);
+        if dropped > 0 {
+            info!(
+                "Leaving {dropped} message(s) unacked beyond the last checkpoint; \
+                 the broker redelivers them after resume"
+            );
+        }
         teardown(conn).await;
     }
     info!("Solace background task exiting");
@@ -633,11 +727,19 @@ async fn background_task(
 /// Flush the input queue into the circuit and route the flushed messages'
 /// broker IDs to the ack path.
 ///
-/// The controller sends exactly one `Queue` per step to every endpoint
-/// regardless of pause or connection state, so every caller must flush (and
-/// account for the returned msg_ids) or acks would leak while the connector
-/// is backpressured.  `step` is incremented on every call so it always
-/// mirrors the controller's step number.
+/// The controller sends exactly one `Queue` per step to every endpoint it
+/// polls, regardless of pause or connection state, so every caller must flush
+/// (and account for the returned msg_ids) or acks would leak while the
+/// connector is backpressured.
+///
+/// Pending acks are keyed by the completed-step count snapshotted *after* the
+/// flush: the flushed data lands in a step that completes only once the count
+/// exceeds this value, so it is the correct release key even when the
+/// controller skipped this endpoint for some steps (checkpoint-barrier or
+/// transaction-commit steps poll barrier endpoints only).  A local per-Queue
+/// counter would drift behind the controller in exactly those cases and
+/// release acks one step early — silently downgrading at-least-once to
+/// at-most-once.
 ///
 /// With `flow: None` (disconnected) the msg_ids are discarded: they belong to
 /// a dead flow and cannot be acked, so the broker redelivers those messages
@@ -647,12 +749,19 @@ fn handle_queue_command(
     consumer: &dyn InputConsumer,
     flow: Option<&OwnedAsyncFlow>,
     pending: &mut PendingAcks,
-    step: &mut u64,
+    step_rx: Option<&watch::Receiver<Completion>>,
     defer_acks: bool,
 ) {
     let (buffer_size, _hasher, aux_vec) = queue.flush_with_aux();
-    // Reply immediately so the controller's step never stalls.
-    consumer.extended(buffer_size, None, vec![]);
+    let step_at_flush = step_rx.map_or(0, |rx| rx.borrow().total_completed_steps);
+
+    // Reply immediately so the controller's step never stalls.  `Resume::Seek`
+    // is passed unconditionally: the durable queue is the resume cursor
+    // (unacked messages redeliver on rebind), so the seek metadata is empty,
+    // and both checkpointing and suspend need *some* resume value from every
+    // step — `None` would panic the checkpoint builder and `Barrier` would
+    // block checkpoints whenever this endpoint has pending input.
+    consumer.extended(buffer_size, Some(Resume::Seek { seek: json!({}) }), vec![]);
 
     let msg_ids: Vec<u64> = aux_vec.into_iter().map(|(_, id)| id).collect();
     match flow {
@@ -663,42 +772,32 @@ fn handle_queue_command(
         }
         Some(_) if defer_acks => {
             if !msg_ids.is_empty() {
-                pending.push_back((*step, msg_ids));
+                pending.push_back((step_at_flush, msg_ids));
             }
         }
         Some(flow) => {
             // No completion source: ack on hand-off (at-most-once fallback).
-            for id in msg_ids {
-                if let Err(e) = flow.ack(id) {
-                    warn!("flow.ack({id}) failed: {e}");
-                }
-            }
+            ack_ids(msg_ids, flow);
         }
     }
-    *step += 1;
 }
 
 /// Ack every message whose ingesting step is complete.
 fn ack_completed(pending: &mut PendingAcks, completed: u64, flow: &OwnedAsyncFlow) {
     let ready = acks_ready(pending, completed);
     let n = ready.len();
-    for id in ready {
-        if let Err(e) = flow.ack(id) {
-            warn!("flow.ack({id}) failed: {e}");
-        }
-    }
+    ack_ids(ready, flow);
     if n > 0 {
         debug!("Acked {n} messages after step completion");
     }
 }
 
-/// Ack all pending messages regardless of step (clean shutdown / lost watcher).
-fn flush_all_acks(pending: &mut PendingAcks, flow: &OwnedAsyncFlow) {
-    for (_, ids) in pending.drain(..) {
-        for id in ids {
-            if let Err(e) = flow.ack(id) {
-                warn!("flow.ack({id}) failed: {e}");
-            }
+/// Acks each ID, logging (but not escalating) failures: a failed ack only
+/// means the broker redelivers the message.
+fn ack_ids(ids: Vec<u64>, flow: &OwnedAsyncFlow) {
+    for id in ids {
+        if let Err(e) = flow.ack(id) {
+            warn!("flow.ack({id}) failed: {e}");
         }
     }
 }
@@ -869,12 +968,19 @@ fn handle_non_queue_command(
     match command {
         InputReaderCommand::Queue { .. } => {
             // Unreachable — caller dispatches Queue to handle_queue_command.
+            // Swallowing a Queue here would leave the controller waiting
+            // forever for extended(), stalling the step, so fail loudly in
+            // debug builds.
+            debug_assert!(false, "handle_non_queue_command received Queue");
             warn!("handle_non_queue_command received Queue — this is a bug");
             None
         }
 
         InputReaderCommand::Replay { .. } => {
-            warn!("Replay issued to non-FT Solace connector — ignoring");
+            // Unreachable: replay is issued only to exactly-once endpoints
+            // (the journal machinery exists only for FtModel::ExactlyOnce),
+            // and this connector declares AtLeastOnce.
+            warn!("Replay issued to at-least-once Solace connector — ignoring");
             None
         }
 
@@ -928,7 +1034,7 @@ mod tests {
     use super::{
         ConnectorError, InputEndpoint, PendingAcks, RgmidCache, SolaceInputEndpoint, State,
         acks_ready, classify_connect_failure, is_fatal_error_text, is_flow_failure,
-        is_session_failure,
+        is_session_failure, split_acks_on_close,
     };
 
     fn make_config() -> SolaceInputConfig {
@@ -946,9 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn fault_tolerance_is_none() {
+    fn fault_tolerance_is_at_least_once() {
+        // The durable queue is the resume cursor: unacked messages redeliver
+        // on rebind, so the connector can resume after any step (with
+        // duplicates possible) but cannot replay a step exactly.
         let ep = SolaceInputEndpoint::new(make_config()).expect("valid config");
-        assert_eq!(ep.fault_tolerance(), None::<FtModel>);
+        assert_eq!(ep.fault_tolerance(), Some(FtModel::AtLeastOnce));
     }
 
     #[test]
@@ -1021,6 +1130,53 @@ mod tests {
     }
 
     #[test]
+    fn acks_ready_handles_frontier_gaps_and_equal_keys() {
+        // Keys are snapshots of the completed-step count at flush time.  When
+        // the controller skips this endpoint for some steps (checkpoint
+        // barriers, transaction commits), the count jumps and later entries
+        // carry gapped keys; two flushes between completions carry equal
+        // keys.  Both must release exactly when the frontier passes them —
+        // this is the drift scenario the old per-Queue counter got wrong.
+        let mut pending: PendingAcks = PendingAcks::new();
+        pending.push_back((0, vec![10]));
+        pending.push_back((0, vec![11])); // second flush before any completion
+        pending.push_back((5, vec![12])); // flushed after a frontier jump
+
+        // Frontier passes key 0: both key-0 entries release, key-5 does not.
+        assert_eq!(acks_ready(&mut pending, 1), vec![10, 11]);
+        assert!(acks_ready(&mut pending, 5).is_empty(), "key 5 not yet passed");
+        assert_eq!(acks_ready(&mut pending, 6), vec![12]);
+    }
+
+    #[test]
+    fn split_acks_on_close_strict_releases_only_covered() {
+        let mut pending: PendingAcks = PendingAcks::new();
+        pending.push_back((0, vec![10, 11]));
+        pending.push_back((3, vec![12]));
+
+        // Checkpoint frontier 1 covers key 0 only; key 3 is dropped unacked
+        // so the broker redelivers it after a resume from that checkpoint.
+        let (ready, dropped) = split_acks_on_close(&mut pending, 1, true);
+        assert_eq!(ready, vec![10, 11]);
+        assert_eq!(dropped, 1);
+        assert!(pending.is_empty(), "uncovered entries are cleared, not kept");
+    }
+
+    #[test]
+    fn split_acks_on_close_non_strict_releases_everything() {
+        let mut pending: PendingAcks = PendingAcks::new();
+        pending.push_back((0, vec![10]));
+        pending.push_back((7, vec![11, 12]));
+
+        // Without durable checkpoints there is nothing to resume from, so
+        // holding acks back would only force pointless redelivery.
+        let (ready, dropped) = split_acks_on_close(&mut pending, 0, false);
+        assert_eq!(ready, vec![10, 11, 12]);
+        assert_eq!(dropped, 0);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn fatal_error_texts_are_recognized() {
         // Case-insensitive substring matches on SDK error strings.
         assert!(is_fatal_error_text("subcode: 3 string: Login Failure"));
@@ -1043,11 +1199,24 @@ mod tests {
     #[test]
     fn classify_connect_failure_splits_fatal_and_retryable() {
         assert!(matches!(
-            classify_connect_failure(anyhow::anyhow!("session connect: Login Failure")),
+            classify_connect_failure("session connect".into(), "Login Failure".into()),
             ConnectorError::Fatal(_)
         ));
         assert!(matches!(
-            classify_connect_failure(anyhow::anyhow!("session connect: Unresolved host")),
+            classify_connect_failure("session connect".into(), "Unresolved host".into()),
+            ConnectorError::Retryable(_)
+        ));
+    }
+
+    #[test]
+    fn classify_connect_failure_ignores_fatal_markers_in_context() {
+        // The context embeds operator-supplied names; a queue literally named
+        // "queue-not-found-test" must not make a transient bind failure fatal.
+        assert!(matches!(
+            classify_connect_failure(
+                "flow bind to queue queue-not-found-test".into(),
+                "Timeout while connecting".into(),
+            ),
             ConnectorError::Retryable(_)
         ));
     }

@@ -223,8 +223,10 @@ impl SolaceOutputEndpoint {
             let remaining = deadline.saturating_duration_since(Instant::now());
             // The endpoint runs on a dedicated OS thread (no ambient runtime),
             // so blocking on the shared runtime here is safe — the same
-            // reasoning that made the previous `blocking_recv()` legal.
-            match TOKIO.block_on(tokio::time::timeout(remaining, rx)) {
+            // reasoning that made the previous `blocking_recv()` legal.  The
+            // timeout must be constructed *inside* the async block: its timer
+            // registration needs the runtime context.
+            match TOKIO.block_on(async { tokio::time::timeout(remaining, rx).await }) {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(e))) => {
                     return Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}"));

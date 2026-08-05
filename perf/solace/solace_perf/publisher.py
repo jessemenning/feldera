@@ -48,11 +48,14 @@ class PublisherStats:
         return self.published / d if d > 0 else 0.0
 
 
-def _build_payload(seq: int, pad: str) -> bytes:
+def _build_payload(seq: int, pad: str) -> bytearray:
+    # The message builder accepts a bytearray or str, not bytes; a bytearray
+    # produces the binary attachment the Feldera connector reads via
+    # get_payload() (a str would create an empty-attachment SDT text message).
     msg = {"seq": seq, "send_ts_ms": int(time.time() * 1000)}
     if pad:
         msg["pad"] = pad
-    return json.dumps(msg).encode()
+    return bytearray(json.dumps(msg).encode())
 
 
 def _compute_pad(payload_bytes: int) -> str:

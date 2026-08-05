@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "run": {
+    "label": "drain-pre",
+    "started_at": "2026-08-05T17:43:52.878104+00:00",
+    "git_sha": "2be48bc51",
+    "feldera_image": "ghcr.io/jessemenning/feldera:a4883be8c8c28a08b23616658feea033545a246f",
+    "solace_tag": "10.10",
+    "host": "JesseMenning"
+  },
+  "params": {
+    "rate": 5000,
+    "duration_s": 60,
+    "payload_bytes": 0,
+    "publishers": 4,
+    "window_size": 255,
+    "delivery_mode": "direct",
+    "with_sink": true,
+    "preload": true,
+    "pipeline_workers": 4,
+    "poll_interval_s": 1.0
+  },
+  "publish": {
+    "attempted": 300000,
+    "published": 300000,
+    "errors": 0,
+    "duration_s": 208.25,
+    "achieved_rate": 1440.6,
+    "max_pacing_deficit_ms": 116981.2
+  },
+  "throughput": {
+    "steady_ingest_rate_mean": null,
+    "steady_ingest_rate_max": null,
+    "drain_rate": 36867.2
+  },
+  "latency_e2e_ms": {
+    "count": 0
+  },
+  "visible_lag_ms": {
+    "avg": 44669.2,
+    "median": 41023.0,
+    "max": 58761
+  },
+  "catch_up_s": {
+    "processed": 7.01,
+    "mv3": 7.01,
+    "echo": null
+  },
+  "backlog": {
+    "q_backlog_max": 265324,
+    "buffered_input_records_max": 581
+  },
+  "checks": {
+    "input_records_match": true,
+    "seq_gaps": null,
+    "termination": "complete"
+  },
+  "samples": [
+    {
+      "t": 1.0,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 33918,
+      "buffered_input_records": 383,
+      "total_processed_records": 33535,
+      "ingest_rate": 0.0,
+      "echo_received": -1,
+      "q_backlog": 265324,
+      "q_delta": 0,
+      "mv3_ms": 187,
+      "mv3_total": 35725,
+      "visible_lag_ms": 179227
+    },
+    {
+      "t": 2.0,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 66372,
+      "buffered_input_records": 0,
+      "total_processed_records": 66372,
+      "ingest_rate": 32810.1,
+      "echo_received": -1,
+      "q_backlog": 232645,
+      "q_delta": -32679,
+      "mv3_ms": 5,
+      "mv3_total": 68405,
+      "visible_lag_ms": 162366
+    },
+    {
+      "t": 3.0,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 111094,
+      "buffered_input_records": 581,
+      "total_processed_records": 110513,
+      "ingest_rate": 44091.1,
+      "echo_received": -1,
+      "q_backlog": 187775,
+      "q_delta": -44870,
+      "mv3_ms": 6,
+      "mv3_total": 113162,
+      "visible_lag_ms": 136897
+    },
+    {
+      "t": 4.0,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 152729,
+      "buffered_input_records": 127,
+      "total_processed_records": 152119,
+      "ingest_rate": 41564.2,
+      "echo_received": -1,
+      "q_backlog": 145893,
+      "q_delta": -41882,
+      "mv3_ms": 7,
+      "mv3_total": 154107,
+      "visible_lag_ms": 106427
+    },
+    {
+      "t": 5.0,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 194429,
+      "buffered_input_records": 93,
+      "total_processed_records": 194336,
+      "ingest_rate": 42186.2,
+      "echo_received": -1,
+      "q_backlog": 104366,
+      "q_delta": -41527,
+      "mv3_ms": 5,
+      "mv3_total": 196084,
+      "visible_lag_ms": 58761
+    },
+    {
+      "t": 6.01,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 235135,
+      "buffered_input_records": 83,
+      "total_processed_records": 235052,
+      "ingest_rate": 40676.8,
+      "echo_received": -1,
+      "q_backlog": 63287,
+      "q_delta": -41079,
+      "mv3_ms": 4,
+      "mv3_total": 237102,
+      "visible_lag_ms": 43160
+    },
+    {
+      "t": 7.01,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 277899,
+      "buffered_input_records": 246,
+      "total_processed_records": 277653,
+      "ingest_rate": 42559.7,
+      "echo_received": -1,
+      "q_backlog": 21331,
+      "q_delta": -41956,
+      "mv3_ms": 5,
+      "mv3_total": 279777,
+      "visible_lag_ms": 37870
+    },
+    {
+      "t": 8.01,
+      "phase": "CATCH-UP",
+      "pub_sent": 300000,
+      "total_input_records": 300000,
+      "buffered_input_records": 0,
+      "total_processed_records": 300000,
+      "ingest_rate": 22331.8,
+      "echo_received": -1,
+      "q_backlog": 511,
+      "q_delta": -20820,
+      "mv3_ms": 4,
+      "mv3_total": 300000,
+      "visible_lag_ms": 38886
+    }
+  ]
+}

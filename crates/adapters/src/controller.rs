@@ -7484,6 +7484,25 @@ impl ControllerInner {
         endpoint_config: &OutputEndpointConfig,
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
     ) -> Result<EndpointId, ControllerError> {
+        // A Solace `{field}` topic template is resolved from JSON-encoded
+        // records, so it is incompatible with any other output format; the
+        // transport factory below cannot see the format config, so check the
+        // combination here.
+        #[cfg(feature = "with-solace")]
+        if let TransportConfig::SolaceOutput(config) = &endpoint_config.connector_config.transport {
+            crate::transport::solace::output::validate_output_format(
+                config,
+                endpoint_config
+                    .connector_config
+                    .format
+                    .as_ref()
+                    .map(|f| f.name.as_ref()),
+            )
+            .map_err(|e| {
+                ControllerError::output_transport_error(endpoint_name, true, anyhow!(e))
+            })?;
+        }
+
         let endpoint = output_transport_config_to_endpoint(
             &endpoint_config.connector_config.transport,
             endpoint_name,

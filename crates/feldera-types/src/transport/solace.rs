@@ -318,6 +318,16 @@ pub struct SolaceOutputConfig {
     #[serde(default = "default_max_inflight_acks")]
     pub max_inflight_acks: usize,
 
+    /// Maximum time to wait for broker acknowledgements when draining
+    /// in-flight `persistent` publishes, in seconds (default: `30`).
+    ///
+    /// Bounds the blocking wait at each batch boundary.  If the broker does
+    /// not acknowledge within this window (broker death, spool over quota),
+    /// the batch fails with a transport error instead of stalling the
+    /// pipeline indefinitely.
+    #[serde(default = "default_ack_timeout_secs")]
+    pub ack_timeout_secs: u64,
+
     // --- connection / resiliency (shared shape with the input config) ---
     /// Use TLS (`tcps://`) instead of plaintext `tcp://` (default: `false`).
     #[serde(default)]
@@ -354,6 +364,10 @@ fn default_max_inflight_acks() -> usize {
     256
 }
 
+fn default_ack_timeout_secs() -> u64 {
+    30
+}
+
 /// Sensible defaults mirroring the serde attributes (see the input config for
 /// the rationale).
 impl Default for SolaceOutputConfig {
@@ -367,6 +381,7 @@ impl Default for SolaceOutputConfig {
             topic: String::new(),
             delivery_mode: OutputDeliveryMode::default(),
             max_inflight_acks: default_max_inflight_acks(),
+            ack_timeout_secs: default_ack_timeout_secs(),
             tls: false,
             ssl_trust_store_dir: None,
             client_name: None,
@@ -392,6 +407,9 @@ impl SolaceOutputConfig {
         }
         if self.topic.trim().is_empty() {
             return Err("topic must not be empty".into());
+        }
+        if self.ack_timeout_secs == 0 {
+            return Err("ack_timeout_secs must be >= 1".into());
         }
         validate_common(
             &self.host,

@@ -1,4 +1,6 @@
-use anyhow::Result as AnyResult;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result as AnyResult, bail};
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{AsyncErrorCallback, OutputBatchType, OutputEndpoint, Step};
 use feldera_types::transport::solace::SolaceLogLevel as ConfigLogLevel;
@@ -136,18 +138,47 @@ impl SolaceOutputEndpoint {
     }
 
     /// Block until every in-flight persistent publish has been acknowledged by
-    /// the broker. A rejected or lost acknowledgment is a hard error so the
-    /// controller does not treat unpersisted data as delivered.
+    /// the broker, or until `ack_timeout_secs` elapses.
+    ///
+    /// A rejected, lost, or timed-out acknowledgment returns an error, which
+    /// the controller logs as a (non-fatal) transport error for the step;
+    /// recovery is retried on the next batch.
+    ///
+    /// The timeout is load-bearing: the ack senders live inside the session
+    /// for its whole lifetime, so if the broker never acks (broker death,
+    /// spool over quota, session stuck mid-reconnect) the channel neither
+    /// resolves nor closes.  An unbounded wait here would block the output
+    /// thread's `batch_end` forever — and because step completion feeds the
+    /// input connectors' deferred acks, that would stall the entire pipeline.
     fn drain_pending_acks(&mut self) -> AnyResult<()> {
-        for rx in self.pending_acks.drain(..) {
-            match rx.blocking_recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+        if self.pending_acks.is_empty() {
+            return Ok(());
+        }
+        // One deadline bounds the whole drain: acks resolve in publish order,
+        // so a healthy broker clears every receiver well inside the window.
+        let deadline = Instant::now() + Duration::from_secs(self.config.ack_timeout_secs);
+        let total = self.pending_acks.len();
+        for (i, rx) in self.pending_acks.drain(..).enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // The endpoint runs on a dedicated OS thread (no ambient runtime),
+            // so blocking on the shared runtime here is safe — the same
+            // reasoning that made the previous `blocking_recv()` legal.
+            match TOKIO.block_on(tokio::time::timeout(remaining, rx)) {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
                     return Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}"));
                 }
-                Err(_) => {
+                Ok(Err(_closed)) => {
                     return Err(anyhow::anyhow!(
                         "Solace ack channel closed before broker acknowledgment"
+                    ));
+                }
+                Err(_elapsed) => {
+                    return Err(anyhow::anyhow!(
+                        "broker did not acknowledge {} of {total} in-flight persistent \
+                         publish(es) within {}s",
+                        total - i,
+                        self.config.ack_timeout_secs
                     ));
                 }
             }
@@ -217,14 +248,16 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     fn push_key(
         &mut self,
         _key: Option<&[u8]>,
-        val: Option<&[u8]>,
+        _val: Option<&[u8]>,
         _headers: &[(&str, Option<&[u8]>)],
     ) -> AnyResult<()> {
-        if let Some(bytes) = val {
-            let topic = self.topic_for(bytes);
-            self.publish(&topic, bytes)?;
-        }
-        Ok(())
+        // Publishing only `val` here would silently discard the key and
+        // headers, so fail instead, per the OutputEndpoint contract.
+        bail!(
+            "Solace output transport does not support key-value pairs. \
+This output endpoint was configured with a data format that produces outputs as key-value pairs; \
+however the Solace transport does not support this representation."
+        );
     }
 
     fn batch_start(&mut self, _step: Step, _batch_type: OutputBatchType) -> AnyResult<()> {
@@ -232,9 +265,12 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     }
 
     fn batch_end(&mut self) -> AnyResult<()> {
-        // Persistent mode: block until the broker has acknowledged every
-        // message in this batch before the step is reported complete, so a
-        // downstream reader never sees data the broker has not persisted.
+        // Persistent mode: block (bounded by `ack_timeout_secs`) until the
+        // broker has acknowledged every message in this batch before the step
+        // is reported complete.  An error here surfaces as a non-fatal
+        // transport error on the step — it is logged and the endpoint's error
+        // count rises, but the step still completes, so operators monitoring
+        // for delivery guarantees must watch the endpoint error metrics.
         // Direct mode leaves pending_acks empty, so this is a no-op.
         self.drain_pending_acks()
     }
@@ -284,6 +320,32 @@ impl Drop for SolaceOutputEndpoint {
             }
         }
     }
+}
+
+/// Validates that a `{field}` topic template is paired with the JSON output
+/// format.
+///
+/// [`resolve_topic`] substitutes placeholders by re-parsing each encoded
+/// record as JSON.  With any other format the parse fails and every record
+/// would silently publish to the literal template string (a topic containing
+/// `{`…`}`), so reject the combination at connect time instead.
+pub fn validate_output_format(
+    config: &SolaceOutputConfig,
+    format_name: Option<&str>,
+) -> Result<(), String> {
+    if config.topic.contains('{') && format_name != Some("json") {
+        return Err(format!(
+            "Solace output topic '{}' contains {{field}} placeholders, which are resolved \
+             from JSON-encoded records; this endpoint uses {}. Configure the connector \
+             with format \"json\" or use a static topic.",
+            config.topic,
+            format_name.map_or_else(
+                || "no output format".to_string(),
+                |name| format!("format \"{name}\"")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +413,30 @@ pub fn resolve_topic(template: &str, buffer: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_topic;
+    use super::{SolaceOutputConfig, resolve_topic, validate_output_format};
+
+    #[test]
+    fn dynamic_topic_requires_json_format() {
+        let config = SolaceOutputConfig {
+            topic: "demo/{region}".into(),
+            ..Default::default()
+        };
+        assert!(validate_output_format(&config, Some("json")).is_ok());
+        assert!(validate_output_format(&config, Some("csv")).is_err());
+        assert!(validate_output_format(&config, Some("avro")).is_err());
+        assert!(validate_output_format(&config, None).is_err());
+    }
+
+    #[test]
+    fn static_topic_accepts_any_format() {
+        let config = SolaceOutputConfig {
+            topic: "demo/results/all".into(),
+            ..Default::default()
+        };
+        assert!(validate_output_format(&config, Some("csv")).is_ok());
+        assert!(validate_output_format(&config, Some("json")).is_ok());
+        assert!(validate_output_format(&config, None).is_ok());
+    }
 
     #[test]
     fn static_topic_passthrough() {

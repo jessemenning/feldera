@@ -10990,6 +10990,14 @@
           }
         }
       },
+      "OutputDeliveryMode": {
+        "type": "string",
+        "description": "Solace message delivery mode for the output connector.",
+        "enum": [
+          "direct",
+          "persistent"
+        ]
+      },
       "OutputEndpointConfig": {
         "allOf": [
           {
@@ -13726,6 +13734,233 @@
           }
         }
       },
+      "SolaceInputConfig": {
+        "type": "object",
+        "description": "Transport configuration for the Solace Platform SMF input connector.\n\nBinds to a durable Solace queue over the native SMF protocol (port 55555).\nMessages are acknowledged to the broker only after the circuit step that\ningested them has been fully processed — or, in a fault-tolerant pipeline,\ndurably checkpointed — giving at-least-once delivery with in-session RGMID\ndeduplication.  The queue itself is the resume cursor: on restart the\nbroker redelivers every unacknowledged message.\n\n## Topic decomposition\n\nSet `topic_pattern` (e.g. `\"demo/events/{region}/{event_type}\"`) to\nautomatically extract named captures from the Solace message destination\nand inject them as table columns via `ConnectorMetadata`. Publishers do\nnot need to embed topic levels in the payload.\n\n## Example SQL\n\n```sql\nCREATE TABLE events (\nsolace_topic VARCHAR,\nregion       VARCHAR,\nevent_type   VARCHAR,\npayload      VARCHAR\n) WITH (\n'connector'            = 'solace_input',\n'host'                 = 'broker.example.com',\n'username'             = 'feldera',\n'password'             = 'secret',\n'queue'                = 'feldera-events-q',\n'topic_pattern'        = 'demo/events/{region}/{event_type}',\n'include_topic'        = 'true'\n);\n```",
+        "required": [
+          "host",
+          "username",
+          "password",
+          "queue"
+        ],
+        "properties": {
+          "client_name": {
+            "type": "string",
+            "description": "Client name reported to the broker. `None` lets the SDK generate one.",
+            "nullable": true
+          },
+          "connect_timeout_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timeout for the initial broker connection, in seconds (default: `10`).",
+            "minimum": 0
+          },
+          "dedup_history_size": {
+            "type": "integer",
+            "description": "Number of recently-seen replication-group message IDs retained for\ndeduplication of broker redeliveries (default: `100_000`; `0` disables\ndeduplication).",
+            "minimum": 0
+          },
+          "host": {
+            "type": "string",
+            "description": "Broker hostname (no scheme, no port)."
+          },
+          "include_broker_timestamp": {
+            "type": "boolean",
+            "description": "Expose the broker receive timestamp as the `broker_ts` metadata field\n(a `TIMESTAMP`; default: `false`)."
+          },
+          "include_topic": {
+            "type": "boolean",
+            "description": "Expose the full destination topic as the `solace_topic` metadata field\n(default: `false`).\n\nMetadata fields are opt-in: extracting them costs allocations on every\nmessage, so enable only the fields a table actually consumes."
+          },
+          "log_level": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SolaceLogLevel"
+              }
+            ],
+            "nullable": true
+          },
+          "max_unacked": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of unacknowledged messages the broker will deliver\nbefore pausing the flow. `None` uses the broker default.",
+            "nullable": true
+          },
+          "password": {
+            "type": "string",
+            "description": "Client password."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "SMF port (default: `55555`).",
+            "minimum": 0
+          },
+          "queue": {
+            "type": "string",
+            "description": "Durable queue name to bind to."
+          },
+          "reconnect_retries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "SDK-level reconnect attempts for transient blips (default: `3`;\n`-1` retries forever). Longer outages are handled by the connector's\nown retry loop."
+          },
+          "reconnect_retry_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wait between SDK-level reconnect attempts, in milliseconds\n(default: `3000`).",
+            "minimum": 0
+          },
+          "reject_parse_errors": {
+            "type": "boolean",
+            "description": "Route completely unparseable payloads to the dead-message queue via a\nbroker `Rejected` settlement, instead of reporting a parse error and\nacking (default: `false`)."
+          },
+          "retry_interval_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wait between connector-level reconnect attempts after the SDK gives up,\nin seconds (default: `5`).",
+            "minimum": 0
+          },
+          "ssl_trust_store_dir": {
+            "type": "string",
+            "description": "Directory holding the trusted CA certificates for TLS. Requires `tls`.",
+            "nullable": true
+          },
+          "tls": {
+            "type": "boolean",
+            "description": "Use TLS (`tcps://`) instead of plaintext `tcp://` (default: `false`)."
+          },
+          "topic_pattern": {
+            "type": "string",
+            "description": "Optional topic decomposition pattern using `{name}` placeholders, e.g.\n`\"demo/events/{region}/{event_type}\"`.\n\nEach `{name}` segment is matched against the corresponding slash-level\nof the Solace message destination topic. Matched values are injected\nas `ConnectorMetadata` fields, making them available as table columns\nwithout requiring publishers to embed them in the payload.",
+            "nullable": true
+          },
+          "username": {
+            "type": "string",
+            "description": "Client username."
+          },
+          "vpn": {
+            "type": "string",
+            "description": "Solace message VPN name (default: `\"default\"`)."
+          },
+          "window_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Flow window size — how many unacked messages the broker buffers\nclient-side. Set to at least `target_msg_rate × step_interval_secs`\nto avoid stalling (default: `255`).",
+            "minimum": 0
+          }
+        }
+      },
+      "SolaceLogLevel": {
+        "type": "string",
+        "description": "Solace C SDK log level, mirrored here so the connector configuration does\nnot depend on the `solace-rs` crate.  `None` defaults to `Warning`.",
+        "enum": [
+          "critical",
+          "error",
+          "warning",
+          "notice",
+          "info",
+          "debug"
+        ]
+      },
+      "SolaceOutputConfig": {
+        "type": "object",
+        "description": "Transport configuration for the Solace Platform SMF output connector.\n\nPublishes serialized view records to a Solace topic over SMF.\nThe destination topic supports `{field}` placeholders resolved from the\nJSON record, including Feldera's `insert_delete` wrapper format.\n\n## Example SQL\n\n```sql\nCREATE MATERIALIZED VIEW region_counts\nWITH (\n'connector'     = 'solace_output',\n'host'          = 'broker.example.com',\n'username'      = 'feldera',\n'password'      = 'secret',\n'topic'         = 'demo/results/{region}/{event_type}',\n'delivery_mode' = 'persistent'\n) AS\nSELECT region, event_type, COUNT(*) AS event_count\nFROM   events\nGROUP  BY region, event_type;\n```",
+        "required": [
+          "host",
+          "username",
+          "password",
+          "topic"
+        ],
+        "properties": {
+          "ack_timeout_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum time to wait for broker acknowledgements when draining\nin-flight `persistent` publishes, in seconds (default: `30`).\n\nBounds the blocking wait at each batch boundary.  If the broker does\nnot acknowledge within this window (broker death, spool over quota),\nthe batch fails with a transport error instead of stalling the\npipeline indefinitely.",
+            "minimum": 0
+          },
+          "client_name": {
+            "type": "string",
+            "description": "Client name reported to the broker. `None` lets the SDK generate one.",
+            "nullable": true
+          },
+          "connect_timeout_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Timeout for the initial broker connection, in seconds (default: `10`).",
+            "minimum": 0
+          },
+          "dedup_window_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-topic publish throttle with conflation, in milliseconds\n(default: `None` — disabled).\n\nWhen set, at most one message per resolved topic is published per\nwindow.  Records arriving inside the window are conflated: only the\nlatest is kept, and it is published at a batch boundary once the\nwindow expires.  Use this to bound the outbound message rate of a\nhigh-churn view (e.g. a per-key aggregate updating hundreds of times\nper second) without losing the newest value.\n\nA record conflated on a stream that then goes quiet is published at\nthe next batch boundary after its window expires, not immediately on\nexpiry.",
+            "nullable": true,
+            "minimum": 0
+          },
+          "delivery_mode": {
+            "$ref": "#/components/schemas/OutputDeliveryMode"
+          },
+          "host": {
+            "type": "string",
+            "description": "Broker hostname (no scheme, no port)."
+          },
+          "log_level": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SolaceLogLevel"
+              }
+            ],
+            "nullable": true
+          },
+          "max_inflight_acks": {
+            "type": "integer",
+            "description": "Maximum broker acknowledgements in flight before `batch_end` blocks,\nfor `persistent` delivery (default: `256`).",
+            "minimum": 0
+          },
+          "password": {
+            "type": "string",
+            "description": "Client password."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "SMF port (default: `55555`).",
+            "minimum": 0
+          },
+          "reconnect_retries": {
+            "type": "integer",
+            "format": "int64",
+            "description": "SDK-level reconnect attempts for transient blips (default: `3`;\n`-1` retries forever)."
+          },
+          "reconnect_retry_wait_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wait between SDK-level reconnect attempts, in milliseconds\n(default: `3000`).",
+            "minimum": 0
+          },
+          "ssl_trust_store_dir": {
+            "type": "string",
+            "description": "Directory holding the trusted CA certificates for TLS. Requires `tls`.",
+            "nullable": true
+          },
+          "tls": {
+            "type": "boolean",
+            "description": "Use TLS (`tcps://`) instead of plaintext `tcp://` (default: `false`)."
+          },
+          "topic": {
+            "type": "string",
+            "description": "Destination topic template. Static topics are used as-is.\nUse `{field}` placeholders to derive the topic from the record.\n\nFor Feldera's `insert_delete` format the connector checks under the\n`\"insert\"` or `\"delete\"` wrapper before falling back to the top level."
+          },
+          "username": {
+            "type": "string",
+            "description": "Client username."
+          },
+          "vpn": {
+            "type": "string",
+            "description": "Solace message VPN name (default: `\"default\"`)."
+          }
+        }
+      },
       "SourcePosition": {
         "type": "object",
         "required": [
@@ -14779,6 +15014,42 @@
                 "type": "string",
                 "enum": [
                   "empty_input"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/SolaceInputConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "solace_input"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "config"
+            ],
+            "properties": {
+              "config": {
+                "$ref": "#/components/schemas/SolaceOutputConfig"
+              },
+              "name": {
+                "type": "string",
+                "enum": [
+                  "solace_output"
                 ]
               }
             }

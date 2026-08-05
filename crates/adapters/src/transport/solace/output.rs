@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -27,13 +27,17 @@ use super::solace_log_level;
 pub struct SolaceOutputEndpoint {
     config: SolaceOutputConfig,
     conn: Option<SolaceConnection>,
-    /// True when the topic has no `{field}` placeholders, so every record
-    /// publishes to the same destination.
-    static_topic: bool,
+    /// `Some(topic)` when the configured topic has no `{field}` placeholders,
+    /// so every record publishes to this destination (`Arc` so per-record
+    /// resolution is a refcount bump, not an allocation).  `None` for dynamic
+    /// topics.
+    static_topic: Option<Arc<str>>,
     /// In-flight broker acknowledgments for `Persistent` delivery, awaiting
     /// resolution. Drained at each `batch_end` and whenever the count reaches
     /// `config.max_inflight_acks`.
     pending_acks: Vec<oneshot::Receiver<Result<(), SessionError>>>,
+    /// Per-topic publish throttle; `Some` when `dedup_window_ms` is set.
+    dedup: Option<DedupState>,
     /// The controller's error callback, stored at `connect` so session
     /// rebuilds can wire a fresh event drainer (see [`ensure_connected`]).
     error_cb: Option<SharedErrorCallback>,
@@ -61,16 +65,22 @@ impl SolaceOutputEndpoint {
         // A static topic (no `{` placeholders) resolves to the same
         // destination for every record, so validate it once here and fail
         // fast on an invalid topic string rather than per-publish.
-        let is_static = !config.topic.contains('{');
-        if is_static {
+        let static_topic = if config.topic.contains('{') {
+            None
+        } else {
             MessageDestination::new(DestinationType::Topic, config.topic.as_str())
                 .map_err(|e| anyhow::anyhow!("invalid topic '{}': {e:?}", config.topic))?;
-        }
+            Some(Arc::from(config.topic.as_str()))
+        };
+        let dedup = config
+            .dedup_window_ms
+            .map(|ms| DedupState::new(Duration::from_millis(ms)));
         Ok(Self {
             config,
             conn: None,
-            static_topic: is_static,
+            static_topic,
             pending_acks: Vec::new(),
+            dedup,
             error_cb: None,
         })
     }
@@ -120,18 +130,32 @@ impl SolaceOutputEndpoint {
     fn publish(&mut self, payload: &[u8]) -> AnyResult<()> {
         self.ensure_connected()?;
 
-        // Static topics borrow the configured string (no template scan, no
-        // per-record allocation); dynamic topics substitute `{field}`
-        // placeholders from the record.
-        let topic: Cow<'_, str> = if self.static_topic {
-            Cow::Borrowed(self.config.topic.as_str())
-        } else {
-            Cow::Owned(resolve_topic(&self.config.topic, payload))
+        // Static topics reuse the pre-validated destination (a refcount bump,
+        // no template scan or allocation); dynamic topics substitute
+        // `{field}` placeholders from the record.
+        let topic: Arc<str> = match &self.static_topic {
+            Some(topic) => Arc::clone(topic),
+            None => Arc::from(resolve_topic(&self.config.topic, payload)),
         };
 
+        // Per-topic throttle: inside the window the record is conflated
+        // (latest payload wins) and published at a batch boundary once the
+        // window expires (see `flush_expired_dedup`).
+        if let Some(dedup) = &mut self.dedup
+            && !dedup.should_send(&topic, payload, Instant::now())
+        {
+            return Ok(());
+        }
+
+        self.send_message(&topic, payload)
+    }
+
+    /// Build and send one message; `Persistent` delivery also windows the
+    /// broker acknowledgment.
+    fn send_message(&mut self, topic: &str, payload: &[u8]) -> AnyResult<()> {
         let msg = OutboundMessageBuilder::new()
             .destination(
-                MessageDestination::new(DestinationType::Topic, topic.as_ref())
+                MessageDestination::new(DestinationType::Topic, topic)
                     .map_err(|e| anyhow::anyhow!("invalid topic '{topic}': {e:?}"))?,
             )
             .delivery_mode(self.delivery_mode())
@@ -325,6 +349,11 @@ however the Solace transport does not support this representation."
     }
 
     fn batch_end(&mut self) -> AnyResult<()> {
+        // Publish conflated records whose dedup window has expired.  Batch
+        // boundaries are the flush opportunity for a synchronous endpoint;
+        // a record conflated on a stream that then goes quiet waits for the
+        // next batch after its window expires.
+        self.flush_expired_dedup()?;
         // Persistent mode: block (bounded by `ack_timeout_secs`) until the
         // broker has acknowledged every message in this batch before the step
         // is reported complete.  An error here surfaces as a non-fatal
@@ -391,6 +420,154 @@ impl Drop for SolaceOutputEndpoint {
             && let Err(e) = conn.session.disconnect()
         {
             warn!("Solace output disconnect error: {e:?}");
+        }
+    }
+}
+
+impl SolaceOutputEndpoint {
+    /// Publish conflated records whose dedup window has expired.  No-op when
+    /// dedup is disabled.
+    fn flush_expired_dedup(&mut self) -> AnyResult<()> {
+        let Some(dedup) = &mut self.dedup else {
+            return Ok(());
+        };
+        let ready = dedup.take_expired(Instant::now());
+        if ready.is_empty() {
+            return Ok(());
+        }
+        self.ensure_connected()?;
+        for (topic, payload) in ready {
+            self.send_message(&topic, &payload)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dedup window
+// ---------------------------------------------------------------------------
+
+/// Per-topic publish throttle with conflation (`dedup_window_ms`).
+///
+/// A record whose resolved topic was published less than `window` ago is
+/// buffered instead of published, and only the latest payload per topic is
+/// kept.  Buffered records are flushed at batch boundaries once their window
+/// expires ([`Self::take_expired`]).  This bounds each topic's outbound rate
+/// to one message per window without losing the newest value.
+///
+/// All decision logic takes `now` as a parameter so it is unit-testable
+/// without real time.
+struct DedupState {
+    window: Duration,
+    /// Last publish time per resolved topic.
+    last_sent: HashMap<String, Instant>,
+    /// Latest conflated payload per topic, awaiting window expiry.
+    pending: HashMap<String, Vec<u8>>,
+    /// Conflated-record count since the last rate-limited log line.
+    conflated_since_log: u64,
+    last_log: Instant,
+}
+
+impl DedupState {
+    /// Memory cap on the per-topic tracking maps (see [`Self::enforce_cap`]).
+    const MAX_ENTRIES: usize = 100_000;
+    /// Minimum interval between conflation-count log lines.
+    const LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_sent: HashMap::new(),
+            pending: HashMap::new(),
+            conflated_since_log: 0,
+            last_log: Instant::now(),
+        }
+    }
+
+    /// Decides whether a record publishes now (`true`) or is conflated for a
+    /// later flush (`false`).
+    fn should_send(&mut self, topic: &str, payload: &[u8], now: Instant) -> bool {
+        if let Some(last) = self.last_sent.get(topic)
+            && now.duration_since(*last) < self.window
+        {
+            // Inside the window: keep only the latest payload per topic.
+            self.pending.insert(topic.to_string(), payload.to_vec());
+            self.conflated_since_log += 1;
+            self.maybe_log(now);
+            return false;
+        }
+        self.mark_sent(topic, now);
+        true
+    }
+
+    /// Records a publish and drops any conflated payload for the topic (the
+    /// record being published now is newer).
+    fn mark_sent(&mut self, topic: &str, now: Instant) {
+        self.pending.remove(topic);
+        self.enforce_cap(now);
+        self.last_sent.insert(topic.to_string(), now);
+    }
+
+    /// Removes and returns the conflated payloads whose window has expired,
+    /// recording `now` as their publish time.
+    fn take_expired(&mut self, now: Instant) -> Vec<(String, Vec<u8>)> {
+        let expired: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|topic| {
+                self.last_sent
+                    .get(*topic)
+                    .is_none_or(|last| now.duration_since(*last) >= self.window)
+            })
+            .cloned()
+            .collect();
+        expired
+            .into_iter()
+            .map(|topic| {
+                let payload = self
+                    .pending
+                    .remove(&topic)
+                    .expect("key collected from pending above");
+                self.last_sent.insert(topic.clone(), now);
+                (topic, payload)
+            })
+            .collect()
+    }
+
+    /// Bounds the tracking maps.  Expired trackers are evicted first; if the
+    /// map is still full (over 100k distinct topics live inside one window),
+    /// it is cleared entirely — the throttle resets and the next record per
+    /// topic publishes immediately, which loses no data.  `pending` needs no
+    /// separate cap: it only holds topics inside their window, and clearing
+    /// `last_sent` makes them all flushable at the next batch boundary.
+    fn enforce_cap(&mut self, now: Instant) {
+        if self.last_sent.len() < Self::MAX_ENTRIES {
+            return;
+        }
+        let window = self.window;
+        self.last_sent
+            .retain(|_, last| now.duration_since(*last) < window);
+        if self.last_sent.len() >= Self::MAX_ENTRIES {
+            warn!(
+                "Solace dedup window tracks over {} live topics; resetting the \
+                 throttle state",
+                Self::MAX_ENTRIES
+            );
+            self.last_sent.clear();
+        }
+    }
+
+    /// Logs the conflation count at most once per [`Self::LOG_INTERVAL`], so
+    /// a high-rate stream cannot flood the log.
+    fn maybe_log(&mut self, now: Instant) {
+        if now.duration_since(self.last_log) >= Self::LOG_INTERVAL {
+            info!(
+                "Solace dedup window conflated {} record(s) in the last {:?}",
+                self.conflated_since_log,
+                now.duration_since(self.last_log)
+            );
+            self.conflated_since_log = 0;
+            self.last_log = now;
         }
     }
 }
@@ -486,7 +663,72 @@ pub fn resolve_topic(template: &str, buffer: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SolaceOutputConfig, resolve_topic, validate_output_format};
+    use std::time::{Duration, Instant};
+
+    use super::{DedupState, SolaceOutputConfig, resolve_topic, validate_output_format};
+
+    // --- dedup window ---
+
+    const WINDOW: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn dedup_first_record_sends_immediately() {
+        let mut dedup = DedupState::new(WINDOW);
+        let now = Instant::now();
+        assert!(dedup.should_send("t/a", b"1", now));
+        assert!(dedup.should_send("t/b", b"1", now), "topics throttle independently");
+    }
+
+    #[test]
+    fn dedup_conflates_latest_inside_window() {
+        let mut dedup = DedupState::new(WINDOW);
+        let start = Instant::now();
+        assert!(dedup.should_send("t", b"1", start));
+        assert!(!dedup.should_send("t", b"2", start + Duration::from_secs(1)));
+        assert!(!dedup.should_send("t", b"3", start + Duration::from_secs(2)));
+
+        // Nothing flushes before the window expires.
+        assert!(dedup.take_expired(start + Duration::from_secs(2)).is_empty());
+
+        // After expiry, exactly one message per topic, carrying the latest value.
+        let flushed = dedup.take_expired(start + WINDOW);
+        assert_eq!(flushed, vec![("t".to_string(), b"3".to_vec())]);
+
+        // The flush restarts the window from the flush time.
+        assert!(!dedup.should_send("t", b"4", start + WINDOW + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn dedup_send_after_expiry_drops_stale_pending() {
+        let mut dedup = DedupState::new(WINDOW);
+        let start = Instant::now();
+        assert!(dedup.should_send("t", b"1", start));
+        assert!(!dedup.should_send("t", b"2", start + Duration::from_secs(1)));
+        // A record arriving after expiry publishes directly; the conflated
+        // "2" is older than it and must not flush later.
+        assert!(dedup.should_send("t", b"3", start + WINDOW));
+        assert!(dedup.take_expired(start + 2 * WINDOW).is_empty());
+    }
+
+    #[test]
+    fn dedup_cap_resets_throttle_without_losing_pending() {
+        let mut dedup = DedupState::new(WINDOW);
+        let start = Instant::now();
+        for i in 0..DedupState::MAX_ENTRIES {
+            assert!(dedup.should_send(&format!("t/{i}"), b"1", start));
+        }
+        assert!(!dedup.should_send("t/0", b"2", start + Duration::from_secs(1)));
+
+        // The next publish hits the cap with every tracker still live, so the
+        // throttle state resets and the new topic sends immediately.
+        assert!(dedup.should_send("t/new", b"1", start + Duration::from_secs(1)));
+        assert!(dedup.last_sent.len() < DedupState::MAX_ENTRIES);
+
+        // The conflated record survives the reset and flushes at the next
+        // boundary (its tracker is gone, so it counts as expired).
+        let flushed = dedup.take_expired(start + Duration::from_secs(2));
+        assert_eq!(flushed, vec![("t/0".to_string(), b"2".to_vec())]);
+    }
 
     #[test]
     fn dynamic_topic_requires_json_format() {

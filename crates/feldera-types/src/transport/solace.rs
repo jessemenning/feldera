@@ -376,6 +376,22 @@ pub struct SolaceOutputConfig {
     #[serde(default = "default_ack_timeout_secs")]
     pub ack_timeout_secs: u64,
 
+    /// Per-topic publish throttle with conflation, in milliseconds
+    /// (default: `None` — disabled).
+    ///
+    /// When set, at most one message per resolved topic is published per
+    /// window.  Records arriving inside the window are conflated: only the
+    /// latest is kept, and it is published at a batch boundary once the
+    /// window expires.  Use this to bound the outbound message rate of a
+    /// high-churn view (e.g. a per-key aggregate updating hundreds of times
+    /// per second) without losing the newest value.
+    ///
+    /// A record conflated on a stream that then goes quiet is published at
+    /// the next batch boundary after its window expires, not immediately on
+    /// expiry.
+    #[serde(default)]
+    pub dedup_window_ms: Option<u64>,
+
     // --- connection / resiliency (shared shape with the input config) ---
     /// Use TLS (`tcps://`) instead of plaintext `tcp://` (default: `false`).
     #[serde(default)]
@@ -430,6 +446,7 @@ impl Default for SolaceOutputConfig {
             delivery_mode: OutputDeliveryMode::default(),
             max_inflight_acks: default_max_inflight_acks(),
             ack_timeout_secs: default_ack_timeout_secs(),
+            dedup_window_ms: None,
             tls: false,
             ssl_trust_store_dir: None,
             client_name: None,
@@ -463,6 +480,9 @@ impl SolaceOutputConfig {
             // 0 would silently degrade to one blocking broker round-trip per
             // message — a latency cliff, not a meaningful configuration.
             return Err("max_inflight_acks must be >= 1".into());
+        }
+        if self.dedup_window_ms == Some(0) {
+            return Err("dedup_window_ms must be >= 1 when set; omit it to disable".into());
         }
         validate_common(
             &self.host,
@@ -623,6 +643,17 @@ mod tests {
         let mut cfg = output_cfg("h", 55555);
         cfg.topic = "".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn output_validate_dedup_window_bounds() {
+        let mut cfg = output_cfg("h", 55555);
+        cfg.dedup_window_ms = Some(0);
+        assert!(cfg.validate().is_err(), "0 ms is not a window; omit to disable");
+        cfg.dedup_window_ms = Some(1);
+        assert!(cfg.validate().is_ok());
+        cfg.dedup_window_ms = None;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use feldera_adapterlib::transport::{
     InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand, Resume,
     TransportInputEndpoint,
 };
-use feldera_sqllib::{SqlString, Variant};
+use feldera_sqllib::{SqlString, Timestamp, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
@@ -124,9 +124,16 @@ impl InputReader for SolaceInputReader {
 /// unbounded set would grow without limit.  A redelivery of a message older
 /// than `cap` distinct messages falls out of the window and would re-ingest,
 /// which is acceptable under at-least-once semantics.
+/// A replication-group message ID in the broker's raw 16-byte wire form.
+///
+/// `Copy`, allocation-free, and cheaper to hash and store than the SDK's
+/// `rmid1:…` string rendering (which costs ~50 heap bytes per entry — at the
+/// 100k default cap the string form held roughly 15 MB per connector).
+type Rgmid = [u8; 16];
+
 struct RgmidCache {
-    seen: HashSet<String>,
-    order: VecDeque<String>,
+    seen: HashSet<Rgmid>,
+    order: VecDeque<Rgmid>,
     cap: usize,
 }
 
@@ -142,20 +149,20 @@ impl RgmidCache {
     /// Records `id`.  Returns `true` if it is new, `false` if already seen.
     ///
     /// A `cap` of 0 disables deduplication: every message is reported as new.
-    fn insert(&mut self, id: &str) -> bool {
+    fn insert(&mut self, id: Rgmid) -> bool {
         if self.cap == 0 {
             return true;
         }
-        if self.seen.contains(id) {
+        if self.seen.contains(&id) {
             return false;
         }
-        if self.order.len() >= self.cap {
-            if let Some(evicted) = self.order.pop_front() {
-                self.seen.remove(&evicted);
-            }
+        if self.order.len() >= self.cap
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
         }
-        self.order.push_back(id.to_owned());
-        self.seen.insert(id.to_owned());
+        self.order.push_back(id);
+        self.seen.insert(id);
         true
     }
 }
@@ -291,6 +298,11 @@ async fn wait_completion(source: &mut Option<CompletionSource>) -> Option<u64> {
 /// received message).  The interval bounds the detection latency for a dead
 /// flow on an idle or paused queue.
 const FLOW_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Maximum messages drained per `select!` iteration when the flow channel has
+/// a backlog.  Bounds the time between polls of the command and completion
+/// branches, so a hot queue cannot starve pause/ack handling.
+const MSG_BATCH_DRAIN_LIMIT: usize = 128;
 
 /// A live broker connection.
 ///
@@ -477,6 +489,9 @@ async fn background_task(
     };
 
     let mut rgmids = RgmidCache::new(config.dedup_history_size);
+    // `None` when the config requests no metadata: tables that never call
+    // CONNECTOR_METADATA() then pay nothing per message.
+    let metadata_spec = MetadataSpec::from_config(&config);
 
     // Deferred acks: a message is acknowledged only after the circuit step
     // that ingested it has been fully processed.  This restores at-least-once
@@ -548,16 +563,16 @@ async fn background_task(
                 () = tokio::time::sleep_until(next_retry_at) => {
                     match connect(Arc::clone(&config), context.clone()).await {
                         Ok(conn) => {
-                            if state == State::Running {
-                                if let Err(e) = conn.flow.start() {
-                                    warn!(
-                                        "flow.start after reconnect failed: {e}; \
-                                         retrying in {retry_interval:?}"
-                                    );
-                                    teardown(conn).await;
-                                    next_retry_at = Instant::now() + retry_interval;
-                                    continue;
-                                }
+                            if state == State::Running
+                                && let Err(e) = conn.flow.start()
+                            {
+                                warn!(
+                                    "flow.start after reconnect failed: {e}; \
+                                     retrying in {retry_interval:?}"
+                                );
+                                teardown(conn).await;
+                                next_retry_at = Instant::now() + retry_interval;
+                                continue;
                             }
                             info!(
                                 "Connected to Solace {} vpn={} queue={}",
@@ -637,23 +652,32 @@ async fn background_task(
 
             maybe_msg = conn.flow.recv(), if state == State::Running => match maybe_msg {
                 Some(msg) => {
-                    match process_message(msg, &queue, &*consumer, &mut parser, &mut rgmids, &config) {
-                        MsgDisposition::Queued => {}
-                        MsgDisposition::AckNow(id) => {
-                            if let Err(e) = conn.flow.ack(id) {
-                                warn!("flow.ack({id}) failed: {e}");
+                    dispatch_message(
+                        msg, &conn.flow, &queue, &*consumer,
+                        &mut parser, &mut rgmids, metadata_spec.as_ref(), &config,
+                    );
+                    // Drain messages already buffered in the flow channel
+                    // before re-entering select!: each select iteration
+                    // rebuilds four futures, so one message per iteration
+                    // caps throughput.  The bound keeps command and
+                    // completion latency low under sustained load.
+                    let mut trigger = None;
+                    for _ in 1..MSG_BATCH_DRAIN_LIMIT {
+                        match conn.flow.try_recv() {
+                            Ok(msg) => dispatch_message(
+                                msg, &conn.flow, &queue, &*consumer,
+                                &mut parser, &mut rgmids, metadata_spec.as_ref(), &config,
+                            ),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                trigger = Some(anyhow::anyhow!("flow message channel closed"));
+                                break;
                             }
                         }
-                        MsgDisposition::SettleRejected(id) => {
-                            if let Err(e) = conn.flow.settle(id, MessageOutcome::Rejected) {
-                                warn!("flow.settle({id}, Rejected) failed: {e}");
-                            }
-                        }
-                        MsgDisposition::Skip => {}
                     }
                     // Drain low-volume flow events (bind/reconnect notices)
                     // so their channel cannot grow between poll ticks.
-                    drain_flow_events(&mut conn.flow)
+                    trigger.or_else(|| drain_flow_events(&mut conn.flow))
                 }
                 None => Some(anyhow::anyhow!("flow message channel closed")),
             },
@@ -827,12 +851,42 @@ enum MsgDisposition {
     Skip,
 }
 
+/// Classify one received message and act on the flow accordingly.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_message(
+    msg: InboundMessage,
+    flow: &OwnedAsyncFlow,
+    queue: &Arc<InputQueue<u64>>,
+    consumer: &dyn InputConsumer,
+    parser: &mut Box<dyn Parser>,
+    rgmids: &mut RgmidCache,
+    metadata_spec: Option<&MetadataSpec>,
+    config: &SolaceInputConfig,
+) {
+    match process_message(msg, queue, consumer, parser, rgmids, metadata_spec, config) {
+        MsgDisposition::Queued => {}
+        MsgDisposition::AckNow(id) => {
+            if let Err(e) = flow.ack(id) {
+                warn!("flow.ack({id}) failed: {e}");
+            }
+        }
+        MsgDisposition::SettleRejected(id) => {
+            if let Err(e) = flow.settle(id, MessageOutcome::Rejected) {
+                warn!("flow.settle({id}, Rejected) failed: {e}");
+            }
+        }
+        MsgDisposition::Skip => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_message(
     msg: InboundMessage,
     queue: &Arc<InputQueue<u64>>,
     consumer: &dyn InputConsumer,
     parser: &mut Box<dyn Parser>,
     rgmids: &mut RgmidCache,
+    metadata_spec: Option<&MetadataSpec>,
     config: &SolaceInputConfig,
 ) -> MsgDisposition {
     // msg_id is the handle flow.ack()/settle() need; fetch it first so every
@@ -852,12 +906,13 @@ fn process_message(
 
     // RGMID dedup: a redelivery of data already ingested this session must be
     // acked (not silently dropped) or it stays unacked forever, leaking the
-    // broker window.
-    if let Ok(Some(rgmid)) = msg.get_replication_group_message_id() {
-        if !rgmids.insert(&rgmid) {
-            debug!("Duplicate RGMID {rgmid} on msg_id={msg_id}; acking");
-            return MsgDisposition::AckNow(msg_id);
-        }
+    // broker window.  The raw 16-byte form avoids the string rendering's
+    // per-message allocations.
+    if let Ok(Some(rgmid)) = msg.get_replication_group_message_id_raw()
+        && !rgmids.insert(rgmid)
+    {
+        debug!("Duplicate RGMID {rgmid:02x?} on msg_id={msg_id}; acking");
+        return MsgDisposition::AckNow(msg_id);
     }
 
     let payload = match msg.get_payload() {
@@ -873,10 +928,7 @@ fn process_message(
         }
     };
 
-    // Build ConnectorMetadata from the Solace destination topic so table
-    // columns can be populated from topic levels without the publisher
-    // embedding them in the payload.
-    let metadata = build_metadata(&msg, config);
+    let metadata = metadata_spec.and_then(|spec| build_metadata(&msg, spec));
 
     let (buffer, errors) = parser.parse(payload, metadata);
 
@@ -896,44 +948,138 @@ fn process_message(
     MsgDisposition::Queued
 }
 
-/// Build `ConnectorMetadata` from the Solace message destination topic.
+// ---------------------------------------------------------------------------
+// Metadata extraction
+// ---------------------------------------------------------------------------
+
+/// Precomputed metadata-extraction plan.
 ///
-/// Always inserts `solace_topic` with the full destination string.
-/// If `config.topic_pattern` is set, also inserts named captures per
-/// `super::config::parse_topic_fields`.
-fn build_metadata(msg: &InboundMessage, config: &SolaceInputConfig) -> Option<ConnectorMetadata> {
-    let topic = match msg.get_destination() {
-        Ok(Some(dest)) => dest.dest.to_string_lossy().into_owned(),
-        Ok(None) => return None,
-        Err(e) => {
-            debug!("get_destination error: {e:?}");
+/// Metadata is opt-in (`include_topic`, `include_broker_timestamp`,
+/// `topic_pattern`): building it costs a handful of heap allocations per
+/// message, so when nothing is requested the connector holds no spec and
+/// skips the work entirely.  The `Variant` keys are refcounted strings built
+/// once per connector and cloned per message.
+struct MetadataSpec {
+    include_topic: bool,
+    include_broker_timestamp: bool,
+    topic_key: Variant,
+    broker_ts_key: Variant,
+    /// One entry per `topic_pattern` slash level: `Some(key)` for a `{name}`
+    /// capture segment, `None` for a static segment.
+    pattern_keys: Option<Vec<Option<Variant>>>,
+}
+
+impl MetadataSpec {
+    /// Returns `None` when the config requests no metadata.
+    fn from_config(config: &SolaceInputConfig) -> Option<Self> {
+        if !config.metadata_requested() {
             return None;
         }
+        let pattern_keys = config.topic_pattern.as_ref().map(|pattern| {
+            pattern
+                .split('/')
+                .map(|seg| -> Option<Variant> {
+                    let name = seg.strip_prefix('{')?.strip_suffix('}')?;
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(Variant::String(SqlString::from(name)))
+                    }
+                })
+                .collect()
+        });
+        Some(Self {
+            include_topic: config.include_topic,
+            include_broker_timestamp: config.include_broker_timestamp,
+            topic_key: Variant::String(SqlString::from("solace_topic")),
+            broker_ts_key: Variant::String(SqlString::from("broker_ts")),
+            pattern_keys,
+        })
+    }
+
+    /// Whether the destination topic must be fetched from the message.
+    fn needs_topic(&self) -> bool {
+        self.include_topic || self.pattern_keys.is_some()
+    }
+}
+
+/// Extract the message fields the spec asks for, then assemble the metadata.
+fn build_metadata(msg: &InboundMessage, spec: &MetadataSpec) -> Option<ConnectorMetadata> {
+    let topic = if spec.needs_topic() {
+        match msg.get_destination() {
+            Ok(Some(dest)) => Some(dest.dest.to_string_lossy().into_owned()),
+            Ok(None) => None,
+            Err(e) => {
+                debug!("get_destination error: {e:?}");
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let mut meta = ConnectorMetadata::new();
-    meta.insert("solace_topic", Variant::String(SqlString::from(topic.as_str())));
+    let broker_ts_ms = if spec.include_broker_timestamp {
+        msg.get_receive_timestamp().ok().flatten().and_then(|ts| {
+            i64::try_from(
+                ts.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .ok()
+        })
+    } else {
+        None
+    };
 
-    // Broker receive timestamp — milliseconds since Unix epoch when the broker
-    // enqueued the message.  Available as CONNECTOR_METADATA()['broker_ts']
-    // (BIGINT) in SQL table DEFAULT expressions.
-    if let Ok(Some(ts)) = msg.get_receive_timestamp() {
-        if let Ok(ms) = i64::try_from(
-            ts.duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        ) {
-            meta.insert("broker_ts", Variant::BigInt(ms));
+    metadata_from_fields(spec, topic.as_deref(), broker_ts_ms)
+}
+
+/// Assemble the metadata map from pre-extracted message fields.
+///
+/// - `solace_topic` (VARCHAR): the full destination topic, when
+///   `include_topic` is set.
+/// - `{name}` captures (VARCHAR): topic levels matched by `topic_pattern`.
+///   Levels beyond the shorter of pattern and topic are ignored.
+/// - `broker_ts` (TIMESTAMP): when the broker enqueued the message, when
+///   `include_broker_timestamp` is set.
+///
+/// Pure function so the capture and inclusion logic is unit-testable without
+/// a live broker message.
+fn metadata_from_fields(
+    spec: &MetadataSpec,
+    topic: Option<&str>,
+    broker_ts_ms: Option<i64>,
+) -> Option<ConnectorMetadata> {
+    let mut meta = BTreeMap::new();
+
+    if let Some(topic) = topic {
+        if spec.include_topic {
+            meta.insert(
+                spec.topic_key.clone(),
+                Variant::String(SqlString::from(topic)),
+            );
+        }
+        if let Some(keys) = &spec.pattern_keys {
+            for (key, seg) in keys.iter().zip(topic.split('/')) {
+                if let Some(key) = key {
+                    meta.insert(key.clone(), Variant::String(SqlString::from(seg)));
+                }
+            }
         }
     }
 
-    if let Some(pattern) = &config.topic_pattern {
-        for (name, value) in super::config::parse_topic_fields(pattern, &topic) {
-            meta.insert(&name, Variant::String(SqlString::from(value.as_str())));
-        }
+    if let Some(ms) = broker_ts_ms {
+        meta.insert(
+            spec.broker_ts_key.clone(),
+            Variant::Timestamp(Timestamp::from_milliseconds(ms)),
+        );
     }
 
-    Some(meta)
+    if meta.is_empty() {
+        None
+    } else {
+        Some(ConnectorMetadata::from(meta))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -973,10 +1119,10 @@ fn handle_non_queue_command(
         InputReaderCommand::Extend => {
             debug!("Extend — starting flow");
             *state = State::Running;
-            if let Some(flow) = flow {
-                if let Err(e) = flow.start() {
-                    return Some(anyhow::anyhow!("flow.start: {e}"));
-                }
+            if let Some(flow) = flow
+                && let Err(e) = flow.start()
+            {
+                return Some(anyhow::anyhow!("flow.start: {e}"));
             }
             None
         }
@@ -1017,10 +1163,12 @@ mod tests {
     use solace_rs::flow::FlowEvent;
     use solace_rs::session::SessionEvent;
 
+    use feldera_sqllib::{SqlString, Timestamp, Variant};
+
     use super::{
-        ConnectorError, InputEndpoint, PendingAcks, RgmidCache, SolaceInputEndpoint, State,
-        acks_ready, classify_connect_failure, is_fatal_error_text, is_flow_failure,
-        is_session_failure, split_acks_on_close,
+        ConnectorError, InputEndpoint, MetadataSpec, PendingAcks, RgmidCache,
+        SolaceInputEndpoint, State, acks_ready, classify_connect_failure, is_fatal_error_text,
+        is_flow_failure, is_session_failure, metadata_from_fields, split_acks_on_close,
     };
 
     fn make_config() -> SolaceInputConfig {
@@ -1059,35 +1207,40 @@ mod tests {
         assert_eq!(format!("{:?}", State::Done), "Done");
     }
 
+    /// Builds a distinct 16-byte RGMID from a tag byte.
+    fn rgmid(tag: u8) -> super::Rgmid {
+        [tag; 16]
+    }
+
     #[test]
     fn rgmid_cache_detects_duplicates() {
         let mut cache = RgmidCache::new(4);
-        assert!(cache.insert("a"), "first sight is new");
-        assert!(!cache.insert("a"), "second sight is a duplicate");
-        assert!(cache.insert("b"));
-        assert!(!cache.insert("b"));
+        assert!(cache.insert(rgmid(1)), "first sight is new");
+        assert!(!cache.insert(rgmid(1)), "second sight is a duplicate");
+        assert!(cache.insert(rgmid(2)));
+        assert!(!cache.insert(rgmid(2)));
     }
 
     #[test]
     fn rgmid_cache_evicts_fifo() {
         let mut cache = RgmidCache::new(2);
-        assert!(cache.insert("a"));
-        assert!(cache.insert("b"));
-        // Inserting "c" evicts "a" (the oldest); "b" and "c" remain.
-        assert!(cache.insert("c"));
-        assert!(!cache.insert("b"), "b is still cached");
-        assert!(!cache.insert("c"), "c is still cached");
-        // "a" fell out of the window, so it reads as new again — and adding it
-        // evicts "b", the now-oldest entry.
-        assert!(cache.insert("a"), "evicted id is treated as new again");
-        assert!(cache.insert("b"), "b was evicted when a was re-added");
+        assert!(cache.insert(rgmid(1)));
+        assert!(cache.insert(rgmid(2)));
+        // Inserting a third id evicts the first (oldest); 2 and 3 remain.
+        assert!(cache.insert(rgmid(3)));
+        assert!(!cache.insert(rgmid(2)), "2 is still cached");
+        assert!(!cache.insert(rgmid(3)), "3 is still cached");
+        // 1 fell out of the window, so it reads as new again — and adding it
+        // evicts 2, the now-oldest entry.
+        assert!(cache.insert(rgmid(1)), "evicted id is treated as new again");
+        assert!(cache.insert(rgmid(2)), "2 was evicted when 1 was re-added");
     }
 
     #[test]
     fn rgmid_cache_zero_cap_disables_dedup() {
         let mut cache = RgmidCache::new(0);
-        assert!(cache.insert("a"));
-        assert!(cache.insert("a"), "dedup disabled: every message is new");
+        assert!(cache.insert(rgmid(1)));
+        assert!(cache.insert(rgmid(1)), "dedup disabled: every message is new");
     }
 
     #[test]
@@ -1218,6 +1371,100 @@ mod tests {
         assert!(!is_flow_failure(FlowEvent::Reconnected));
         assert!(!is_flow_failure(FlowEvent::Active));
         assert!(!is_flow_failure(FlowEvent::Inactive));
+    }
+
+    // --- metadata extraction ---
+
+    /// Builds a spec for a config with the given metadata options.
+    fn spec(
+        include_topic: bool,
+        include_broker_timestamp: bool,
+        pattern: Option<&str>,
+    ) -> Option<MetadataSpec> {
+        let mut cfg = make_config();
+        cfg.include_topic = include_topic;
+        cfg.include_broker_timestamp = include_broker_timestamp;
+        cfg.topic_pattern = pattern.map(str::to_string);
+        MetadataSpec::from_config(&cfg)
+    }
+
+    fn string_variant(s: &str) -> Variant {
+        Variant::String(SqlString::from(s))
+    }
+
+    #[test]
+    fn metadata_spec_absent_when_nothing_requested() {
+        assert!(spec(false, false, None).is_none());
+        assert!(spec(true, false, None).is_some());
+        assert!(spec(false, true, None).is_some());
+        assert!(spec(false, false, Some("a/{b}")).is_some());
+    }
+
+    #[test]
+    fn metadata_topic_and_pattern_captures() {
+        let spec = spec(true, false, Some("demo/events/{region}/{event_type}")).unwrap();
+        let meta =
+            metadata_from_fields(&spec, Some("demo/events/us-east/order"), None).unwrap();
+        assert_eq!(
+            meta.get_by_name("solace_topic"),
+            Some(&string_variant("demo/events/us-east/order"))
+        );
+        assert_eq!(meta.get_by_name("region"), Some(&string_variant("us-east")));
+        assert_eq!(
+            meta.get_by_name("event_type"),
+            Some(&string_variant("order"))
+        );
+    }
+
+    #[test]
+    fn metadata_pattern_only_omits_topic() {
+        let spec = spec(false, false, Some("app/v1/{tenant}/events")).unwrap();
+        let meta = metadata_from_fields(&spec, Some("app/v1/acme/events"), None).unwrap();
+        assert_eq!(meta.get_by_name("solace_topic"), None);
+        assert_eq!(meta.get_by_name("tenant"), Some(&string_variant("acme")));
+    }
+
+    #[test]
+    fn metadata_pattern_length_mismatches_are_ignored() {
+        // Pattern longer than topic: unmatched captures are absent.
+        let spec_long = spec(false, false, Some("a/{b}/{c}")).unwrap();
+        let meta = metadata_from_fields(&spec_long, Some("a/x"), None).unwrap();
+        assert_eq!(meta.get_by_name("b"), Some(&string_variant("x")));
+        assert_eq!(meta.get_by_name("c"), None);
+
+        // Topic longer than pattern: extra levels produce no captures.
+        let spec_short = spec(false, false, Some("a/{b}")).unwrap();
+        let meta = metadata_from_fields(&spec_short, Some("a/x/y/z"), None).unwrap();
+        assert_eq!(meta.get_by_name("b"), Some(&string_variant("x")));
+    }
+
+    #[test]
+    fn metadata_empty_brace_and_static_segments_capture_nothing() {
+        let spec = spec(false, false, Some("{}/mid/{tail}")).unwrap();
+        let meta = metadata_from_fields(&spec, Some("val/mid/end"), None).unwrap();
+        assert_eq!(meta.get_by_name(""), None, "empty capture name is skipped");
+        assert_eq!(meta.get_by_name("mid"), None, "static segment captures nothing");
+        assert_eq!(meta.get_by_name("tail"), Some(&string_variant("end")));
+    }
+
+    #[test]
+    fn metadata_broker_timestamp_is_sql_timestamp() {
+        let spec = spec(false, true, None).unwrap();
+        let meta = metadata_from_fields(&spec, None, Some(1_700_000_000_000)).unwrap();
+        assert_eq!(
+            meta.get_by_name("broker_ts"),
+            Some(&Variant::Timestamp(Timestamp::from_milliseconds(
+                1_700_000_000_000
+            )))
+        );
+    }
+
+    #[test]
+    fn metadata_empty_result_is_none() {
+        // Topic requested but unavailable on the message, no timestamp:
+        // nothing to attach.
+        let spec = spec(true, false, None).unwrap();
+        assert!(metadata_from_fields(&spec, None, None).is_none());
     }
 
     #[test]

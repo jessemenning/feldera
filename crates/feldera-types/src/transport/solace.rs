@@ -116,7 +116,8 @@ fn scheme(tls: bool) -> &'static str {
 ///   'username'             = 'feldera',
 ///   'password'             = 'secret',
 ///   'queue'                = 'feldera-events-q',
-///   'topic_pattern'        = 'demo/events/{region}/{event_type}'
+///   'topic_pattern'        = 'demo/events/{region}/{event_type}',
+///   'include_topic'        = 'true'
 /// );
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
@@ -161,6 +162,19 @@ pub struct SolaceInputConfig {
     /// without requiring publishers to embed them in the payload.
     #[serde(default)]
     pub topic_pattern: Option<String>,
+
+    /// Expose the full destination topic as the `solace_topic` metadata field
+    /// (default: `false`).
+    ///
+    /// Metadata fields are opt-in: extracting them costs allocations on every
+    /// message, so enable only the fields a table actually consumes.
+    #[serde(default)]
+    pub include_topic: bool,
+
+    /// Expose the broker receive timestamp as the `broker_ts` metadata field
+    /// (a `TIMESTAMP`; default: `false`).
+    #[serde(default)]
+    pub include_broker_timestamp: bool,
 
     /// Number of recently-seen replication-group message IDs retained for
     /// deduplication of broker redeliveries (default: `100_000`; `0` disables
@@ -227,6 +241,8 @@ impl Default for SolaceInputConfig {
             window_size: default_window_size(),
             max_unacked: None,
             topic_pattern: None,
+            include_topic: false,
+            include_broker_timestamp: false,
             dedup_history_size: default_dedup_history_size(),
             reject_parse_errors: false,
             tls: false,
@@ -242,6 +258,13 @@ impl Default for SolaceInputConfig {
 }
 
 impl SolaceInputConfig {
+    /// Whether any per-message metadata extraction is configured.  The
+    /// connector skips metadata construction entirely when this is `false`,
+    /// so tables that never call `CONNECTOR_METADATA()` pay nothing for it.
+    pub fn metadata_requested(&self) -> bool {
+        self.include_topic || self.include_broker_timestamp || self.topic_pattern.is_some()
+    }
+
     /// Full SMF URL for the Solace C SDK, e.g. `tcp://broker.example.com:55555`
     /// (or `tcps://…` when `tls` is set).
     pub fn smf_url(&self) -> String {
@@ -255,10 +278,11 @@ impl SolaceInputConfig {
             // a bind failure at runtime (the C SDK caps the flow window).
             return Err(format!("window_size must be in 1..={MAX_WINDOW_SIZE}"));
         }
-        if let Some(max_unacked) = self.max_unacked {
-            if max_unacked != -1 && max_unacked <= 0 {
-                return Err("max_unacked must be > 0, or -1 for no limit".into());
-            }
+        if let Some(max_unacked) = self.max_unacked
+            && max_unacked != -1
+            && max_unacked <= 0
+        {
+            return Err("max_unacked must be > 0, or -1 for no limit".into());
         }
         if self.dedup_history_size > MAX_DEDUP_HISTORY_SIZE {
             return Err(format!(

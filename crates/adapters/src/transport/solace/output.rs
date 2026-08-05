@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -35,8 +36,12 @@ pub struct SolaceOutputEndpoint {
     pending_acks: Vec<oneshot::Receiver<Result<(), SessionError>>>,
     /// The controller's error callback, stored at `connect` so session
     /// rebuilds can wire a fresh event drainer (see [`ensure_connected`]).
-    error_cb: Option<Arc<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>>,
+    error_cb: Option<SharedErrorCallback>,
 }
+
+/// [`AsyncErrorCallback`] wrapped in `Arc` so each rebuilt session's event
+/// drainer can hold its own handle to the controller's callback.
+type SharedErrorCallback = Arc<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>;
 
 struct SolaceConnection {
     /// Kept alive so the session's C-SDK context pointer remains valid.
@@ -112,22 +117,21 @@ impl SolaceOutputEndpoint {
         }
     }
 
-    /// Resolve the destination topic for a record. Static topics return an
-    /// owned copy of the configured topic (no template scan); dynamic topics
-    /// substitute `{field}` placeholders from the record.
-    fn topic_for(&self, buffer: &[u8]) -> String {
-        if self.static_topic {
-            self.config.topic.clone()
-        } else {
-            resolve_topic(&self.config.topic, buffer)
-        }
-    }
-
-    fn publish(&mut self, topic: &str, payload: &[u8]) -> AnyResult<()> {
+    fn publish(&mut self, payload: &[u8]) -> AnyResult<()> {
         self.ensure_connected()?;
+
+        // Static topics borrow the configured string (no template scan, no
+        // per-record allocation); dynamic topics substitute `{field}`
+        // placeholders from the record.
+        let topic: Cow<'_, str> = if self.static_topic {
+            Cow::Borrowed(self.config.topic.as_str())
+        } else {
+            Cow::Owned(resolve_topic(&self.config.topic, payload))
+        };
+
         let msg = OutboundMessageBuilder::new()
             .destination(
-                MessageDestination::new(DestinationType::Topic, topic)
+                MessageDestination::new(DestinationType::Topic, topic.as_ref())
                     .map_err(|e| anyhow::anyhow!("invalid topic '{topic}': {e:?}"))?,
             )
             .delivery_mode(self.delivery_mode())
@@ -298,8 +302,7 @@ impl OutputEndpoint for SolaceOutputEndpoint {
     }
 
     fn push_buffer(&mut self, buffer: &[u8]) -> AnyResult<()> {
-        let topic = self.topic_for(buffer);
-        self.publish(&topic, buffer)
+        self.publish(buffer)
     }
 
     fn push_key(
@@ -348,7 +351,7 @@ however the Solace transport does not support this representation."
 /// endpoint permanently.
 async fn drain_session_events(
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
-    error_callback: Arc<dyn Fn(bool, AnyError, Option<&'static str>) + Send + Sync>,
+    error_callback: SharedErrorCallback,
     poisoned: Arc<AtomicBool>,
 ) {
     while let Some(event) = event_rx.recv().await {
@@ -384,10 +387,10 @@ async fn drain_session_events(
 
 impl Drop for SolaceOutputEndpoint {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            if let Err(e) = conn.session.disconnect() {
-                warn!("Solace output disconnect error: {e:?}");
-            }
+        if let Some(conn) = self.conn.take()
+            && let Err(e) = conn.session.disconnect()
+        {
+            warn!("Solace output disconnect error: {e:?}");
         }
     }
 }

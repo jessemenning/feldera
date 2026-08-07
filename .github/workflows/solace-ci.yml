@@ -186,7 +186,10 @@ jobs:
           bun install --frozen-lockfile
           # `build` runs prebuild (workspace dep chain) then build:self
           # (svelte-kit sync + vite build) → static output in web-console/build.
-          bun --cwd js-packages/web-console run build
+          # cd into the member dir: bun's `--cwd` only parses the `=` form; the
+          # space form silently prints usage and exits 0 (builds nothing).
+          cd js-packages/web-console
+          bun run build
 
       - name: Build pipeline-manager (release)
         env:

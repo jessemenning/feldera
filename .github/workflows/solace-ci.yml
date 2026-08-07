@@ -107,7 +107,7 @@ jobs:
     # Only push on direct pushes — not PRs (PRs from forks don't have GITHUB_TOKEN write access)
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     # Large runner recommended; Rust + Java compile takes ~25 min on a 2-core runner.
     # If you have access to larger GitHub-hosted runners, change to ubuntu-latest-16-cores.
 
@@ -170,17 +170,33 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-release-${{ runner.os }}-
 
+      # ── Web console (SvelteKit) ───────────────────────────────────────────────
+      # Build the console so the cargo step below embeds it into the
+      # pipeline-manager binary, giving the image the native Feldera Web Console
+      # at the manager root (http://<host>:8081/). check-bun-version.ts requires
+      # bun >= 1.3.3. The generated API client is committed under
+      # js-packages/web-console/src/lib/services/manager/, so no codegen is needed.
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Build web console
+        run: |
+          bun install --frozen-lockfile
+          # `build` runs prebuild (workspace dep chain) then build:self
+          # (svelte-kit sync + vite build) → static output in web-console/build.
+          bun --cwd js-packages/web-console run build
+
       - name: Build pipeline-manager (release)
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
           OPENSSL_NO_VENDOR: "1"
           OPENSSL_STATIC: "1"
-          # Skip the bun/SvelteKit web-console build — we only need the REST API.
-          # build.rs embeds whatever is in this dir; an empty dir = no web UI.
-          WEBCONSOLE_BUILD_DIR: /tmp/webconsole-empty
-        run: |
-          mkdir -p /tmp/webconsole-empty
-          cargo build --release --locked -p pipeline-manager
+          # Embed the pre-built web console (previous step) into the binary.
+          # build.rs serves whatever this dir contains; empty dir = no web UI.
+          WEBCONSOLE_BUILD_DIR: ${{ github.workspace }}/js-packages/web-console/build
+        run: cargo build --release --locked -p pipeline-manager
 
       # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────
       - name: Stage build artifacts

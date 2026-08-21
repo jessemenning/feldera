@@ -116,6 +116,8 @@ reported complete until the broker has persisted every message of the batch;
   queue, add a topic subscription to the queue on the broker.
 - JSON is required for `{field}` topic templates; static topics work with any
   output format.
+- The one-record-per-message guarantee applies to the JSON output format.
+  Other formats (e.g. CSV) may pack several records into one message.
 - Key-value output formats (e.g. Debezium-style keyed formats) are not
   supported.
 - Basic (username/password) authentication only.

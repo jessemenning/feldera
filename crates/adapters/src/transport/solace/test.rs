@@ -1021,3 +1021,72 @@ fn output_persistent_publish_is_acknowledged() {
         .semp
         .wait_for_backlog(&broker.queue, N, Duration::from_secs(30));
 }
+
+/// Shared body for the high-volume output tests: publish `TOTAL` single-record
+/// buffers with a `batch_end` every `BATCH` records (mirroring the
+/// controller's step cadence), then require every message on the queue.
+///
+/// Regression coverage for the 2026-08-21 perf-harness egress investigation:
+/// the perf pipeline pushes tens of thousands of per-record buffers through
+/// one endpoint, which must survive sustained direct publishing (no silent
+/// C-SDK send-buffer drops) and, in persistent mode, many in-flight-ack
+/// window drains (`TOTAL / max_inflight_acks` ≈ 39 windows of 256).
+fn run_high_volume_output(delivery_mode: &str, test_name: &str) {
+    let broker = TestBroker::provision(test_name);
+    let topic = format!("feldera/test/{}", uuid::Uuid::new_v4());
+    broker.semp.add_queue_subscription(&broker.queue, &topic);
+
+    let config: SolaceOutputConfig = serde_json::from_value(json!({
+        "host": broker.host,
+        "port": SMF_PORT,
+        "vpn": VPN,
+        "username": CLIENT_USERNAME,
+        "password": CLIENT_PASSWORD,
+        "topic": topic,
+        "delivery_mode": delivery_mode,
+    }))
+    .unwrap();
+
+    let mut endpoint = SolaceOutputEndpoint::new(config).unwrap();
+    endpoint
+        .connect(Box::new(|fatal, error, code| {
+            panic!("async error (fatal={fatal}, code={code:?}): {error}");
+        }))
+        .unwrap();
+
+    const TOTAL: usize = 10_000;
+    const BATCH: usize = 500;
+    let start = Instant::now();
+    for i in 0..TOTAL {
+        endpoint
+            .push_buffer(format!("{{\"seq\":{i}}}").as_bytes())
+            .unwrap();
+        if (i + 1) % BATCH == 0 {
+            endpoint.batch_end().unwrap();
+        }
+    }
+    endpoint.batch_end().unwrap();
+    info!(
+        "{test_name}: published {TOTAL} {delivery_mode} messages in {:?}",
+        start.elapsed()
+    );
+
+    broker
+        .semp
+        .wait_for_backlog(&broker.queue, TOTAL as i64, Duration::from_secs(60));
+}
+
+/// High-volume direct output: fire-and-forget publishing at full speed must
+/// not drop messages to C-SDK send-buffer exhaustion on a healthy broker.
+#[test]
+fn output_high_volume_direct() {
+    run_high_volume_output("direct", "out-hv-direct");
+}
+
+/// High-volume persistent output: windowed broker acks must keep resolving
+/// across many `drain_pending_acks` cycles, both mid-batch (window full) and
+/// at batch boundaries.
+#[test]
+fn output_high_volume_persistent() {
+    run_high_volume_output("persistent", "out-hv-persistent");
+}

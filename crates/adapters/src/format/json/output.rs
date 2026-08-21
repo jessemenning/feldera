@@ -88,20 +88,22 @@ impl OutputFormat for JsonOutputFormat {
             json_config.buffer_size_records = 1;
         }
 
-        // A Solace output with a per-row `{field}` topic template resolves the
-        // destination from each message (see `resolve_topic` in the solace
-        // output transport), so such messages must each contain exactly one
-        // record encoded as a bare object — not a batch and not a JSON array.
-        // Force one-record-per-buffer, matching the Snowflake/Debezium/Redis
-        // behavior above. `array = false` guarantees a bare `{"insert":{…}}`
-        // object (a one-element `[{…}]` array would defeat `resolve_topic`'s
-        // `.get("insert")` lookup and drop back to the literal template topic).
+        // A Solace output publishes each encoder buffer as one broker
+        // message, so a multi-record buffer would reach subscribers as a
+        // single message holding a newline-delimited batch — which
+        // record-oriented consumers cannot parse (`json.loads` and friends
+        // reject trailing data), and which defeats per-message routing.
+        // Force one record per message for every Solace output, matching the
+        // Snowflake/Debezium/Redis behavior above.
         //
-        // A static topic (no `{`) publishes every record to the same
-        // destination, so it keeps normal batching for throughput.
-        if let TransportConfig::SolaceOutput(solace_config) = &config.transport
-            && solace_config.topic.contains('{')
-        {
+        // For `{field}` topic templates this is additionally load-bearing:
+        // `resolve_topic` (see the solace output transport) reads the
+        // destination from each message, which must therefore be a single
+        // record encoded as a bare object. `array = false` guarantees a bare
+        // `{"insert":{…}}` object (a one-element `[{…}]` array would defeat
+        // `resolve_topic`'s `.get("insert")` lookup and drop back to the
+        // literal template topic).
+        if matches!(&config.transport, TransportConfig::SolaceOutput(_)) {
             json_config.buffer_size_records = 1;
             json_config.array = false;
         }
@@ -1111,5 +1113,86 @@ mod test {
             test_json::<DebeziumUpdate<TestStruct>>(false, data)
         }
 
+    }
+
+    /// A Solace output must encode exactly one record per buffer: the Solace
+    /// transport publishes each buffer as one broker message, and subscribers
+    /// expect one record per message. Without the transport-specific override
+    /// in `new_encoder`, generic batching (`buffer_size_records`, default
+    /// 10,000) would pack a whole batch into a single message on a static
+    /// topic, which record-oriented consumers cannot parse. Regression test
+    /// for the 2026-08-21 perf-harness egress investigation.
+    #[test]
+    fn solace_output_encodes_one_record_per_message() {
+        use crate::OutputFormat;
+        use feldera_types::config::ConnectorConfig;
+
+        let connector_config: ConnectorConfig = serde_json::from_value(json!({
+            "transport": {
+                "name": "solace_output",
+                "config": {
+                    "host": "broker.example.com",
+                    "username": "user",
+                    "password": "pass",
+                    // Static topic (no `{field}` placeholder): only the
+                    // unconditional Solace override forces per-record buffers.
+                    "topic": "feldera/test/echo",
+                }
+            },
+            "format": {
+                "name": "json",
+                "config": {
+                    "update_format": "insert_delete",
+                    "skip_deletes": true,
+                }
+            }
+        }))
+        .unwrap();
+
+        let consumer = MockOutputConsumer::new();
+        let data = consumer.data.clone();
+        let mut encoder = super::JsonOutputFormat
+            .new_encoder(
+                "test_endpoint",
+                &connector_config,
+                &None,
+                &Relation::new(
+                    "TestStruct".into(),
+                    TestStruct::schema(),
+                    false,
+                    BTreeMap::new(),
+                ),
+                Box::new(consumer),
+                false,
+            )
+            .unwrap();
+
+        const NUM_RECORDS: u32 = 100;
+        let zset = OrdZSet::from_keys(
+            (),
+            (0..NUM_RECORDS)
+                .map(|i| Tup2(TestStruct::for_id(i), 1))
+                .collect::<Vec<_>>(),
+        );
+        let batch = Arc::new(<SerBatchImpl<_, TestStruct, ()>>::new(zset)) as Arc<dyn SerBatch>;
+        encoder.consumer().batch_start(0, OutputBatchType::Delta);
+        encoder.encode(batch.arc_as_batch_reader()).unwrap();
+        encoder.consumer().batch_end();
+
+        let buffers = data.lock().unwrap();
+        assert_eq!(
+            buffers.len(),
+            NUM_RECORDS as usize,
+            "each record must arrive in its own buffer (one Solace message per record)"
+        );
+        for (_key, val, _headers) in buffers.iter() {
+            let val = val.as_ref().expect("buffer must carry a value");
+            let doc: serde_json::Value = serde_json::from_slice(val)
+                .expect("each buffer must be a single well-formed JSON document");
+            assert!(
+                doc.get("insert").is_some(),
+                "expected a bare insert_delete object, got: {doc}"
+            );
+        }
     }
 }

@@ -62,9 +62,8 @@ publish:  demo/results/us-east/order
 ```
 
 Dynamic topics require the JSON output format (the connector rejects other
-formats at startup) and force one record per message, trading batching
-throughput for per-record routing.  A placeholder whose field is absent from
-the record is kept literally.
+formats at startup).  A placeholder whose field is absent from the record is
+kept literally.
 
 ### Dedup window
 

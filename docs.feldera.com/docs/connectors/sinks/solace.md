@@ -1,5 +1,13 @@
 # Solace output connector
 
+:::info Sidecar alternative
+This in-process connector requires a custom Feldera build (it links the Solace
+C SDK into the pipeline).  For new deployments consider the
+[Solace sidecar](https://github.com/jessemenning/feldera-solace-sidecar),
+which offers the same behavior against an **unmodified upstream Feldera image**
+by bridging data over the pipeline's HTTP API.
+:::
+
 Feldera can publish a stream of changes to a SQL view to a
 [Solace Platform](https://solace.com/) event broker with the `solace_output`
 connector.  Records are published to a topic over the native SMF protocol,

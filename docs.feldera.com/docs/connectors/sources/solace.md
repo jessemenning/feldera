@@ -1,5 +1,13 @@
 # Solace input connector
 
+:::info Sidecar alternative
+This in-process connector requires a custom Feldera build (it links the Solace
+C SDK into the pipeline).  For new deployments consider the
+[Solace sidecar](https://github.com/jessemenning/feldera-solace-sidecar),
+which offers the same behavior against an **unmodified upstream Feldera image**
+by bridging data over the pipeline's HTTP API.
+:::
+
 Feldera can consume a stream of changes to a SQL table from a
 [Solace Platform](https://solace.com/) event broker with the `solace_input`
 connector.  The connector binds to a durable queue over the native SMF

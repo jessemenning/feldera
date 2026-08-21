@@ -1,5 +1,17 @@
 //! Solace Platform input/output transport adapters using the SMF native protocol.
 //!
+//! # Sidecar alternative (recommended for new deployments)
+//!
+//! This in-process connector compiles the Solace C SDK into the pipeline
+//! binary and therefore requires a custom Feldera build.  A standalone
+//! **sidecar** — <https://github.com/jessemenning/feldera-solace-sidecar> —
+//! provides the same behavior (durable-queue consumption with deferred acks
+//! and RGMID dedup, topic-template publishing with a conflation window) while
+//! running beside an **unmodified upstream Feldera image**, bridging data over
+//! the pipeline's HTTP API.  Prefer the sidecar unless you specifically need
+//! the in-process connector's tighter completion/checkpoint ack coupling; see
+//! that repo's `docs/SEMANTICS.md` for the delivery-guarantee differences.
+//!
 //! # Input (`SolaceInputEndpoint`)
 //!
 //! Binds to a durable Solace queue via `solace-rs` (Solace C SDK wrapper).

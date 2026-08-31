@@ -13876,7 +13876,7 @@
           "ack_timeout_secs": {
             "type": "integer",
             "format": "int64",
-            "description": "Maximum time to wait for broker acknowledgements when draining\nin-flight `persistent` publishes, in seconds (default: `30`).\n\nBounds the blocking wait at each batch boundary.  If the broker does\nnot acknowledge within this window (broker death, spool over quota),\nthe batch fails with a transport error instead of stalling the\npipeline indefinitely.",
+            "description": "Maximum time to wait for broker acknowledgements when a blocking\ndrain of in-flight `persistent` publishes is required, in seconds\n(default: `30`).\n\nIf the broker does not acknowledge within this window (broker death,\nspool over quota), the batch fails with a transport error instead of\nstalling the pipeline indefinitely.",
             "minimum": 0
           },
           "client_name": {
@@ -13914,7 +13914,7 @@
           },
           "max_inflight_acks": {
             "type": "integer",
-            "description": "Maximum broker acknowledgements in flight before `batch_end` blocks,\nfor `persistent` delivery (default: `256`).",
+            "description": "Maximum broker acknowledgements in flight before publishing blocks,\nfor `persistent` delivery (default: `256`).",
             "minimum": 0
           },
           "password": {
@@ -13942,6 +13942,10 @@
             "type": "string",
             "description": "Directory holding the trusted CA certificates for TLS. Requires `tls`.",
             "nullable": true
+          },
+          "strict_step_acks": {
+            "type": "boolean",
+            "description": "Couple step completion to broker persistence for `persistent`\ndelivery (default: `false`).\n\nWhen `true`, every batch boundary blocks until the broker has\nacknowledged all messages of the batch, so a step is not reported\ncomplete (and upstream Solace inputs do not acknowledge their\nmessages) until its outputs are persisted.  The broker coalesces\npublisher acknowledgements on a roughly one-second timer, so each\nstep batch pays up to ~1 s of latency; pipelines that emit many\nsmall step batches throttle to a few messages per second.\n\nWhen `false`, acknowledgements are reaped asynchronously: rejections\nstill surface as transport errors, and publishing blocks only when\n`max_inflight_acks` is reached.  A hard crash can lose up to\n`max_inflight_acks` published-but-unacknowledged messages whose\ninputs were already acknowledged."
           },
           "tls": {
             "type": "boolean",

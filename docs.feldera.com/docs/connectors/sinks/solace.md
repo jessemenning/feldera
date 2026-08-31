@@ -21,10 +21,14 @@ topic.  Two delivery modes are available:
 - **`direct`** (default): fire-and-forget, lowest latency, no broker
   acknowledgment.  Messages published during a broker outage are lost.
 - **`persistent`**: broker-acknowledged.  The connector windows up to
-  `max_inflight_acks` outstanding acknowledgments and blocks at each batch
-  boundary (bounded by `ack_timeout_secs`) until the broker has persisted
-  every message in the batch.  An acknowledgment failure or timeout fails the
-  batch with a transport error visible in the endpoint's error metrics.
+  `max_inflight_acks` outstanding acknowledgments; publishing blocks (bounded
+  by `ack_timeout_secs`) only when that window fills.  Acknowledgments are
+  otherwise reaped without blocking, so a pipeline emitting many small step
+  batches is not throttled by the broker's acknowledgment-coalescing timer.
+  A rejected or lost acknowledgment surfaces as a transport error visible in
+  the endpoint's error metrics.  Set `strict_step_acks` to instead block at
+  every batch boundary until the broker has persisted the whole batch —
+  coupling step completion to durability, at the cost of throughput.
 
 If the broker connection is lost past the SDK's own reconnect budget, the
 connector rebuilds the session on the next publish rather than failing
@@ -47,7 +51,8 @@ connection options: `host`, `port`, `vpn`, `username`, `password`, `tls`,
 | `topic` | string | Yes | Destination topic; supports `{field}` placeholders (see below) |
 | `delivery_mode` | string | No | `direct` or `persistent`. Default: `direct` |
 | `max_inflight_acks` | integer | No | Maximum broker acknowledgments in flight before publishing blocks (`persistent` only). Must be ≥ 1. Default: 256 |
-| `ack_timeout_secs` | integer | No | Maximum wait for broker acknowledgments at each batch boundary (`persistent` only). Must be ≥ 1. Default: 30 |
+| `ack_timeout_secs` | integer | No | Maximum wait for broker acknowledgments when a blocking drain is required (`persistent` only). Must be ≥ 1. Default: 30 |
+| `strict_step_acks` | boolean | No | Block at every batch boundary until the broker has persisted the whole batch, coupling step completion to durability (`persistent` only). Default: `false` |
 | `dedup_window_ms` | integer | No | Per-topic publish throttle with conflation (see below). Default: disabled |
 
 ### Dynamic topics
@@ -106,9 +111,13 @@ GROUP  BY region, event_type;
 
 The output connector is not fault-tolerant: it does not participate in
 checkpointing, and delivery is at-most-once across pipeline restarts.
-Within a running pipeline, `persistent` mode guarantees that a step is not
-reported complete until the broker has persisted every message of the batch;
-`direct` mode offers no delivery guarantee.
+Within a running pipeline, `persistent` mode obtains a broker
+acknowledgment for every published message and reports a rejected or lost
+acknowledgment as a transport error.  By default acknowledgments are reaped
+asynchronously, so a step may be reported complete before the broker has
+acknowledged its most recent messages; set `strict_step_acks` to hold step
+completion until the whole batch is persisted.  `direct` mode offers no
+delivery guarantee.
 
 ## Limitations
 

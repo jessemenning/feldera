@@ -361,20 +361,39 @@ pub struct SolaceOutputConfig {
     #[serde(default)]
     pub delivery_mode: OutputDeliveryMode,
 
-    /// Maximum broker acknowledgements in flight before `batch_end` blocks,
+    /// Maximum broker acknowledgements in flight before publishing blocks,
     /// for `persistent` delivery (default: `256`).
     #[serde(default = "default_max_inflight_acks")]
     pub max_inflight_acks: usize,
 
-    /// Maximum time to wait for broker acknowledgements when draining
-    /// in-flight `persistent` publishes, in seconds (default: `30`).
+    /// Maximum time to wait for broker acknowledgements when a blocking
+    /// drain of in-flight `persistent` publishes is required, in seconds
+    /// (default: `30`).
     ///
-    /// Bounds the blocking wait at each batch boundary.  If the broker does
-    /// not acknowledge within this window (broker death, spool over quota),
-    /// the batch fails with a transport error instead of stalling the
-    /// pipeline indefinitely.
+    /// If the broker does not acknowledge within this window (broker death,
+    /// spool over quota), the batch fails with a transport error instead of
+    /// stalling the pipeline indefinitely.
     #[serde(default = "default_ack_timeout_secs")]
     pub ack_timeout_secs: u64,
+
+    /// Couple step completion to broker persistence for `persistent`
+    /// delivery (default: `false`).
+    ///
+    /// When `true`, every batch boundary blocks until the broker has
+    /// acknowledged all messages of the batch, so a step is not reported
+    /// complete (and upstream Solace inputs do not acknowledge their
+    /// messages) until its outputs are persisted.  The broker coalesces
+    /// publisher acknowledgements on a roughly one-second timer, so each
+    /// step batch pays up to ~1 s of latency; pipelines that emit many
+    /// small step batches throttle to a few messages per second.
+    ///
+    /// When `false`, acknowledgements are reaped asynchronously: rejections
+    /// still surface as transport errors, and publishing blocks only when
+    /// `max_inflight_acks` is reached.  A hard crash can lose up to
+    /// `max_inflight_acks` published-but-unacknowledged messages whose
+    /// inputs were already acknowledged.
+    #[serde(default)]
+    pub strict_step_acks: bool,
 
     /// Per-topic publish throttle with conflation, in milliseconds
     /// (default: `None` — disabled).
@@ -446,6 +465,7 @@ impl Default for SolaceOutputConfig {
             delivery_mode: OutputDeliveryMode::default(),
             max_inflight_acks: default_max_inflight_acks(),
             ack_timeout_secs: default_ack_timeout_secs(),
+            strict_step_acks: false,
             dedup_window_ms: None,
             tls: false,
             ssl_trust_store_dir: None,
@@ -746,5 +766,20 @@ mod tests {
     #[test]
     fn delivery_mode_default_is_direct() {
         assert_eq!(OutputDeliveryMode::default(), OutputDeliveryMode::Direct);
+    }
+
+    #[test]
+    fn output_config_strict_step_acks_defaults_off() {
+        let json = r#"{"host":"h","username":"u","password":"p","topic":"t"}"#;
+        let cfg: SolaceOutputConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.strict_step_acks);
+    }
+
+    #[test]
+    fn output_config_strict_step_acks_parses() {
+        let json =
+            r#"{"host":"h","username":"u","password":"p","topic":"t","strict_step_acks":true}"#;
+        let cfg: SolaceOutputConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.strict_step_acks);
     }
 }

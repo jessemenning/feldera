@@ -981,8 +981,9 @@ fn output_dedup_window_conflates() {
     );
 }
 
-/// Persistent-mode output: every published record is broker-acknowledged by
-/// `batch_end`, and all records arrive on a queue subscribed to the topic.
+/// Persistent-mode output with `strict_step_acks`: every published record is
+/// broker-acknowledged by `batch_end`, and all records arrive on a queue
+/// subscribed to the topic.
 #[test]
 fn output_persistent_publish_is_acknowledged() {
     let broker = TestBroker::provision("output");
@@ -997,6 +998,7 @@ fn output_persistent_publish_is_acknowledged() {
         "password": CLIENT_PASSWORD,
         "topic": topic,
         "delivery_mode": "persistent",
+        "strict_step_acks": true,
     }))
     .unwrap();
 
@@ -1089,4 +1091,58 @@ fn output_high_volume_direct() {
 #[test]
 fn output_high_volume_persistent() {
     run_high_volume_output("persistent", "out-hv-persistent");
+}
+
+/// Persistent output at real pipeline step cadence: a `batch_end` after every
+/// single record must not throttle publishing to the broker's ~1 s
+/// acknowledgment-coalescing timer.
+///
+/// Regression test for the 2026-08-21 egress investigation, second root
+/// cause: the default (non-strict) mode reaps resolved acknowledgments
+/// without blocking, so 200 one-record batches complete in seconds rather
+/// than in ~200 s (one coalesced-ack wait per batch).
+#[test]
+fn output_persistent_step_cadence_not_throttled() {
+    let broker = TestBroker::provision("out-cadence");
+    let topic = format!("feldera/test/{}", uuid::Uuid::new_v4());
+    broker.semp.add_queue_subscription(&broker.queue, &topic);
+
+    let config: SolaceOutputConfig = serde_json::from_value(json!({
+        "host": broker.host,
+        "port": SMF_PORT,
+        "vpn": VPN,
+        "username": CLIENT_USERNAME,
+        "password": CLIENT_PASSWORD,
+        "topic": topic,
+        "delivery_mode": "persistent",
+    }))
+    .unwrap();
+
+    let mut endpoint = SolaceOutputEndpoint::new(config).unwrap();
+    endpoint
+        .connect(Box::new(|fatal, error, code| {
+            panic!("async error (fatal={fatal}, code={code:?}): {error}");
+        }))
+        .unwrap();
+
+    const N: i64 = 200;
+    let start = Instant::now();
+    for i in 0..N {
+        endpoint
+            .push_buffer(format!("{{\"seq\":{i}}}").as_bytes())
+            .unwrap();
+        endpoint.batch_end().unwrap();
+    }
+    let elapsed = start.elapsed();
+    info!("out-cadence: {N} one-record batches in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "one-record batches must not serialize on the broker's ack-coalescing \
+         timer (took {elapsed:?} for {N} batches; the throttled behavior takes \
+         ~{N} s)"
+    );
+
+    broker
+        .semp
+        .wait_for_backlog(&broker.queue, N, Duration::from_secs(60));
 }

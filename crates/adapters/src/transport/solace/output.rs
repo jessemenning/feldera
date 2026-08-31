@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -35,9 +35,12 @@ pub struct SolaceOutputEndpoint {
     /// topics.
     static_topic: Option<Arc<str>>,
     /// In-flight broker acknowledgments for `Persistent` delivery, awaiting
-    /// resolution. Drained at each `batch_end` and whenever the count reaches
-    /// `config.max_inflight_acks`.
-    pending_acks: Vec<oneshot::Receiver<Result<(), SessionError>>>,
+    /// resolution, oldest first (the broker acknowledges in publish order).
+    /// Resolved entries are reaped without blocking at each `batch_end`;
+    /// publishing blocks for acknowledgments only when the count reaches
+    /// `config.max_inflight_acks`, or at every `batch_end` when
+    /// `config.strict_step_acks` is set.
+    pending_acks: VecDeque<oneshot::Receiver<Result<(), SessionError>>>,
     /// Per-topic publish throttle; `Some` when `dedup_window_ms` is set.
     dedup: Option<DedupState>,
     /// The controller's error callback, stored at `connect` so session
@@ -81,7 +84,7 @@ impl SolaceOutputEndpoint {
             config,
             conn: None,
             static_topic,
-            pending_acks: Vec::new(),
+            pending_acks: VecDeque::new(),
             dedup,
             error_cb: None,
         })
@@ -179,9 +182,10 @@ impl SolaceOutputEndpoint {
             OutputDeliveryMode::Persistent => {
                 // Windowed acknowledgment: publish_with_ack returns a oneshot
                 // that resolves when the broker persists (or rejects) the
-                // message. Collect the receivers and drain them at the batch
-                // boundary, bounding in-flight acks so a slow broker applies
-                // backpressure instead of growing memory without limit.
+                // message. Collect the receivers; resolved ones are reaped at
+                // batch boundaries, and `max_inflight_acks` bounds the window
+                // so a slow broker applies backpressure instead of growing
+                // memory without limit.
                 let rx = {
                     let conn = self
                         .conn
@@ -191,17 +195,74 @@ impl SolaceOutputEndpoint {
                         .publish_with_ack(msg)
                         .map_err(|e| anyhow::anyhow!("publish to '{topic}': {e:?}"))?
                 };
-                self.pending_acks.push(rx);
+                self.pending_acks.push_back(rx);
                 if self.pending_acks.len() >= self.config.max_inflight_acks {
-                    self.drain_pending_acks()?;
+                    self.wait_for_ack_capacity()?;
                 }
             }
         }
         Ok(())
     }
 
+    /// Reap in-flight persistent acknowledgments that have already resolved,
+    /// oldest first, without blocking.
+    ///
+    /// The broker acknowledges in publish order, so the reap stops at the
+    /// first unresolved receiver.  A rejected or lost acknowledgment returns
+    /// an error, which the controller logs as a (non-fatal) transport error
+    /// for the step.
+    fn reap_resolved_acks(&mut self) -> AnyResult<()> {
+        while let Some(rx) = self.pending_acks.front_mut() {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.pending_acks.pop_front();
+                }
+                Ok(Err(e)) => {
+                    self.pending_acks.pop_front();
+                    return Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}"));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => break,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.pending_acks.pop_front();
+                    return Err(anyhow::anyhow!(
+                        "Solace ack channel closed before broker acknowledgment"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Block until the in-flight acknowledgment count drops below
+    /// `max_inflight_acks`, or until `ack_timeout_secs` elapses.
+    ///
+    /// Called when a publish fills the window.  In practice the C SDK's own
+    /// publish window (50 unacked messages) blocks `publish` long before this
+    /// window fills, so by the time `pending_acks` reaches capacity most
+    /// entries have already resolved and the reap frees space without
+    /// blocking; the blocking path runs only when the broker has genuinely
+    /// stopped acknowledging.
+    fn wait_for_ack_capacity(&mut self) -> AnyResult<()> {
+        self.reap_resolved_acks()?;
+        if self.pending_acks.len() < self.config.max_inflight_acks {
+            return Ok(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(self.config.ack_timeout_secs);
+        while self.pending_acks.len() >= self.config.max_inflight_acks {
+            self.block_on_oldest_ack(deadline)?;
+            self.reap_resolved_acks()?;
+        }
+        Ok(())
+    }
+
     /// Block until every in-flight persistent publish has been acknowledged by
     /// the broker, or until `ack_timeout_secs` elapses.
+    ///
+    /// Runs at each `batch_end` when `strict_step_acks` is set, coupling step
+    /// completion to broker persistence.  The broker coalesces publisher
+    /// acknowledgments on a roughly one-second timer when the publish window
+    /// is not turning over, so the tail of any burst waits up to ~1 s here —
+    /// which is why this drain is opt-in rather than the default.
     ///
     /// A rejected, lost, or timed-out acknowledgment returns an error, which
     /// the controller logs as a (non-fatal) transport error for the step;
@@ -220,35 +281,38 @@ impl SolaceOutputEndpoint {
         // One deadline bounds the whole drain: acks resolve in publish order,
         // so a healthy broker clears every receiver well inside the window.
         let deadline = Instant::now() + Duration::from_secs(self.config.ack_timeout_secs);
-        let total = self.pending_acks.len();
-        for (i, rx) in self.pending_acks.drain(..).enumerate() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            // The endpoint runs on a dedicated OS thread (no ambient runtime),
-            // so blocking on the shared runtime here is safe — the same
-            // reasoning that made the previous `blocking_recv()` legal.  The
-            // timeout must be constructed *inside* the async block: its timer
-            // registration needs the runtime context.
-            match TOKIO.block_on(async { tokio::time::timeout(remaining, rx).await }) {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    return Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}"));
-                }
-                Ok(Err(_closed)) => {
-                    return Err(anyhow::anyhow!(
-                        "Solace ack channel closed before broker acknowledgment"
-                    ));
-                }
-                Err(_elapsed) => {
-                    return Err(anyhow::anyhow!(
-                        "broker did not acknowledge {} of {total} in-flight persistent \
-                         publish(es) within {}s",
-                        total - i,
-                        self.config.ack_timeout_secs
-                    ));
-                }
-            }
+        while !self.pending_acks.is_empty() {
+            self.block_on_oldest_ack(deadline)?;
         }
         Ok(())
+    }
+
+    /// Block until the oldest in-flight acknowledgment resolves or `deadline`
+    /// passes, removing it from the window.
+    fn block_on_oldest_ack(&mut self, deadline: Instant) -> AnyResult<()> {
+        let total = self.pending_acks.len();
+        let rx = self
+            .pending_acks
+            .pop_front()
+            .expect("caller checked pending_acks is nonempty");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // The endpoint runs on a dedicated OS thread (no ambient runtime),
+        // so blocking on the shared runtime here is safe — the same
+        // reasoning that made the previous `blocking_recv()` legal.  The
+        // timeout must be constructed *inside* the async block: its timer
+        // registration needs the runtime context.
+        match TOKIO.block_on(async { tokio::time::timeout(remaining, rx).await }) {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(anyhow::anyhow!("broker rejected persistent publish: {e:?}")),
+            Ok(Err(_closed)) => Err(anyhow::anyhow!(
+                "Solace ack channel closed before broker acknowledgment"
+            )),
+            Err(_elapsed) => Err(anyhow::anyhow!(
+                "broker did not acknowledge {total} in-flight persistent publish(es) \
+                 within {}s",
+                self.config.ack_timeout_secs
+            )),
+        }
     }
 }
 
@@ -358,14 +422,22 @@ however the Solace transport does not support this representation."
         // a record conflated on a stream that then goes quiet waits for the
         // next batch after its window expires.
         self.flush_expired_dedup()?;
-        // Persistent mode: block (bounded by `ack_timeout_secs`) until the
-        // broker has acknowledged every message in this batch before the step
-        // is reported complete.  An error here surfaces as a non-fatal
-        // transport error on the step — it is logged and the endpoint's error
-        // count rises, but the step still completes, so operators monitoring
-        // for delivery guarantees must watch the endpoint error metrics.
-        // Direct mode leaves pending_acks empty, so this is a no-op.
-        self.drain_pending_acks()
+        // Persistent mode: surface acknowledgment results.  An error here is
+        // a non-fatal transport error on the step — it is logged and the
+        // endpoint's error count rises, but the step still completes, so
+        // operators monitoring for delivery guarantees must watch the
+        // endpoint error metrics.  Direct mode leaves pending_acks empty, so
+        // both paths are no-ops.
+        if self.config.strict_step_acks {
+            // Block (bounded by `ack_timeout_secs`) until the broker has
+            // acknowledged every message in this batch before the step is
+            // reported complete.
+            self.drain_pending_acks()
+        } else {
+            // Reap resolved acknowledgments without blocking; unresolved ones
+            // stay in flight, bounded by `max_inflight_acks`.
+            self.reap_resolved_acks()
+        }
     }
 
     fn is_fault_tolerant(&self) -> bool {

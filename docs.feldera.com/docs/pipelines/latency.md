@@ -88,6 +88,24 @@ The `completed_frontier` property is currently supported for the following conne
 * [Kafka input connector](/connectors/sources/kafka)
 * [Delta Lake connector](/connectors/sources/delta)
 
+For a [distributed](/connectors#distributed) connector in a multihost
+pipeline, each host reports its own frontier, and `/stats` combines them as
+follows:
+
+| Hosts                                        | Combined frontier                    |
+|----------------------------------------------|--------------------------------------|
+| A host that is still reading has no frontier | None.                                |
+| Otherwise, some hosts are still reading      | The oldest frontier of those hosts.  |
+| Every host is at end of input                | The newest frontier.                 |
+
+Hosts at end of input do not hold back the frontier.  The combined
+frontier's `metadata` describes the whole connector:
+
+| Connector  | Combined `metadata`                                                             |
+|------------|---------------------------------------------------------------------------------|
+| Delta Lake | The `version` of the host whose frontier it is.  Every host reads the same table. |
+| Kafka      | The `partitions` and `offsets` of every host, in partition order.                |
+
 These connectors support the following metadata formats:
 
 <Tabs>
@@ -117,6 +135,16 @@ These connectors support the following metadata formats:
     }
     ```
     where the `offsets` array stores the offset range in the last processed batch per Kafka partition.
+
+    A [distributed](/connectors#distributed) connector also lists the
+    partitions that `offsets` describes, in the same order:
+
+    ```json
+    {
+        "partitions": [0, 1, ...],
+        "offsets": [{"start": START_OFFSET0, "end": END_OFFSET0}, ...]
+    }
+    ```
     </TabItem>
 </Tabs>
 
@@ -143,11 +171,11 @@ the first Delta table version after version 10 (if any). For example, using Spar
 
 ```sql
 WITH history AS (
-  DESCRIBE HISTORY my_table
+  describe history my_table
 )
 SELECT
-  CASE WHEN version = 11 THEN timestamp END AS v11_timestamp,
-  (unix_timestamp(now()) - unix_timestamp(v11_timestamp)) AS seconds_between
+  CASE WHEN version = 11 THEN TIMESTAMP END AS v11_timestamp,
+  (unix_timestamp(NOW()) - unix_timestamp(v11_timestamp)) AS seconds_between
 FROM history;
 ```
 

@@ -1,12 +1,19 @@
+use crate::trace::StoragePath;
+use crate::utils::test::CIRCUIT_CASES;
+use feldera_types::size::ConfigSize;
 use std::{
     cmp::max,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    thread::sleep,
+    time::{Duration, Instant},
 };
 
 use feldera_storage::tokio::TOKIO;
+use feldera_types::config::dev_tweaks::DevTweaks;
+use feldera_types::memory_pressure::MemoryPressure;
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
 use size_of::SizeOf;
 use tempfile::tempdir;
@@ -19,13 +26,18 @@ use crate::{
     },
     circuit::{CircuitConfig, mkconfig},
     dynamic::{DowncastTrait, DynData, DynUnit, DynWeightedPairs, Erase, LeanVec, pair::DynPair},
-    storage::{buffer_cache::CacheStats, file::FilterKind},
+    storage::{
+        buffer_cache::CacheStats,
+        file::FilterKind,
+        file::reader::{CorruptionError, Error as ReaderError},
+    },
     trace::{
-        Batch, BatchLocation, BatchReader, BatchReaderFactories, Builder, FileIndexedWSetFactories,
-        FileWSetFactories, GroupFilter, ListMerger, Spine, Trace, VecIndexedWSet,
+        Batch, BatchLayout, BatchLocation, BatchReader, BatchReaderFactories, Builder,
+        FallbackIndexedWSet, FallbackIndexedWSetFactories, FileIndexedWSetFactories,
+        FileWSetFactories, GroupFilter, ListMerger, Spine, Trace, TraceRole, VecIndexedWSet,
         VecIndexedWSetFactories, VecKeyBatch, VecKeyBatchFactories, VecValBatch,
-        VecValBatchFactories, VecWSet, VecWSetFactories,
-        cursor::{Cursor, CursorPair},
+        VecValBatchFactories, VecWSet, VecWSetFactories, WithSnapshot,
+        cursor::{Cursor, CursorList, CursorPair},
         ord::{
             FileIndexedWSet, FileKeyBatch, FileKeyBatchFactories, FileValBatch,
             FileValBatchFactories, FileWSet, OrdKeyBatch, OrdKeyBatchFactories, OrdValBatch,
@@ -33,13 +45,15 @@ use crate::{
         },
         test::test_batch::{
             TestBatch, TestBatchFactories, assert_batch_cursors_eq, assert_batch_eq,
-            assert_trace_eq, test_batch_sampling, test_trace_sampling,
+            assert_bounds_match_cursor, assert_negative_weights_counted, assert_trace_eq,
+            test_batch_sampling, test_trace_sampling,
         },
     },
     utils::{Tup1, Tup2, Tup3, Tup4},
 };
 
 use super::Filter;
+use crate::circuit::runtime::tests::with_mock_process_rss;
 use itertools::Itertools;
 
 pub mod test_batch;
@@ -193,10 +207,17 @@ fn test_zset_spine<B: ZSet<Key = DynI32>>(
     batches: Vec<(Vec<Tup2<i32, ZWeight>>, i32)>,
     seed: u64,
 ) {
-    let mut trace: Spine<B> = Spine::new(factories, Arc::new(String::from("Test")));
+    let mut trace: Spine<B> = Spine::new(
+        factories,
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
-    let mut ref_trace: TestBatch<DynI32, DynUnit /* <()> */, (), DynZWeight> =
-        TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut ref_trace: TestBatch<DynI32, DynUnit /* <()> */, (), DynZWeight> = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     let mut kbound = 0;
     for (tuples, bound) in batches.into_iter() {
@@ -207,6 +228,8 @@ fn test_zset_spine<B: ZSet<Key = DynI32>>(
             TestBatch::dyn_from_tuples(&TestBatchFactories::new(), (), &mut erased_tuples);
 
         test_batch_sampling(&batch);
+        assert_negative_weights_counted(&batch);
+        assert_negative_weights_counted(&batch.neg_by_ref());
 
         assert_batch_eq(&batch, &ref_batch);
 
@@ -221,6 +244,9 @@ fn test_zset_spine<B: ZSet<Key = DynI32>>(
         test_trace_sampling(&trace);
 
         assert_trace_eq(&trace, &ref_trace);
+        for batch in trace.get_batches() {
+            assert_negative_weights_counted(&*batch);
+        }
 
         kbound = max(kbound, bound);
         trace.retain_keys(Filter::new(Box::new(move |key| {
@@ -241,10 +267,17 @@ fn test_indexed_zset_spine<B: IndexedZSet<Key = DynI32, Val = DynI32>>(
     batches: Vec<(Vec<Tup2<Tup2<i32, i32>, ZWeight>>, i32, i32)>,
     seed: u64,
 ) {
-    let mut trace: Spine<B> = Spine::new(factories, Arc::new(String::from("Test")));
+    let mut trace: Spine<B> = Spine::new(
+        factories,
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
-    let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> =
-        TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     let mut bound = 0;
     let mut kbound = 0;
@@ -256,6 +289,8 @@ fn test_indexed_zset_spine<B: IndexedZSet<Key = DynI32, Val = DynI32>>(
             TestBatch::dyn_from_tuples(&TestBatchFactories::new(), (), &mut erased_tuples);
 
         test_batch_sampling(&batch);
+        assert_negative_weights_counted(&batch);
+        assert_negative_weights_counted(&batch.neg_by_ref());
 
         assert_batch_eq(&batch, &ref_batch);
 
@@ -273,6 +308,9 @@ fn test_indexed_zset_spine<B: IndexedZSet<Key = DynI32, Val = DynI32>>(
 
         assert_trace_eq(&trace, &ref_trace);
         assert_batch_cursors_eq(trace.cursor(), &ref_trace, seed);
+        for batch in trace.get_batches() {
+            assert_negative_weights_counted(&*batch);
+        }
 
         kbound = max(kbound, key_bound);
         trace.retain_keys(Filter::new(Box::new(move |key| {
@@ -311,9 +349,16 @@ fn test_fork_spine<B: IndexedZSet<Key = DynI32, Val = DynI32>>(
 ) {
     let fork_at = fork_at.min(batches.len());
 
-    let mut trace: Spine<B> = Spine::new(factories, Arc::new(String::from("Test")));
-    let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> =
-        TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut trace: Spine<B> = Spine::new(
+        factories,
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
+    let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     for tuples in &batches[..fork_at] {
         let mut erased_tuples = indexed_zset_tuples(tuples.clone());
@@ -371,9 +416,16 @@ fn test_val_batch_trace_spine<B: ZBatch<Key = DynI32, Val = DynI32, Time = u32>>
 ) {
     // `trace1` uses `truncate_keys_below`.
     // `trace2` uses `retain_keys`.
-    let mut trace: Spine<B> = Spine::new(factories, Arc::new(String::from("Test")));
-    let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> =
-        TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut trace: Spine<B> = Spine::new(
+        factories,
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
+    let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     let mut bound = 0;
     let mut kbound = 0;
@@ -503,9 +555,16 @@ fn test_key_batch_spine<B: ZBatch<Key = DynI32, Val = DynUnit, Time = u32>>(
     batches: Vec<(Vec<Tup2<i32, ZWeight>>, i32)>,
     seed: u64,
 ) {
-    let mut trace: Spine<B> = Spine::new(factories, Arc::new(String::from("Test")));
-    let mut ref_trace: TestBatch<DynI32, DynUnit /* <()> */, u32, DynZWeight> =
-        TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut trace: Spine<B> = Spine::new(
+        factories,
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
+    let mut ref_trace: TestBatch<DynI32, DynUnit /* <()> */, u32, DynZWeight> = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     let mut kbound = 0;
     for (time, (tuples, bound)) in batches.into_iter().enumerate() {
@@ -586,6 +645,574 @@ fn test_file_wset_neg_by_ref_preserves_key_bounds() {
         assert_batch_eq(&negated, &expected);
         assert_out_of_range_seek_uses_range_filter(&negated, -20, 40);
     });
+}
+
+/// A layer file records whether its value column carries a hidden trailing
+/// column, and opening one through factories that disagree is a loud error
+/// rather than a misdecode.
+///
+/// This is the guard that keeps a projected batch from being read as though its
+/// values were plain, which would deserialize `Tup2<V, u32>` bytes as `V`
+/// through unchecked rkyv.
+#[test]
+fn test_file_indexed_wset_value_stamp_guards_from_path() {
+    run_in_circuit_with_storage(|| {
+        let stamped =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::stamped::<i32, i32, ZWeight>();
+        let plain =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+
+        let mut tuples = indexed_zset_tuples(vec![Tup2(Tup2(1, 10), 1), Tup2(Tup2(2, 20), 1)]);
+        let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &stamped,
+            (),
+            &mut tuples,
+        );
+
+        let path = batch.file_reader().unwrap().path().to_string().into();
+
+        // Same factories: reopens, and the contents survive. This also proves
+        // the builder wrote the stamp, since the guard compares the two.
+        let reopened = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::from_path(&stamped, &path)
+            .expect("a stamped file reopens through stamped factories");
+        assert_eq!(reopened.len_upper_bound(), batch.len_upper_bound());
+
+        // Plain factories: refused, not misdecoded.
+        let err = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::from_path(&plain, &path)
+            .expect_err("plain factories must refuse a stamped file");
+        assert!(
+            format!("{err}").contains("stamped"),
+            "expected a value-stamp mismatch, got: {err}"
+        );
+    });
+}
+
+/// `(key, value, hidden stamp, weight)` for a projected batch.
+type ProjectedRow = (i32, i32, u32, ZWeight);
+
+type ProjectedPair = DynPair<DynData, DynData>;
+type Projectable = FallbackIndexedWSet<DynData, DynData, DynZWeight>;
+
+/// The inner batch a projected variant wraps: values are `(value, stamp)`
+/// pairs, and the batch consolidates rows agreeing on all three of key, value
+/// and stamp.
+///
+/// # Arguments
+///
+/// * `rows` - the rows to hold.
+///
+/// # Returns
+///
+/// The inner batch, held in memory.
+fn projected_inner(rows: &[ProjectedRow]) -> VecIndexedWSet<DynData, ProjectedPair, DynZWeight> {
+    let factories = <VecIndexedWSetFactories<DynData, ProjectedPair, DynZWeight>>::new::<
+        i32,
+        Tup2<i32, u32>,
+        ZWeight,
+    >();
+    let tuples: Vec<Tup2<Tup2<i32, Tup2<i32, u32>>, ZWeight>> = rows
+        .iter()
+        .map(|&(key, value, stamp, weight)| Tup2(Tup2(key, Tup2(value, stamp)), weight))
+        .collect();
+    let mut tuples = Box::new(LeanVec::from(tuples)).erase_box();
+    VecIndexedWSet::dyn_from_tuples(&factories, (), &mut tuples)
+}
+
+/// [`projected_inner`] on storage, written through the stamped factories so the
+/// file records that its values carry a trailing column.
+///
+/// # Arguments
+///
+/// * `factories` - factories describing both value types.
+/// * `rows` - the rows to hold.
+///
+/// # Returns
+///
+/// The inner batch, on storage.
+fn projected_inner_file(
+    factories: &FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>,
+    rows: &[ProjectedRow],
+) -> FileIndexedWSet<DynData, ProjectedPair, DynZWeight> {
+    let tuples: Vec<Tup2<Tup2<i32, Tup2<i32, u32>>, ZWeight>> = rows
+        .iter()
+        .map(|&(key, value, stamp, weight)| Tup2(Tup2(key, Tup2(value, stamp)), weight))
+        .collect();
+    let mut tuples = Box::new(LeanVec::from(tuples)).erase_box();
+    FileIndexedWSet::dyn_from_tuples(factories.projected(), (), &mut tuples)
+}
+
+/// Every `(key, value, weight)` a batch's cursor exposes.
+///
+/// # Arguments
+///
+/// * `batch` - the batch to walk.
+///
+/// # Returns
+///
+/// Its records, in key and value order.
+fn projected_contents<B>(batch: &B) -> Vec<(i32, i32, ZWeight)>
+where
+    B: BatchReader<Key = DynData, Val = DynData, Time = (), R = DynZWeight>,
+{
+    cursor_contents(&mut batch.cursor())
+}
+
+/// Every `(key, value, weight)` that `cursor` exposes from where it stands.
+///
+/// # Arguments
+///
+/// * `cursor` - the cursor to walk.
+///
+/// # Returns
+///
+/// Its records, in key and value order.
+fn cursor_contents(
+    cursor: &mut dyn Cursor<DynData, DynData, (), DynZWeight>,
+) -> Vec<(i32, i32, ZWeight)> {
+    let mut contents = Vec::new();
+    while cursor.key_valid() {
+        while cursor.val_valid() {
+            contents.push((
+                *unsafe { cursor.key().downcast::<i32>() },
+                *unsafe { cursor.val().downcast::<i32>() },
+                **cursor.weight(),
+            ));
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    contents
+}
+
+/// A batch over values that carry a trailing column reads back as a batch over
+/// the leading column alone: values differing only in the stamp become one
+/// value carrying their summed weight.
+#[test]
+fn test_fallback_indexed_wset_projects_hidden_column() {
+    let factories = <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+        i32,
+        i32,
+        ZWeight,
+    >();
+    // Key 1 holds value 10 at two stamps and value 20 at one; key 2 holds a
+    // value whose two stamps cancel, so it disappears along with its key.
+    let rows: &[ProjectedRow] = &[
+        (1, 10, 0, 1),
+        (1, 10, 5, 2),
+        (1, 20, 1, 1),
+        (2, 30, 0, 1),
+        (2, 30, 7, -1),
+    ];
+
+    let batch = Projectable::from_projected_vec(&factories, projected_inner(rows));
+    assert_eq!(
+        projected_contents(&batch),
+        vec![(1, 10, 3), (1, 20, 1)],
+        "the stamps must be invisible and their runs consolidated"
+    );
+
+    // The count is over the inner batch, so it counts the stamps rather than
+    // the values they project to; `len_upper_bound` promises only an upper bound.
+    assert!(
+        batch.len_upper_bound() >= 2,
+        "len_upper_bound is an upper bound on the projected length"
+    );
+}
+
+/// A projected batch keeps the answer its first `is_empty` call finds, and the
+/// answer holds on later calls, on a clone and on the negated batch.
+#[test]
+fn test_fallback_indexed_wset_keeps_projected_emptiness() {
+    let factories = <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+        i32,
+        i32,
+        ZWeight,
+    >();
+    // Keys 1 and 2 cancel across their stamps; key 3 does not.
+    let cancelling: &[ProjectedRow] =
+        &[(1, 10, 0, 1), (1, 10, 5, -1), (2, 20, 0, 2), (2, 20, 1, -2)];
+    let mut surviving = cancelling.to_vec();
+    surviving.push((3, 30, 0, 1));
+
+    for (rows, empty) in [(cancelling, true), (surviving.as_slice(), false)] {
+        let batch = Projectable::from_projected_vec(&factories, projected_inner(rows));
+        assert_eq!(batch.is_empty(), empty, "first call on {rows:?}");
+        assert_eq!(batch.is_empty(), empty, "kept answer on {rows:?}");
+        assert_eq!(batch.clone().is_empty(), empty, "clone of {rows:?}");
+        assert_eq!(batch.neg_by_ref().is_empty(), empty, "negation of {rows:?}");
+    }
+}
+
+/// Spilling a projected batch to storage drops the trailing column: the file
+/// holds the values a reader of the batch sees, so it is an ordinary batch that
+/// reopens without one.
+#[test]
+fn test_fallback_indexed_wset_persisting_drops_the_hidden_column() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        // Value 10 is held at two stamps, so the inner batch has one more record
+        // than the projection exposes.
+        let rows: &[ProjectedRow] = &[(1, 10, 0, 1), (1, 10, 5, 2), (1, 20, 1, 1)];
+        let expected = vec![(1, 10, 3), (1, 20, 1)];
+
+        let batch = Projectable::from_projected_vec(&factories, projected_inner(rows));
+        assert_eq!(
+            batch.len_upper_bound(),
+            3,
+            "the inner batch still counts stamps"
+        );
+
+        let persisted = batch
+            .persisted()
+            .expect("an in-memory batch persists to storage");
+        assert_eq!(persisted.location(), BatchLocation::Storage);
+        assert_eq!(
+            projected_contents(&persisted),
+            expected,
+            "spilling must not disturb the projection"
+        );
+        assert_eq!(
+            persisted.len_upper_bound(),
+            expected.len(),
+            "the spilled batch counts values, so the column is gone rather than hidden"
+        );
+
+        let path: StoragePath = persisted.file_reader().unwrap().path().to_string().into();
+        let reopened = Projectable::from_path(&factories, &path)
+            .expect("a batch spilled from a projected one reopens as an ordinary batch");
+        assert_eq!(projected_contents(&reopened), expected);
+        assert_eq!(reopened.len_upper_bound(), expected.len());
+    });
+}
+
+/// A file whose values do carry the trailing column reopens as a projected
+/// batch, on the stamp the file records.
+#[test]
+fn test_fallback_indexed_wset_reopens_a_stamped_file_as_projected() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        let rows: &[ProjectedRow] = &[(1, 10, 0, 1), (1, 10, 5, 2), (1, 20, 1, 1)];
+        let expected = vec![(1, 10, 3), (1, 20, 1)];
+
+        let batch =
+            Projectable::from_projected_file(&factories, projected_inner_file(&factories, rows));
+        assert_eq!(projected_contents(&batch), expected);
+
+        let path: StoragePath = batch.file_reader().unwrap().path().to_string().into();
+        let reopened = Projectable::from_path(&factories, &path).expect("a stamped file reopens");
+        assert_eq!(
+            projected_contents(&reopened),
+            expected,
+            "the stamp must route the file back to the projected variant"
+        );
+        assert_eq!(
+            reopened.len_upper_bound(),
+            3,
+            "reopened as projected, so the count is still over the stamped records"
+        );
+    });
+}
+
+/// A stamped file opened through factories that describe no projection is
+/// refused.
+///
+/// The plain factories cannot read the file: its values carry a column they know
+/// nothing about, and decoding one as the other would hand rkyv a record of the
+/// wrong type.  The stamp the file records is what makes the refusal possible.
+#[test]
+fn test_fallback_indexed_wset_refuses_a_stamped_file_without_projection() {
+    run_in_circuit_with_storage(|| {
+        let projecting =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        let batch = Projectable::from_projected_file(
+            &projecting,
+            projected_inner_file(&projecting, &[(1, 10, 0, 1)]),
+        );
+        let path: StoragePath = batch.file_reader().unwrap().path().to_string().into();
+
+        let plain =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<i32, i32, ZWeight>(
+            );
+        assert!(
+            matches!(
+                Projectable::from_path(&plain, &path),
+                Err(ReaderError::Corruption(
+                    CorruptionError::ValueStampMismatch {
+                        expected: false,
+                        found: true,
+                    }
+                ))
+            ),
+            "a stamped file must be refused, not read as an unstamped one"
+        );
+    });
+}
+
+/// Fetching keys from a projected batch on storage returns their records with
+/// the trailing value hidden, as the batch's own cursor does, so a spine can read
+/// such a batch with one parallel fetch instead of a lookup per key.
+#[test]
+fn test_fallback_indexed_wset_fetches_projected_keys() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        // Key 1 keeps both of its values, the only value of key 2 cancels, and
+        // key 3 is not asked for.
+        let rows: &[ProjectedRow] = &[
+            (1, 10, 0, 1),
+            (1, 10, 1, 2),
+            (1, 20, 0, 1),
+            (2, 20, 0, 5),
+            (2, 20, 1, -5),
+            (3, 30, 0, 4),
+        ];
+        let batch =
+            Projectable::from_projected_file(&factories, projected_inner_file(&factories, rows));
+
+        // Only the keys of `wanted` matter: 1, 2, and 4, which the batch lacks.
+        let wanted = projected_inner(&[(1, 0, 0, 1), (2, 0, 0, 1), (4, 0, 0, 1)]);
+        let fetched = TOKIO
+            .block_on(batch.fetch(&wanted))
+            .expect("a projected batch on storage fetches the keys it is asked for");
+        assert_eq!(
+            cursor_contents(&mut *fetched.get_cursor()),
+            vec![(1, 10, 3), (1, 20, 1)],
+            "the fetched records must hide the trailing value"
+        );
+    });
+}
+
+/// Factories that describe no projection cannot hold a projected batch, and say
+/// so rather than reading its values as though they had no trailing column.
+#[test]
+#[should_panic(expected = "with_projection")]
+fn test_fallback_indexed_wset_projection_requires_its_factories() {
+    let plain =
+        <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<i32, i32, ZWeight>();
+    let _ = Projectable::from_projected_vec(&plain, projected_inner(&[(1, 10, 0, 1)]));
+}
+
+/// Rows for a projected batch.  A row may be mirrored by one that carries the
+/// negated weight under another stamp, which cancels the row in the projection
+/// but not in the inner batch, so values, keys, and whole batches can cancel.
+///
+/// # Returns
+///
+/// A strategy for the rows.
+fn projected_rows() -> impl Strategy<Value = Vec<ProjectedRow>> + Clone {
+    vec(
+        (
+            0..8i32,
+            0..4i32,
+            0..4u32,
+            prop_oneof![-2i64..=-1, 1i64..=2],
+            any::<bool>(),
+        ),
+        0..30,
+    )
+    .prop_map(|rows| {
+        let mut projected = Vec::with_capacity(rows.len() * 2);
+        for (key, value, stamp, weight, mirror) in rows {
+            projected.push((key, value, stamp, weight));
+            if mirror {
+                projected.push((key, value, stamp + 4, -weight));
+            }
+        }
+        projected
+    })
+}
+
+/// The batch that a projected batch over `rows` must read as: the rows without
+/// their stamps, consolidated.
+///
+/// # Arguments
+///
+/// * `rows` - the projected batch's rows.
+///
+/// # Returns
+///
+/// A reference batch holding the projection.
+fn projected_reference(rows: &[ProjectedRow]) -> TestBatch<DynData, DynData, (), DynZWeight> {
+    let tuples = rows
+        .iter()
+        .map(|&(key, value, _stamp, weight)| Tup2(Tup2(key, value), weight))
+        .collect();
+    TestBatch::dyn_from_tuples(
+        &TestBatchFactories::new(),
+        (),
+        &mut indexed_zset_tuples(tuples),
+    )
+}
+
+/// `rows` with every weight negated.
+///
+/// # Arguments
+///
+/// * `rows` - the rows to negate.
+///
+/// # Returns
+///
+/// The negated rows, which a negated projected batch must read as.
+fn negated(rows: &[ProjectedRow]) -> Vec<ProjectedRow> {
+    rows.iter()
+        .map(|&(key, value, stamp, weight)| (key, value, stamp, -weight))
+        .collect()
+}
+
+/// A retention filter that keeps the keys from `bound` up.
+///
+/// # Arguments
+///
+/// * `bound` - the least key to keep.
+///
+/// # Returns
+///
+/// The filter.
+fn keys_from(bound: i32) -> Filter<DynData> {
+    Filter::new(Box::new(move |key: &DynData| {
+        *key.downcast_checked::<i32>() >= bound
+    }))
+}
+
+/// A retention filter that keeps the values from `bound` up.
+///
+/// # Arguments
+///
+/// * `bound` - the least value to keep.
+///
+/// # Returns
+///
+/// The filter.
+fn values_from(bound: i32) -> GroupFilter<DynData> {
+    GroupFilter::Simple(Filter::new(Box::new(move |value: &DynData| {
+        *value.downcast_checked::<i32>() >= bound
+    })))
+}
+
+proptest! {
+    /// A projected batch, in memory or on storage, and its negation read as their
+    /// projections, and their size bounds, `is_empty`, negative weight counts, and
+    /// key samples agree with their cursors however much of them cancels.
+    #[test]
+    fn projected_batch_reads_as_its_projection(rows in projected_rows(), seed in 0..u64::MAX) {
+        let factories =
+            <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        let reference = projected_reference(&rows);
+        let batch = Projectable::from_projected_vec(&factories, projected_inner(&rows));
+        assert_batch_eq(&batch, &reference);
+        assert_batch_cursors_eq(batch.cursor(), &reference, seed);
+        test_batch_sampling(&batch);
+        assert_negative_weights_counted(&batch);
+        let negation = batch.neg_by_ref();
+        assert_batch_eq(&negation, &projected_reference(&negated(&rows)));
+        assert_negative_weights_counted(&negation);
+
+        run_in_circuit_with_storage(move || {
+            let factories =
+                <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                    i32,
+                    i32,
+                    ZWeight,
+                >();
+            let reference = projected_reference(&rows);
+            let batch =
+                Projectable::from_projected_file(&factories, projected_inner_file(&factories, &rows));
+            assert_batch_eq(&batch, &reference);
+            assert_batch_cursors_eq(batch.cursor(), &reference, seed);
+            test_batch_sampling(&batch);
+            assert_negative_weights_counted(&batch);
+            let negation = batch.neg_by_ref();
+            assert_batch_eq(&negation, &projected_reference(&negated(&rows)));
+            assert_negative_weights_counted(&negation);
+        });
+    }
+
+    /// A spine of projected batches, in memory or on storage, reads as a spine
+    /// of their projections while it merges them and drops the records its
+    /// retention filters reject, its size bounds and `is_empty` agree with its
+    /// cursor, and each batch it holds counts its negative weights.
+    #[test]
+    fn projected_batches_merge_into_a_spine(
+        batches in vec(
+            (projected_rows(), any::<bool>(), any::<bool>(), 0..4i32, 0..3i32),
+            0..12,
+        ),
+        seed in 0..u64::MAX,
+    ) {
+        run_in_circuit_with_storage(move || {
+            let factories =
+                <FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>>::with_projection::<
+                    i32,
+                    i32,
+                    ZWeight,
+                >();
+            let mut spine: Spine<Projectable> =
+                Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
+            let mut reference: TestBatch<DynData, DynData, (), DynZWeight> = TestBatch::new(
+                &TestBatchFactories::new(),
+                Arc::new(String::from("Test")),
+                TraceRole::Integral,
+            );
+            let mut least_key = 0;
+            let mut least_value = 0;
+            for (rows, on_storage, merge, key_bound, value_bound) in batches {
+                let batch = if on_storage {
+                    Projectable::from_projected_file(
+                        &factories,
+                        projected_inner_file(&factories, &rows),
+                    )
+                } else {
+                    Projectable::from_projected_vec(&factories, projected_inner(&rows))
+                };
+                TOKIO.block_on(spine.insert(batch));
+                TOKIO.block_on(reference.insert(projected_reference(&rows)));
+
+                // The spine can still hold records that a higher bound rejected,
+                // so the bounds never fall.
+                least_key = max(least_key, key_bound);
+                least_value = max(least_value, value_bound);
+                spine.retain_keys(keys_from(least_key));
+                reference.retain_keys(keys_from(least_key));
+                spine.retain_values(values_from(least_value));
+                reference.retain_values(values_from(least_value));
+
+                // The merger in the background may or may not get to the
+                // batches before the checks; merging here makes sure that some
+                // merges read projected batches.
+                if merge {
+                    spine.complete_merges();
+                }
+                assert_trace_eq(&spine, &reference);
+                assert_batch_cursors_eq(spine.cursor(), &reference, seed);
+                test_trace_sampling(&spine);
+                for batch in spine.get_batches() {
+                    assert_negative_weights_counted(&*batch);
+                }
+            }
+        });
+    }
 }
 
 #[test]
@@ -847,12 +1474,14 @@ fn test_vec_wset_key_bounds() {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
     #[test]
     fn test_truncate_key_bounded_memory(batches in kvr_batches_monotone_keys(100, 20, 50, 20, 500)) {
         Runtime::run(CircuitConfig::with_workers(1), move |_parker| {
             let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
 
-            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
 
             for (i, tuples) in batches.into_iter().enumerate() {
                 let mut erased_tuples = indexed_zset_tuples(tuples);
@@ -876,7 +1505,7 @@ proptest! {
         Runtime::run(CircuitConfig::with_workers(1), move |_parker| {
             let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
 
-            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
 
             for (i, tuples) in batches.into_iter().enumerate() {
                 let mut erased_tuples = indexed_zset_tuples(tuples);
@@ -939,8 +1568,8 @@ proptest! {
         Runtime::run(CircuitConfig::with_workers(1), move |_parker| {
             let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
 
-            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")));
-            let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
+            let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             trace.retain_values(GroupFilter::Simple(Filter::new(Box::new(
                 move |val: &DynI32| *val.downcast_checked::<i32>() % 2 == 0,
@@ -977,8 +1606,8 @@ proptest! {
         Runtime::run(CircuitConfig::with_workers(1), move |_parker| {
             let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
 
-            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")));
-            let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
+            let mut ref_trace: TestBatch<DynI32, DynI32, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             trace.retain_keys(Filter::new(Box::new(move |val| *val.downcast_checked::<i32>() % 2 == 0)));
             ref_trace.retain_keys(Filter::new(Box::new(move |val| *val.downcast_checked::<i32>() % 2 == 0)));
@@ -1066,8 +1695,8 @@ proptest! {
 
             // `trace1` uses `truncate_keys_below`.
             // `trace2` uses `retain_keys`.
-            let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> = Spine::new(&factories, Arc::new(String::from("Test")));
-            let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
+            let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             trace.retain_values(GroupFilter::Simple(Filter::new(Box::new(
                 move |val: &DynI32| *val.downcast_checked::<i32>() % 2 == 0,
@@ -1103,8 +1732,8 @@ proptest! {
 
             // `trace1` uses `truncate_keys_below`.
             // `trace2` uses `retain_keys`.
-            let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> = Spine::new(&factories, Arc::new(String::from("Test")));
-            let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> = Spine::new(&factories, Arc::new(String::from("Test")), TraceRole::Integral);
+            let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             trace.retain_keys(Filter::new(Box::new(move |key| *key.downcast_checked::<i32>() % 2 == 0)));
             ref_trace.retain_keys(Filter::new(Box::new(move |key| *key.downcast_checked::<i32>() % 2 == 0)));
@@ -1141,8 +1770,11 @@ fn test_fork_spine_metadata() {
         let factories =
             <OrdValBatchFactories<DynI32, DynI32, u32, DynZWeight>>::new::<i32, i32, ZWeight>();
 
-        let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> =
-            Spine::new(&factories, Arc::new(String::from("Test")));
+        let mut trace: Spine<OrdValBatch<DynI32, DynI32, u32, DynZWeight>> = Spine::new(
+            &factories,
+            Arc::new(String::from("Test")),
+            TraceRole::Integral,
+        );
 
         // A fresh spine has a minimal frontier, and the fork of an empty
         // spine is empty.
@@ -1174,12 +1806,58 @@ fn test_fork_spine_metadata() {
 
         // The reference model honors the same frontier round-trip contract,
         // including across fork.
-        let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> =
-            TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+        let mut ref_trace: TestBatch<DynI32, DynI32, u32, DynZWeight> = TestBatch::new(
+            &TestBatchFactories::new(),
+            Arc::new(String::from("Test")),
+            TraceRole::Integral,
+        );
         assert_eq!(ref_trace.frontier(), 0);
         ref_trace.set_frontier(&5);
         assert_eq!(ref_trace.frontier(), 5);
         assert_eq!(ref_trace.fork().frontier(), 5);
+    })
+    .unwrap()
+    .join()
+    .unwrap();
+}
+
+/// A spine whose separate batches cancel each other yields nothing through its
+/// cursor, so it and its snapshot are empty although every batch holds updates.
+///
+/// The topmost level of a spine merges early once enough of its records have
+/// negative weights.  That merge runs in the background and may cancel the
+/// batches before the test looks at them, so the test turns it off.
+#[test]
+fn spine_is_empty_when_its_batches_cancel() {
+    let config = CircuitConfig::with_workers(1).with_dev_tweaks(DevTweaks {
+        top_level_negative_weight_fraction: Some(1.0),
+        ..DevTweaks::default()
+    });
+    Runtime::run(config, move |_parker| {
+        let factories = <OrdZSetFactories<DynI32>>::new::<i32, (), ZWeight>();
+        let batch = |tuples: Vec<Tup2<i32, ZWeight>>| {
+            OrdZSet::<DynI32>::dyn_from_tuples(&factories, (), &mut zset_tuples(tuples))
+        };
+        let mut spine: Spine<OrdZSet<DynI32>> = Spine::new(
+            &factories,
+            Arc::new(String::from("Test")),
+            TraceRole::Integral,
+        );
+        assert!(spine.is_empty());
+
+        TOKIO.block_on(spine.insert(batch(vec![Tup2(1, 1), Tup2(2, 1)])));
+        assert!(!spine.is_empty());
+        TOKIO.block_on(spine.insert(batch(vec![Tup2(1, -1)])));
+        assert!(!spine.is_empty());
+        assert!(!spine.ro_snapshot().is_empty());
+        TOKIO.block_on(spine.insert(batch(vec![Tup2(2, -1)])));
+
+        // The batches have not been merged, so their counts still add up.
+        assert_eq!(spine.len_upper_bound(), 4);
+        assert!(spine.is_empty());
+        assert!(spine.ro_snapshot().is_empty());
+        assert_bounds_match_cursor(&spine);
+        assert_bounds_match_cursor(&spine.ro_snapshot());
     })
     .unwrap()
     .join()
@@ -1192,7 +1870,7 @@ fn test_fork_spine_metadata() {
 /// This is necessary because the batches in `crate::trace::ord::file` require
 /// access to storage, which they get per-thread from a [Runtime], and which is
 /// only available within a circuit initialized with storage.
-fn run_in_circuit_with_storage<F>(f: F)
+pub(crate) fn run_in_circuit_with_storage<F>(f: F)
 where
     F: FnOnce() + Clone + Send + 'static,
 {
@@ -1203,7 +1881,7 @@ where
 /// Like [`run_in_circuit_with_storage`], but lets the caller supply the
 /// `CircuitConfig` (e.g. to flip `dev_tweaks` flags). Storage-backing for
 /// the config is the caller's responsibility.
-fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
+pub(crate) fn run_in_circuit_with_storage_config<F>(config: CircuitConfig, f: F)
 where
     F: FnOnce() + Clone + Send + 'static,
 {
@@ -1337,7 +2015,7 @@ fn test_fallback_wset_roaring_filter_rebuilt_after_storage_merge() {
     let _temp_dir = tempdir().expect("Can't create temp dir for storage");
     let mut config = mkconfig(_temp_dir.path());
     config.dev_tweaks.enable_roaring = Some(true);
-    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+    config.storage.as_mut().unwrap().options.min_spill_size = Some(ConfigSize::ZERO);
 
     run_in_circuit_with_storage_config(config, move || {
         let lhs = build_fallback_wset_i32(&[1, 5]);
@@ -1350,6 +2028,7 @@ fn test_fallback_wset_roaring_filter_rebuilt_after_storage_merge() {
                 &factories,
                 [&lhs, &rhs],
                 Some(BatchLocation::Storage),
+                BatchLayout::default(),
             ),
             vec![lhs.merge_cursor(None, None), rhs.merge_cursor(None, None)],
         );
@@ -1363,6 +2042,233 @@ fn test_fallback_wset_roaring_filter_rebuilt_after_storage_merge() {
         assert!(!cursor.seek_key_exact(missing.erase(), None));
         assert_eq!(total_cache_accesses(merged.cache_stats()), before);
     });
+}
+
+/// Lists the keys that `seek_key_exact` does not find in a batch.
+///
+/// # Arguments
+///
+/// * `batch` - A batch keyed by `Tup1<i64>`.
+/// * `keys` - The keys to look up, each with a fresh cursor.
+///
+/// # Returns
+///
+/// The keys that were not found, in the order of `keys`.
+fn keys_not_found<B>(batch: &B, keys: &[i64]) -> Vec<i64>
+where
+    B: BatchReader<Key = DynData>,
+{
+    keys.iter()
+        .copied()
+        .filter(|key| !batch.cursor().seek_key_exact(Tup1(*key).erase(), None))
+        .collect()
+}
+
+/// Checks that a merged batch's roaring filter still finds every key after
+/// the batch is reloaded from storage, when the merge drops the smallest key
+/// of its inputs.
+///
+/// A merge plans its roaring filter around the smallest key of its input
+/// batches. Here that key has weight 1 in one input and -1 in the other, so
+/// the merged batch starts at a larger key. The surviving keys sit at odd
+/// offsets from the dropped one, so a filter decoded relative to the merged
+/// batch's first key, instead of the base it was built from, probes only clear
+/// bits. The reload happens in a fresh circuit, as a restore does.
+///
+/// Each of the four file batch types reaches the filter through its own
+/// `from_path`, so all of them run through this check.
+///
+/// # Arguments
+///
+/// * `label` - Names the batch type in failure messages.
+/// * `factories` - Returns the factories of the batch type, keyed by
+///   `Tup1<i64>`.
+/// * `build` - Builds a batch from `(key, weight)` pairs in ascending key
+///   order.
+fn assert_roaring_filter_survives_reload<B>(
+    label: &str,
+    factories: fn() -> B::Factories,
+    build: fn(&B::Factories, &[(i64, ZWeight)]) -> B,
+) where
+    B: Batch<Key = DynData> + Send + 'static,
+    B::Factories: Send + 'static,
+{
+    const MINIMUM: i64 = 8_000_000;
+    const NAME: &str = "merged-batch.feldera";
+    let label = label.to_string();
+    let keys: Vec<i64> = (0..1_000).map(|i| MINIMUM + 1 + 2 * i).collect();
+
+    // A circuit deletes its storage directory when it shuts down, so the
+    // merged batch file is stashed outside it and copied into the next one.
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    let stash = temp_dir.path().join("stashed-batch.feldera");
+    let write_dir = temp_dir.path().join("write");
+    let read_dir = temp_dir.path().join("read");
+    std::fs::create_dir_all(&write_dir).unwrap();
+    std::fs::create_dir_all(&read_dir).unwrap();
+
+    let mut config = mkconfig(&write_dir);
+    config.dev_tweaks.enable_roaring = Some(true);
+    {
+        let (label, keys, stash, write_dir) = (
+            label.clone(),
+            keys.clone(),
+            stash.clone(),
+            write_dir.clone(),
+        );
+        run_in_circuit_with_storage_config(config, move || {
+            let factories = factories();
+            let input: Vec<(i64, ZWeight)> = std::iter::once(MINIMUM)
+                .chain(keys.iter().copied())
+                .map(|key| (key, 1))
+                .collect();
+            let with_minimum = build(&factories, &input);
+            let cancels_minimum = build(&factories, &[(MINIMUM, -1)]);
+            let merged: B = ListMerger::merge(
+                &factories,
+                B::Builder::for_merge(
+                    &factories,
+                    [&with_minimum, &cancels_minimum],
+                    Some(BatchLocation::Storage),
+                    BatchLayout::default(),
+                ),
+                vec![
+                    with_minimum.merge_cursor(None, None),
+                    cancels_minimum.merge_cursor(None, None),
+                ],
+            );
+
+            assert_eq!(
+                merged.membership_filter_kind(),
+                FilterKind::Roaring,
+                "{label}"
+            );
+            let (first, _) = merged.key_bounds().expect("merged batch is empty");
+            assert_eq!(
+                *first.downcast_checked::<Tup1<i64>>(),
+                Tup1(MINIMUM + 1),
+                "{label}"
+            );
+            assert_eq!(
+                keys_not_found(&merged, &keys),
+                Vec::<i64>::new(),
+                "{label}: keys not found before reload"
+            );
+
+            let file = merged
+                .file_reader()
+                .expect("merged batch must be file backed");
+            let source = file.path().to_string();
+            std::fs::copy(write_dir.join(source.trim_start_matches('/')), &stash).unwrap();
+        });
+    }
+
+    std::fs::copy(&stash, read_dir.join(NAME)).unwrap();
+    let mut config = mkconfig(&read_dir);
+    config.dev_tweaks.enable_roaring = Some(true);
+    run_in_circuit_with_storage_config(config, move || {
+        let reloaded = B::from_path(&factories(), &StoragePath::from(NAME))
+            .unwrap_or_else(|e| panic!("{label}: reloading the merged batch: {e}"));
+
+        assert_eq!(
+            reloaded.membership_filter_kind(),
+            FilterKind::Roaring,
+            "{label}"
+        );
+        let missing = keys_not_found(&reloaded, &keys);
+        assert!(
+            missing.is_empty(),
+            "{label}: {} of {} keys not found after reload, starting with {:?}",
+            missing.len(),
+            keys.len(),
+            &missing[..missing.len().min(5)]
+        );
+    });
+}
+
+#[test]
+fn file_wset_roaring_filter_survives_reload_after_the_minimum_cancels() {
+    assert_roaring_filter_survives_reload::<FileWSet<DynData, DynZWeight>>(
+        "FileWSet",
+        <FileWSetFactories<DynData, DynZWeight>>::new::<Tup1<i64>, (), ZWeight>,
+        |factories, tuples| {
+            let mut builder = <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(
+                factories,
+                tuples.len(),
+                0,
+            );
+            for (key, weight) in tuples {
+                builder.push_time_diff(&(), weight.erase());
+                builder.push_key(Tup1(*key).erase());
+            }
+            builder.done()
+        },
+    );
+}
+
+#[test]
+fn file_indexed_wset_roaring_filter_survives_reload_after_the_minimum_cancels() {
+    assert_roaring_filter_survives_reload::<FileIndexedWSet<DynData, DynData, DynZWeight>>(
+        "FileIndexedWSet",
+        <FileIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<Tup1<i64>, i64, ZWeight>,
+        |factories, tuples| {
+            let mut builder =
+                <FileIndexedWSet<DynData, DynData, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories,
+                    tuples.len(),
+                    tuples.len(),
+                );
+            for (key, weight) in tuples {
+                builder.push_val_diff(0i64.erase(), weight.erase());
+                builder.push_key(Tup1(*key).erase());
+            }
+            builder.done()
+        },
+    );
+}
+
+#[test]
+fn file_key_batch_roaring_filter_survives_reload_after_the_minimum_cancels() {
+    assert_roaring_filter_survives_reload::<FileKeyBatch<DynData, u32, DynZWeight>>(
+        "FileKeyBatch",
+        <FileKeyBatchFactories<DynData, u32, DynZWeight>>::new::<Tup1<i64>, (), ZWeight>,
+        |factories, tuples| {
+            let mut builder =
+                <FileKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories,
+                    tuples.len(),
+                    tuples.len(),
+                );
+            for (key, weight) in tuples {
+                builder.push_time_diff(&0u32, weight.erase());
+                builder.push_val(().erase());
+                builder.push_key(Tup1(*key).erase());
+            }
+            builder.done()
+        },
+    );
+}
+
+#[test]
+fn file_val_batch_roaring_filter_survives_reload_after_the_minimum_cancels() {
+    assert_roaring_filter_survives_reload::<FileValBatch<DynData, DynData, u32, DynZWeight>>(
+        "FileValBatch",
+        <FileValBatchFactories<DynData, DynData, u32, DynZWeight>>::new::<Tup1<i64>, i64, ZWeight>,
+        |factories, tuples| {
+            let mut builder =
+                <FileValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories,
+                    tuples.len(),
+                    tuples.len(),
+                );
+            for (key, weight) in tuples {
+                builder.push_time_diff(&0u32, weight.erase());
+                builder.push_val(0i64.erase());
+                builder.push_key(Tup1(*key).erase());
+            }
+            builder.done()
+        },
+    );
 }
 
 /// Builds a `FallbackIndexedWSet` over `(key, value, weight)` triples.
@@ -1383,7 +2289,7 @@ fn build_fallback_indexed_wset_i32(
 }
 
 /// Builds a `FallbackIndexedWSet` and re-routes it to the requested storage
-/// tier, regardless of the runtime's `min_step_storage_bytes` default
+/// tier, regardless of the runtime's `min_step_spill_size` default
 /// that gives more control over batch location.
 fn build_fallback_indexed_wset_i32_at(
     tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>>,
@@ -1399,8 +2305,529 @@ fn build_fallback_indexed_wset_i32_at(
         DynI32,
         DynI32,
         DynZWeight,
-    > as Batch>::Builder::for_merge(&factories, [&initial], Some(location));
+    > as Batch>::Builder::for_merge(
+        &factories,
+        [&initial],
+        Some(location),
+        BatchLayout::default(),
+    );
     ListMerger::merge(&factories, builder, vec![initial.merge_cursor(None, None)])
+}
+
+/// A worker's storage system calls are charged to their own reasons, and only
+/// for the part the thread spends off the CPU: a buffered write or a cached
+/// read runs in the kernel on this thread, where the step's CPU time already
+/// counts it, so charging the whole call would put one interval in two numbers
+/// that divide the step's wall clock between them.
+///
+/// The backend's simulated device latency stands in for the part that really
+/// does block, which is what makes the read and the write measurable here; a
+/// real fsync blocks without any help.
+#[test]
+fn storage_calls_are_charged_to_the_worker_for_their_time_off_the_cpu() {
+    /// Blocks per layer file, enough to pass the writer's 1 MiB buffer and so
+    /// to spill before the file is finished.
+    const BLOCKS: usize = 1024 * 1024 / BLOCK_SIZE + 1;
+    const BLOCK_SIZE: usize = 4096;
+    const IO_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    run_in_circuit_with_storage_config(slow_read_storage_config(temp_dir.path(), IO_DELAY), || {
+        use crate::circuit::ThreadCpuTime;
+        use std::time::Instant;
+
+        let idle = crate::profile::current_runtime_idle()
+            .expect("a worker thread carries its runtime's accumulator");
+        let read = crate::profile::ParkReason::StorageRead as usize;
+        let write = crate::profile::ParkReason::StorageWrite as usize;
+        let sync = crate::profile::ParkReason::StorageSync as usize;
+
+        /// What a call may be charged: no more than its thread spent off the
+        /// CPU, plus a slack for the clock reads around it.
+        ///
+        /// The CPU clock is read first, so that a thread descheduled between
+        /// the two reads widens this bound rather than narrowing it.
+        fn off_cpu(wall: Instant, cpu: ThreadCpuTime) -> std::time::Duration {
+            let cpu = cpu.elapsed();
+            wall.elapsed().saturating_sub(cpu) + std::time::Duration::from_millis(1)
+        }
+
+        // Straight to the backend: the buffer cache sits above it, and a
+        // cached block would never reach `pread`.
+        let backend = crate::Runtime::storage_backend().expect("storage is configured");
+        let before = idle.by_reason();
+
+        let mut writer = backend.create().expect("create a layer file");
+        let wall = Instant::now();
+        let cpu = ThreadCpuTime::now();
+        for _ in 0..BLOCKS {
+            let mut block = crate::storage::buffer_cache::FBuf::with_capacity(BLOCK_SIZE);
+            block.resize(BLOCK_SIZE, 7);
+            writer.write_block(block).expect("write a block");
+        }
+        let after_write = idle.by_reason();
+        let written = after_write[write] - before[write];
+        assert!(
+            written >= IO_DELAY / 2,
+            "spilling blocks waited {written:?}"
+        );
+        assert!(
+            written <= off_cpu(wall, cpu),
+            "spilling blocks charged {written:?} of its time off the CPU"
+        );
+        assert_eq!(
+            after_write[sync], before[sync],
+            "spilling blocks fsyncs nothing"
+        );
+
+        // Finishing a file renames it and no longer syncs it: durability is
+        // the committer's job, which is what keeps the fsync off the threads
+        // that write files.
+        let reader = writer.complete().expect("finish the file");
+        let after_complete = idle.by_reason();
+        assert_eq!(
+            after_complete[sync], after_write[sync],
+            "finishing a file fsyncs nothing"
+        );
+
+        let wall = Instant::now();
+        let cpu = ThreadCpuTime::now();
+        reader.commit().expect("commit the file");
+        let after_sync = idle.by_reason();
+        let synced = after_sync[sync] - after_complete[sync];
+        assert!(synced > Duration::ZERO, "committing a file fsyncs it");
+        assert!(
+            synced <= off_cpu(wall, cpu),
+            "committing a file charged {synced:?} of its time off the CPU"
+        );
+        assert_eq!(
+            after_sync[read], before[read],
+            "finishing and committing a file reads nothing"
+        );
+
+        let wall = Instant::now();
+        let cpu = ThreadCpuTime::now();
+        reader
+            .read_block(feldera_storage::block::BlockLocation::new(0, BLOCK_SIZE).unwrap())
+            .expect("read the block back");
+        let after_read = idle.by_reason();
+        let waited = after_read[read] - after_sync[read];
+        assert!(waited >= IO_DELAY / 2, "a block read waited {waited:?}");
+        assert!(
+            waited <= off_cpu(wall, cpu),
+            "a block read charged {waited:?} of its time off the CPU"
+        );
+        assert_eq!(
+            after_read[sync], after_sync[sync],
+            "a block read fsyncs nothing"
+        );
+
+        assert_eq!(
+            idle.by_reason().iter().sum::<std::time::Duration>(),
+            idle.total(),
+            "the breakdown adds up to the total it splits"
+        );
+    });
+}
+
+/// A buffered write is not idle time: it runs in the kernel on this thread,
+/// where the step's CPU time already counts it.  Writing enough to make that
+/// CPU time dominate pins the difference, which a call that also blocks, or one
+/// the backend delays on purpose, would hide.
+#[test]
+fn a_buffered_write_is_charged_only_for_its_time_off_the_cpu() {
+    const BLOCK_SIZE: usize = 4096;
+    const BLOCKS: usize = 8 * 1024; // 32 MiB, enough for the kernel's copy to dominate
+
+    run_in_circuit_with_storage(|| {
+        use crate::circuit::ThreadCpuTime;
+        use std::time::Instant;
+
+        let idle = crate::profile::current_runtime_idle()
+            .expect("a worker thread carries its runtime's accumulator");
+        let write = crate::profile::ParkReason::StorageWrite as usize;
+
+        let backend = crate::Runtime::storage_backend().expect("storage is configured");
+        let mut writer = backend.create().expect("create a layer file");
+        let before = idle.by_reason();
+        let wall = Instant::now();
+        let cpu = ThreadCpuTime::now();
+        for _ in 0..BLOCKS {
+            let mut block = crate::storage::buffer_cache::FBuf::with_capacity(BLOCK_SIZE);
+            block.resize(BLOCK_SIZE, 7);
+            writer.write_block(block).expect("write a block");
+        }
+        // The CPU clock is read first, so that a thread descheduled between the
+        // two reads widens the bound rather than narrowing it.
+        let cpu = cpu.elapsed();
+        let wall = wall.elapsed();
+        let charged = idle.by_reason()[write] - before[write];
+
+        // On an idle machine the kernel's copy accounts for nearly all of this,
+        // which is what makes the bound tight enough to catch the whole call
+        // being charged.  A loaded node deschedules the thread instead, which
+        // is time the guard may charge, so the bound loosens rather than the
+        // test failing.
+        assert!(
+            charged <= wall.saturating_sub(cpu) + Duration::from_millis(1),
+            "writing {BLOCKS} blocks charged {charged:?} as wait, of {wall:?} with {cpu:?} on the CPU"
+        );
+    });
+}
+
+/// Creating, finishing and dropping a layer file costs a system call apiece
+/// that moves no data: `open`, `rename`, `unlink`.  Locally each of those runs
+/// on the CPU and so is charged almost nothing, but on storage that blocks
+/// they are exactly the calls whose time would otherwise go missing.  What is
+/// pinned here is that they never charge more than their thread spent off the
+/// CPU.
+#[test]
+fn storage_metadata_calls_charge_no_more_than_their_time_off_the_cpu() {
+    run_in_circuit_with_storage(|| {
+        use crate::circuit::ThreadCpuTime;
+        use std::time::Instant;
+
+        let idle = crate::profile::current_runtime_idle()
+            .expect("a worker thread carries its runtime's accumulator");
+        let metadata = crate::profile::ParkReason::StorageMetadata as usize;
+
+        let backend = crate::Runtime::storage_backend().expect("storage is configured");
+        let before = idle.by_reason();
+        let wall = Instant::now();
+        let cpu = ThreadCpuTime::now();
+
+        let writer = backend.create().expect("create a layer file");
+        let reader = writer.complete().expect("finish the file");
+        // The file was never marked to keep, so the last reference unlinks it.
+        drop(reader);
+
+        let charged = idle.by_reason()[metadata] - before[metadata];
+        // The CPU clock is read first; see `off_cpu` above.
+        let cpu = cpu.elapsed();
+        let off_cpu = wall.elapsed().saturating_sub(cpu) + Duration::from_millis(1);
+        assert!(
+            charged <= off_cpu,
+            "opening, renaming and unlinking a file charged {charged:?} of {off_cpu:?} off the CPU"
+        );
+    });
+}
+
+/// Storage whose reads sleep, so that a test observes a wait rather than
+/// racing a read that has already finished.
+fn slow_read_storage_config(
+    path: &std::path::Path,
+    read_delay: std::time::Duration,
+) -> CircuitConfig {
+    use feldera_types::config::{FileBackendConfig, StorageBackendConfig};
+
+    let mut config = CircuitConfig::with_workers(1).with_storage(Some(
+        crate::circuit::CircuitStorageConfig::for_config(
+            crate::circuit::StorageConfig {
+                path: path.to_string_lossy().into_owned(),
+                cache: crate::circuit::StorageCacheConfig::default(),
+            },
+            crate::circuit::StorageOptions {
+                min_spill_size: Some(ConfigSize::ZERO),
+                backend: StorageBackendConfig::File(Box::new(FileBackendConfig {
+                    ioop_latency: Some(read_delay.into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    ));
+    // Writing a file leaves its blocks in the buffer cache, which sits above
+    // the backend, so a reader has to be able to evict them to reach storage.
+    config.dev_tweaks.eager_evict = Some(true);
+    config
+}
+
+/// `fetch` hands its block reads to the blocking pool, where no accumulator is
+/// installed, and awaits them.  The worker's runtime parks with no system call
+/// for the park hook to look at, so the wait has to name the read itself or it
+/// lands in the breakdown's catch-all.
+#[test]
+fn a_fetch_waiting_for_a_block_read_declares_the_read() {
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+
+    // Long enough that the read cannot finish between issuing it and parking
+    // for it, even on a node loaded enough to deschedule this thread in
+    // between.
+    const READ_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    run_in_circuit_with_storage_config(
+        slow_read_storage_config(temp_dir.path(), READ_DELAY),
+        || {
+            let keys = (0..4096u32).collect::<Vec<_>>();
+            let batch = build_file_wset_u32(&keys);
+            batch.evict();
+            // Left in the cache: the fetch walks it before it issues any read,
+            // and the test is about the wait for the read.
+            let wanted = build_file_wset_u32(&keys);
+
+            let mut fetch = Box::pin(batch.fetch(&wanted));
+            let mut context = Context::from_waker(Waker::noop());
+
+            assert!(
+                fetch.as_mut().poll(&mut context).is_pending(),
+                "the fetch finished before it had to wait for a block"
+            );
+            assert_eq!(
+                crate::profile::current_park_reason(),
+                crate::profile::ParkReason::StorageRead
+            );
+        },
+    );
+}
+
+/// The hint reaches the file cursor through everything between: a spine
+/// snapshot, its cursor list, the fallback batch.  A walk declared sequential
+/// reads ahead; the same walk undeclared reads one block at a time.
+#[test]
+fn a_hint_reaches_the_file_cursor_through_a_snapshot() {
+    run_in_circuit_with_storage(|| {
+        const KEYS: i32 = 60_000;
+        let tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>> = (0..KEYS)
+            .map(|key| Tup2(Tup2(key, key), 1 as ZWeight))
+            .collect();
+        let written = build_fallback_indexed_wset_i32_at(tuples, BatchLocation::Storage);
+        let path = written.file_path().expect("built on storage").clone();
+        let factories =
+            <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+
+        // Opened by path the file has a new id the cache knows nothing about,
+        // so every block is cold; `written` keeps the file on disk meanwhile.
+        let prefetches_under = |hint: crate::trace::AccessHint| {
+            let batch = Arc::new(
+                crate::trace::FallbackIndexedWSet::<DynI32, DynI32, DynZWeight>::from_path(
+                    &factories, &path,
+                )
+                .unwrap(),
+            );
+            let snapshot =
+                crate::trace::SpineSnapshot::with_batches(&factories, vec![batch.clone()]);
+            let mut cursor = snapshot.cursor_with_hint(hint);
+            let mut keys = 0;
+            while cursor.key_valid() {
+                keys += 1;
+                cursor.step_key();
+            }
+            assert_eq!(keys, KEYS);
+            let stats = batch.cache_stats().0[feldera_buffer_cache::ThreadType::Foreground];
+            let count = |access| stats[access].count;
+            use crate::storage::buffer_cache::CacheAccess::{Hit, Miss, Prefetch, Wait};
+            (count(Prefetch), count(Hit), count(Miss), count(Wait))
+        };
+        let (prefetches, hits, misses, waits) =
+            prefetches_under(crate::trace::AccessHint::Sequential);
+        assert!(
+            prefetches >= 16,
+            "a walk declared sequential read little ahead: prefetches {prefetches}, hits {hits}, misses {misses}, waits {waits}"
+        );
+        assert_eq!(prefetches_under(crate::trace::AccessHint::Unknown).0, 0);
+    });
+}
+
+/// Under a zero step threshold, which is what Critical memory pressure
+/// imposes, a builder that receives nothing must finish in memory.  It has
+/// nothing to spill, and a layer file costs two fsyncs on the way out, which a
+/// backfill paid for every step whose output was empty.  A builder that
+/// receives anything still spills, at its first item.
+#[test]
+fn an_empty_builder_stays_in_memory_under_a_zero_threshold() {
+    let dir = tempdir().expect("temp dir");
+    let config = CircuitConfig::with_workers(1).with_storage(Some(
+        crate::circuit::CircuitStorageConfig::for_config(
+            crate::circuit::StorageConfig {
+                path: dir.path().to_string_lossy().into_owned(),
+                cache: crate::circuit::StorageCacheConfig::default(),
+            },
+            crate::circuit::StorageOptions {
+                min_spill_size: Some(ConfigSize::ZERO),
+                min_step_spill_size: Some(ConfigSize::ZERO),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    ));
+    run_in_circuit_with_storage_config(config, || {
+        // The capacity is what the lazy input map's per-step builder asks for,
+        // and at 32 estimated bytes per slot it clears any positive threshold.
+        const CAPACITY: usize = 10_000;
+
+        let factories =
+            <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        type Indexed =
+            <crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> as Batch>::Builder;
+        let empty = Indexed::with_capacity(&factories, CAPACITY, CAPACITY).done();
+        assert_eq!(
+            empty.location(),
+            BatchLocation::Memory,
+            "an empty indexed batch went to storage"
+        );
+
+        let (key, val, weight): (i32, i32, ZWeight) = (1, 7, 1);
+        let mut one = Indexed::with_capacity(&factories, CAPACITY, CAPACITY);
+        one.push_time_diff(&(), weight.erase());
+        one.push_val(val.erase());
+        one.push_key(key.erase());
+        assert_eq!(
+            one.done().location(),
+            BatchLocation::Storage,
+            "an indexed batch with content stayed in memory under a zero threshold"
+        );
+
+        let factories =
+            <crate::trace::FallbackWSetFactories<DynI32, DynZWeight>>::new::<i32, (), ZWeight>();
+        type Plain = <crate::trace::FallbackWSet<DynI32, DynZWeight> as Batch>::Builder;
+        let empty = Plain::with_capacity(&factories, CAPACITY, CAPACITY).done();
+        assert_eq!(
+            empty.location(),
+            BatchLocation::Memory,
+            "an empty batch went to storage"
+        );
+
+        let mut one = Plain::with_capacity(&factories, CAPACITY, CAPACITY);
+        one.push_time_diff(&(), weight.erase());
+        one.push_val(().erase());
+        one.push_key(key.erase());
+        assert_eq!(
+            one.done().location(),
+            BatchLocation::Storage,
+            "a batch with content stayed in memory under a zero threshold"
+        );
+    });
+}
+
+/// A builder that starts in memory under a threshold reserves room for what
+/// it can hold before it spills, not for the caller's whole capacity guess.
+/// Under a zero threshold every item spills at once, so a guess of a million
+/// rows must not cost a million slots of memory first.
+#[test]
+fn a_threshold_builder_reserves_no_more_than_the_threshold() {
+    let dir = tempdir().expect("temp dir");
+    let config = CircuitConfig::with_workers(1).with_storage(Some(
+        crate::circuit::CircuitStorageConfig::for_config(
+            crate::circuit::StorageConfig {
+                path: dir.path().to_string_lossy().into_owned(),
+                cache: crate::circuit::StorageCacheConfig::default(),
+            },
+            crate::circuit::StorageOptions {
+                min_spill_size: Some(ConfigSize::ZERO),
+                min_step_spill_size: Some(ConfigSize::ZERO),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    ));
+    run_in_circuit_with_storage_config(config, || {
+        const CAPACITY: usize = 1_000_000;
+        // Room for the bookkeeping of an empty builder, far below what a
+        // million slots of keys, values and weights would take.
+        const ALLOWANCE: usize = 64 * 1024;
+
+        let factories =
+            <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                i32,
+                i32,
+                ZWeight,
+            >();
+        type Indexed =
+            <crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> as Batch>::Builder;
+        let reserved = Indexed::with_capacity(&factories, CAPACITY, CAPACITY)
+            .size_of()
+            .total_bytes();
+        assert!(
+            reserved < ALLOWANCE,
+            "an indexed builder under a zero threshold holds {reserved} bytes for a guess of {CAPACITY} rows"
+        );
+
+        let factories =
+            <crate::trace::FallbackWSetFactories<DynI32, DynZWeight>>::new::<i32, (), ZWeight>();
+        type Plain = <crate::trace::FallbackWSet<DynI32, DynZWeight> as Batch>::Builder;
+        let reserved = Plain::with_capacity(&factories, CAPACITY, CAPACITY)
+            .size_of()
+            .total_bytes();
+        assert!(
+            reserved < ALLOWANCE,
+            "a builder under a zero threshold holds {reserved} bytes for a guess of {CAPACITY} rows"
+        );
+    });
+}
+
+/// Critical memory pressure is what imposes the zero threshold in practice:
+/// `Runtime::min_step_storage_bytes()` answers zero under it whatever the
+/// configured value.  An empty builder still finishes in memory, one that
+/// receives an item spills, and neither reserves room for its capacity guess.
+#[test]
+fn critical_memory_pressure_keeps_an_empty_builder_in_memory() {
+    const GIB: u64 = 1 << 30;
+    // 9.6 GiB of a 10 GiB limit is past the 95% where Critical starts.
+    with_mock_process_rss(96 * GIB / 10, || {
+        let dir = tempdir().expect("temp dir");
+        let config = CircuitConfig::with_workers(1)
+            .with_temporary_storage(dir.path())
+            .with_max_rss_bytes(Some(10 * GIB));
+        run_in_circuit_with_storage_config(config, || {
+            // The runtime samples the process size once a second.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Runtime::memory_pressure() != Some(MemoryPressure::Critical) {
+                assert!(
+                    Instant::now() < deadline,
+                    "memory pressure stayed at {:?}",
+                    Runtime::memory_pressure()
+                );
+                sleep(Duration::from_millis(100));
+            }
+            assert_eq!(Runtime::min_step_storage_bytes(), Some(0));
+
+            const CAPACITY: usize = 1_000_000;
+            const ALLOWANCE: usize = 64 * 1024;
+            let factories =
+                <crate::trace::FallbackIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<
+                    i32,
+                    i32,
+                    ZWeight,
+                >();
+            type Indexed =
+                <crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> as Batch>::Builder;
+            let empty = Indexed::with_capacity(&factories, CAPACITY, CAPACITY);
+            let reserved = empty.size_of().total_bytes();
+            assert!(
+                reserved < ALLOWANCE,
+                "a builder under Critical pressure holds {reserved} bytes for a guess of {CAPACITY} rows"
+            );
+            assert_eq!(
+                empty.done().location(),
+                BatchLocation::Memory,
+                "an empty batch went to storage under Critical pressure"
+            );
+
+            let (key, val, weight): (i32, i32, ZWeight) = (1, 7, 1);
+            let mut one = Indexed::with_capacity(&factories, CAPACITY, CAPACITY);
+            one.push_time_diff(&(), weight.erase());
+            one.push_val(val.erase());
+            one.push_key(key.erase());
+            assert_eq!(
+                one.done().location(),
+                BatchLocation::Storage,
+                "a batch with content stayed in memory under Critical pressure"
+            );
+        });
+    });
 }
 
 /// Strategy for the storage tier of a single proptest input batch.
@@ -1534,10 +2961,30 @@ fn assert_seek_key_exact_matches<B>(
     }
 }
 
+/// Reopens a file-backed batch from its file, as a restore does.
+///
+/// # Arguments
+///
+/// * `batch` - A batch that resides in storage.
+/// * `factories` - The factories of the batch's type.
+///
+/// # Returns
+///
+/// A second batch that reads the same file.
+fn reopen<B>(batch: &B, factories: &B::Factories) -> B
+where
+    B: Batch,
+{
+    let file = batch.file_reader().expect("batch must be file backed");
+    B::from_path(factories, file.path())
+        .unwrap_or_else(|e| panic!("reopening {}: {e}", file.path()))
+}
+
 /// Shared body for `indexed_wset_storage_merges_*` proptests. Generates
 /// inputs as a vec/file mix, runs `ListMerger::merge` to file storage, and
-/// validates the merged batch against a `TestBatch` reference. The input
-/// batches are reduced by an optional key filter `retain_above`.
+/// validates the merged batch against a `TestBatch` reference, both as the
+/// merge wrote it and reopened from its file. The input batches are reduced by
+/// an optional key filter `retain_above`.
 fn run_indexed_wset_storage_merges(
     batches: MergeInputBatches,
     retain_above: Option<i32>,
@@ -1546,9 +2993,9 @@ fn run_indexed_wset_storage_merges(
     let _temp_dir = tempdir().expect("Can't create temp dir for storage");
     let mut config = mkconfig(_temp_dir.path());
     fc.apply(&mut config);
-    // `min_storage_bytes` forces the merged batch to file; per-input tiers
+    // `min_spill_size` forces the merged batch to file; per-input tiers
     // come from `build_fallback_indexed_wset_i32_at`.
-    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+    config.storage.as_mut().unwrap().options.min_spill_size = Some(ConfigSize::ZERO);
 
     run_in_circuit_with_storage_config(config, move || {
         let factories =
@@ -1567,7 +3014,7 @@ fn run_indexed_wset_storage_merges(
 
         // Sanity check that each input batch resides where we requested it to be.
         for (input, (_tuples, requested_loc)) in inputs.iter().zip(batches.iter()) {
-            if input.key_count() > 0 {
+            if input.key_count_upper_bound() > 0 {
                 assert_eq!(input.location(), *requested_loc);
             }
         }
@@ -1598,6 +3045,7 @@ fn run_indexed_wset_storage_merges(
             &factories,
             input_refs,
             Some(BatchLocation::Storage),
+            BatchLayout::default(),
         );
         let cursors: Vec<_> = inputs
             .iter()
@@ -1614,22 +3062,39 @@ fn run_indexed_wset_storage_merges(
             fc.allowed_filter_kinds().contains(&kind),
             "filter kind {kind:?} is not allowed under {fc:?}",
         );
+        if merged.is_empty() {
+            assert_eq!(
+                kind,
+                FilterKind::None,
+                "the empty merged batch has a filter"
+            );
+        }
         assert_batch_eq(&merged, &expected);
 
         // Check some absent probes across the input range.
         let absent_probes = (-150_000i32..=150_000).step_by(7_500);
-        assert_seek_key_exact_matches(&merged, &expected, absent_probes, 42);
+        assert_seek_key_exact_matches(&merged, &expected, absent_probes.clone(), 42);
+
+        // A restore reopens every batch from its file, and the filter it loads
+        // must answer like the one the merge built. The merge drops keys that
+        // cancel or fall below `retain_above`, so the file can start above the
+        // smallest input key.
+        let reopened = reopen(&merged, &factories);
+        assert_eq!(reopened.membership_filter_kind(), kind);
+        assert_batch_eq(&reopened, &expected);
+        assert_seek_key_exact_matches(&reopened, &expected, absent_probes, 42);
     });
 }
 
 /// Dense-key sibling of `run_indexed_wset_storage_merges`. Same merge plumbing
 /// but with the `0..200` key domain so we probe every possible key in
-/// `seek_key_exact` and so per-batch overlap is high.
+/// `seek_key_exact` and so per-batch overlap is high. It also validates the
+/// merged batch reopened from its file.
 fn run_indexed_wset_storage_merges_dense(batches: MergeInputBatches, fc: FilterConfig) {
     let _temp_dir = tempdir().expect("Can't create temp dir for storage");
     let mut config = mkconfig(_temp_dir.path());
     fc.apply(&mut config);
-    config.storage.as_mut().unwrap().options.min_storage_bytes = Some(0);
+    config.storage.as_mut().unwrap().options.min_spill_size = Some(ConfigSize::ZERO);
 
     run_in_circuit_with_storage_config(config, move || {
         let factories =
@@ -1645,7 +3110,7 @@ fn run_indexed_wset_storage_merges_dense(batches: MergeInputBatches, fc: FilterC
             .collect();
 
         for (input, (_tuples, requested_loc)) in inputs.iter().zip(batches.iter()) {
-            if input.key_count() > 0 {
+            if input.key_count_upper_bound() > 0 {
                 assert_eq!(input.location(), *requested_loc);
             }
         }
@@ -1668,6 +3133,7 @@ fn run_indexed_wset_storage_merges_dense(batches: MergeInputBatches, fc: FilterC
             &factories,
             input_refs,
             Some(BatchLocation::Storage),
+            BatchLayout::default(),
         );
         let cursors: Vec<_> = inputs.iter().map(|b| b.merge_cursor(None, None)).collect();
         let merged: crate::trace::FallbackIndexedWSet<DynI32, DynI32, DynZWeight> =
@@ -1679,20 +3145,32 @@ fn run_indexed_wset_storage_merges_dense(batches: MergeInputBatches, fc: FilterC
             fc.allowed_filter_kinds().contains(&kind),
             "filter kind {kind:?} is not allowed under {fc:?}",
         );
+        if merged.is_empty() {
+            assert_eq!(
+                kind,
+                FilterKind::None,
+                "the empty merged batch has a filter"
+            );
+        }
 
         assert_batch_eq(&merged, &expected);
 
         // Key domain is `0..200`; probe every value to cover present and
         // absent paths exhaustively.
         assert_seek_key_exact_matches(&merged, &expected, 0..200i32, 42);
+
+        // A restore reopens every batch from its file, and the filter it loads
+        // must answer like the one the merge built, even when the smallest
+        // input key cancelled out of the merged batch.
+        let reopened = reopen(&merged, &factories);
+        assert_eq!(reopened.membership_filter_kind(), kind);
+        assert_batch_eq(&reopened, &expected);
+        assert_seek_key_exact_matches(&reopened, &expected, 0..200i32, 42);
     });
 }
 
 proptest! {
-    // 32 cases per test × 8 tests = 256 cases per `cargo test` run. CI runs
-    // the suite many times across PRs so cumulative coverage compounds.
-    // Override with `PROPTEST_CASES=N` for occasional deeper sweeps.
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
 
     #[test]
     fn indexed_wset_storage_merges_bloom_only(
@@ -1779,6 +3257,39 @@ proptest! {
     }
 }
 
+/// Merges an empty input, inputs whose weights cancel, and an input whose keys
+/// a key filter drops, under every filter configuration.
+///
+/// Each merge picks its output's filter before it learns that no key survives.
+/// The runners check that the empty output has no filter, both as the merge
+/// built it and as reopened from its file.
+#[test]
+fn indexed_wset_storage_merges_to_empty_batch() {
+    for fc in [
+        FilterConfig::BloomOnly,
+        FilterConfig::RoaringOnly,
+        FilterConfig::Both,
+        FilterConfig::Neither,
+    ] {
+        run_indexed_wset_storage_merges_dense(vec![(Vec::new(), BatchLocation::Storage)], fc);
+        run_indexed_wset_storage_merges_dense(
+            vec![
+                (vec![Tup2(Tup2(5, 1), 2)], BatchLocation::Storage),
+                (vec![Tup2(Tup2(5, 1), -2)], BatchLocation::Memory),
+            ],
+            fc,
+        );
+        run_indexed_wset_storage_merges(
+            vec![(
+                vec![Tup2(Tup2(-5, 1), 1), Tup2(Tup2(7, 0), -1)],
+                BatchLocation::Storage,
+            )],
+            Some(7),
+            fc,
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 
@@ -1811,4 +3322,1398 @@ proptest! {
             test_key_batch_builder::<FileKeyBatch<DynI32, u32, DynZWeight>>(&factories, batch, seed);
         });
     }
+}
+
+/// Sets the false positive rate `config`'s circuit will report.
+fn set_false_positive_rate(config: &mut CircuitConfig, rate: f64) {
+    config
+        .storage
+        .as_mut()
+        .expect("config must be storage-backed")
+        .options
+        .bloom_false_positive_rate = Some(rate);
+}
+
+/// Builds a file batch at the most accurate rate, then reloads it at each
+/// coarser rate and checks that the filter shrinks without ever losing a key.
+///
+/// The filter lives below every batch type, in the layer file reader, but each
+/// of the four file batch types reaches it through its own `from_path`. This
+/// runs the same ladder through all of them so a divergence in any one shows up.
+fn assert_rate_ladder<B>(
+    label: &str,
+    dir: &std::path::Path,
+    factories: fn() -> B::Factories,
+    build: fn(&B::Factories) -> B,
+    keys: &'static [u32],
+) where
+    B: Batch<Key = DynData> + Send + 'static,
+    B::Factories: Send + 'static,
+{
+    // A circuit deletes its storage directory when it shuts down, so the batch
+    // file is stashed outside any of them and copied back in for each reload.
+    let stash = dir.join("stashed-batch.feldera");
+    let name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    {
+        let write_dir = dir.join("write");
+        std::fs::create_dir_all(&write_dir).unwrap();
+        let mut config = mkconfig(&write_dir);
+        set_false_positive_rate(&mut config, 1e-4);
+        let (name, stash, write_dir) = (name.clone(), stash.clone(), write_dir.clone());
+        run_in_circuit_with_storage_config(config, move || {
+            let batch = build(&factories());
+            let file = batch
+                .file_reader()
+                .expect("batch under test must be file backed");
+            let source = file.path().to_string();
+            std::fs::copy(write_dir.join(source.trim_start_matches('/')), &stash).unwrap();
+            *name.lock().unwrap() = Some("ladder-batch.feldera".to_string());
+            drop(batch);
+        });
+    }
+    let name = name.lock().unwrap().clone().unwrap();
+    let path = StoragePath::from(name.clone());
+
+    // Coarsening the rate never costs more memory, and going the whole way
+    // from the finest rate to the coarsest costs strictly less. Adjacent rungs
+    // can tie: a batch small enough to sit on the layout's floor is more
+    // accurate than nominal, so one module can already satisfy two of them.
+    let mut previous_bytes = usize::MAX;
+    let mut finest_bytes = 0;
+    for rate in [1e-4, 1e-3, 1e-2, 1e-1] {
+        let read_dir = dir.join(format!("read-{rate:e}"));
+        std::fs::create_dir_all(&read_dir).unwrap();
+        std::fs::copy(&stash, read_dir.join(&name)).unwrap();
+        let mut config = mkconfig(&read_dir);
+        set_false_positive_rate(&mut config, rate);
+        let bytes = Arc::new(Mutex::new(0));
+        {
+            let (bytes, path) = (bytes.clone(), path.clone());
+            let label = label.to_string();
+            run_in_circuit_with_storage_config(config, move || {
+                let batch = B::from_path(&factories(), &path)
+                    .unwrap_or_else(|e| panic!("{label} at {rate:e}: {e}"));
+
+                assert_eq!(
+                    batch.membership_filter_kind(),
+                    FilterKind::Bloom,
+                    "{label} at {rate:e} lost its Bloom filter"
+                );
+                for key in keys {
+                    let mut cursor = batch.cursor();
+                    assert!(
+                        cursor.seek_key_exact(key.erase(), None),
+                        "{label} at {rate:e}: eviction lost key {key}"
+                    );
+                }
+                *bytes.lock().unwrap() = batch.membership_filter_stats().size_byte;
+            });
+        }
+        let bytes = *bytes.lock().unwrap();
+        assert!(
+            bytes <= previous_bytes,
+            "{label} at {rate:e} kept {bytes} bytes, more than the {previous_bytes} before it"
+        );
+        if previous_bytes == usize::MAX {
+            finest_bytes = bytes;
+        }
+        previous_bytes = bytes;
+    }
+    assert!(
+        previous_bytes < finest_bytes,
+        "{label} kept {previous_bytes} bytes at the coarsest rate, no less than \
+         the {finest_bytes} it kept at the finest"
+    );
+}
+
+/// Keys wide enough that roaring is not preferred, so every batch type really
+/// exercises the Bloom path.
+const LADDER_KEYS: &[u32] = &[
+    1,
+    5_000,
+    90_000,
+    1_000_000,
+    7_000_000,
+    40_000_000,
+    300_000_000,
+    4_000_000_000,
+];
+
+#[test]
+fn file_wset_filter_follows_the_rate() {
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    assert_rate_ladder::<FileWSet<DynData, DynZWeight>>(
+        "FileWSet",
+        temp_dir.path(),
+        <FileWSetFactories<DynData, DynZWeight>>::new::<u32, (), ZWeight>,
+        |factories| {
+            let mut builder =
+                <FileWSet<DynData, DynZWeight> as Batch>::Builder::with_capacity(factories, 8, 0);
+            for key in LADDER_KEYS {
+                let weight: ZWeight = 1;
+                builder.push_time_diff(&(), weight.erase());
+                builder.push_key(key.erase());
+            }
+            builder.done()
+        },
+        LADDER_KEYS,
+    );
+}
+
+#[test]
+fn file_indexed_wset_filter_follows_the_rate() {
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    assert_rate_ladder::<FileIndexedWSet<DynData, DynData, DynZWeight>>(
+        "FileIndexedWSet",
+        temp_dir.path(),
+        <FileIndexedWSetFactories<DynData, DynData, DynZWeight>>::new::<u32, u32, ZWeight>,
+        |factories| {
+            let mut builder =
+                <FileIndexedWSet<DynData, DynData, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories, 8, 0,
+                );
+            for key in LADDER_KEYS {
+                let weight: ZWeight = 1;
+                builder.push_time_diff(&(), weight.erase());
+                builder.push_val(7u32.erase());
+                builder.push_key(key.erase());
+            }
+            builder.done()
+        },
+        LADDER_KEYS,
+    );
+}
+
+#[test]
+fn file_key_batch_filter_follows_the_rate() {
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    assert_rate_ladder::<FileKeyBatch<DynData, u32, DynZWeight>>(
+        "FileKeyBatch",
+        temp_dir.path(),
+        <FileKeyBatchFactories<DynData, u32, DynZWeight>>::new::<u32, (), ZWeight>,
+        |factories| {
+            let mut builder =
+                <FileKeyBatch<DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories, 8, 0,
+                );
+            for key in LADDER_KEYS {
+                let weight: ZWeight = 1;
+                builder.push_time_diff(&0u32, weight.erase());
+                builder.push_val(().erase());
+                builder.push_key(key.erase());
+            }
+            builder.done()
+        },
+        LADDER_KEYS,
+    );
+}
+
+#[test]
+fn file_val_batch_filter_follows_the_rate() {
+    let temp_dir = tempdir().expect("Can't create temp dir for storage");
+    assert_rate_ladder::<FileValBatch<DynData, DynData, u32, DynZWeight>>(
+        "FileValBatch",
+        temp_dir.path(),
+        <FileValBatchFactories<DynData, DynData, u32, DynZWeight>>::new::<u32, u32, ZWeight>,
+        |factories| {
+            let mut builder =
+                <FileValBatch<DynData, DynData, u32, DynZWeight> as Batch>::Builder::with_capacity(
+                    factories, 8, 0,
+                );
+            for key in LADDER_KEYS {
+                let weight: ZWeight = 1;
+                builder.push_time_diff(&0u32, weight.erase());
+                builder.push_val(7u32.erase());
+                builder.push_key(key.erase());
+            }
+            builder.done()
+        },
+        LADDER_KEYS,
+    );
+}
+
+/// Retention by `LastN`, `TopN` and `BottomN`: every value satisfying the filter
+/// survives, along with a bounded number that do not.
+///
+/// `TopN` and `BottomN` accept a predicate that is not monotone, and most of
+/// what these tests pin came from treating one as monotone. `TopN` used to reach
+/// the first value to keep with `Cursor::seek_val_with`, a galloping search that
+/// holds only for a predicate staying true once it turns true, so it skipped
+/// values it had to keep. `BottomN` never positioned the batch cursor, so it
+/// kept values it had to collect, and, because the cursors of one merge then
+/// disagreed over a value, resurrected deleted rows. The snapshot key gate was a
+/// separate defect that needed no predicate at all.
+mod non_monotone_retention {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use proptest::collection::vec as prop_vec;
+    use proptest::prelude::*;
+
+    use super::{CircuitConfig, DynI32, Filter, indexed_zset_tuples};
+    use crate::algebra::{OrdIndexedZSet, OrdIndexedZSetFactories};
+    use crate::dynamic::{DowncastTrait, DynData, WithFactory};
+    use crate::trace::{
+        Batch, BatchLayout, BatchLocation, BatchReader, BatchReaderFactories, Builder, GroupFilter,
+        ListMerger, cursor::Cursor,
+    };
+    use crate::utils::Tup2;
+    use crate::{Runtime, ZWeight};
+
+    type Batched = OrdIndexedZSet<DynI32, DynI32>;
+
+    /// Every `(key, value, weight)` a batch holds.
+    fn contents_of(batch: &Batched) -> Vec<(i32, i32, ZWeight)> {
+        let mut out = Vec::new();
+        let mut cursor = batch.cursor();
+        while cursor.key_valid() {
+            while cursor.val_valid() {
+                out.push((
+                    *unsafe { cursor.key().downcast::<i32>() },
+                    *unsafe { cursor.val().downcast::<i32>() },
+                    **cursor.weight(),
+                ));
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        out
+    }
+
+    /// `retain_within_spine` for a spine that holds nothing but the merged
+    /// batches.
+    fn retain(
+        filter: GroupFilter<DynI32>,
+        batches: &[&[(i32, ZWeight)]],
+    ) -> Vec<(i32, i32, ZWeight)> {
+        retain_within_spine(filter, batches, &[])
+    }
+
+    /// Runs the filtered merge that performs retention, and reports what
+    /// survived.
+    ///
+    /// `elsewhere` is what the spine holds in batches this merge does not cover.
+    /// That is the usual case: a merge takes some of the spine's batches, while
+    /// the snapshot it reads spans all of them.
+    ///
+    /// Retention only happens in the merge that reads a snapshot.
+    /// `Spine::complete_merges` does not read one, so it applies no `TopN` or
+    /// `BottomN` retention at all. The spine's background merger does, through
+    /// `merge_cursor_with_snapshot`, and that is the path this mirrors, with one
+    /// batch of every value standing in for the snapshot.
+    fn retain_within_spine(
+        filter: GroupFilter<DynI32>,
+        batches: &[&[(i32, ZWeight)]],
+        elsewhere: &[(i32, ZWeight)],
+    ) -> Vec<(i32, i32, ZWeight)> {
+        let batches: Vec<Vec<(i32, ZWeight)>> = batches.iter().map(|b| b.to_vec()).collect();
+        // The snapshot is the whole spine, so weights sum and anything that
+        // cancels becomes invisible to it, exactly as `CursorList` makes it.
+        let values: Vec<(i32, ZWeight)> = {
+            let mut v: Vec<(i32, ZWeight)> = batches
+                .iter()
+                .flatten()
+                .chain(elsewhere.iter())
+                .copied()
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let result = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = result.clone();
+
+        Runtime::run(CircuitConfig::with_workers(1), move |_parker| {
+            let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
+            let build_key = |key: i32, vals: &[(i32, ZWeight)]| {
+                let mut tuples =
+                    indexed_zset_tuples(vals.iter().map(|&(v, w)| Tup2(Tup2(key, v), w)).collect());
+                Batched::dyn_from_tuples(&factories, (), &mut tuples)
+            };
+
+            // How key 1's values are split across batches matters, so each
+            // caller chooses. The extra key keeps a single-batch merge from
+            // being the identity, and, since the snapshot never holds it, puts
+            // every run through `retain_whole_key`.
+            let mut inputs: Vec<Batched> = batches.iter().map(|b| build_key(1, b)).collect();
+            inputs.push(build_key(ABSENT_KEY, &ABSENT_KEY_VALUES));
+
+            // Everything under key 1, as the spine snapshot would see it.
+            let snapshot = Some(Arc::new(build_key(1, &values)));
+
+            let builder = <Batched as Batch>::Builder::for_merge(
+                &factories,
+                inputs.iter(),
+                Some(BatchLocation::Memory),
+                BatchLayout::default(),
+            );
+            let cursors = inputs
+                .iter()
+                .map(|b| b.merge_cursor_with_snapshot(None, Some(filter.clone()), &snapshot))
+                .collect();
+
+            let merged: Batched = ListMerger::merge(&factories, builder, cursors);
+            *out.lock().unwrap() = contents_of(&merged);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+        let contents = result.lock().unwrap().clone();
+
+        // The snapshot holds key 1 alone, so `ABSENT_KEY` reaches
+        // `retain_whole_key` on every run and must come back whole: nothing
+        // measures it, so nothing may be dropped from it. It carries several
+        // values, so a filter still holding the previous key's mark shows up.
+        let absent: Vec<(i32, i32, ZWeight)> = contents
+            .iter()
+            .copied()
+            .filter(|&(key, _value, _weight)| key == ABSENT_KEY)
+            .collect();
+        assert_eq!(
+            absent,
+            ABSENT_KEY_VALUES
+                .iter()
+                .map(|&(value, weight)| (ABSENT_KEY, value, weight))
+                .collect::<Vec<_>>(),
+            "a key the snapshot does not hold must survive the merge whole"
+        );
+
+        contents
+            .into_iter()
+            .filter(|&(key, _value, _weight)| key == 1)
+            .collect()
+    }
+
+    /// A key the snapshot never holds, present in every merge.
+    const ABSENT_KEY: i32 = 2;
+    const ABSENT_KEY_VALUES: [(i32, ZWeight); 4] = [(0, 1), (5, 1), (9, 1), (14, 1)];
+
+    /// A monotone predicate, which is all the in-tree tests use. The filters
+    /// behave correctly here, so this pins the baseline the bug is measured
+    /// against.
+    #[test]
+    fn top_n_is_correct_for_a_monotone_predicate() {
+        // Retain everything >= 8, plus the 2 largest below it.
+        let filter = GroupFilter::TopN(
+            2,
+            Filter::new(Box::new(|v: &DynI32| *unsafe { v.downcast::<i32>() } >= 8)),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        let all: Vec<(i32, ZWeight)> = (0..12).map(|v| (v, 1)).collect();
+        let survived = retain(filter, &[&all]);
+        let values: Vec<i32> = survived.iter().map(|&(_, v, _)| v).collect();
+        assert_eq!(values, vec![6, 7, 8, 9, 10, 11]);
+    }
+
+    /// The same shape of filter, but not monotone: it holds for value 3 and for
+    /// nothing else below the top. Value 3 satisfies the filter, so it survives.
+    /// The galloping seek used to skip it.
+    #[test]
+    fn top_n_keeps_a_retained_value_for_a_non_monotone_predicate() {
+        let filter = GroupFilter::TopN(
+            2,
+            Filter::new(Box::new(|v: &DynI32| *unsafe { v.downcast::<i32>() } == 3)),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        // One batch, so the seek runs over more than 8 values and `advance`
+        // takes its galloping path.
+        let all: Vec<(i32, ZWeight)> = (0..12).map(|v| (v, 1)).collect();
+        let survived = retain(filter, &[&all]);
+        let values: Vec<i32> = survived.iter().map(|&(_, v, _)| v).collect();
+
+        // Documented semantics: every value satisfying the filter, which is {3},
+        // plus the 2 largest that do not, which are {10, 11}.
+        assert_eq!(
+            values,
+            vec![3, 10, 11],
+            "value 3 satisfies the filter and must be retained"
+        );
+    }
+
+    /// `BottomN` resurrects a deleted row.
+    ///
+    /// This is the worst of the three, and it needs no non-monotonicity: the
+    /// filter here is a plain threshold. It follows purely from
+    /// `BottomN::on_step_key` never touching the batch cursor, so each batch's
+    /// FIRST value is emitted with no filter check at all.
+    ///
+    /// A value that cancels across the spine is invisible to the snapshot, so
+    /// the filter never reasons about it: `CursorList::seek_key_exact` skips
+    /// values whose weights sum to zero. This is what the `GroupFilter` docs
+    /// warn about. Here value 5 leads one batch and trails the
+    /// other. Both copies must reach the same verdict, or they stop cancelling
+    /// and the deleted row comes back; that is what happened while `BottomN`
+    /// left the leading copy unexamined.
+    #[test]
+    fn bottom_n_does_not_resurrect_a_deleted_value() {
+        // Nothing satisfies the filter, so retention keeps only the n smallest.
+        let filter = GroupFilter::BottomN(
+            1,
+            Filter::new(Box::new(|v: &DynI32| {
+                *unsafe { v.downcast::<i32>() } >= 100
+            })),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+
+        // Spine total for key 1: {1: +1, 5: 0, 20: +1}. Value 5 is deleted.
+        // With n = 1 the only value to retain is 1, the smallest failing one.
+        let survived = retain(
+            filter,
+            &[
+                &[(5, 1), (20, 1)], // 5 leads this batch
+                &[(1, 1), (5, -1)], // and trails this one
+            ],
+        );
+
+        assert_eq!(
+            survived,
+            vec![(1, 1, 1)],
+            "value 5 was deleted; retention must not bring it back"
+        );
+    }
+
+    /// `BottomN` retains everything satisfying the filter plus the `n` smallest
+    /// that do not. Anything else is collected; it used to be kept.
+    #[test]
+    fn bottom_n_collects_a_collectable_value_for_a_non_monotone_predicate() {
+        let filter = GroupFilter::BottomN(
+            2,
+            Filter::new(Box::new(|v: &DynI32| *unsafe { v.downcast::<i32>() } == 8)),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        // Split so the second batch starts at 6. `BottomN`'s `on_step_key` does
+        // no seek, unlike `TopN`'s, so nothing ever skips the values leading
+        // each batch.
+        let survived = retain(
+            filter,
+            &[
+                &[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)],
+                &[(6, 1), (7, 1), (8, 1), (9, 1), (10, 1), (11, 1)],
+            ],
+        );
+        let values: Vec<i32> = survived.iter().map(|&(_, v, _)| v).collect();
+
+        assert_eq!(
+            values,
+            vec![0, 1, 8],
+            "6 fails the filter and is not among the 2 smallest that do"
+        );
+    }
+
+    /// Values come from a small domain so that a random bitmask ranges over
+    /// every shape of predicate, and so that one batch can hold more than the
+    /// eight values `advance` probes before it starts skipping.
+    const VALUES: i32 = 16;
+    const BATCHES: usize = 3;
+
+    /// `(value, batch, weight)` triples. Repeating a value across batches with
+    /// opposing weights cancels it, which is how a value becomes invisible to
+    /// the snapshot while still present in the batches being merged.
+    fn entries() -> impl Strategy<Value = Vec<(i32, usize, ZWeight)>> {
+        prop_vec(
+            (
+                0..VALUES,
+                0..BATCHES,
+                prop::sample::select(vec![-2 as ZWeight, -1, 1, 2]),
+            ),
+            1..32usize,
+        )
+    }
+
+    /// How the records outside the merge cancel the merged ones. Cancelling a
+    /// key's whole group is what empties the snapshot for it, and a free draw
+    /// essentially never does that, so it has to be constructed.
+    #[derive(Clone, Copy, Debug)]
+    enum Cancel {
+        Nothing,
+        Subset,
+        Everything,
+    }
+
+    fn cancellation() -> impl Strategy<Value = (Cancel, Vec<bool>)> {
+        (
+            prop::sample::select(vec![Cancel::Nothing, Cancel::Subset, Cancel::Everything]),
+            prop_vec(any::<bool>(), 0..32usize),
+        )
+    }
+
+    /// What the spine holds outside the merge: `extra`, drawn freely, plus exact
+    /// negations of some merged records.
+    fn spine_only(
+        entries: &[(i32, usize, ZWeight)],
+        extra: &[(i32, ZWeight)],
+        (cancel, mask): &(Cancel, Vec<bool>),
+    ) -> Vec<(i32, ZWeight)> {
+        let mut out = extra.to_vec();
+        for (i, &(value, _batch, weight)) in entries.iter().enumerate() {
+            let cancelled = match cancel {
+                Cancel::Nothing => false,
+                Cancel::Everything => true,
+                Cancel::Subset => mask.get(i).copied().unwrap_or(false),
+            };
+            if cancelled {
+                out.push((value, -weight));
+            }
+        }
+        out
+    }
+
+    /// Records the spine holds in batches the merge does not cover. They decide
+    /// retention without being emitted, and can cancel a merged record so that
+    /// the snapshot never sees it.
+    fn elsewhere() -> impl Strategy<Value = Vec<(i32, ZWeight)>> {
+        prop_vec(
+            (
+                0..VALUES,
+                prop::sample::select(vec![-2 as ZWeight, -1, 1, 2]),
+            ),
+            0..8usize,
+        )
+    }
+
+    /// `fold` collapses the batch assignment onto fewer batches. Whether a key's
+    /// values sit in one batch or are spread over several decides how far the
+    /// cursor has to skip, and skipping is where the bugs are, so the property
+    /// tests need both shapes.
+    fn split(entries: &[(i32, usize, ZWeight)], fold: usize) -> Vec<Vec<(i32, ZWeight)>> {
+        let mut batches = vec![Vec::new(); fold];
+        for &(value, batch, weight) in entries {
+            batches[batch % fold].push((value, weight));
+        }
+        batches.retain(|batch| !batch.is_empty());
+        batches
+    }
+
+    /// The spine as the snapshot sees it: weights summed over every batch,
+    /// including the ones outside the merge, with anything that cancels gone.
+    fn spine_of(
+        merged: &[(i32, usize, ZWeight)],
+        elsewhere: &[(i32, ZWeight)],
+    ) -> BTreeMap<i32, ZWeight> {
+        let mut spine = BTreeMap::new();
+        for &(value, _batch, weight) in merged {
+            *spine.entry(value).or_insert(0) += weight;
+        }
+        for &(value, weight) in elsewhere {
+            *spine.entry(value).or_insert(0) += weight;
+        }
+        spine.retain(|_value, weight| *weight != 0);
+        spine
+    }
+
+    /// What the merge holds, and so all that it can emit. Retention is decided
+    /// against the whole spine, but only these records pass through the merge.
+    fn merged_of(merged: &[(i32, usize, ZWeight)]) -> BTreeMap<i32, ZWeight> {
+        let mut batch = BTreeMap::new();
+        for &(value, _batch, weight) in merged {
+            *batch.entry(value).or_insert(0) += weight;
+        }
+        batch.retain(|_value, weight| *weight != 0);
+        batch
+    }
+
+    fn expected(
+        merged: &BTreeMap<i32, ZWeight>,
+        keep: impl Fn(i32) -> bool,
+    ) -> Vec<(i32, i32, ZWeight)> {
+        merged
+            .iter()
+            .filter(|&(&value, _weight)| keep(value))
+            .map(|(&value, &weight)| (1, value, weight))
+            .collect()
+    }
+
+    /// Which values `TopN` and `BottomN` must retain, from the semantics stated
+    /// in filter.rs rather than from the cursor: every value satisfying the
+    /// filter, plus the `n` failing values nearest the chosen end of the group.
+    fn keep_n(
+        spine: &BTreeMap<i32, ZWeight>,
+        mask: u32,
+        n: usize,
+        keep_largest: bool,
+    ) -> Box<dyn Fn(i32) -> bool> {
+        // The spine holds nothing for this key, so nothing measures it and all
+        // of it stays.
+        if spine.is_empty() {
+            return Box::new(|_value| true);
+        }
+
+        let failing: Vec<i32> = spine
+            .keys()
+            .copied()
+            .filter(|&value| !satisfies(mask, value))
+            .collect();
+        let bound = if keep_largest {
+            failing.iter().rev().nth(n - 1).copied()
+        } else {
+            failing.get(n - 1).copied()
+        };
+
+        match bound {
+            // Fewer than `n` values fail the filter, so all of them stay.
+            None => Box::new(|_value| true),
+            Some(bound) if keep_largest => {
+                Box::new(move |value| satisfies(mask, value) || value >= bound)
+            }
+            Some(bound) => Box::new(move |value| satisfies(mask, value) || value <= bound),
+        }
+    }
+
+    /// Which values `LastN` must retain: every one from the `n`'th before the
+    /// first satisfying value onwards, or the last `n` when none satisfies it.
+    fn keep_last_n(
+        spine: &BTreeMap<i32, ZWeight>,
+        threshold: i32,
+        n: usize,
+    ) -> Box<dyn Fn(i32) -> bool> {
+        if spine.is_empty() {
+            return Box::new(|_value| true);
+        }
+
+        let values: Vec<i32> = spine.keys().copied().collect();
+        let first = values
+            .iter()
+            .position(|&value| value >= threshold)
+            .unwrap_or(values.len());
+        // Fewer than `n` values precede the first satisfying one, so all of them
+        // are retained and nothing bounds the group from below.
+        let bound = (first >= n).then(|| values[first - n]);
+        Box::new(move |value| bound.is_none_or(|bound| value >= bound))
+    }
+
+    fn satisfies(mask: u32, value: i32) -> bool {
+        mask >> value & 1 == 1
+    }
+
+    fn bitmask_filter(mask: u32) -> Filter<DynI32> {
+        Filter::new(Box::new(move |v: &DynI32| {
+            satisfies(mask, *unsafe { v.downcast::<i32>() })
+        }))
+    }
+
+    /// A monotone filter, the only kind `LastN` supports.
+    fn threshold_filter(threshold: i32) -> Filter<DynI32> {
+        Filter::new(Box::new(move |v: &DynI32| {
+            *unsafe { v.downcast::<i32>() } >= threshold
+        }))
+    }
+
+    fn run(
+        filter: GroupFilter<DynI32>,
+        batches: &[Vec<(i32, ZWeight)>],
+        elsewhere: &[(i32, ZWeight)],
+    ) -> Vec<(i32, i32, ZWeight)> {
+        let refs: Vec<&[(i32, ZWeight)]> = batches.iter().map(|b| b.as_slice()).collect();
+        retain_within_spine(filter, &refs, elsewhere)
+    }
+
+    /// A merge covers some of the spine's batches. When the spine's weights for a
+    /// key cancel out, `on_step_key` cannot find the key in the snapshot and
+    /// drops every record it holds for that key. The records that cancel it live
+    /// in batches this merge does not cover, so they survive, and the retraction
+    /// they used to balance is gone.
+    #[test]
+    fn a_key_cancelled_elsewhere_in_the_spine_keeps_its_records() {
+        let filter = GroupFilter::TopN(
+            2,
+            Filter::new(Box::new(|v: &DynI32| {
+                *unsafe { v.downcast::<i32>() } >= 100
+            })),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        // 150 satisfies the filter, so retention must keep it and the operator
+        // will read it. The merge sees the insertion; the matching deletion sits
+        // in a batch outside the merge, so the spine nets to zero for key 1.
+        let survived = retain_within_spine(filter, &[&[(150, 1)]], &[(150, -1)]);
+
+        assert_eq!(
+            survived,
+            vec![(1, 150, 1)],
+            "the deletion that balances this record is in a batch the merge does \
+             not cover, so dropping the record leaves that deletion unbalanced"
+        );
+    }
+
+    /// The mirror of the case above: the merge holds the deletion and a batch
+    /// outside it holds the insertion. Dropping the deletion resurrects a row.
+    #[test]
+    fn a_key_cancelled_elsewhere_keeps_its_deletion() {
+        let filter = GroupFilter::TopN(
+            2,
+            Filter::new(Box::new(|v: &DynI32| {
+                *unsafe { v.downcast::<i32>() } >= 100
+            })),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        let survived = retain_within_spine(filter, &[&[(150, -1)]], &[(150, 1)]);
+
+        assert_eq!(survived, vec![(1, 150, -1)]);
+    }
+
+    /// The same for `BottomN`, which is what MIN and ARG_MIN install.
+    #[test]
+    fn bottom_n_keeps_a_key_cancelled_elsewhere() {
+        let filter = GroupFilter::BottomN(
+            1,
+            Filter::new(Box::new(|v: &DynI32| {
+                *unsafe { v.downcast::<i32>() } >= 100
+            })),
+            <DynData as WithFactory<i32>>::FACTORY,
+        );
+        let survived = retain_within_spine(filter, &[&[(150, 1)]], &[(150, -1)]);
+
+        assert_eq!(survived, vec![(1, 150, 1)]);
+    }
+
+    /// And for `LastN`. The gate runs before any arm, so its monotone predicate
+    /// makes no difference here.
+    #[test]
+    fn last_n_keeps_a_key_cancelled_elsewhere() {
+        let filter = GroupFilter::LastN(2, threshold_filter(100));
+        let survived = retain_within_spine(filter, &[&[(150, 1)]], &[(150, -1)]);
+
+        assert_eq!(survived, vec![(1, 150, 1)]);
+    }
+
+    /// `n = 0` denotes `Simple`, but the marking these filters rely on cannot
+    /// express it, and the compiler never emits it. Rejecting it turns a silent
+    /// wrong answer into a loud one.
+    ///
+    /// The rejection panics on a worker thread, and the runtime re-raises it as
+    /// its own panic, so the message does not survive to be matched on. Running
+    /// the same call with a limit of one instead pins the panic to the zero
+    /// rather than to the surrounding machinery.
+    fn assert_rejects_zero_n(zero: GroupFilter<DynI32>, one: GroupFilter<DynI32>) {
+        let values: [(i32, ZWeight); 2] = [(0, 1), (8, 1)];
+
+        retain(one, &[&values]);
+
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| retain(zero, &[&values])));
+        assert!(panicked.is_err(), "a group filter with n = 0 was accepted");
+    }
+
+    #[test]
+    fn top_n_rejects_a_zero_limit() {
+        assert_rejects_zero_n(
+            GroupFilter::TopN(
+                0,
+                threshold_filter(8),
+                <DynData as WithFactory<i32>>::FACTORY,
+            ),
+            GroupFilter::TopN(
+                1,
+                threshold_filter(8),
+                <DynData as WithFactory<i32>>::FACTORY,
+            ),
+        );
+    }
+
+    #[test]
+    fn bottom_n_rejects_a_zero_limit() {
+        assert_rejects_zero_n(
+            GroupFilter::BottomN(
+                0,
+                threshold_filter(8),
+                <DynData as WithFactory<i32>>::FACTORY,
+            ),
+            GroupFilter::BottomN(
+                1,
+                threshold_filter(8),
+                <DynData as WithFactory<i32>>::FACTORY,
+            ),
+        );
+    }
+
+    #[test]
+    fn last_n_rejects_a_zero_limit() {
+        assert_rejects_zero_n(
+            GroupFilter::LastN(0, threshold_filter(8)),
+            GroupFilter::LastN(1, threshold_filter(8)),
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn top_n_matches_the_documented_semantics(
+            mask in any::<u32>(),
+            n in 1usize..4,
+            fold in 1usize..=BATCHES,
+            entries in entries(),
+            extra in elsewhere(),
+            cancellation in cancellation(),
+        ) {
+            let elsewhere = spine_only(&entries, &extra, &cancellation);
+            let filter = GroupFilter::TopN(n, bitmask_filter(mask), <DynData as WithFactory<i32>>::FACTORY);
+            let spine = spine_of(&entries, &elsewhere);
+            prop_assert_eq!(
+                run(filter, &split(&entries, fold), &elsewhere),
+                expected(&merged_of(&entries), keep_n(&spine, mask, n, true)));
+        }
+
+        #[test]
+        fn bottom_n_matches_the_documented_semantics(
+            mask in any::<u32>(),
+            n in 1usize..4,
+            fold in 1usize..=BATCHES,
+            entries in entries(),
+            extra in elsewhere(),
+            cancellation in cancellation(),
+        ) {
+            let elsewhere = spine_only(&entries, &extra, &cancellation);
+            let filter = GroupFilter::BottomN(n, bitmask_filter(mask), <DynData as WithFactory<i32>>::FACTORY);
+            let spine = spine_of(&entries, &elsewhere);
+            prop_assert_eq!(
+                run(filter, &split(&entries, fold), &elsewhere),
+                expected(&merged_of(&entries), keep_n(&spine, mask, n, false)));
+        }
+
+        /// `LastN` is only defined for a monotone filter, so this drives it with
+        /// a threshold rather than a bitmask.
+        #[test]
+        fn last_n_matches_the_documented_semantics(
+            threshold in 0i32..=VALUES,
+            n in 1usize..4,
+            fold in 1usize..=BATCHES,
+            entries in entries(),
+            extra in elsewhere(),
+            cancellation in cancellation(),
+        ) {
+            let elsewhere = spine_only(&entries, &extra, &cancellation);
+            let filter = GroupFilter::LastN(n, threshold_filter(threshold));
+            let spine = spine_of(&entries, &elsewhere);
+            prop_assert_eq!(
+                run(filter, &split(&entries, fold), &elsewhere),
+                expected(&merged_of(&entries), keep_last_n(&spine, threshold, n)));
+        }
+    }
+}
+
+/// Builds an indexed w-set whose keys carry a known number of values each:
+/// key `i` holds values `0..i`, so key 1 holds one and key 4 holds four.
+///
+/// # Arguments
+///
+/// * `keys` - how many keys to build.
+///
+/// # Returns
+///
+/// The tuples of the batch, ready for a builder.
+fn indexed_wset_tuples_with_fanout(
+    keys: i32,
+) -> Box<DynWeightedPairs<DynPair<DynI32, DynI32>, DynZWeight>> {
+    let mut tuples = Vec::new();
+    for key in 1..=keys {
+        for val in 0..key {
+            tuples.push(Tup2(Tup2(key, val), 1));
+        }
+    }
+    let mut result = indexed_zset_tuples(tuples);
+    result.consolidate();
+    result
+}
+
+/// Walks a cursor and collects `(key, bound, values actually stepped through)`.
+///
+/// # Arguments
+///
+/// * `cursor` - the cursor to walk.
+///
+/// # Returns
+///
+/// Per key, the bound it reported and the values the walk actually found.
+fn fanout_reported_and_walked<C>(cursor: &mut C) -> Vec<(i32, usize, usize)>
+where
+    C: Cursor<DynI32, DynI32, (), DynZWeight>,
+{
+    let mut seen = Vec::new();
+    while cursor.key_valid() {
+        let key = *unsafe { cursor.key().downcast::<i32>() };
+        let bound = cursor.value_count_upper_bound();
+
+        let mut walked = 0;
+        while cursor.val_valid() {
+            walked += 1;
+            cursor.step_val();
+        }
+        seen.push((key, bound, walked));
+        cursor.step_key();
+    }
+    seen
+}
+
+/// A cursor over one batch reports exactly what stepping through the key's
+/// values would find.
+#[test]
+fn value_count_upper_bound_is_exact_for_one_batch() {
+    run_in_circuit_with_storage(|| {
+        let vec_factories =
+            <VecIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let vec = VecIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &vec_factories,
+            (),
+            &mut indexed_wset_tuples_with_fanout(4),
+        );
+        assert_eq!(
+            fanout_reported_and_walked(&mut vec.cursor()),
+            vec![(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)]
+        );
+
+        let file_factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let file = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &file_factories,
+            (),
+            &mut indexed_wset_tuples_with_fanout(4),
+        );
+        assert_eq!(
+            fanout_reported_and_walked(&mut file.cursor()),
+            vec![(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)]
+        );
+    });
+}
+
+/// The point of the method: asking a file-backed batch how many values a key
+/// has must not read the value column.
+///
+/// The key's own block is already in memory once the cursor is on the key, and
+/// the row group recorded beside it carries the answer.
+#[test]
+fn value_count_upper_bound_reads_nothing() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &factories,
+            (),
+            &mut indexed_wset_tuples_with_fanout(4),
+        );
+
+        let cursor = batch.cursor();
+        assert!(cursor.key_valid());
+
+        // Settle whatever the first key's position needed, then measure only
+        // the bound.
+        let _ = cursor.value_count_upper_bound();
+        let before = total_cache_accesses(batch.cache_stats());
+        for _ in 0..100 {
+            assert_eq!(cursor.value_count_upper_bound(), 1);
+        }
+        assert_eq!(total_cache_accesses(batch.cache_stats()), before);
+    });
+}
+
+/// A cursor that has run off the end of the keys reports nothing.
+#[test]
+fn value_count_upper_bound_is_zero_off_the_end() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &factories,
+            (),
+            &mut indexed_wset_tuples_with_fanout(2),
+        );
+
+        let mut cursor = batch.cursor();
+        while cursor.key_valid() {
+            cursor.step_key();
+        }
+        assert_eq!(cursor.value_count_upper_bound(), 0);
+        assert!(!cursor.val_valid());
+    });
+}
+
+/// A spine merges batches through a cursor list, and that is where undercounting
+/// would do real harm: a caller that trusts a bound of one, on a key two batches
+/// both hold a value for, concludes the key is unambiguous when it is not.
+#[test]
+fn value_count_upper_bound_sums_a_spine_s_batches() {
+    run_in_circuit_with_storage(|| {
+        let factories = <OrdIndexedZSetFactories<DynI32, DynI32>>::new::<i32, i32, ZWeight>();
+        let mut trace: Spine<OrdIndexedZSet<DynI32, DynI32>> = Spine::new(
+            &factories,
+            Arc::new(String::from("Test")),
+            TraceRole::Integral,
+        );
+
+        // Key 1 gets value 7 from one batch and value 7 again from another, so
+        // it really holds one value; key 2 gets two distinct values from one
+        // batch, where the count is exact.
+        for tuples in [
+            vec![
+                Tup2(Tup2(1, 7), 1),
+                Tup2(Tup2(2, 5), 1),
+                Tup2(Tup2(2, 6), 1),
+            ],
+            vec![Tup2(Tup2(1, 7), 1)],
+        ] {
+            let batch = OrdIndexedZSet::<DynI32, DynI32>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut indexed_zset_tuples(tuples),
+            );
+            TOKIO.block_on(trace.insert(batch));
+        }
+
+        let walked = fanout_reported_and_walked(&mut trace.cursor());
+        assert_eq!(walked.len(), 2);
+
+        let (key, bound, values) = walked[0];
+        assert_eq!((key, values), (1, 1), "key 1 really holds one value");
+        assert_eq!(
+            bound, 2,
+            "and both batches hold it, so the bound counts two"
+        );
+
+        let (key, bound, values) = walked[1];
+        assert_eq!((key, bound, values), (2, 2, 2), "one batch, so exact");
+
+        for (key, bound, values) in walked {
+            assert!(bound >= values, "key {key} was undercounted");
+        }
+    });
+}
+
+/// Across several batches the figure is a bound, not a count: two batches
+/// holding the same value for a key contribute it twice, because finding out
+/// otherwise would mean reading the values.
+#[test]
+fn value_count_upper_bound_overestimates_across_batches() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <VecIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let build = |tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>>| {
+            let mut erased = indexed_zset_tuples(tuples);
+            erased.consolidate();
+            VecIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut erased,
+            )
+        };
+
+        // Both batches hold key 1 at value 7, so the key really has one value.
+        let left = build(vec![Tup2(Tup2(1, 7), 1)]);
+        let right = build(vec![Tup2(Tup2(1, 7), 1)]);
+        let mut first = left.cursor();
+        let mut second = right.cursor();
+        assert_eq!(first.value_count_upper_bound(), 1);
+        assert_eq!(second.value_count_upper_bound(), 1);
+
+        let mut pair = CursorPair::new(&mut first, &mut second);
+        let walked = fanout_reported_and_walked(&mut pair);
+        assert_eq!(walked.len(), 1);
+        let (key, bound, values) = walked[0];
+        assert_eq!((key, values), (1, 1), "the key really holds one value");
+        assert_eq!(bound, 2, "and the bound counts it once per batch");
+        assert!(bound >= values, "a bound that undercounts is unusable");
+    });
+}
+
+#[test]
+fn probe_step_key_value_reads() {
+    run_in_circuit_with_storage(|| {
+        // Same keys in both, but one has eight times the value rows, so any
+        // difference in a key-only sweep is the value column being read.
+        for fanout in [1, 8] {
+            let factories =
+                <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+            let tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>> = (0..50_000)
+                .flat_map(|k| (0..fanout).map(move |v| Tup2(Tup2(k, v), 1)))
+                .collect();
+            let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut indexed_zset_tuples(tuples),
+            );
+
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut keys = 0u64;
+            while cursor.key_valid() {
+                keys += 1;
+                cursor.step_key();
+            }
+            let keys_only = total_cache_accesses(batch.cache_stats()) - base;
+
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut vals = 0u64;
+            while cursor.key_valid() {
+                while cursor.val_valid() {
+                    let _ = unsafe { cursor.val().downcast::<i32>() };
+                    vals += 1;
+                    cursor.step_val();
+                }
+                cursor.step_key();
+            }
+            let with_values = total_cache_accesses(batch.cache_stats()) - base;
+
+            println!(
+                "fanout={fanout}: keys={keys} vals={vals}  step_key_only={keys_only}  \
+                 step_key_and_read={with_values}"
+            );
+        }
+    });
+}
+
+/// Walking a file-backed batch's keys must not read its values.
+///
+/// The value cursor is positioned only when something asks for a value, so the
+/// cost of a key-only sweep is set by the key column alone.  Two batches with
+/// the same keys and eight times the values settle it: if the values were being
+/// read, the second would cost about eight times the first.
+#[test]
+fn stepping_keys_does_not_read_values() {
+    run_in_circuit_with_storage(|| {
+        let sweep = |fanout: i32| {
+            let factories =
+                <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+            let tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>> = (0..50_000)
+                .flat_map(|key| (0..fanout).map(move |val| Tup2(Tup2(key, val), 1)))
+                .collect();
+            let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut indexed_zset_tuples(tuples),
+            );
+
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut keys = 0;
+            while cursor.key_valid() {
+                keys += 1;
+                cursor.step_key();
+            }
+            let keys_only = total_cache_accesses(batch.cache_stats()) - base;
+
+            // Asking how many values a key has must be free too, or a caller
+            // that wants the count still pays for the column it is avoiding.
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut counted = 0;
+            while cursor.key_valid() {
+                counted += cursor.value_count_upper_bound();
+                cursor.step_key();
+            }
+            let counting = total_cache_accesses(batch.cache_stats()) - base;
+
+            // And so must asking whether a key has any, which is what a scan
+            // calls on every key before deciding whether it wants the value.
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut nonempty = 0;
+            while cursor.key_valid() {
+                nonempty += cursor.val_valid() as usize;
+                cursor.step_key();
+            }
+            let checking = total_cache_accesses(batch.cache_stats()) - base;
+            assert_eq!(nonempty, 50_000);
+
+            // Reading the values still has to cost what it always did: the
+            // position handed to `first_with_hint` is what keeps a scan at one
+            // read per value block rather than one descent per key.
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            let mut read = 0;
+            while cursor.key_valid() {
+                while cursor.val_valid() {
+                    read += 1;
+                    cursor.step_val();
+                }
+                cursor.step_key();
+            }
+            let reading = total_cache_accesses(batch.cache_stats()) - base;
+
+            assert_eq!(keys, 50_000);
+            assert_eq!(counted, 50_000 * fanout as usize);
+            assert_eq!(read, 50_000 * fanout as usize);
+            (keys_only, counting, checking, reading)
+        };
+
+        let (thin_keys, thin_counting, thin_checking, thin_reading) = sweep(1);
+        let (fat_keys, fat_counting, fat_checking, fat_reading) = sweep(8);
+
+        assert_eq!(
+            thin_counting, thin_keys,
+            "counting a key's values cost more than stepping past it"
+        );
+        assert_eq!(fat_counting, fat_keys);
+        assert_eq!(
+            thin_checking, thin_keys,
+            "asking whether a key has values cost more than stepping past it"
+        );
+        assert_eq!(fat_checking, fat_keys);
+
+        assert!(
+            fat_keys < thin_keys * 2,
+            "eight times the values cost {fat_keys} against {thin_keys}, so they are being read"
+        );
+        assert!(
+            fat_reading > fat_keys * 4,
+            "reading the values cost {fat_reading} against {fat_keys} for the keys alone, \
+             which is too close to be reading anything"
+        );
+        assert!(thin_reading > thin_keys);
+
+        // Reading has to stay at one read per value block.  Losing the hint
+        // handed to `first_with_hint` would put it at one descent per key, so
+        // anything approaching the key count means the fast path is gone.
+        for (reading, label) in [(thin_reading, "one value"), (fat_reading, "eight values")] {
+            assert!(
+                reading < 50_000 / 4,
+                "with {label} a key, reading cost {reading} against 50000 keys, \
+                 which is a descent per key rather than a read per block"
+            );
+        }
+    });
+}
+
+/// A cursor list over one batch must cost what that batch's own cursor costs.
+///
+/// Stepping a key checks whether the values under it cancel, and summing their
+/// weights means reading the block those weights sit in.  With one cursor there
+/// is nothing to cancel against, so the check is skipped and the sweep stays on
+/// the key column.
+#[test]
+fn a_cursor_list_over_one_batch_does_not_read_values() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <FileIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+
+        for fanout in [1, 8] {
+            let tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>> = (0..50_000)
+                .flat_map(|key| (0..fanout).map(move |val| Tup2(Tup2(key, val), 1)))
+                .collect();
+            let batch = FileIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut indexed_zset_tuples(tuples),
+            );
+
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = CursorList::new(factories.weight_factory(), vec![batch.cursor()]);
+            let mut keys = 0;
+            while cursor.key_valid() {
+                keys += 1;
+                cursor.step_key();
+            }
+            let through_list = total_cache_accesses(batch.cache_stats()) - base;
+
+            let base = total_cache_accesses(batch.cache_stats());
+            let mut cursor = batch.cursor();
+            while cursor.key_valid() {
+                cursor.step_key();
+            }
+            let through_batch = total_cache_accesses(batch.cache_stats()) - base;
+
+            assert_eq!(keys, 50_000);
+            assert_eq!(
+                through_list, through_batch,
+                "with {fanout} values a key, a list of one cursor cost {through_list} \
+                 against the batch cursor's {through_batch}"
+            );
+        }
+    });
+}
+
+/// `map_values` hands out weights, so it has to add them up where stepping the
+/// cursor deliberately did not.
+#[test]
+fn a_cursor_list_reports_weights_it_did_not_sum() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <VecIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let batch = VecIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+            &factories,
+            (),
+            &mut indexed_zset_tuples(vec![
+                Tup2(Tup2(1, 4), 2),
+                Tup2(Tup2(1, 5), 3),
+                Tup2(Tup2(2, 6), -7),
+            ]),
+        );
+
+        // One cursor, so nothing cancels and no weight is summed while stepping.
+        let mut cursor = CursorList::new(factories.weight_factory(), vec![batch.cursor()]);
+
+        let mut seen = Vec::new();
+        while cursor.key_valid() {
+            let key = *unsafe { cursor.key().downcast::<i32>() };
+            cursor.map_values(&mut |val, weight| {
+                seen.push((key, *unsafe { val.downcast::<i32>() }, *unsafe {
+                    weight.downcast::<ZWeight>()
+                }));
+            });
+            cursor.step_key();
+        }
+        assert_eq!(seen, vec![(1, 4, 2), (1, 5, 3), (2, 6, -7)]);
+
+        // And so does `weight`, reached the usual way.
+        let mut cursor = CursorList::new(factories.weight_factory(), vec![batch.cursor()]);
+        let mut seen = Vec::new();
+        while cursor.key_valid() {
+            let key = *unsafe { cursor.key().downcast::<i32>() };
+            while cursor.val_valid() {
+                let val = *unsafe { cursor.val().downcast::<i32>() };
+                seen.push((key, val, *unsafe { cursor.weight().downcast::<ZWeight>() }));
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        assert_eq!(seen, vec![(1, 4, 2), (1, 5, 3), (2, 6, -7)]);
+    });
+}
+
+/// Skipping the check for a lone cursor must not stop values from cancelling
+/// when there is something to cancel against.
+#[test]
+fn a_cursor_list_still_cancels_across_batches() {
+    run_in_circuit_with_storage(|| {
+        let factories =
+            <VecIndexedWSetFactories<DynI32, DynI32, DynZWeight>>::new::<i32, i32, ZWeight>();
+        let build = |tuples: Vec<Tup2<Tup2<i32, i32>, ZWeight>>| {
+            VecIndexedWSet::<DynI32, DynI32, DynZWeight>::dyn_from_tuples(
+                &factories,
+                (),
+                &mut indexed_zset_tuples(tuples),
+            )
+        };
+
+        // Key 1 is written and retracted, so it cancels away entirely; key 2
+        // keeps one of its two values and key 3 is only in one batch.
+        let left = build(vec![
+            Tup2(Tup2(1, 7), 1),
+            Tup2(Tup2(2, 4), 1),
+            Tup2(Tup2(2, 5), 1),
+            Tup2(Tup2(3, 9), 1),
+        ]);
+        let right = build(vec![Tup2(Tup2(1, 7), -1), Tup2(Tup2(2, 4), -1)]);
+
+        let mut cursor = CursorList::new(
+            factories.weight_factory(),
+            vec![left.cursor(), right.cursor()],
+        );
+
+        let mut survived = Vec::new();
+        while cursor.key_valid() {
+            let key = *unsafe { cursor.key().downcast::<i32>() };
+            while cursor.val_valid() {
+                let val = *unsafe { cursor.val().downcast::<i32>() };
+                survived.push((key, val));
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+
+        assert_eq!(
+            survived,
+            vec![(2, 5), (3, 9)],
+            "a value whose weights cancel across batches has to stay hidden"
+        );
+    });
 }

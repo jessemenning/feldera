@@ -15,13 +15,14 @@ feldera-types = { workspace = true }
 feldera-adapterlib = { workspace = true }
 dbsp = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
+async-trait = { workspace = true }
 atomic = { workspace = true }
 bytemuck = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time"] }
 datafusion = { workspace = true }
 log = { workspace = true }
 iceberg = { workspace = true }
-iceberg-datafusion = { workspace = true }
+datafusion-iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-catalog-s3tables = { workspace = true }
@@ -31,3 +32,9 @@ chrono = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+feldera-sqllib = { workspace = true }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
+serde_arrow = { workspace = true }

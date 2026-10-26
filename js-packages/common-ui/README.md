@@ -14,11 +14,16 @@ import { SegmentedControl, TabsPanel, PersistentContent, MonacoEditor } from 'co
 
 ## What's inside
 
-- **Controls** — `SegmentedControl`, `Select`, `TabsPanel`, `Popover`, `Tooltip`.
-- **Editor** — `MonacoEditorRunes` / `monaco.ts`: a runes-based Monaco wrapper.
-- **Layout helpers** — `PersistentContent` + `persistentRect.svelte` for content
-  that must survive conditional re-renders (see those files for details),
-  `ANSIDecoratedText` for rendering ANSI-colored log output.
+| Group | Components |
+|---|---|
+| Controls | `SegmentedControl`, `Select`, `TabsPanel`, `Popover`, `Tooltip` |
+| Editor | `MonacoEditorRunes` and `monaco.ts`, a runes-based Monaco wrapper |
+| Layout helpers | `PersistentContent` and `persistentRect.svelte` for content that must survive conditional re-renders (see those files for details). `ANSIDecoratedText` renders ANSI-colored log output. |
+| Buttons | `ClipboardCopyButton`. `ClickFeedback` shows a short confirmation state after a click. |
+| Pipeline views | `ConnectorMetricsTables` shows the connector statistics of each table and view. Use `aggregateConnectorMetrics` from `common-lib/connectorMetrics` to make its input from a `/stats` response. |
+
+Code that does not need Svelte (formatting, collections, domain types) lives in
+[`common-lib`](../common-lib/README.md) instead.
 
 `src/lib` is the published surface (re-exported from `src/lib/index.ts`);
 `src/routes` is only a local preview/showcase app and is not published.
@@ -33,19 +38,20 @@ bun run check    # type-check
 
 ## How it's built and consumed
 
-Consumers import the **built** output (`dist/`), not the source. Building `web-console` or `profiler-app`
-(`bun run build`) rebuilds this package automatically — their `prebuild` step
-runs `build:deps:*` at the repo root, which includes
-`bun --cwd=js-packages/common-ui run build`.
+Consumers import the built output (`dist/`), not the source. `bun install`
+builds this package.
 
-`bun run dev`, however, does **not** run that step, so it uses whatever is
-already in `dist/`. After changing anything in `common-ui` while developing an
-app, rebuild this package and restart the dev server:
+The `dev`, `build`, `check` and test scripts of web-console and profiler-app
+first run `bun run deps`, which rebuilds this package. A running dev server does
+not get your later changes. To use them, rebuild this package and restart the
+dev server:
 
 ```sh
-bun --cwd=js-packages/common-ui run build   # from the repo root
+bun --cwd=js-packages/common-ui run build:self   # from the repo root
 # then re-run `bun run dev` in web-console or profiler-app
 ```
+
+`build` rebuilds `common-lib` first. `build:self` builds only this package.
 
 This package was scaffolded with [`sv`](https://npmjs.com/package/sv); the
 underlying tooling docs live at <https://svelte.dev/docs/kit/packaging>.

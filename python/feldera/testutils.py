@@ -1,21 +1,26 @@
 "Utility functions for writing tests against a Feldera instance."
 
-import math
+import logging
 import os
 import platform
 import re
 import time
 import json
 import unittest
+import warnings
+from pathlib import Path
 from typing import List, Optional, cast
 from datetime import datetime
 
+from feldera._long_operation_warning import LongOperationWarning
 from feldera.enums import CompilationProfile
 from feldera.pipeline import Pipeline
 from feldera.pipeline_builder import PipelineBuilder
 from feldera.runtime_config import Resources, RuntimeConfig
-from feldera.rest import FelderaClient
+from feldera.rest import FelderaClient, RetryConfig
 from feldera.rest._helpers import requests_verify_from_env
+
+logger = logging.getLogger(__name__)
 
 API_KEY = os.environ.get("FELDERA_API_KEY")
 
@@ -40,35 +45,33 @@ def _get_effective_api_key():
     return oidc_token if oidc_token else API_KEY
 
 
+def feldera_bearer_token() -> Optional[str]:
+    """The bearer token to send with a request issued now.
+
+    A configured OIDC login flow wins, then the token file named by
+    FELDERA_OIDC_TOKEN_FILE, which feldera/oidc-auth-action keeps current for
+    the life of a CI job. Then the static API key, and None when nothing is
+    configured, which is how a local instance without authentication runs.
+
+    Callers that build their own requests resolve this per request: a CI token
+    expires well inside a test run, and one read at import time starts
+    returning 401 partway through. Reading per request is not by itself
+    enough, because the file can hold an expired token when its refresher is
+    late; `RetryConfig.expired_token_wait_seconds` covers that gap for callers
+    that hand the SDK this function rather than its result.
+    """
+    if os.environ.get("OIDC_TEST_ISSUER"):
+        return _get_effective_api_key()
+    token_file = os.environ.get("FELDERA_OIDC_TOKEN_FILE")
+    if token_file:
+        return Path(token_file).read_text().strip()
+    return API_KEY
+
+
 BASE_URL = os.environ.get("FELDERA_HOST") or "http://localhost:8080"
 FELDERA_REQUESTS_VERIFY = requests_verify_from_env()
 FELDERA_TEST_NUM_WORKERS = int(os.environ.get("FELDERA_TEST_NUM_WORKERS", "8"))
 FELDERA_TEST_NUM_HOSTS = int(os.environ.get("FELDERA_TEST_NUM_HOSTS", "1"))
-
-# Ad-hoc queries reserve 64 MiB per worker for sort spill before sorting a
-# single row (SORT_SPILL_RESERVATION_BYTES in
-# adapterlib/src/utils/datafusion.rs), so a `datafusion_memory_mb` pool
-# smaller than `workers * 64 MiB` fails any ORDER BY/EXCEPT/hash-join ad-hoc
-# query with "Resources exhausted", independent of data size. This holds
-# regardless of `hosts`: the reservation is sized from the *total* configured
-# `workers`, whether they all run on one host or are split across several
-# (the coordinator's own ad-hoc engine also uses the total worker count as
-# its partition count -- see crates/coord/src/adhoc.rs).
-_ADHOC_SORT_RESERVATION_MB_PER_WORKER = (64 * 1024 * 1024) / 1_000_000
-
-
-def min_datafusion_memory_mb(
-    workers: int = FELDERA_TEST_NUM_WORKERS,
-    hosts: int = FELDERA_TEST_NUM_HOSTS,
-    headroom_mb: int = 512,
-) -> int:
-    """Minimum `datafusion_memory_mb` for a sort-heavy ad-hoc query to avoid
-    "Resources exhausted" with the given number of workers, plus
-    `headroom_mb` for the query's actual data. `hosts` doesn't change the
-    result (see module comment above); it's accepted so callers can pass
-    both test parameters without worrying about which one matters.
-    """
-    return math.ceil(workers * _ADHOC_SORT_RESERVATION_MB_PER_WORKER) + headroom_mb
 
 
 class _LazyClient:
@@ -81,9 +84,38 @@ class _LazyClient:
 
     def _ensure(self):
         if self._client is None:
+            # A CI token expires inside a run, so where one refreshes the SDK
+            # gets the resolver itself: it re-resolves per request and retries
+            # once on 401. Elsewhere the credential is fixed for the process.
             self._client = FelderaClient(
                 connection_timeout=10,
-                api_key=_get_effective_api_key(),
+                # Shared CI instances see infrastructure churn (node
+                # replacement, pipeline pod rescheduling) that outlasts the
+                # default attempt-based retry budget of ~14 seconds. Retry on
+                # a wall-clock budget sized to ride out a node replacement.
+                # CI only: `enterprise_only` gates call `get_config` at
+                # import time, and a 5-minute retry against an instance that
+                # is not running would hang local test collection.
+                retry_config=(
+                    RetryConfig(
+                        deadline_seconds=300.0,
+                        # A late refresh leaves the token file holding an
+                        # expired token, and every worker then fails at once
+                        # for as long as the gap lasts. Waiting it out costs a
+                        # couple of minutes; not waiting costs the whole job,
+                        # because these suites run under `--maxfail=1`.
+                        # Only a provably expired token waits, so a job with
+                        # no credential at all still fails immediately.
+                        expired_token_wait_seconds=150.0,
+                    )
+                    if os.environ.get("CI")
+                    else RetryConfig()
+                ),
+                api_key=(
+                    feldera_bearer_token
+                    if os.environ.get("FELDERA_OIDC_TOKEN_FILE")
+                    else feldera_bearer_token()
+                ),
             )
         return self._client
 
@@ -193,24 +225,95 @@ def _log_row_diff(label: str, rows: list) -> None:
         log(json.dumps(row, default=str))
 
 
+def suite_tag() -> str:
+    """Identifier of the test suite this process belongs to, or "" outside CI.
+
+    CI runs `python` and `python-multihost` concurrently against one Feldera
+    instance and one MinIO bucket. Only `python-multihost` sets
+    FELDERA_TEST_TAG_SUFFIX (to "m"), which is enough to keep anything the two
+    would otherwise share disjoint.
+    """
+    return os.getenv("FELDERA_TEST_TAG_SUFFIX", "")
+
+
+# A pipeline name becomes a Kubernetes label value, which the platform caps at
+# 63 characters. Stay a character inside that.
+PIPELINE_NAME_MAX_LEN = 62
+
+
 def unique_pipeline_name(base_name: str) -> str:
     """
     In CI, multiple tests of different runs can run against the same Feldera instance, we
     make sure the pipeline names they use are unique by appending the first 5 characters
-    of the commit SHA or 'local' if not in CI. FELDERA_TEST_TAG_SUFFIX distinguishes
+    of the commit SHA or 'local' if not in CI. The suite tag distinguishes
     test suites of the same commit running concurrently against one instance.
     """
-    ci_tag = os.getenv("GITHUB_SHA", "local")[:5] + os.getenv(
-        "FELDERA_TEST_TAG_SUFFIX", ""
-    )
+    ci_tag = os.getenv("GITHUB_SHA", "local")[:5] + suite_tag()
     name = f"{ci_tag}_{base_name}"
-    # The pipeline name becomes a Kubernetes label value (max 63 chars). Fail here
-    # with a clear message rather than letting provisioning hit a cryptic 422.
-    assert len(name) <= 62, (
-        f"Generated pipeline name '{name}' is {len(name)} chars, exceeding the 62-char "
-        f"limit; shorten the test name '{base_name}' to at most {62 - len(ci_tag) - 1} chars."
+    # Fail here with a clear message rather than letting provisioning hit a
+    # cryptic 422.
+    assert len(name) <= PIPELINE_NAME_MAX_LEN, (
+        f"Generated pipeline name '{name}' is {len(name)} chars, exceeding the "
+        f"{PIPELINE_NAME_MAX_LEN}-char limit; shorten the test name '{base_name}' to at "
+        f"most {PIPELINE_NAME_MAX_LEN - len(ci_tag) - 1} chars."
     )
     return name
+
+
+def variant_pipeline_name(pipeline_name: str, variant: str) -> str:
+    """Name the pipeline a test creates for one `variant` of itself.
+
+    `unique_pipeline_name` bounds only the name it returns, so a test that
+    appends a variant to that name leaves the bound behind. The length it lands
+    on also depends on the suite: `python-multihost` stamps a tag one character
+    longer than `python` does, so the same test can fit in one suite and
+    overflow in the other. Check the whole name here, where the test that built
+    it is still named, instead of at pipeline creation.
+    """
+    name = f"{pipeline_name}_{variant}"
+    assert len(name) <= PIPELINE_NAME_MAX_LEN, (
+        f"Pipeline name '{name}' is {len(name)} chars, exceeding the "
+        f"{PIPELINE_NAME_MAX_LEN}-char limit; shorten the test name behind "
+        f"'{pipeline_name}' by {len(name) - PIPELINE_NAME_MAX_LEN} chars, or shorten "
+        f"the variant '{variant}'."
+    )
+    return name
+
+
+# Teardown must not block on one wedged pipeline: the SDK otherwise polls for
+# `Stopped` forever, and when the runner finally kills the job every pipeline
+# the run started keeps consuming compute on the shared instance.
+RECLAIM_TIMEOUT_SECONDS = 60.0
+
+
+def reclaim_pipeline(name: str, delete: bool = False) -> List[str]:
+    """Force-stop `name`, clear its storage, and optionally delete it.
+
+    Every step runs even when the one before it raised: a pipeline that never
+    reports `Stopped` can still release its storage, and abandoning the rest on
+    the first error leaves them running on a shared instance. Returns one
+    message per failed step, empty when the pipeline is fully reclaimed, so the
+    caller decides whether a cleanup failure is worth failing a test over.
+    """
+    failures = []
+
+    try:
+        TEST_CLIENT.stop_pipeline(name, force=True, timeout_s=RECLAIM_TIMEOUT_SECONDS)
+    except Exception as error:
+        failures.append(f"{name}: stop: {error}")
+
+    try:
+        TEST_CLIENT.clear_storage(name, timeout_s=RECLAIM_TIMEOUT_SECONDS)
+    except Exception as error:
+        failures.append(f"{name}: clear storage: {error}")
+
+    if delete:
+        try:
+            TEST_CLIENT.delete_pipeline(name)
+        except Exception as error:
+            failures.append(f"{name}: delete: {error}")
+
+    return failures
 
 
 def enterprise_only(fn):
@@ -318,24 +421,58 @@ def build_pipeline(
     resources: Optional[Resources] = None,
     dev_tweaks: Optional[dict] = None,
     datafusion_memory_mb: Optional[int] = None,
+    udf_rust: str = "",
+    udf_toml: str = "",
 ) -> Pipeline:
+    """Create or replace a workload test pipeline from its tables and views.
+
+    Workload tests build their pipelines here instead of calling
+    `PipelineBuilder` directly, so that the CI settings it applies, such as
+    the provisioning timeout, reach every one of them.
+
+    :param pipeline_name: Name of the pipeline to create or replace.
+    :param tables: SQL fragments that precede the views, keyed by name; see
+        `generate_program`.
+    :param views: Views to define after the tables.
+    :param resources: Resource requests and limits, or None for the
+        instance's defaults.
+    :param dev_tweaks: Developer tweaks for the runtime, or None.
+    :param datafusion_memory_mb: Size of the pool for ad hoc queries, or None
+        for the default share of the memory budget.
+    :param udf_rust: Rust source of the program's user-defined functions, or
+        "" if it has none.
+    :param udf_toml: Cargo dependencies of those functions, or "" if they
+        need none.
+    :return: The pipeline, created but not yet started.
+    """
     sql = generate_program(tables, views)
 
-    pipeline = PipelineBuilder(
-        TEST_CLIENT,
-        pipeline_name,
-        sql=sql,
-        compilation_profile=CompilationProfile.OPTIMIZED,
-        runtime_config=RuntimeConfig(
+    with warnings.catch_warnings():
+        # The older spelling of the timeout, so that a deployment from before
+        # the current names reads it too; it warns, and the warning is noise
+        # here. TODO: write `provisioning_timeout="5m"` once no such
+        # deployment is tested against any more.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        runtime_config = RuntimeConfig(
             # Covers node auto-provisioning: a pipeline that needs a fresh
-            # node shape waits for node boot plus image pull.
-            provisioning_timeout_secs=180,
+            # node shape waits for node boot plus image pull, and parallel
+            # test workers can request several fresh nodes at once.
+            provisioning_timeout_secs=300,
             resources=resources,
             workers=FELDERA_TEST_NUM_WORKERS,
             hosts=FELDERA_TEST_NUM_HOSTS,
             dev_tweaks=dev_tweaks,
             datafusion_memory_mb=datafusion_memory_mb,
-        ),
+        )
+
+    pipeline = PipelineBuilder(
+        TEST_CLIENT,
+        pipeline_name,
+        sql=sql,
+        udf_rust=udf_rust,
+        udf_toml=udf_toml,
+        compilation_profile=CompilationProfile.OPTIMIZED,
+        runtime_config=runtime_config,
     ).create_or_replace()
 
     return pipeline
@@ -358,10 +495,43 @@ def check_end_of_input(pipeline: Pipeline) -> bool:
 
 
 def wait_end_of_input(pipeline: Pipeline, timeout_s: Optional[int] = None):
+    """Waits until every input connector has read its source to the end.
+
+    End of input is not completion: a connector reports it once it has read its
+    last record, and records it has already read may still be waiting to reach
+    the circuit. `Pipeline.wait_for_completion` waits for those to be processed
+    as well; this weaker wait is for the cases that cannot reach completion,
+    such as an open transaction.
+    """
     start_time = time.monotonic()
-    while not check_end_of_input(pipeline):
+    # Reused by the warning message below so a stalled ingest can be told
+    # apart from a slow one; check_end_of_input() would fetch and discard it.
+    latest_stats = None
+    wait_for_input_end = LongOperationWarning(
+        logger,
+        lambda elapsed: (
+            f"still waiting for end of input on pipeline {pipeline.name}, "
+            f"waited {elapsed:.1f} seconds ({latest_stats.global_metrics.progress_summary()})"
+        ),
+        lambda elapsed: (
+            f"end of input reached on pipeline {pipeline.name} "
+            f"after {elapsed:.1f} seconds"
+        ),
+    )
+
+    while True:
+        latest_stats = pipeline.stats()
+        if all(
+            input_endpoint.metrics.end_of_input
+            for input_endpoint in latest_stats.inputs
+        ):
+            wait_for_input_end.done()
+            return
+
         if timeout_s is not None and time.monotonic() - start_time > timeout_s:
             raise TimeoutError("Timeout waiting for end of input")
+
+        wait_for_input_end.check()
         time.sleep(3)
 
 

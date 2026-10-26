@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from http import HTTPStatus
 
 import pyarrow as pa
 import pytest
@@ -21,7 +20,6 @@ from feldera import PipelineBuilder
 from feldera.runtime_config import RuntimeConfig
 from feldera.testutils import FELDERA_TEST_NUM_HOSTS, FELDERA_TEST_NUM_WORKERS
 from tests import TEST_CLIENT, enterprise_only
-from tests.platform.helper import api_url, get
 from tests.utils import DeltaTestLocation, wait_for_condition
 
 TABLE = "t"
@@ -32,19 +30,10 @@ INITIAL_VERSIONS = 10
 FOLLOW_ROUNDS = (3, 2, 4)
 
 
-def _writer_storage_options(loc: DeltaTestLocation) -> dict | None:
-    opts = loc.delta_storage_options()
-    if not opts:
-        return None
-    if loc.uri.startswith("s3://"):
-        opts.setdefault("aws_s3_allow_unsafe_rename", "true")
-    return opts
-
-
 def _delta_version(loc: DeltaTestLocation) -> int:
     from deltalake import DeltaTable
 
-    dt = DeltaTable(loc.uri, storage_options=_writer_storage_options(loc))
+    dt = DeltaTable(loc.uri, storage_options=loc.writer_storage_options())
     return dt.version()
 
 
@@ -57,7 +46,7 @@ def _append_version(loc: DeltaTestLocation, row_id: int) -> None:
         pa.Table.from_pylist([{"id": row_id}]),
         mode="append",
         schema_mode="merge",
-        storage_options=_writer_storage_options(loc),
+        storage_options=loc.writer_storage_options(),
     )
 
 
@@ -69,7 +58,7 @@ def _seed_delta_table(loc: DeltaTestLocation, num_versions: int) -> None:
         loc.uri,
         pa.Table.from_pylist([{"id": 0}]),
         mode="overwrite",
-        storage_options=_writer_storage_options(loc),
+        storage_options=loc.writer_storage_options(),
     )
     for version in range(1, num_versions):
         _append_version(loc, version * 2)
@@ -115,10 +104,9 @@ def _build_sql(loc: DeltaTestLocation, *, mode: str, paused: bool = False) -> st
 
 
 def _delta_metric(pipeline_name: str, metric_name: str) -> float:
-    response = get(api_url(f"/pipelines/{pipeline_name}/metrics?format=prometheus"))
-    assert response.status_code == HTTPStatus.OK, response.text
+    scrape = TEST_CLIENT.get_pipeline_metrics(pipeline_name)
     pattern = rf'^{re.escape(metric_name)}\{{[^}}]*endpoint="{re.escape(ENDPOINT)}"[^}}]*\}}\s+(\S+)'
-    for line in response.text.splitlines():
+    for line in scrape.splitlines():
         match = re.match(pattern, line)
         if match:
             return float(match.group(1))
@@ -208,7 +196,7 @@ def _append_cdc_insert(
         ),
         mode=mode,
         schema_mode="merge",
-        storage_options=_writer_storage_options(loc),
+        storage_options=loc.writer_storage_options(),
     )
 
 
@@ -235,7 +223,7 @@ def _run_catchup_rounds(
 ) -> tuple[int, int, int]:
     """Pause, append, resume for each round; return final version, row id, and ts."""
     for round_idx, num_versions in enumerate(FOLLOW_ROUNDS):
-        pipeline.pause_connector(TABLE, CONNECTOR)
+        pipeline.pause_input_connector(TABLE, CONNECTOR)
         _wait_for_connector_paused(pipeline, paused=True)
 
         follow_at_round_start = _delta_counter(
@@ -258,7 +246,7 @@ def _run_catchup_rounds(
             or _completed_version(pipeline) < table_version
         ), f"round {round_idx}: connector must not ingest commits written while paused"
 
-        pipeline.resume_connector(TABLE, CONNECTOR)
+        pipeline.start_input_connector(TABLE, CONNECTOR)
         _wait_for_connector_paused(pipeline, paused=False)
         _wait_for_completed_version(pipeline, table_version)
 
@@ -441,7 +429,7 @@ def test_delta_input_cdc_multi_key_order_by(pipeline_name):
             ),
             mode=mode,
             schema_mode="merge",
-            storage_options=_writer_storage_options(loc),
+            storage_options=loc.writer_storage_options(),
         )
 
     try:

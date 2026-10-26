@@ -109,12 +109,19 @@ public class RegressionTests extends SqlIoTest {
 
     @Test
     public void issue3364() {
+        // Joining on ROW values is supported, but only with IS NOT DISTINCT FROM
         this.statementsFailingInCompilation("""
                 create type typ1 as (f int);
                 create table t1 (x1 typ1);
                 create table t2 (x1 typ1);
                 create view v1 as select t1.* from t1 join t2
-                on t1.x1 = t2.x1;""", "Not yet implemented: Join on struct types");
+                on t1.x1 = t2.x1;""", "ROW values cannot be compared using '='");
+        this.getCC("""
+                create type typ1 as (f int);
+                create table t1 (x1 typ1);
+                create table t2 (x1 typ1);
+                create view v1 as select t1.* from t1 join t2
+                on t1.x1 is not distinct from t2.x1;""");
     }
 
     @Test
@@ -180,6 +187,19 @@ public class RegressionTests extends SqlIoTest {
                 DECLARE RECURSIVE VIEW e(id TEXT, y VARCHAR(2) NOT NULL);
                 CREATE VIEW e AS
                 SELECT * FROM U;""");
+    }
+
+    /** Two views read a local view whose row contains a ROW value built with casts.  The
+     * compiler does not fold these casts, so CSE cannot compare the two copies of the constant,
+     * which have the same persistent id. */
+    @Test
+    public void duplicateConstants() {
+        this.getCC("""
+                CREATE LOCAL VIEW T AS SELECT CAST(ROW(1, 'string') AS ROW(lf INTEGER, rf VARCHAR)) AS r,
+                    CAST(1 AS VARIANT) AS v,
+                    CAST(UUID '123e4567-e89b-12d3-a456-426655440000' AS UUID) AS u;
+                CREATE VIEW V1 AS SELECT CAST(r AS ROW(lf INTEGER, rf VARCHAR)), CAST(u AS UUID) FROM T;
+                CREATE VIEW V2 AS SELECT CAST(CAST(u AS UUID) AS VARIANT) FROM T;""");
     }
 
     @Test
@@ -907,7 +927,7 @@ public class RegressionTests extends SqlIoTest {
 
     @Test
     public void issue3180() {
-        this.getCCS("CREATE VIEW V AS SELECT ROW(1, 'x') = ROW('x', 1);");
+        this.getCCS("CREATE VIEW V AS SELECT ROW(1, 'x') IS NOT DISTINCT FROM ROW('x', 1);");
     }
 
     @Test
@@ -1552,7 +1572,7 @@ public class RegressionTests extends SqlIoTest {
                 CREATE TABLE T (
                    id INT,
                    amt INT,
-                   ts TIMESTAMP
+                   ts TIMESTAMP NOT NULL
                 );
 
                 CREATE VIEW V AS SELECT

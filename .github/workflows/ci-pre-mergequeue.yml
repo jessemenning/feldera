@@ -4,14 +4,18 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+# The pre-commit hooks below hand GITHUB_TOKEN to every build script in the
+# tree, so keep it read-only. Nothing here writes through it: the auto-fix
+# commit pushes with the App token that the checkout configured.
+permissions:
+  contents: read
+
 env:
   RUSTC_WRAPPER: sccache
   # sccache: native GCS backend, credentials come from the runner pod via
   # Workload Identity (no secrets).
   SCCACHE_GCS_BUCKET: ${{ vars.SCCACHE_GCS_BUCKET }}
   SCCACHE_GCS_RW_MODE: READ_WRITE
-  AWS_ACCESS_KEY_ID: "${{ secrets.CI_GCS_HMAC_ACCESS_KEY_ID }}"
-  AWS_SECRET_ACCESS_KEY: "${{ secrets.CI_GCS_HMAC_SECRET_ACCESS_KEY }}"
   # sccache cannot cache rustc invocations when incremental is on.
   CARGO_INCREMENTAL: 0
 
@@ -20,7 +24,7 @@ jobs:
   # because of how merge queues work: https://stackoverflow.com/a/78030618
   main:
     container:
-      image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
+      image: us-central1-docker.pkg.dev/feldera-ci/ghcr-remote/feldera/feldera-dev:sha-a112fd877176bba0f4e5f3475853f918b276d1ef
     runs-on: [gke-runners-amd64]
     steps:
       # Compute the internal-PR boolean once so individual steps can reference
@@ -93,13 +97,22 @@ jobs:
           pre-commit run --show-diff-on-failure --color=always --all-files
         shell: bash
         if: ${{ vars.CI_DRY_RUN != 'true' }}
+        env:
+          # The cargo hooks compile the workspace, and postgresql_embedded's
+          # build script lists the releases of theseus-rs/postgresql-binaries
+          # through the GitHub API. Anonymous calls share the runners' egress
+          # address and its 60-per-hour limit, which fails the build with
+          # "403 rate limit exceeded"; postgresql_archive sends this token when
+          # it is set. Only this step compiles, so only this step gets it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Validate OpenAPI codegen
         if: ${{ vars.CI_DRY_RUN != 'true' }}
-        working-directory: js-packages/web-console
         run: |
-          bun install --frozen-lockfile
-          bunx openapi-ts --output /tmp/openapi-ts-check
+          if ! pre-commit run update-api-client --all-files --show-diff-on-failure; then
+            echo "::error::The generated API client no longer matches openapi.json. Run 'pre-commit run update-api-client --all-files' and commit the result."
+            exit 1
+          fi
 
       - name: Print sccache stats
         run: sccache --show-stats

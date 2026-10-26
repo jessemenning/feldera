@@ -534,12 +534,12 @@ fn compute_program_diff(
     let new_relations_with_lateness = new_program_schema
         .relations_with_lateness()
         .into_iter()
-        .map(|s| s.name().to_string())
+        .map(|s| s.name())
         .collect::<Vec<_>>();
     let old_relations_with_lateness = old_program_schema
         .relations_with_lateness()
         .into_iter()
-        .map(|s| s.name().to_string())
+        .map(|s| s.name())
         .collect::<Vec<_>>();
 
     let blockers = BootstrapBlockers {
@@ -572,8 +572,6 @@ pub fn compute_pipeline_diff(
         });
     };
 
-    let mir_diff = diff.map(|(diff, _)| diff.clone());
-
     let mut old_configured_inputs = old_config
         .inputs
         .iter()
@@ -601,12 +599,13 @@ pub fn compute_pipeline_diff(
         .iter()
         .filter(|(k, config)| {
             !new_config.inputs.contains_key(*k)
-                && !mir_diff
+                && !diff
                     .as_ref()
-                    .map(|mir_diff| {
+                    .map(|(mir_diff, _)| {
                         mir_diff
                             .removed_tables()
-                            .contains(&config.stream.to_string())
+                            .iter()
+                            .any(|t| t == &config.stream)
                     })
                     .unwrap_or(true)
         })
@@ -638,12 +637,10 @@ pub fn compute_pipeline_diff(
         .iter()
         .filter(|(k, config)| {
             !new_config.outputs.contains_key(*k)
-                && !mir_diff
+                && !diff
                     .as_ref()
-                    .map(|mir_diff| {
-                        mir_diff
-                            .removed_views()
-                            .contains(&config.stream.to_string())
+                    .map(|(mir_diff, _)| {
+                        mir_diff.removed_views().iter().any(|v| v == &config.stream)
                     })
                     .unwrap_or(true)
         })
@@ -664,7 +661,7 @@ pub fn compute_pipeline_diff(
         .map(|(k, _)| k.to_string())
         .collect::<Vec<_>>();
 
-    Ok(PipelineDiff::new(mir_diff)
+    Ok(PipelineDiff::new(diff.map(|(diff, _)| diff))
         .with_added_input_connectors(added_input_connectors)
         .with_modified_input_connectors(modified_input_connectors)
         .with_removed_input_connectors(removed_input_connectors)
@@ -678,6 +675,125 @@ mod tests {
     use super::compute_pipeline_diff;
     use crate::config::PipelineConfigProgramInfo;
     use serde_json::{Map, Value, json};
+
+    /// An output connector stored by a release older than the duration rename
+    /// carries its duration defaults spelled out, where a fresh configuration
+    /// leaves them out. The two configure the same connector, so an upgrade
+    /// must not report it as modified: a modified connector makes the pipeline
+    /// wait on its bootstrap policy.
+    #[test]
+    fn legacy_output_defaults_do_not_modify_connector() {
+        fn outputs(output: Value) -> PipelineConfigProgramInfo {
+            serde_json::from_value(json!({"inputs": {}, "outputs": {"v1.out": output}})).unwrap()
+        }
+        let fresh = json!({
+            "stream": "v1",
+            "transport": {"name": "kafka_output", "config": {"topic": "t"}},
+            "enable_output_buffer": false,
+        });
+        let buffer_default = json!({
+            "stream": "v1",
+            "transport": {"name": "kafka_output", "config": {"topic": "t"}},
+            "enable_output_buffer": false,
+            "max_output_buffer_time_millis": u64::MAX,
+        });
+        let kafka_default = json!({
+            "stream": "v1",
+            "transport": {
+                "name": "kafka_output",
+                "config": {"topic": "t", "initialization_timeout_secs": 60},
+            },
+            "enable_output_buffer": false,
+        });
+        let both_defaults = json!({
+            "stream": "v1",
+            "transport": {
+                "name": "kafka_output",
+                "config": {"topic": "t", "initialization_timeout_secs": 60},
+            },
+            "enable_output_buffer": false,
+            "max_output_buffer_time_millis": u64::MAX,
+        });
+        for stored in [buffer_default, kafka_default, both_defaults] {
+            let diff =
+                compute_pipeline_diff(&outputs(stored.clone()), &outputs(fresh.clone())).unwrap();
+            assert!(
+                diff.modified_output_connectors().is_empty(),
+                "{stored} reads as modified"
+            );
+        }
+
+        // A real change is still reported.
+        let changed = json!({
+            "stream": "v1",
+            "transport": {
+                "name": "kafka_output",
+                "config": {"topic": "t", "initialization_timeout": "90s"},
+            },
+            "enable_output_buffer": false,
+        });
+        let diff = compute_pipeline_diff(&outputs(fresh), &outputs(changed)).unwrap();
+        assert_eq!(
+            diff.modified_output_connectors(),
+            &vec!["v1.out".to_string()]
+        );
+    }
+
+    /// The input-side twin of the test above: a release before the rename
+    /// wrote each input transport's default timeouts into its checkpointed
+    /// configuration, under the older key. An upgrade must not report such a
+    /// connector as modified, or the pipeline would skip the journal replay
+    /// and wait on its bootstrap policy.
+    #[test]
+    fn legacy_input_defaults_do_not_modify_connector() {
+        let cases = [
+            (
+                "kafka_input",
+                json!({"name": "kafka_input", "config": {"topic": "t"}}),
+                json!({"name": "kafka_input", "config": {
+                    "topic": "t", "group_join_timeout_secs": 10}}),
+            ),
+            (
+                "nats_input",
+                json!({"name": "nats_input", "config": {
+                    "connection_config": {"server_url": "nats://x"},
+                    "stream_name": "s",
+                    "consumer_config": {"deliver_policy": "All"}}}),
+                json!({"name": "nats_input", "config": {
+                    "connection_config": {"server_url": "nats://x",
+                        "connection_timeout_secs": 10, "request_timeout_secs": 10},
+                    "stream_name": "s",
+                    "consumer_config": {"deliver_policy": "All"},
+                    "inactivity_timeout_secs": 60, "retry_interval_secs": 5}}),
+            ),
+            (
+                "url_input",
+                json!({"name": "url_input", "config": {"path": "http://x"}}),
+                json!({"name": "url_input", "config": {"path": "http://x", "pause_timeout": 60}}),
+            ),
+        ];
+        for (name, fresh, stored) in cases {
+            let fresh = pipeline_config(json!({"stream": "t1", "transport": fresh}));
+            let stored = pipeline_config(json!({"stream": "t1", "transport": stored}));
+            let diff = compute_pipeline_diff(&stored, &fresh).unwrap();
+            assert!(
+                diff.modified_input_connectors().is_empty(),
+                "{name} with its legacy defaults spelled out reads as modified"
+            );
+        }
+
+        // A real change is still reported.
+        let fresh = pipeline_config(json!({"stream": "t1",
+            "transport": {"name": "kafka_input", "config": {"topic": "t"}}}));
+        let changed = pipeline_config(json!({"stream": "t1",
+            "transport": {"name": "kafka_input", "config": {
+                "topic": "t", "group_join_timeout": "30s"}}}));
+        let diff = compute_pipeline_diff(&fresh, &changed).unwrap();
+        assert_eq!(
+            diff.modified_input_connectors(),
+            &vec!["t1.connector".to_string()]
+        );
+    }
 
     fn input_endpoint(mut fields: Map<String, Value>) -> Value {
         let mut endpoint = Map::from_iter([

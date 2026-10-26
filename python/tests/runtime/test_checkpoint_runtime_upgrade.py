@@ -23,9 +23,8 @@ The test runs in two phases:
 2. **Current phase.** Stop the legacy pipeline, switch
    ``runtime_version`` to ``None`` (the manager's default, which is the
    build under test), and resume from the synced checkpoint with
-   ``BootstrapPolicy.ALLOW``. The restored row counts in every
-   downstream view must match the values observed under the legacy
-   runtime.
+   ``BootstrapPolicy.ALLOW``. The view hashes must match
+   ``EXPECTED_VIEW_HASHES``.
 
 Caching:
 
@@ -37,7 +36,7 @@ Caching:
   ``CHECKPOINT_CACHE_KEY``. When ``checkpoints.feldera`` already exists
   under that prefix, phase 1 is skipped and only phase 2 runs (it
   compares the restored view hashes against ``EXPECTED_VIEW_HASHES``).
-  Bump the key when the SQL or expected hashes change.
+  Bump the key when the SQL changes.
 
 Requirements:
 
@@ -68,7 +67,7 @@ from feldera.testutils import (
     single_host_only,
 )
 from tests import TEST_CLIENT, enterprise_only
-from tests.platform.helper import gen_pipeline_name
+from tests.platform.helper import gen_pipeline_name, wait_until_compiled
 from tests.platform.test_checkpoint_sync import checkpoint_sync_bucket, storage_cfg
 from tests.utils import DeltaTestLocation
 
@@ -86,21 +85,20 @@ TABLE_ROWS = 1000
 DELTA_SOURCE_CACHE_KEY = "checkpoint_runtime_upgrade_delta_v1"
 CHECKPOINT_CACHE_KEY = "checkpoint_runtime_upgrade_checkpoint_v2"
 
-# Expected per-view hashes after ingesting the cached Delta source. We
-# deliberately compare phase 2 against fixed hashes (rather than against
-# phase 1's output) so phase 1 can be skipped on cache hits and we still
-# detect a regression. Recompute by running the test once, copying the
-# values printed by ``pipeline.query_hash`` for each view, and pasting
-# them here. Bump ``CHECKPOINT_CACHE_KEY`` whenever these change.
+# Per-view hashes after ingesting the cached Delta source, as the current
+# runtime computes them. Phase 2 compares against these fixed values rather
+# than against phase 1's output, so phase 1 can be skipped on a cache hit and
+# a regression is still caught. Recompute by running the test once and pasting
+# the values it prints.
 EXPECTED_VIEW_HASHES = {
-    "v_passthrough": "844C02F1F5D4FDF07BBA13545502CE9D94B09C773491F695AC56839F4060EEB9",
-    "v_filtered": "53FFCCDDE1F1053E543EA2B31D73748AB12A67421318A6828E38D17364542653",
-    "v_distinct_tags": "1B63E4F38BC40A2982B8176397F7E5EB6E56D12D17465A2C164302B212713607",
-    "v_grouped": "B8B58C67487E45EFC4F5786F3573E0A0CCF4A167D703FAB4075E9128B42338AF",
-    "v_joined": "A07E1680990BABC69EFD0FFC89E44837D771A7A796BA6AD3C1A876F5103B98CA",
-    "v_three_way": "FEF6DB37149C29441364C0FA40594AE77BF40855FB0523CE9AF2D9577436E9C9",
-    "v_window_count": "95DB57846E76A5F8DC073F9614ACFAEA8E932DC50FFC07D6F5899A70F36C4FC7",
-    "closure": "4CF3EE5BA9183E48DFDDAAB9D33EE33E4086F2284B2192ABF863CF06A591A5B2",
+    "v_passthrough": "173AE251F246C742C3E936675D6373E26792114FCB419136E03765F6FE5B44A2",
+    "v_filtered": "DB3D56D6A4CD629C522FDC9B2FF0F3F3A7C2AC88705A9E92306FDD01D4F81DC7",
+    "v_distinct_tags": "E81D29DAE1E2F0FB4EDAAA48A7FE425DDA53277F0EA427CC6C0CB57A38A9BA8C",
+    "v_grouped": "97EE1FA0657BC5A0A08DF7A05388D383F699A6FF8CA1B6C0F8E889FB744C63AD",
+    "v_joined": "27AAF2482E36A4CB8C5742FA5839C77DA33F0CEC4E69228ED22A835F99F476CA",
+    "v_three_way": "74D8D192BDAFE6712D65F4E15B8FBCDBA809B897E84E7592E501C866EAE37004",
+    "v_window_count": "210481AB7CA59EB78AC0E6CE4955C0FF4389752F27881BA51EB18B7D1EDE3217",
+    "closure": "4B21416A9EC3B698ECEC5892D93FEDB62801EBE50C78ABB04D710D7F812C6122",
     # v_emit_final omitted: see TODO in _build_sql
 }
 
@@ -257,25 +255,12 @@ def _row(idx: int) -> dict:
     }
 
 
-def _writer_storage_options(source: DeltaTestLocation) -> dict | None:
-    """Return ``storage_options`` for ``deltalake.write_deltalake``.
-
-    The base options come from the connector config. For S3/MinIO writes
-    we also enable ``aws_s3_allow_unsafe_rename`` because deltalake's
-    default lock provider is DynamoDB, which is not available in the
-    test environment.
-    """
-
-    opts = source.delta_storage_options()
-    if not opts:
-        return None
-    if source.uri.startswith("s3://"):
-        opts.setdefault("aws_s3_allow_unsafe_rename", "true")
-    return opts
-
-
 def _ensure_delta_source(source: DeltaTestLocation) -> None:
-    """Generate the Delta source if the cache is missing or wrong-sized."""
+    """Generate the Delta source if the cache is missing or wrong-sized.
+
+    Needs no build lock: one atomic Delta commit of deterministic content, so a
+    racing writer rewrites the same rows rather than mixing two builds.
+    """
 
     cached = source.row_count(missing_ok=True)
     if cached == TABLE_ROWS:
@@ -300,33 +285,16 @@ def _ensure_delta_source(source: DeltaTestLocation) -> None:
         source.uri,
         table,
         mode="overwrite",
-        storage_options=_writer_storage_options(source),
+        storage_options=source.writer_storage_options(),
     )
 
 
 def _cache_fs():
-    """Return ``(fs, bucket_path)`` for the synced-checkpoint cache."""
+    """pyarrow filesystem of the store holding the synced-checkpoint cache."""
 
-    from urllib.parse import urlparse
+    from tests.utils import ObjectStore
 
-    import pyarrow.fs as pafs
-
-    from tests.utils import (
-        MINIO_ENDPOINT,
-        MINIO_REGION,
-        required_env,
-    )
-
-    endpoint = MINIO_ENDPOINT.rstrip("/")
-    parsed = urlparse(endpoint)
-    s3 = pafs.S3FileSystem(
-        access_key=required_env("CI_K8S_MINIO_ACCESS_KEY_ID"),
-        secret_key=required_env("CI_K8S_MINIO_SECRET_ACCESS_KEY"),
-        endpoint_override=endpoint,
-        scheme=parsed.scheme,
-        region=MINIO_REGION,
-    )
-    return s3
+    return ObjectStore.from_env().pyarrow_fs()
 
 
 def _remote_checkpoint_exists(cache_name: str) -> bool:
@@ -406,7 +374,7 @@ def _build_sql(connector_json: str) -> str:
       JOIN.
     * ``InputUpsertWithWaterline`` -- input + LATENESS waterline.
     * ``Window`` -- emitted because of the ``emit_final`` annotation
-      below; the runtime gates output on the watermark.
+      below; the runtime gates output on the waterline.
     * ``InnerStarJoin_*`` -- the runtime wrapper around the multijoin
       ``Match`` operator (``operator/dynamic/multijoin/match_keys.rs``);
       synthesized by the SQL star-join pass for the multi-aggregation
@@ -488,7 +456,7 @@ CREATE MATERIALIZED VIEW v_three_way AS
    WHERE a.id < 25;
 
 -- LATENESS on `input_table.created_at` routes ingest through the
--- watermark-aware input operator; the GROUP BY here keeps that path
+-- waterline-aware input operator; the GROUP BY here keeps that path
 -- materialized.
 CREATE MATERIALIZED VIEW v_window_count AS
   SELECT
@@ -498,14 +466,14 @@ CREATE MATERIALIZED VIEW v_window_count AS
   GROUP BY TIMESTAMP_TRUNC(created_at, HOUR);
 
 -- TODO: restore once bootstrapping supports relations with lateness;
--- `emit_final` requires a watermark, which requires LATENESS on
+-- `emit_final` requires a waterline, which requires LATENESS on
 -- `created_at` above.
 --
 -- The combination of `emit_final` on a LATENESS-bearing column and a
 -- multi-aggregation GROUP BY drives the compiler down the star-join
 -- path: the grouped MIN/MAX/STDDEV/ARG_MAX collapses into a Window
 -- operator (waterline gating) plus a StarJoin / Match multijoin.
--- Until the watermark advances the view emits no rows, but the
+-- Until the waterline advances the view emits no rows, but the
 -- Window/Match state is still part of the checkpoint.
 --CREATE MATERIALIZED VIEW v_emit_final
 --WITH ('emit_final' = 'created_at')
@@ -610,11 +578,9 @@ def test_runtime_upgrade_round_trip(pipeline_name: str) -> None:
             legacy_pipeline.start(timeout_s=600)
 
             # Wait until every record from the Delta snapshot has been
-            # ingested and processed end-to-end.
-            token = legacy_pipeline.generate_completion_token("input_table", "delta_in")
-            legacy_pipeline.wait_for_token(token)
-
-            _assert_view_hashes(legacy_pipeline)
+            # ingested and processed end-to-end.  A completion token only
+            # covers the records received so far, so wait for end-of-input.
+            legacy_pipeline.wait_for_completion(timeout_s=600)
 
             legacy_pipeline.checkpoint(wait=True)
             synced_uuid = legacy_pipeline.sync_checkpoint(wait=True)
@@ -660,6 +626,11 @@ def test_runtime_upgrade_round_trip(pipeline_name: str) -> None:
         # SQL); allow the diff to apply.
         current_pipeline.start(bootstrap_policy=BootstrapPolicy.ALLOW, timeout_s=600)
 
+        # A modified table loses its state and the connector reads the Delta
+        # snapshot again after `start` returns, so wait for end-of-input.
+        current_pipeline.wait_for_completion(timeout_s=600)
+
+        # Phase 1 runs the previous release, which can hash rows differently.
         _assert_view_hashes(current_pipeline)
     finally:
         current_pipeline.stop(force=True)
@@ -813,6 +784,7 @@ CREATE MATERIALIZED VIEW closure AS
     )
     try:
         legacy_pipeline.update_runtime()
+        wait_until_compiled(legacy_pipeline)
         legacy_pipeline.start(bootstrap_policy=BootstrapPolicy.ALLOW, timeout_s=600)
         legacy_pipeline.wait_for_idle()
 

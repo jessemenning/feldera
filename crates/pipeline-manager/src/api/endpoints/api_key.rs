@@ -1,16 +1,17 @@
 // API to create and delete API keys
 use crate::api::main::ServerState;
-use crate::api::util::parse_url_parameter;
-use crate::db::types::api_key::{ApiKeyId, ApiPermission};
+use crate::auth::AuthenticatedPrincipal;
+use crate::db::error::DBError;
+use crate::db::types::api_key::ApiKeyId;
+use crate::db::types::role::{MintableKeyRole, Role};
 use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
 use crate::{api::examples, db::storage::Storage};
 use actix_web::{
-    delete, get,
+    HttpResponse, delete, get,
     http::header::{CacheControl, CacheDirective},
     post,
     web::{self, Data as WebData, ReqData},
-    HttpRequest, HttpResponse,
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -23,6 +24,13 @@ pub(crate) struct NewApiKeyRequest {
     /// Key name.
     #[schema(example = "my-api-key")]
     name: String,
+
+    /// Role the key carries. Must be `read` or `write` and may not exceed the
+    /// caller's own role; `admin` and `owner` are never issuable as API keys.
+    /// Defaults to `read`.
+    #[serde(default)]
+    #[schema(value_type = Option<MintableKeyRole>)]
+    role: Option<Role>,
 }
 
 /// Response to a successful API key creation.
@@ -93,9 +101,9 @@ pub(crate) async fn list_api_keys(
 pub(crate) async fn get_api_key(
     state: WebData<ServerState>,
     tenant_id: ReqData<TenantId>,
-    req: HttpRequest,
+    path: web::Path<String>,
 ) -> Result<HttpResponse, ManagerError> {
-    let name = parse_url_parameter(&req, "api_key_name")?;
+    let name = path.into_inner();
     let api_key = state.db.lock().await.get_api_key(*tenant_id, &name).await?;
     Ok(HttpResponse::Ok()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
@@ -124,21 +132,28 @@ pub(crate) async fn get_api_key(
 pub(crate) async fn post_api_key(
     state: WebData<ServerState>,
     tenant_id: ReqData<TenantId>,
+    principal: ReqData<AuthenticatedPrincipal>,
     req: web::Json<NewApiKeyRequest>,
 ) -> Result<HttpResponse, ManagerError> {
+    // Mint cap: the key's role may not exceed the caller's role.
+    let requested = req.role.unwrap_or(Role::Read);
+    if requested > principal.role {
+        return Err(DBError::RoleExceedsCreator {
+            requested,
+            creator: principal.role,
+        }
+        .into());
+    }
+    let role =
+        MintableKeyRole::from_role(requested).ok_or(DBError::OwnerAdminNotMintableAsApiKey)?;
+
     let new_id = Uuid::now_v7();
     let generated_api_key = crate::auth::generate_api_key();
     let res = state
         .db
         .lock()
         .await
-        .store_api_key_hash(
-            *tenant_id,
-            new_id,
-            &req.name,
-            &generated_api_key,
-            vec![ApiPermission::Read, ApiPermission::Write],
-        )
+        .store_api_key_hash(*tenant_id, new_id, &req.name, &generated_api_key, role)
         .await
         .map(|_| {
             info!("Created API key {} (tenant: {})", &req.name, *tenant_id);
@@ -175,9 +190,9 @@ pub(crate) async fn post_api_key(
 pub(crate) async fn delete_api_key(
     state: WebData<ServerState>,
     tenant_id: ReqData<TenantId>,
-    req: HttpRequest,
+    path: web::Path<String>,
 ) -> Result<HttpResponse, ManagerError> {
-    let name = parse_url_parameter(&req, "api_key_name")?;
+    let name = path.into_inner();
     let resp = state
         .db
         .lock()

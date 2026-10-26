@@ -14,7 +14,7 @@ use crate::{
     },
     utils::Tup2,
 };
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use rkyv::Archive;
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
@@ -92,6 +92,7 @@ pub type DynNeighborhood<K, V> = OrdZSet<DynPair<DynDataTyped<i64>, DynPair<K, V
     Hash,
     SizeOf,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(
@@ -579,6 +580,7 @@ where
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 mod test {
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
         DBData, DynZWeight, RootCircuit, Runtime, Stream, ZWeight,
         dynamic::{DowncastTrait, DynData, Erase},
@@ -586,7 +588,7 @@ mod test {
             IndexedZSetHandle, InputHandle, NeighborhoodDescr, NeighborhoodDescrBox, OutputHandle,
         },
         trace::{
-            BatchReaderFactories, Trace,
+            BatchReaderFactories, Trace, TraceRole,
             test::test_batch::{
                 TestBatch, TestBatchFactories, assert_batch_eq, batch_to_tuples,
                 typed_batch_to_tuples,
@@ -655,7 +657,11 @@ mod test {
 
                 TestBatch::from_data(output.as_slice())
             } else {
-                TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")))
+                TestBatch::new(
+                    &TestBatchFactories::new(),
+                    Arc::new(String::from("Test")),
+                    TraceRole::Integral,
+                )
             }
         }
     }
@@ -911,13 +917,15 @@ mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn neighborhood_proptest(trace in input_trace(100, 5, 200, 20)) {
 
             let (mut dbsp, (descr_handle, input_handle, output_handle)) =
                 Runtime::init_circuit(4, test_circuit).unwrap();
 
-            let mut ref_trace = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut ref_trace = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             for (batch, (start_key, start_val), before, after) in trace.into_iter() {
 

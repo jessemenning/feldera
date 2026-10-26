@@ -23,6 +23,7 @@
 
 package org.dbsp.sqlCompiler.compiler.visitors.outer;
 
+import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPApply2Operator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPApplyNOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPApplyOperator;
@@ -65,6 +66,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceLazyMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMultisetOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
@@ -75,6 +77,7 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.IRTransform;
+import org.dbsp.sqlCompiler.ir.IDBSPOuterNode;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregateList;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregator;
@@ -186,7 +189,7 @@ public class CircuitRewriter extends CircuitCloneVisitor {
             result = new DBSPInputMapWithWaterlineOperator(
                     operator.getRelNode(), operator.sourceName, operator.keyFields,
                     outputType, originalRowType, operator.metadata,
-                    operator.tableName, initializer, timestamp, lub, filter, error);
+                    operator.tableName, operator.kind, initializer, timestamp, lub, filter, error);
         }
         this.map(operator, result, true);
     }
@@ -200,7 +203,7 @@ public class CircuitRewriter extends CircuitCloneVisitor {
                 || !outputType.sameType(operator.outputType)) {
             result = new DBSPSourceMultisetOperator(operator.getRelNode(), operator.sourceName,
                     outputType.to(DBSPTypeZSet.class), originalRowType,
-                    operator.metadata, operator.getTableName(), operator.comment)
+                    operator.metadata, operator.getTableName(), operator.kind, operator.comment)
                     .copyAnnotations(operator);
         }
         this.map(operator, result);
@@ -215,7 +218,22 @@ public class CircuitRewriter extends CircuitCloneVisitor {
                 || !outputType.sameType(operator.outputType)) {
             result = new DBSPSourceMapOperator(operator.getRelNode(), operator.sourceName,
                     operator.keyFields, outputType.to(DBSPTypeIndexedZSet.class), originalRowType,
-                    operator.metadata, operator.getTableName(), operator.comment)
+                    operator.metadata, operator.getTableName(), operator.kind, operator.comment)
+                    .copyAnnotations(operator);
+        }
+        this.map(operator, result);
+    }
+
+    @Override
+    public void postorder(DBSPSourceLazyMapOperator operator) {
+        DBSPTypeStruct originalRowType = this.transform(operator.originalRowType).to(DBSPTypeStruct.class);
+        DBSPType outputType = this.transform(operator.outputType);
+        DBSPSimpleOperator result = operator;
+        if (!originalRowType.sameType(operator.originalRowType)
+                || !outputType.sameType(operator.outputType)) {
+            result = new DBSPSourceLazyMapOperator(operator.getRelNode(), operator.sourceName,
+                    operator.keyFields, outputType.to(DBSPTypeIndexedZSet.class), originalRowType,
+                    operator.metadata, operator.getTableName(), operator.kind, operator.comment)
                     .copyAnnotations(operator);
         }
         this.map(operator, result);
@@ -302,7 +320,7 @@ public class CircuitRewriter extends CircuitCloneVisitor {
                 || !input.equals(operator.input())) {
             result = new DBSPIndexedTopKOperator(operator.getRelNode(),
                     operator.numbering, function, limit, equalityComparator,
-                    outputProducer, input)
+                    outputProducer, operator.isMultiset, input)
                     .copyAnnotations(operator);
         }
         this.map(operator, result);
@@ -690,7 +708,7 @@ public class CircuitRewriter extends CircuitCloneVisitor {
         DBSPSimpleOperator result = operator;
         if (Linq.different(sources, operator.inputs))
             result = new DBSPWindowOperator(operator.getRelNode(), operator.lowerInclusive, operator.upperInclusive,
-                    sources.get(0), sources.get(1))
+                    operator.lowerUnbounded, sources.get(0), sources.get(1))
                     .copyAnnotations(operator);
         this.map(operator, result);
     }
@@ -975,6 +993,13 @@ public class CircuitRewriter extends CircuitCloneVisitor {
                 toAdd = new DBSPDeclaration(item);
         }
         this.getUnderConstructionCircuit().addDeclaration(toAdd);
+    }
+
+    @Override
+    public Token startVisit(IDBSPOuterNode circuit) {
+        if (circuit.is(DBSPCircuit.class))
+            this.transform.setCircuitContext(circuit.to(DBSPCircuit.class));
+        return super.startVisit(circuit);
     }
 
     @Override

@@ -3,18 +3,19 @@ use crate::db::types::monitor::{ClusterMonitorEventId, PipelineMonitorEventId};
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::program::ProgramStatus;
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
+use crate::db::types::role::{InvalidRole, Role};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::InvalidMembershipOrigin;
 use crate::db::types::utils::ValidationError;
 use crate::db::types::version::Version;
-use actix_web::{
-    body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
-};
+use crate::error::source_error;
+use actix_web::{HttpResponse, ResponseError, body::BoxBody, http::StatusCode};
 use deadpool_postgres::PoolError;
 use feldera_types::error::DetailedError;
 use feldera_types::error::ErrorResponse;
 use refinery::Error as RefineryError;
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 use std::{backtrace::Backtrace, borrow::Cow, error::Error as StdError, fmt, fmt::Display};
 use tokio_postgres::error::{Error as PgError, SqlState};
 
@@ -142,11 +143,68 @@ pub enum DBError {
     UnknownTenant {
         tenant_id: TenantId,
     },
+    UnknownTenantName {
+        name: String,
+    },
+    TenantNotEmpty {
+        tenant_id: TenantId,
+        pipelines: i64,
+        api_keys: i64,
+        oidc_trusts: i64,
+    },
     // API key-related errors
     UnknownApiKey {
         name: String,
     },
     InvalidApiKey,
+    // OIDC trust relationship errors
+    UnknownOidcTrust {
+        name: String,
+    },
+    EmptyOidcTrustField {
+        field: String,
+    },
+    InvalidOidcIssuerUrl {
+        issuer: String,
+        reason: String,
+    },
+    AmbiguousOidcTenant,
+    OidcTenantNotTrusted {
+        tenant: String,
+    },
+    /// A login whose user belongs to several tenants sent no selector.
+    AmbiguousTenantMembership,
+    /// A login named a tenant it holds no membership in, or one that does not
+    /// exist; one variant for both, so the login path is no existence oracle.
+    NotATenantMember {
+        tenant: String,
+    },
+    /// A login whose user belongs to no tenant at all.
+    NoTenantMemberships,
+    InvalidOidcToken {
+        reason: String,
+    },
+    UnauthorizedOidcToken,
+    // RBAC errors
+    InsufficientPermissions {
+        required: Role,
+        actual: Role,
+    },
+    RoleExceedsCreator {
+        requested: Role,
+        creator: Role,
+    },
+    OwnerAdminNotMintableAsApiKey,
+    OwnerRoleNotAssignable,
+    InvalidRoleString {
+        value: String,
+    },
+    InvalidMembershipOriginString {
+        value: String,
+    },
+    UnknownUser {
+        user_id: String,
+    },
     // Pipeline-related errors
     UnknownPipeline {
         pipeline_id: PipelineId,
@@ -155,6 +213,10 @@ pub enum DBError {
         pipeline_name: String,
     },
     UpdateRestrictedToStopped,
+    DeploymentRestrictedToRunning,
+    InvalidDeploymentPatch {
+        reason: String,
+    },
     ProgramStatusUpdateRestrictedToStopped,
     DeleteRestrictedToFullyStopped,
     DeleteRestrictedToClearedStorage,
@@ -209,8 +271,7 @@ pub enum DBError {
     },
     TlsConnection {
         hint: String,
-        #[serde(skip)]
-        openssl_error: Option<openssl::error::ErrorStack>,
+        error: Option<String>,
     },
     PauseWhileNotProvisioned,
     ResumeWhileNotProvisioned,
@@ -286,6 +347,27 @@ impl DBError {
     }
 }
 
+/// Renders `error` with the innermost error that caused it.
+///
+/// The half of a Postgres failure that identifies it sits in that innermost
+/// error: `tokio_postgres::Error` displays the category the failure falls into
+/// ("db error", "error connecting to server") and leaves what the server said to
+/// its source. Reporting the outer error alone therefore says that something went
+/// wrong and nothing about what.
+///
+/// Only those two ends of the chain are needed, as every wrapper in between
+/// displays its own source: refinery names the migration and then quotes the
+/// error it got, and the pool error quotes the connection error it got.
+fn message_with_cause(error: &dyn StdError) -> String {
+    let message = error.to_string();
+    let cause = source_error(error).to_string();
+    if message.ends_with(&cause) {
+        message
+    } else {
+        format!("{message}: {cause}")
+    }
+}
+
 fn serialize_pg_error<S>(
     error: &PgError,
     backtrace: &Backtrace,
@@ -295,7 +377,7 @@ where
     S: Serializer,
 {
     let mut ser = serializer.serialize_struct("PgError", 2)?;
-    ser.serialize_field("error", &error.to_string())?;
+    ser.serialize_field("error", &message_with_cause(error))?;
     ser.serialize_field("backtrace", &backtrace.to_string())?;
     ser.end()
 }
@@ -309,7 +391,7 @@ where
     S: Serializer,
 {
     let mut ser = serializer.serialize_struct("PgPoolError", 2)?;
-    ser.serialize_field("error", &error.to_string())?;
+    ser.serialize_field("error", &message_with_cause(error))?;
     ser.serialize_field("backtrace", &backtrace.to_string())?;
     ser.end()
 }
@@ -323,7 +405,7 @@ where
     S: Serializer,
 {
     let mut ser = serializer.serialize_struct("RefineryError", 2)?;
-    ser.serialize_field("error", &error.to_string())?;
+    ser.serialize_field("error", &message_with_cause(error))?;
     ser.serialize_field("backtrace", &backtrace.to_string())?;
     ser.end()
 }
@@ -419,6 +501,20 @@ impl From<PoolError> for DBError {
     }
 }
 
+/// Lets a read path parse a stored role with `Role::from_str(..)?` instead of
+/// hand-mapping the error at every call site.
+impl From<InvalidRole> for DBError {
+    fn from(error: InvalidRole) -> Self {
+        Self::InvalidRoleString { value: error.0 }
+    }
+}
+
+impl From<InvalidMembershipOrigin> for DBError {
+    fn from(error: InvalidMembershipOrigin) -> Self {
+        Self::InvalidMembershipOriginString { value: error.0 }
+    }
+}
+
 impl From<RefineryError> for DBError {
     fn from(error: RefineryError) -> Self {
         Self::PostgresMigrationError {
@@ -442,13 +538,25 @@ impl Display for DBError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DBError::PostgresError { error, .. } => {
-                write!(f, "Unexpected Postgres error: '{error}'")
+                write!(
+                    f,
+                    "Unexpected Postgres error: '{}'",
+                    message_with_cause(&**error)
+                )
             }
             DBError::PostgresPoolError { error, .. } => {
-                write!(f, "Postgres connection pool error: '{error}'")
+                write!(
+                    f,
+                    "Postgres connection pool error: '{}'",
+                    message_with_cause(&**error)
+                )
             }
             DBError::PostgresMigrationError { error, .. } => {
-                write!(f, "DB schema migration error: '{error}'")
+                write!(
+                    f,
+                    "DB schema migration error: '{}'",
+                    message_with_cause(&**error)
+                )
             }
             #[cfg(feature = "postgresql_embedded")]
             DBError::PgEmbedError { error, .. } => {
@@ -497,7 +605,10 @@ impl Display for DBError {
                 )
             }
             DBError::InvalidProgramError { value, error } => {
-                write!(f, "JSON for 'program_error' field:\n{value:#}\n\n... is not valid due to: {error}")
+                write!(
+                    f,
+                    "JSON for 'program_error' field:\n{value:#}\n\n... is not valid due to: {error}"
+                )
             }
             DBError::EditRestrictedToClearedStorage { not_allowed } => {
                 write!(
@@ -507,19 +618,34 @@ impl Display for DBError {
                 )
             }
             DBError::InvalidErrorResponse { value, error } => {
-                write!(f, "JSON for 'deployment_error' field:\n{value:#}\n\n... is not valid due to: {error}")
+                write!(
+                    f,
+                    "JSON for 'deployment_error' field:\n{value:#}\n\n... is not valid due to: {error}"
+                )
             }
             DBError::FailedToSerializeRuntimeConfig { error } => {
-                write!(f, "Unable to serialize runtime configuration for 'runtime_config' field as JSON due to: {error}")
+                write!(
+                    f,
+                    "Unable to serialize runtime configuration for 'runtime_config' field as JSON due to: {error}"
+                )
             }
             DBError::FailedToSerializeProgramConfig { error } => {
-                write!(f, "Unable to serialize program configuration for 'program_config' field as JSON due to: {error}")
+                write!(
+                    f,
+                    "Unable to serialize program configuration for 'program_config' field as JSON due to: {error}"
+                )
             }
             DBError::FailedToSerializeProgramError { error } => {
-                write!(f, "Unable to serialize program error for 'program_error' field as JSON due to: {error}")
+                write!(
+                    f,
+                    "Unable to serialize program error for 'program_error' field as JSON due to: {error}"
+                )
             }
             DBError::FailedToSerializeErrorResponse { error } => {
-                write!(f, "Unable to serialize error response for 'deployment_error' field as JSON due to: {error}")
+                write!(
+                    f,
+                    "Unable to serialize error response for 'deployment_error' field as JSON due to: {error}"
+                )
             }
             DBError::UniqueKeyViolation { constraint, .. } => {
                 write!(f, "Unique key violation for '{constraint}'")
@@ -577,11 +703,107 @@ impl Display for DBError {
             DBError::UnknownTenant { tenant_id } => {
                 write!(f, "Unknown tenant id '{tenant_id}'")
             }
+            DBError::UnknownTenantName { name } => {
+                write!(f, "Unknown tenant '{name}'")
+            }
+            DBError::TenantNotEmpty {
+                tenant_id,
+                pipelines,
+                api_keys,
+                oidc_trusts,
+            } => {
+                write!(
+                    f,
+                    "Tenant '{tenant_id}' still holds {pipelines} pipeline(s), {api_keys} API key(s) \
+                     and {oidc_trusts} OIDC trust relationship(s); delete those first"
+                )
+            }
             DBError::UnknownApiKey { name } => {
                 write!(f, "Unknown API key '{name}'")
             }
             DBError::InvalidApiKey => {
                 write!(f, "Invalid API key")
+            }
+            DBError::InsufficientPermissions { required, actual } => {
+                write!(
+                    f,
+                    "Insufficient permissions: this action requires the '{required}' role, but the caller has '{actual}'"
+                )
+            }
+            DBError::RoleExceedsCreator { requested, creator } => {
+                write!(
+                    f,
+                    "Cannot grant the '{requested}' role: it exceeds the creator's own '{creator}' role"
+                )
+            }
+            DBError::OwnerAdminNotMintableAsApiKey => {
+                write!(
+                    f,
+                    "The 'owner' and 'admin' roles cannot be issued as an API key; use an OIDC trust relationship or interactive login"
+                )
+            }
+            DBError::OwnerRoleNotAssignable => {
+                write!(
+                    f,
+                    "The 'owner' role is platform-wide: it is set at deploy time and cannot be granted through the API"
+                )
+            }
+            DBError::InvalidRoleString { value } => {
+                write!(f, "Invalid role string '{value}' encountered")
+            }
+            DBError::InvalidMembershipOriginString { value } => {
+                write!(f, "Invalid membership origin string '{value}' encountered")
+            }
+            DBError::UnknownUser { user_id } => {
+                write!(f, "Unknown user '{user_id}'")
+            }
+            DBError::UnknownOidcTrust { name } => {
+                write!(f, "Unknown OIDC trust relationship '{name}'")
+            }
+            DBError::EmptyOidcTrustField { field } => {
+                write!(
+                    f,
+                    "OIDC trust relationship field '{field}' must not be empty"
+                )
+            }
+            DBError::InvalidOidcIssuerUrl { issuer, reason } => {
+                write!(
+                    f,
+                    "OIDC trust issuer '{issuer}' is not a permitted destination: {reason}"
+                )
+            }
+            DBError::AmbiguousOidcTenant => {
+                write!(
+                    f,
+                    "Token matches trust relationships in multiple tenants; \
+                     set the Feldera-Tenant header to select one"
+                )
+            }
+            DBError::OidcTenantNotTrusted { tenant } => {
+                write!(f, "Token is not trusted in tenant '{tenant}'")
+            }
+            DBError::AmbiguousTenantMembership => {
+                write!(
+                    f,
+                    "This user belongs to several tenants; set the Feldera-Tenant \
+                     header to select one"
+                )
+            }
+            DBError::NotATenantMember { tenant } => {
+                write!(f, "Not a member of tenant '{tenant}', or no such tenant")
+            }
+            DBError::NoTenantMemberships => {
+                write!(
+                    f,
+                    "This user has no tenant memberships. A tenant admin grants \
+                     access through the tenant's member management"
+                )
+            }
+            DBError::InvalidOidcToken { reason } => {
+                write!(f, "Invalid OIDC token: {reason}")
+            }
+            DBError::UnauthorizedOidcToken => {
+                write!(f, "No OIDC trust relationship matches this token")
             }
             DBError::UnknownPipeline { pipeline_id } => {
                 write!(f, "Unknown pipeline id '{pipeline_id}'")
@@ -590,16 +812,34 @@ impl Display for DBError {
                 write!(f, "Unknown pipeline name '{pipeline_name}'")
             }
             DBError::UpdateRestrictedToStopped => {
-                write!(f, "Pipeline can only be updated while stopped. Stop it first by invoking '/stop'.")
+                write!(
+                    f,
+                    "Pipeline can only be updated while stopped. Stop it first by invoking '/stop'."
+                )
+            }
+            DBError::DeploymentRestrictedToRunning => {
+                write!(
+                    f,
+                    "Pipeline 'deployment_config' can only be changed while it is running. Start it with '/start', or change 'runtime_config.resources' while it is stopped."
+                )
+            }
+            DBError::InvalidDeploymentPatch { reason } => {
+                write!(f, "Invalid deployment patch: {reason}")
             }
             DBError::ProgramStatusUpdateRestrictedToStopped => {
                 write!(f, "Program status can only be updated while stopped.")
             }
             DBError::DeleteRestrictedToFullyStopped => {
-                write!(f, "Cannot delete a pipeline which is not fully stopped. Stop the pipeline first fully by invoking the '/stop' endpoint.")
+                write!(
+                    f,
+                    "Cannot delete a pipeline which is not fully stopped. Stop the pipeline first fully by invoking the '/stop' endpoint."
+                )
             }
             DBError::CannotRenameNonExistingPipeline => {
-                write!(f, "The pipeline name in the request body does not match the one provided in the URL path. This is not allowed when no pipeline with the name provided in the URL path exists.")
+                write!(
+                    f,
+                    "The pipeline name in the request body does not match the one provided in the URL path. This is not allowed when no pipeline with the name provided in the URL path exists."
+                )
             }
             DBError::OutdatedProgramVersion {
                 outdated_version,
@@ -800,7 +1040,11 @@ impl Display for DBError {
                 write!(f, "Invalid monitor status: '{value}'")
             }
             DBError::UnknownClusterMonitorEvent { event_id } => {
-                write!(f, "Cluster monitor event with identifier '{event_id}' does not exist -- it might have been deleted as monitor events are only retained for {}h and at most {}", MONITOR_RETENTION_HOURS, MONITOR_RETENTION_NUM)
+                write!(
+                    f,
+                    "Cluster monitor event with identifier '{event_id}' does not exist -- it might have been deleted as monitor events are only retained for {}h and at most {}",
+                    MONITOR_RETENTION_HOURS, MONITOR_RETENTION_NUM
+                )
             }
             DBError::NoClusterMonitorEventsAvailable => {
                 write!(f, "There are not yet any cluster monitor events recorded")
@@ -816,16 +1060,25 @@ impl Display for DBError {
                 )
             }
             DBError::UnknownPipelineMonitorEvent { event_id } => {
-                write!(f, "Pipeline monitor event with identifier '{event_id}' does not exist -- it might have been deleted as only a limited number of events are retained")
+                write!(
+                    f,
+                    "Pipeline monitor event with identifier '{event_id}' does not exist -- it might have been deleted as only a limited number of events are retained"
+                )
             }
             DBError::NoPipelineMonitorEventsAvailable => {
                 write!(f, "There are not yet any pipeline monitor events recorded")
             }
             DBError::LockTookTooLong => {
-                write!(f, "The lock required for this operation took too long to acquire. Try this operation again later.")
+                write!(
+                    f,
+                    "The lock required for this operation took too long to acquire. Try this operation again later."
+                )
             }
             DBError::DeadlockDetected => {
-                write!(f, "A deadlock was detected while performing the operation. Try this operation again later. Please also file a bug report, as this error should not happen.")
+                write!(
+                    f,
+                    "A deadlock was detected while performing the operation. Try this operation again later. Please also file a bug report, as this error should not happen."
+                )
             }
         }
     }
@@ -875,11 +1128,34 @@ impl DetailedError for DBError {
             Self::TooManyTags { .. } => Cow::from("TooManyTags"),
             Self::TooLongDescription { .. } => Cow::from("TooLongDescription"),
             Self::UnknownTenant { .. } => Cow::from("UnknownTenant"),
+            Self::UnknownTenantName { .. } => Cow::from("UnknownTenantName"),
+            Self::TenantNotEmpty { .. } => Cow::from("TenantNotEmpty"),
             Self::UnknownApiKey { .. } => Cow::from("UnknownApiKey"),
             Self::InvalidApiKey => Cow::from("InvalidApiKey"),
+            Self::InsufficientPermissions { .. } => Cow::from("InsufficientPermissions"),
+            Self::RoleExceedsCreator { .. } => Cow::from("RoleExceedsCreator"),
+            Self::OwnerAdminNotMintableAsApiKey => Cow::from("OwnerAdminNotMintableAsApiKey"),
+            Self::OwnerRoleNotAssignable => Cow::from("OwnerRoleNotAssignable"),
+            Self::InvalidRoleString { .. } => Cow::from("InvalidRoleString"),
+            Self::InvalidMembershipOriginString { .. } => {
+                Cow::from("InvalidMembershipOriginString")
+            }
+            Self::UnknownUser { .. } => Cow::from("UnknownUser"),
+            Self::UnknownOidcTrust { .. } => Cow::from("UnknownOidcTrust"),
+            Self::EmptyOidcTrustField { .. } => Cow::from("EmptyOidcTrustField"),
+            Self::InvalidOidcIssuerUrl { .. } => Cow::from("InvalidOidcIssuerUrl"),
+            Self::AmbiguousOidcTenant => Cow::from("AmbiguousOidcTenant"),
+            Self::OidcTenantNotTrusted { .. } => Cow::from("OidcTenantNotTrusted"),
+            Self::AmbiguousTenantMembership => Cow::from("AmbiguousTenantMembership"),
+            Self::NotATenantMember { .. } => Cow::from("NotATenantMember"),
+            Self::NoTenantMemberships => Cow::from("NoTenantMemberships"),
+            Self::InvalidOidcToken { .. } => Cow::from("InvalidOidcToken"),
+            Self::UnauthorizedOidcToken => Cow::from("UnauthorizedOidcToken"),
             Self::UnknownPipeline { .. } => Cow::from("UnknownPipeline"),
             Self::UnknownPipelineName { .. } => Cow::from("UnknownPipelineName"),
             Self::UpdateRestrictedToStopped { .. } => Cow::from("UpdateRestrictedToStopped"),
+            Self::DeploymentRestrictedToRunning => Cow::from("DeploymentRestrictedToRunning"),
+            Self::InvalidDeploymentPatch { .. } => Cow::from("InvalidDeploymentPatch"),
             Self::ProgramStatusUpdateRestrictedToStopped { .. } => {
                 Cow::from("ProgramStatusUpdateRestrictedToStopped")
             }
@@ -987,12 +1263,33 @@ impl ResponseError for DBError {
             Self::InvalidTag { .. } => StatusCode::BAD_REQUEST,
             Self::TooManyTags { .. } => StatusCode::BAD_REQUEST,
             Self::TooLongDescription { .. } => StatusCode::BAD_REQUEST,
-            Self::UnknownTenant { .. } => StatusCode::UNAUTHORIZED, // TODO: should we report not found instead?
+            Self::UnknownTenant { .. } => StatusCode::NOT_FOUND,
+            Self::UnknownTenantName { .. } => StatusCode::NOT_FOUND,
+            Self::TenantNotEmpty { .. } => StatusCode::CONFLICT,
             Self::UnknownApiKey { .. } => StatusCode::NOT_FOUND,
             Self::InvalidApiKey => StatusCode::UNAUTHORIZED,
+            Self::InsufficientPermissions { .. } => StatusCode::FORBIDDEN,
+            Self::RoleExceedsCreator { .. } => StatusCode::FORBIDDEN,
+            Self::OwnerAdminNotMintableAsApiKey => StatusCode::FORBIDDEN,
+            Self::OwnerRoleNotAssignable => StatusCode::FORBIDDEN,
+            Self::InvalidRoleString { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidMembershipOriginString { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::UnknownUser { .. } => StatusCode::NOT_FOUND,
+            Self::UnknownOidcTrust { .. } => StatusCode::NOT_FOUND,
+            Self::EmptyOidcTrustField { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidOidcIssuerUrl { .. } => StatusCode::BAD_REQUEST,
+            Self::AmbiguousOidcTenant => StatusCode::BAD_REQUEST,
+            Self::OidcTenantNotTrusted { .. } => StatusCode::FORBIDDEN,
+            Self::AmbiguousTenantMembership => StatusCode::BAD_REQUEST,
+            Self::NotATenantMember { .. } => StatusCode::FORBIDDEN,
+            Self::NoTenantMemberships => StatusCode::FORBIDDEN,
+            Self::InvalidOidcToken { .. } => StatusCode::UNAUTHORIZED,
+            Self::UnauthorizedOidcToken => StatusCode::UNAUTHORIZED,
             Self::UnknownPipeline { .. } => StatusCode::NOT_FOUND,
             Self::UnknownPipelineName { .. } => StatusCode::NOT_FOUND,
             Self::UpdateRestrictedToStopped { .. } => StatusCode::BAD_REQUEST,
+            Self::DeploymentRestrictedToRunning => StatusCode::BAD_REQUEST,
+            Self::InvalidDeploymentPatch { .. } => StatusCode::BAD_REQUEST,
             Self::ProgramStatusUpdateRestrictedToStopped { .. } => StatusCode::BAD_REQUEST,
             Self::DeleteRestrictedToFullyStopped { .. } => StatusCode::BAD_REQUEST,
             Self::CannotRenameNonExistingPipeline { .. } => StatusCode::BAD_REQUEST,
@@ -1037,7 +1334,7 @@ impl ResponseError for DBError {
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
-        HttpResponseBuilder::new(self.status_code()).json(ErrorResponse::from_error(self))
+        crate::error::json_error_response(self)
     }
 }
 
@@ -1049,8 +1346,74 @@ impl From<DBError> for ErrorResponse {
 
 #[cfg(test)]
 mod test {
-    use crate::db::error::DBError;
+    use crate::db::error::{DBError, message_with_cause};
     use crate::error::ManagerError;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    /// Error with a `Display` and a source, both of which the test dictates.
+    #[derive(Debug)]
+    struct Layer {
+        message: String,
+        cause: Option<Box<Layer>>,
+    }
+
+    impl Layer {
+        fn new(message: &str, cause: Option<Layer>) -> Self {
+            Self {
+                message: message.to_string(),
+                cause: cause.map(Box::new),
+            }
+        }
+    }
+
+    impl fmt::Display for Layer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl StdError for Layer {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.cause.as_deref().map(|cause| cause as &dyn StdError)
+        }
+    }
+
+    #[test]
+    fn the_innermost_cause_is_reported() {
+        // The shape a refused connection arrives in: each wrapper displays the
+        // error it got, except the innermost one, which nobody displays.
+        let innermost = Layer::new("FATAL: unsupported startup parameter", None);
+        let middle = Layer::new("db error", Some(innermost));
+        let outer = Layer::new(
+            "Error occurred while creating a new object: db error",
+            Some(middle),
+        );
+        assert_eq!(
+            message_with_cause(&outer),
+            "Error occurred while creating a new object: db error: \
+             FATAL: unsupported startup parameter"
+        );
+    }
+
+    #[test]
+    fn a_cause_already_displayed_is_reported_once() {
+        // A wrapper whose innermost cause is the error it already displays.
+        let cause = Layer::new("db error", None);
+        let outer = Layer::new(
+            "Error occurred while creating a new object: db error",
+            Some(cause),
+        );
+        assert_eq!(
+            message_with_cause(&outer),
+            "Error occurred while creating a new object: db error"
+        );
+    }
+
+    #[test]
+    fn an_error_without_causes_is_unchanged() {
+        assert_eq!(message_with_cause(&Layer::new("alone", None)), "alone");
+    }
 
     #[test]
     fn invalid_bootstrap_error_serialization() {

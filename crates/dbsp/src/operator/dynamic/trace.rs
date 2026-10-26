@@ -1,7 +1,7 @@
-use crate::circuit::circuit_builder::{StreamId, register_replay_stream};
 use crate::circuit::metadata::{INPUT_RECORDS_COUNT, MEMORY_ALLOCATIONS_COUNT, RETAINMENT_BOUNDS};
-use crate::circuit::operator_traits::OperatorName;
+use crate::circuit::operator_traits::{OperatorCheckpoint, OperatorName};
 use crate::circuit::{NodeId, splitter_output_chunk_size};
+use crate::circuit::{bootstrap::register_replay_stream, circuit_builder::StreamId};
 use crate::dynamic::Factory;
 use crate::operator::dynamic::replay::ReplayState;
 use crate::operator::require_persistent_id;
@@ -20,10 +20,10 @@ use crate::{
     },
     circuit_cache_key,
     dynamic::DataTrait,
-    trace::{Batch, BatchReader, Filter, Spine, SpineSnapshot, Trace},
+    trace::{Batch, BatchReader, Filter, Spine, SpineSnapshot, Trace, TraceRole},
 };
 use dyn_clone::clone_box;
-use feldera_storage::{FileCommitter, StoragePath};
+use feldera_storage::StoragePath;
 use size_of::SizeOf;
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
@@ -278,7 +278,7 @@ impl<V: DataTrait + ?Sized> GroupPredicate<V> {
                     .map(|b| MetaItem::String(format!("{b:?}")))
                     .collect(),
             ),
-            Self::Filter(filter) => filter.metadata().clone(),
+            Self::Filter(filter) => filter.metadata(),
         }
     }
 }
@@ -437,6 +437,11 @@ where
         TS: DataTrait + ?Sized,
         Box<TS>: Clone,
     {
+        assert!(
+            n > 0,
+            "dyn_integrate_trace_retain_values_last_n called with n = 0"
+        );
+
         let bounds = self.trace_bounds();
         bounds.set_unique_val_bound_name(bounds_stream.get_persistent_id().as_deref());
 
@@ -458,6 +463,11 @@ where
         TS: DataTrait + ?Sized,
         Box<TS>: Clone,
     {
+        assert!(
+            n > 0,
+            "dyn_integrate_trace_retain_values_top_n called with n = 0"
+        );
+
         let bounds = self.trace_bounds();
         bounds.set_unique_val_bound_name(bounds_stream.get_persistent_id().as_deref());
 
@@ -808,7 +818,7 @@ where
     }
 
     async fn eval_owned_and_ref(&mut self, mut trace: T, batch: &T::Batch) -> T {
-        self.num_inputs += batch.len();
+        self.num_inputs += batch.len_upper_bound();
         trace.insert(batch.clone()).await;
         trace
     }
@@ -820,7 +830,7 @@ where
     }
 
     async fn eval_owned(&mut self, mut trace: T, batch: T::Batch) -> T {
-        self.num_inputs += batch.len();
+        self.num_inputs += batch.len_upper_bound();
 
         trace.insert(batch).await;
         trace
@@ -890,7 +900,7 @@ where
     async fn eval_owned_and_ref(&mut self, mut trace: T, batch: &B) -> T {
         // TODO: extend `trace` type to feed untimed batches directly
         // (adding fixed timestamp on the fly).
-        self.num_inputs += batch.len();
+        self.num_inputs += batch.len_upper_bound();
         trace
             .insert(T::Batch::from_batch(
                 batch,
@@ -908,7 +918,7 @@ where
     }
 
     async fn eval_owned(&mut self, mut trace: T, batch: B) -> T {
-        self.num_inputs += batch.len();
+        self.num_inputs += batch.len_upper_bound();
 
         if TypeId::of::<B>() == TypeId::of::<T::Batch>() {
             let mut batch = Some(batch);
@@ -1049,7 +1059,11 @@ where
         self.dirty[scope as usize] = false;
 
         if scope == 0 && self.trace.is_none() {
-            self.trace = Some(T::new(&self.trace_factories, self.name.get()));
+            self.trace = Some(T::new(
+                &self.trace_factories,
+                self.name.get(),
+                TraceRole::Integral,
+            ));
         }
     }
 
@@ -1101,29 +1115,34 @@ where
 
     fn checkpoint(
         &mut self,
-        base: &StoragePath,
-        pid: Option<&str>,
-        files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), Error> {
-        let pid = require_persistent_id(pid, &self.name)?;
+        persistent_id: Option<&str>,
+    ) -> Result<Option<Box<dyn OperatorCheckpoint>>, Error> {
+        let persistent_id = require_persistent_id(persistent_id, &self.name)?;
         self.trace
-            .as_mut()
-            .map(|trace| trace.save(base, pid, files))
-            .unwrap_or(Ok(()))
+            .get_or_insert_with(|| {
+                T::new(&self.trace_factories, self.name.get(), TraceRole::Integral)
+            })
+            .save(persistent_id)
+            .map(Some)
     }
 
     fn restore(&mut self, base: &StoragePath, pid: Option<&str>) -> Result<(), Error> {
         let pid = require_persistent_id(pid, &self.name)?;
 
         self.trace
-            .as_mut()
-            .map(|trace| trace.restore(base, pid))
-            .unwrap_or(Ok(()))
+            .get_or_insert_with(|| {
+                T::new(&self.trace_factories, self.name.get(), TraceRole::Integral)
+            })
+            .restore(base, pid)
     }
 
     fn clear_state(&mut self) -> Result<(), Error> {
         // println!("Z1Trace-{}::clear_state", &self.global_id);
-        self.trace = Some(T::new(&self.trace_factories, self.name.get()));
+        self.trace = Some(T::new(
+            &self.trace_factories,
+            self.name.get(),
+            TraceRole::Integral,
+        ));
         self.replay_state = None;
         self.dirty = vec![false; self.root_scope as usize + 1];
 
@@ -1141,7 +1160,11 @@ where
         self.replay_mode = true;
         if self.delta_stream.is_some() && self.replay_state.is_none() {
             let trace = self.trace.take().expect("Z1Trace::start_replay: no trace");
-            self.trace = Some(T::new(&self.trace_factories, self.name.get()));
+            self.trace = Some(T::new(
+                &self.trace_factories,
+                self.name.get(),
+                TraceRole::Integral,
+            ));
 
             //println!("Z1Trace-{}::initializing replay_state", &self.global_id);
 
@@ -1493,10 +1516,7 @@ mod test {
             ) -> BTreeSet<(i32, i32, ZWeight)> {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
                 let mut expected = BTreeSet::new();
                 for (k, mut tuples) in all_tuples.into_iter() {
@@ -1520,10 +1540,7 @@ mod test {
             ) -> BTreeSet<(i32, i32, ZWeight)> {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
 
                 let mut expected = BTreeSet::new();
@@ -1540,10 +1557,7 @@ mod test {
             trace.apply3(&trace3, &watermark, move |trace, trace3, ts| {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
 
                 let expected =
@@ -1563,10 +1577,7 @@ mod test {
             trace.apply3(&trace4, &watermark, move |trace, trace4, ts| {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
 
                 let expected =
@@ -1586,10 +1597,7 @@ mod test {
             trace.apply3(&trace5, &watermark, move |trace, trace5, ts| {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
 
                 let expected =
@@ -1609,10 +1617,7 @@ mod test {
             trace.apply3(&trace6, &watermark, move |trace, trace6, ts| {
                 let mut all_tuples = BTreeMap::new();
                 typed_batch::IndexedZSetReader::iter(trace.as_ref()).for_each(|(k, v, w)| {
-                    all_tuples
-                        .entry(k)
-                        .or_insert_with(|| Vec::new())
-                        .push((v, w))
+                    all_tuples.entry(k).or_insert_with(Vec::new).push((v, w))
                 });
 
                 let expected =

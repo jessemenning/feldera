@@ -27,16 +27,18 @@ default = [
     "with-postgres-cdc",
     "with-dynamodb",
     "with-solace",
+    "with-heap-profiling",
+    "with-s2",
 ]
 with-kafka = ["rdkafka"]
-# `parquet/async` + `parquet/object_store` serve only the deletion-vector
-# reader (`integrated/delta_table/deletion_vector.rs`).
+# `parquet/async` serves only the deletion-vector reader.
 with-deltalake = [
     "deltalake",
     "deltalake-catalog-unity",
+    "feldera-modular-bloom",
     "roaring",
+    "z85",
     "parquet/async",
-    "parquet/object_store",
 ]
 with-iceberg = ["feldera-iceberg"]
 with-pubsub = ["google-cloud-pubsub", "google-cloud-gax"]
@@ -55,9 +57,14 @@ with-redis = ["redis", "r2d2"]
 with-nats = []
 # Solace Platform SMF input/output. Requires the Solace C SDK on the build host.
 with-solace = ["dep:solace-rs"]
+with-s2 = ["s2-sdk"]
 # Run delta table tests against an S3 bucket.  Requires S3 authentication key
 # to be provided via an environment variable.
 delta-s3-test = []
+# Databricks Unity Catalog tests. Separate from `delta-s3-test`: those run in CI
+# against the CI object store, while these need a Databricks workspace whose
+# credentials CI does not hold.
+delta-unity-test = []
 # Run Solace connector integration tests against a live broker.
 # The broker must be running. See `transport/solace/test.rs`.
 solace-integration-test = ["with-solace"]
@@ -72,9 +79,12 @@ iceberg-tests-fs = []
 iceberg-tests-glue = []
 iceberg-tests-rest = []
 iceberg-tests-s3tables = []
-fips = ["rustls/fips"]
+# Follow-mode tests. Need a REST catalog and an S3 store both the writer
+# (pyiceberg) and the connector can reach. See crates/iceberg/src/test/README.md.
+iceberg-tests-follow = []
+fips = ["rustls/fips", "aws-lc-rs/fips"]
 bench-mode = []
-with-postgres-cdc = ["etl", "etl-config", "etl-postgres"]
+with-postgres-cdc = ["etl"]
 # jemalloc heap-profiling endpoint (/heap_profile). Linux-only dep; on other
 # targets the feature is a no-op.
 with-heap-profiling = ["dep:jemalloc_pprof"]
@@ -96,7 +106,9 @@ awc = { workspace = true, features = [
 async-nats = { workspace = true }
 solace-rs = { git = "https://github.com/jessemenning/solace-rs", rev = "9787d31", features = ["async"], optional = true }
 async-stream = { workspace = true }
+data-encoding = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }
+s2-sdk = { workspace = true, optional = true }
 bytestring = "1.4.0"
 circular-queue = { workspace = true, features = ["serde_support"] }
 crossbeam = { workspace = true }
@@ -105,16 +117,20 @@ semver = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_dynamo = { workspace = true, optional = true }
 erased-serde = { workspace = true }
-serde_yaml = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 form_urlencoded = { workspace = true }
 csv = { workspace = true }
+# dynamic-linking makes rdkafka-sys consume the librdkafka that
+# scripts/install-librdkafka.sh builds against AWS-LC, instead of compiling its
+# own copy against whatever OpenSSL pkg-config happens to find. The ssl,
+# gssapi, zstd and libz features only configured that vendored build, so they
+# go: those capabilities now come from the installed library, and the configure
+# flags in the script are what preserve them. `ssl` in particular is the only
+# thing that pulled openssl-sys into the tree.
 rdkafka = { workspace = true, features = [
-    "ssl",
-    "gssapi",
-    "zstd",
-    "libz",
+    "dynamic-linking",
+    "tokio",
 ], optional = true }
 aws-config = { workspace = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
@@ -136,11 +152,11 @@ futures-util = { workspace = true }
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["sync", "macros", "fs", "rt"] }
+tokio = { workspace = true, features = ["sync", "macros", "fs", "rt", "time", "signal"] }
 utoipa = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 colored = { workspace = true }
-uuid = { workspace = true, features = ["v4", "std"] }
+uuid = { workspace = true, features = ["v4", "v7", "std"] }
 rkyv = { workspace = true, features = ["std", "size_64"] }
 csv-core = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
@@ -159,35 +175,38 @@ deltalake = { workspace = true, features = [
     "azure",
     "unity-experimental",
 ], optional = true }
-deltalake-catalog-unity = { workspace = true, features = ["aws", "azure", "gcp"], optional = true}
+# No code here calls it; deltalake re-exports the crate. The direct declaration
+# enables its aws/azure/gcp features, which provide cloud credentials for the
+# unity catalog.
+deltalake-catalog-unity = { workspace = true, features = ["aws", "azure", "gcp"], optional = true }
 apache-avro = { workspace = true, optional = true }
 schema_registry_converter = { workspace = true, features = [
     "avro",
     "blocking",
+    "futures",
+    "rustls_tls",
 ], optional = true }
 rust_decimal = { package = "feldera_rust_decimal", version = "1.33.1-feldera.1", features = [
     "tokio-pg",
 ] }
 url = { workspace = true }
-ordered-float = { workspace = true }
-openssl = { workspace = true }
 atomic = { workspace = true }
 once_cell = { workspace = true }
 dbsp_nexmark = { workspace = true, features = [], optional = true }
 enum-map = { workspace = true }
 google-cloud-pubsub = { workspace = true, optional = true }
 google-cloud-gax = { workspace = true, optional = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io", "rt"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 home = { workspace = true }
 datafusion = { workspace = true }
-ahash = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true, features = ["with-serde"] }
 serde_bytes = { workspace = true }
 governor = { workspace = true }
 nonzero_ext = { workspace = true }
+feldera-modular-bloom = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -202,17 +221,22 @@ redis = { workspace = true, features = ["r2d2"], optional = true }
 r2d2 = { workspace = true, optional = true }
 async-channel = { workspace = true }
 threadpool = { workspace = true }
-bytemuck = { workspace = true }
-num-derive = { workspace = true }
-num-traits = { workspace = true } # Used by num-derive derive macro, which cargo-machete can't see
 postgres = { workspace = true }
-postgres-openssl = { workspace = true }
 dyn-clone = { workspace = true }
 cpu-time = "1.0.0"
 feldera-ir = { workspace = true }
+aws-lc-rs = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
 aws-msk-iam-sasl-signer = "1.0.1"
-aws-credential-types = "1.2.3"
+google-cloud-auth = { workspace = true }
+google-cloud-metadata = { workspace = true }
+# No code here calls it; the AWS SDK pulls it transitively. The declaration
+# floors the version at 1.4.5, where SigV4a signing stopped using ring. A
+# lockfile regenerated during a rebase resolved it back below that twice; a
+# floor the resolver enforces cannot regress that way.
+aws-sigv4 = { version = "1.4.5", default-features = false }
 feldera-sqllib = { workspace = true }
 inventory = { workspace = true }
 backtrace = { workspace = true }
@@ -220,23 +244,16 @@ itertools = { workspace = true }
 metrics-process = { version = "2.4.0", default-features = false }
 rustls = { workspace = true }
 serde_json_path_to_error = { workspace = true }
-smallstr = { workspace = true }
 dashmap = { workspace = true }
-thread-id = { workspace = true }
 parking_lot = { workspace = true }
-backoff = { workspace = true }
-sentry = { workspace = true }
-zip = { workspace = true }
 smallvec = { workspace = true }
 delta_kernel = { workspace = true }
 roaring = { workspace = true, optional = true }
-flate2 = { workspace = true }
+z85 = { workspace = true, optional = true }
 etl = { workspace = true, optional = true }
-etl-config = { workspace = true, optional = true }
-etl-postgres = { workspace = true, optional = true }
 
 [package.metadata.cargo-machete]
-ignored = ["num-traits"]
+ignored = ["aws-sigv4", "deltalake-catalog-unity"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Optional so the SQL test fixture (sql-to-dbsp-compiler/temp), which builds
@@ -249,12 +266,18 @@ jemalloc_pprof = { workspace = true, features = ["symbolize"], optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 nix = { workspace = true, features = ["signal", "mman", "feature"] }
+signal-hook = { workspace = true }
 
 [build-dependencies]
 vergen-gitcl = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Test key generation only; runtime signing goes through aws-lc-rs.
+nkeys = { workspace = true }
 actix-test = { workspace = true }
+flate2 = { workspace = true }
+rcgen = { workspace = true }
 bstr = { workspace = true, features = ["serde1"] }
 feldera-macros = { workspace = true }
 serde_json = { workspace = true }
@@ -275,6 +298,9 @@ pretty_assertions = { workspace = true }
 google-cloud-googleapis = { workspace = true }
 postgres-types = { version = "0.2.9", features = ["derive"] }
 criterion = { workspace = true }
+# Builds the Parquet variant fixtures the VARIANT tests read.
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 
 [[bench]]
 name = "avro_encoder"
@@ -288,4 +314,8 @@ required-features = ["bench-mode"]
 
 [[bench]]
 name = "delta_encoder"
+harness = false
+
+[[bench]]
+name = "delta_merge"
 harness = false

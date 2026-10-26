@@ -80,6 +80,28 @@ public class NegativeParserTests extends BaseSQLTests {
     }
 
     @Test
+    public void defaultValueErrorPosition() {
+        // The message names the position of the literal in the program, and the error once
+        String ddl = """
+                CREATE TABLE T (
+                    a DOUBLE DEFAULT 1e400
+                );""";
+        this.statementsFailingInCompilation(ddl,
+                "From line 2, column 22 to line 2, column 26: Numeric literal '1E400' out of range\n");
+    }
+
+    @Test
+    public void latenessErrorPosition() {
+        // The message names the position of the lateness expression in the program
+        String ddl = """
+                CREATE TABLE T (
+                    ts TIMESTAMP LATENESS INTERVAL 1e400 SECONDS
+                );""";
+        this.statementsFailingInCompilation(ddl,
+                "From line 2, column 27 to line 2, column 48: Numeric literal '1E400' out of range\n");
+    }
+
+    @Test
     public void duplicatedKey2() {
         String ddl = "create table git_commit (\n" +
                 "    git_commit_id bigint not null PRIMARY KEY PRIMARY KEY)";
@@ -153,6 +175,21 @@ public class NegativeParserTests extends BaseSQLTests {
     public void testRejectFloatType() {
         String statement = "CREATE TABLE T(c1 FLOAT);";
         this.statementsFailingInCompilation(statement, "Do not use");
+    }
+
+    /** The body of a function is compiled inside a generated program; an error on
+     * the second line of the body must point at that line of the user's program,
+     * both in the location and in the message */
+    @Test
+    public void functionBodyErrorPosition() {
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE FUNCTION f(a INT) RETURNS INT AS
+                  a +
+                  nosuch;
+                CREATE VIEW V AS SELECT f(x) FROM T;""",
+                "(no input file):4:3: error: Compilation error: " +
+                        "From line 4, column 3 to line 4, column 8: Column 'nosuch' not found in any table\n");
     }
 
     @Test
@@ -232,5 +269,34 @@ public class NegativeParserTests extends BaseSQLTests {
         Assert.assertTrue(error.warning);
         Assert.assertTrue(error.message.contains("Table 't' is not used"));
         Assert.assertTrue(messages.toString().contains("CREATE TABLE T"));
+    }
+
+    @Test
+    public void predefinedFunctionNameTest() {
+        // The rule holds for every predefined function, not just for the 'user' of
+        // RegressionTests.issue3006, and quoting the name does not evade it
+        String message = "has the same name as a predefined function";
+        this.statementsFailingInCompilation("CREATE TABLE abs(x INT);", message);
+        this.statementsFailingInCompilation("CREATE TABLE \"now\"(x INT);", message);
+    }
+
+    @Test
+    public void niladicFunctionColumnTest() {
+        // SQL calls USER without parentheses, so a bare 'user' is that call and not the
+        // column; MetadataTests.predefinedNameColumnTest shows how to reach the column
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(user INT);
+                CREATE VIEW V AS SELECT user FROM T;""",
+                "Function 'USER' is not supported.  If you meant a column with this name, "
+                + "qualify it with a table name or quote it: \"user\"");
+    }
+
+    @Test
+    public void niladicDateFunctionTest() {
+        // The date and time functions have a supported replacement, named first
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE VIEW V AS SELECT current_date FROM T;""",
+                "Function 'CURRENT_DATE' is not supported; use CAST(NOW() AS DATE) instead.");
     }
 }

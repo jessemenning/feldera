@@ -132,6 +132,43 @@ state of all tables and materialized views as of the start of that
 transaction, even when earlier statements in the same request inserted
 into source tables.
 
+### Read-after-write across ad-hoc requests
+
+An ad-hoc `INSERT` returns when the pipeline has accepted its rows as
+input. This can occur before the pipeline completes the step that
+processes the rows. Thus, an ad-hoc query that you send immediately
+after the `INSERT` returns can show the state from before the `INSERT`.
+
+To see the rows of an `INSERT` in a later query, use one of these
+methods:
+
+- **Python SDK:** call
+  [`execute`](pathname:///python/feldera.html#feldera.pipeline.Pipeline.execute)
+  with `wait=True`. The call returns when later ad-hoc queries can see
+  the rows.
+
+  ```py
+  pipeline.execute("INSERT INTO tbl VALUES(1, 2, 3);", wait=True)
+  ```
+
+- **REST API:** when the `INSERT` returns, read
+  the `global_metrics` of [`/stats`](/api/get-pipeline-stats) and calculate
+  `total_input_records - buffered_input_records`. Then read `/stats`
+  again until `total_completed_records` is equal to or more than this
+  value. This is what the Python SDK does. The value includes the rows
+  of all clients, thus the wait can be longer when other clients send
+  much data.
+
+- **Ingress endpoint:** if you can send the rows in a data format
+  instead of SQL, write them with the
+  [ingress endpoint](/api/insert-data) and wait until its
+  [completion token](/connectors/completion-tokens) is complete. The
+  token includes only the rows of that endpoint. An ad-hoc `INSERT`
+  does not supply a completion token.
+
+While an API transaction is open, all three methods wait until the
+transaction commits.
+
 ## Examples
 
 ### Inserting Complex Data Types
@@ -139,24 +176,24 @@ into source tables.
 Given the following Feldera SQL program:
 
 ```sql
-create type struct_typ as (
-  a int,
-  b varchar
+CREATE TYPE struct_typ AS (
+  a INT,
+  b VARCHAR
 );
 
-create table complex_types (
-    a int array not null,
-    b struct_typ not null,
-    json variant not null,
-    m map<varchar, int>,
-    tup row(one int not null, two int not null)
-) with ('materialized' = 'true');
+CREATE TABLE complex_types (
+    a INT ARRAY NOT NULL,
+    b struct_typ NOT NULL,
+    json VARIANT NOT NULL,
+    m MAP<VARCHAR, INT>,
+    tup ROW(one INT NOT NULL, two INT NOT NULL)
+) WITH ('materialized' = 'true');
 ```
 
 An ad-hoc query to insert data into the `complex_types` table would look like this:
 
 ```sql
-insert into complex_types values ([1,2,3], struct(2, 'b'), '{"field": 3}', MAP(['answer'], [42]), struct(2, 3));
+INSERT INTO complex_types VALUES ([1,2,3], STRUCT(2, 'b'), '{"field": 3}', MAP(['answer'], [42]), STRUCT(2, 3));
 ```
 
 ### Querying VARIANT Columns with JSON Functions
@@ -215,7 +252,7 @@ values. The two statements must be submitted together in the same
 request, separated by a semicolon:
 
 ```sql
-PREPARE q AS SELECT * FROM materialized_view WHERE v = $1;
+prepare q AS SELECT * FROM materialized_view WHERE v = $1;
 EXECUTE q('2');
 ```
 

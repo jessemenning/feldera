@@ -1,42 +1,44 @@
-use crate::api::demo::{read_demos_from_directories, Demo};
+use crate::api::demo::{Demo, read_demos_from_directories};
 use crate::api::endpoints;
 use crate::api::support_data_collector::SupportDataCollector;
-use crate::auth::JwkCache;
-use crate::config::{ApiServerConfig, CommonConfig};
+use crate::auth::{IssuerJwkCache, JwkCache};
+use crate::config::{ApiServerConfig, BasePath, CommonConfig};
 use crate::db::probe::DbProbe;
 use crate::db::storage_postgres::StoragePostgres;
 use crate::error::ManagerError;
 use crate::license::LicenseCheck;
+use crate::oidc::fetch::OidcClients;
+use crate::oidc::userinfo::UserProfileCache;
 use crate::runner::interaction::RunnerInteraction;
 use crate::unstable_features;
-use actix_http::body::BoxBody;
 use actix_http::StatusCode;
+use actix_http::body::BoxBody;
+use actix_web::Scope;
 use actix_web::body::MessageBody;
 use actix_web::dev::{Service, ServiceResponse};
-use actix_web::http::{header, Method};
-use actix_web::Scope;
+use actix_web::http::{Method, header};
 use actix_web::{
-    get, middleware,
+    App, HttpResponse, HttpServer, middleware,
     web::Data as WebData,
     web::{self},
-    App, HttpResponse, HttpServer,
 };
 use actix_web_httpauth::middleware::HttpAuthentication;
 use actix_web_static_files::ResourceFiles;
 use anyhow::Result as AnyResult;
-use feldera_observability as observability;
 use futures_util::FutureExt;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::{env, io, net::TcpListener, sync::Arc};
-use termbg::{theme, Theme};
+use termbg::{Theme, theme};
 use tokio::signal;
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{error, info, Level};
+use tracing::{Level, error, info};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
-use utoipa_swagger_ui::SwaggerUi;
 
 macro_rules! log_with_level {
     ($level:expr, $($arg:tt)+) => {
@@ -52,7 +54,7 @@ macro_rules! log_with_level {
 
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &MinRoleAddon),
     info(
         title = "Feldera API",
         description = r#"
@@ -207,6 +209,8 @@ It contains the following fields:
         endpoints::pipeline_interaction::post_pipeline_input_connector_action,
         endpoints::pipeline_interaction::get_pipeline_input_connector_status,
         endpoints::pipeline_interaction::get_pipeline_output_connector_status,
+        endpoints::pipeline_interaction::post_pipeline_output_connector_action,
+        endpoints::pipeline_interaction::post_pipeline_output_connector_command,
         endpoints::pipeline_interaction::get_pipeline_stats,
         endpoints::pipeline_interaction::get_pipeline_metrics,
         endpoints::pipeline_interaction::get_pipeline_circuit_profile,
@@ -243,10 +247,17 @@ It contains the following fields:
         endpoints::api_key::post_api_key,
         endpoints::api_key::delete_api_key,
 
+        // OIDC trust relationships
+        endpoints::oidc_trust::list_oidc_trust,
+        endpoints::oidc_trust::get_oidc_trust,
+        endpoints::oidc_trust::post_oidc_trust,
+        endpoints::oidc_trust::delete_oidc_trust,
+
         // Configuration
         endpoints::config::get_config_authentication,
         endpoints::config::get_config_demos,
         endpoints::config::get_config_session,
+        endpoints::config::get_config_owners,
         endpoints::config::get_config,
 
         // Metrics
@@ -255,7 +266,18 @@ It contains the following fields:
         // Cluster
         endpoints::cluster::list_cluster_events,
         endpoints::cluster::get_cluster_event,
-        endpoints::cluster::get_cluster_health
+        endpoints::cluster::get_cluster_health,
+
+        // Tenant and user management (RBAC)
+        endpoints::tenant::list_tenant_users,
+        endpoints::tenant::add_tenant_user,
+        endpoints::tenant::put_tenant_user,
+        endpoints::tenant::delete_tenant_user,
+        endpoints::tenant::list_tenants,
+        endpoints::tenant::get_tenant,
+        endpoints::tenant::create_tenant,
+        endpoints::tenant::patch_tenant,
+        endpoints::tenant::delete_tenant
     ),
     components(schemas(
         // Authentication
@@ -271,6 +293,8 @@ It contains the following fields:
         crate::api::endpoints::config::Configuration,
         crate::api::endpoints::config::BuildInformation,
         crate::api::endpoints::config::SessionInfo,
+        crate::api::endpoints::config::ConfiguredOwners,
+        crate::api::endpoints::config::ConfiguredOwnerTrust,
 
         // Pipeline
         crate::db::types::pipeline::PipelineId,
@@ -297,6 +321,8 @@ It contains the following fields:
         crate::api::endpoints::pipeline_management::PostStopPipelineParameters,
         crate::api::endpoints::pipeline_management::PipelineDiffRequest,
         crate::api::endpoints::pipeline_management::ValidateProgramRequest,
+        crate::db::types::deployment::PipelineDeploymentConfig,
+        crate::db::types::deployment::DeploymentResources,
         crate::compiler::ValidateProgramResponse,
         crate::db::types::monitor::PipelineMonitorEventId,
         crate::api::endpoints::pipeline_management::pipeline_events::PipelineMonitorEventSelectedInfo,
@@ -314,6 +340,7 @@ It contains the following fields:
         feldera_ir::Op,
         feldera_ir::Condition,
         feldera_types::config::ProgramIr,
+        feldera_types::config::UdfLibrary,
 
         // Storage
         crate::db::types::storage::StorageStatus,
@@ -324,6 +351,7 @@ It contains the following fields:
         // Program
         crate::db::types::program::CompilationProfile,
         crate::db::types::program::SqlCompilerMessage,
+        crate::db::types::program::RustCompilerMessage,
         crate::db::types::program::ProgramStatus,
         crate::db::types::program::ProgramError,
         crate::db::types::program::SqlCompilationInfo,
@@ -332,12 +360,31 @@ It contains the following fields:
         crate::db::types::program::ProgramInfo,
         crate::api::endpoints::pipeline_management::PartialProgramInfo,
 
+        // RBAC
+        crate::db::types::role::Role,
+        crate::db::types::role::MintableKeyRole,
+        crate::db::types::role::MemberRole,
+        crate::db::types::user::UserId,
+        crate::db::types::user::TenantMember,
+        crate::db::types::user::TenantInfo,
+        crate::db::types::user::MembershipOrigin,
+        crate::db::types::user::UserMembership,
+        crate::api::endpoints::tenant::SetMemberRoleRequest,
+        crate::api::endpoints::tenant::AddMemberRequest,
+        crate::api::endpoints::tenant::AddMemberResponse,
+        crate::api::endpoints::tenant::NewTenantRequest,
+        crate::api::endpoints::tenant::RenameTenantRequest,
+        crate::api::endpoints::tenant::RenameTenantResponse,
+
         // API key
         crate::db::types::api_key::ApiKeyId,
-        crate::db::types::api_key::ApiPermission,
         crate::db::types::api_key::ApiKeyDescr,
         crate::api::endpoints::api_key::NewApiKeyRequest,
         crate::api::endpoints::api_key::NewApiKeyResponse,
+        crate::db::types::oidc_trust::OidcTrustId,
+        crate::db::types::oidc_trust::OidcTrustDescr,
+        crate::api::endpoints::oidc_trust::NewOidcTrustRequest,
+        crate::api::endpoints::oidc_trust::NewOidcTrustResponse,
 
         // Monitor
         crate::db::types::monitor::MonitorStatus,
@@ -361,6 +408,7 @@ It contains the following fields:
         feldera_types::config::StartFromCheckpoint,
         feldera_types::config::FileBackendConfig,
         feldera_types::config::StorageCompression,
+        feldera_types::config::StorageSyncMode,
         feldera_types::config::RuntimeConfig,
         feldera_types::config::FtConfig,
         feldera_types::config::InputEndpointConfig,
@@ -370,6 +418,8 @@ It contains the following fields:
         feldera_types::config::TransportConfig,
         feldera_types::config::FormatConfig,
         feldera_types::config::ResourceConfig,
+        feldera_types::config::AutoscalingConfig,
+        feldera_types::config::StorageAutoscalingConfig,
         feldera_types::config::ObjectStorageConfig,
         feldera_types::config::FtModel,
         feldera_types::config::PipelineTemplateConfig,
@@ -387,6 +437,7 @@ It contains the following fields:
         feldera_types::transport::kafka::KafkaHeader,
         feldera_types::transport::kafka::KafkaHeaderValue,
         feldera_types::transport::kafka::KafkaLogLevel,
+        feldera_types::transport::kafka::KafkaOauthProvider,
         feldera_types::transport::kafka::KafkaInputConfig,
         feldera_types::transport::kafka::KafkaOutputConfig,
         feldera_types::transport::kafka::KafkaOutputFtConfig,
@@ -399,13 +450,20 @@ It contains the following fields:
         feldera_types::transport::nats::Credentials,
         feldera_types::transport::nats::DeliverPolicy,
         feldera_types::transport::nats::NatsInputConfig,
+        feldera_types::transport::nats::NatsHeader,
+        feldera_types::transport::nats::NatsMessageId,
+        feldera_types::transport::nats::NatsOutputConfig,
         feldera_types::transport::nats::ReplayPolicy,
+        feldera_types::transport::nats::Tls,
         feldera_types::transport::nats::UserAndPassword,
         feldera_types::transport::solace::SolaceInputConfig,
         feldera_types::transport::solace::SolaceOutputConfig,
         feldera_types::transport::solace::SolaceLogLevel,
         feldera_types::transport::solace::OutputDeliveryMode,
         feldera_types::transport::pubsub::PubSubInputConfig,
+        feldera_types::transport::s2::S2InputConfig,
+        feldera_types::transport::s2::S2OutputConfig,
+        feldera_types::transport::s2::S2StartFrom,
         feldera_types::transport::s3::S3InputConfig,
         feldera_types::transport::datagen::DatagenStrategy,
         feldera_types::transport::datagen::RngFieldSettings,
@@ -414,9 +472,12 @@ It contains the following fields:
         feldera_types::transport::nexmark::NexmarkInputConfig,
         feldera_types::transport::nexmark::NexmarkTable,
         feldera_types::transport::nexmark::NexmarkInputOptions,
+        feldera_types::transport::delta_table::DeltaTableChangeFeed,
         feldera_types::transport::delta_table::DeltaTableIngestMode,
         feldera_types::transport::delta_table::DeltaTableTransactionMode,
         feldera_types::transport::delta_table::DeltaTableWriteMode,
+        feldera_types::transport::delta_table::DeltaVariantEncoding,
+        feldera_types::transport::delta_table::DeltaTableUpdateMode,
         feldera_types::transport::delta_table::DeltaTableReaderConfig,
         feldera_types::transport::delta_table::DeltaTableWriterConfig,
         feldera_types::transport::dynamodb::DynamoDBWriteMode,
@@ -430,6 +491,8 @@ It contains the following fields:
         feldera_types::transport::iceberg::IcebergTransactionMode,
         feldera_types::transport::postgres::PostgresReaderConfig,
         feldera_types::transport::postgres::PostgresCdcReaderConfig,
+        feldera_types::transport::postgres::PostgresCdcBatchConfig,
+        feldera_types::transport::postgres::PostgresCdcMemoryBackpressureConfig,
         feldera_types::transport::postgres::PostgresWriterConfig,
         feldera_types::transport::postgres::PostgresWriteMode,
         feldera_types::transport::postgres::PostgresTlsConfig,
@@ -482,6 +545,7 @@ It contains the following fields:
         feldera_types::adapter_stats::ExternalControllerStatus,
         feldera_types::memory_pressure::MemoryPressure,
         feldera_types::adapter_stats::ExternalGlobalControllerMetrics,
+        feldera_types::adapter_stats::HostMetrics,
         feldera_types::adapter_stats::ConnectorError,
         feldera_types::adapter_stats::ConnectorHealth,
         feldera_types::adapter_stats::ConnectorHealthStatus,
@@ -511,8 +575,190 @@ It contains the following fields:
 )]
 pub struct ApiDoc;
 
+#[cfg(test)]
+mod api_doc_tests {
+    //! Invariants the generated OpenAPI document must satisfy for the Rust
+    //! and TypeScript clients to build.
+
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    /// Request-body media types `progenitor` accepts, from
+    /// `BodyContentType::from_str` in `progenitor-impl`.
+    const PROGENITOR_MEDIA_TYPES: &[&str] = &[
+        "application/json",
+        "application/octet-stream",
+        "application/x-www-form-urlencoded",
+        "text/plain",
+        "text/x-markdown",
+    ];
+
+    /// Utoipa requires referenced schemas to be registered explicitly. Missing
+    /// S2 schemas leave dangling references in the generated API clients.
+    #[test]
+    fn s2_transport_schema_references_resolve() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &document["components"]["schemas"];
+        let transports = schemas["TransportConfig"]["oneOf"].as_array().unwrap();
+
+        for (transport, config) in [
+            ("s2_input", "S2InputConfig"),
+            ("s2_output", "S2OutputConfig"),
+        ] {
+            let variant = transports
+                .iter()
+                .find(|variant| variant["properties"]["name"]["enum"][0] == transport)
+                .unwrap_or_else(|| panic!("missing transport variant: {transport}"));
+            assert_eq!(
+                variant["properties"]["config"]["$ref"],
+                format!("#/components/schemas/{config}")
+            );
+            assert!(schemas[config].is_object(), "unregistered schema: {config}");
+        }
+
+        assert_eq!(
+            schemas["S2InputConfig"]["properties"]["start_from"]["$ref"],
+            "#/components/schemas/S2StartFrom"
+        );
+        assert!(
+            schemas["S2StartFrom"].is_object(),
+            "unregistered schema: S2StartFrom"
+        );
+    }
+
+    /// Checks that every request body in `ApiDoc`'s OpenAPI document offers
+    /// exactly one media type, and that the media type is in
+    /// `PROGENITOR_MEDIA_TYPES`. Does not check response media types.
+    #[test]
+    fn request_bodies_use_media_types_progenitor_accepts() {
+        let mut rejected = vec![];
+        for (path, item) in ApiDoc::openapi().paths.paths.iter() {
+            for operation in item.operations.values() {
+                let Some(body) = &operation.request_body else {
+                    continue;
+                };
+                let id = operation.operation_id.as_deref().unwrap_or(path);
+                if body.content.len() > 1 {
+                    let types: Vec<&str> = body.content.keys().map(String::as_str).collect();
+                    rejected.push(format!("{id}: several media types: {}", types.join(", ")));
+                    continue;
+                }
+                for media_type in body.content.keys() {
+                    // `progenitor` matches on the part before any parameter,
+                    // as in `text/plain; charset=utf-8`.
+                    let base = media_type
+                        .split_once(';')
+                        .map_or(media_type.as_str(), |(base, _)| base);
+                    if !PROGENITOR_MEDIA_TYPES.contains(&base) {
+                        rejected.push(format!("{id}: {media_type}"));
+                    }
+                }
+            }
+        }
+        rejected.sort();
+        assert!(
+            rejected.is_empty(),
+            "these request bodies break the feldera-rest-api build; use one of {:?}:\n  {}",
+            PROGENITOR_MEDIA_TYPES,
+            rejected.join("\n  ")
+        );
+    }
+}
+
 // `static_files` magic.
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+/// Placeholder base path baked into the embedded web console bundle at build
+/// time (see `crates/pipeline-manager/build.rs`, which sets
+/// `WEBCONSOLE_BASE_PATH` to this value, and `js-packages/web-console`'s
+/// `svelte.config.js`, which reads it into `kit.paths.base`).
+///
+/// At serve time the manager rewrites every occurrence of this string in the
+/// bundle to the operator-configured base path (or the empty string for a root
+/// deployment), so a single prebuilt binary can be served from any subpath
+/// without a rebuild. The string is deliberately distinctive so the rewrite is
+/// an unambiguous substring replacement.
+const WEBCONSOLE_BASE_PATH_PLACEHOLDER: &str = "/__FELDERA_BASE_PATH__";
+
+/// One file of the embedded console bundle after the base-path rewrite, holding
+/// what `static_files::Resource` needs to serve it. Rewritten files own their
+/// bytes; the rest borrow the embedded ones.
+struct RewrittenResource {
+    name: &'static str,
+    data: Cow<'static, [u8]>,
+    modified: u64,
+    mime_type: &'static str,
+}
+
+/// Build the embedded web console resource map with the base-path placeholder
+/// rewritten to `base_path` (empty string for a root deployment).
+///
+/// The rewrite is computed once for the lifetime of the process — `base_path`
+/// is a process constant derived from configuration, and `HttpServer` invokes
+/// the app factory once per worker thread — so the rewritten bytes are computed
+/// a single time and every worker rebuilds a fresh (but cheap, pointer-only)
+/// `HashMap` borrowing them out of the `static`.
+fn webconsole_resources(base_path: &str) -> HashMap<&'static str, static_files::Resource> {
+    static REWRITTEN: OnceLock<Vec<RewrittenResource>> = OnceLock::new();
+
+    let entries: &'static Vec<RewrittenResource> = REWRITTEN.get_or_init(|| {
+        debug_assert!(
+            base_path.is_empty() || base_path.starts_with('/'),
+            "base path must be empty or start with '/'"
+        );
+        let mut rewrote_placeholder = false;
+        let entries = generate()
+            .into_iter()
+            .map(|(name, resource)| {
+                let data: Cow<'static, [u8]> = match std::str::from_utf8(resource.data) {
+                    Ok(text) if text.contains(WEBCONSOLE_BASE_PATH_PLACEHOLDER) => {
+                        rewrote_placeholder = true;
+                        Cow::Owned(
+                            text.replace(WEBCONSOLE_BASE_PATH_PLACEHOLDER, base_path)
+                                .into_bytes(),
+                        )
+                    }
+                    // Binary asset, or text without the placeholder: serve the
+                    // embedded bytes unchanged.
+                    _ => Cow::Borrowed(resource.data),
+                };
+                RewrittenResource {
+                    name,
+                    data,
+                    modified: resource.modified,
+                    mime_type: resource.mime_type,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // A non-empty base path that the bundle can't carry is a
+        // misconfiguration the operator must see: the console will load its
+        // assets and call the API from the wrong paths and silently fail.
+        if !base_path.is_empty() && !rewrote_placeholder {
+            error!(
+                "--http-base-path is set to '{base_path}', but the embedded web console bundle \
+                 does not contain the expected base-path placeholder '{WEBCONSOLE_BASE_PATH_PLACEHOLDER}'. \
+                 The console was built without subpath support; the UI will not work under the subpath. \
+                 Rebuild the bundle with WEBCONSOLE_BASE_PATH={WEBCONSOLE_BASE_PATH_PLACEHOLDER}."
+            );
+        }
+        entries
+    });
+
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name,
+                static_files::Resource {
+                    data: &entry.data,
+                    modified: entry.modified,
+                    mime_type: entry.mime_type,
+                },
+            )
+        })
+        .collect()
+}
 
 /// Middleware to add aggressive caching headers for immutable static files
 /// (files with hashes in their names from web-console build)
@@ -575,16 +821,29 @@ fn build_app(
     api_config: &ApiServerConfig,
     auth_configuration: &Option<crate::auth::AuthConfiguration>,
 ) -> App<
+    // `use<>`: the returned app owns everything it needs, so it must not
+    // capture the argument lifetimes that edition 2024 would capture by
+    // default. Callers pass short-lived config to an app that outlives it.
     impl actix_web::dev::ServiceFactory<
         actix_web::dev::ServiceRequest,
         Config = (),
-        Response = actix_web::dev::ServiceResponse<impl MessageBody>,
+        Response = actix_web::dev::ServiceResponse<impl MessageBody + use<>>,
         Error = actix_web::Error,
         InitError = (),
-    >,
+    > + use<>,
 > {
     let cors = api_config.cors();
+    // URL prefix the API and console are served under (empty for a root
+    // deployment, e.g. `/feldera` behind a reverse proxy). Threaded into every
+    // scope below so a single binary serves any subpath.
+    let base_path = api_config.normalized_http_base_path();
     let app = App::new()
+        // Middleware inside the prefixed scopes matches root-relative paths
+        // (the RBAC route table, the session-endpoint exemption), so it needs
+        // the prefix to strip. App data rather than a captured argument
+        // because the consumers sit behind `HttpAuthentication`, which hands
+        // its validator nothing but the request.
+        .app_data(BasePath(base_path.clone()))
         .wrap_fn(|req, srv| {
             let log_level = if req.method() == Method::GET && req.path() == "/healthz" {
                 Level::TRACE
@@ -594,19 +853,21 @@ fn build_app(
             log_with_level!(log_level, "Request: {} {}", req.method(), req.path());
             srv.call(req).map(log_response)
         })
-        .wrap(middleware::Compress::default())
-        .wrap(observability::actix_middleware());
+        .wrap(middleware::Compress::default());
 
     let app = match auth_configuration {
         Some(auth_configuration) => {
             let auth_middleware = HttpAuthentication::with_fn(crate::auth::auth_validator);
+            // Wrap order is inside-out (last wrap = outermost): cors, then the
+            // websocket subprotocol promotion (browsers can't set the
+            // `Authorization` header on a WebSocket handshake, so promote a
+            // token carried in a `feldera-bearer.*` subprotocol to that header
+            // first), then auth (installs the principal), then the RBAC check
+            // (reads it), then the handler.
             app.app_data(auth_configuration.clone()).service(
-                api_scope()
+                api_scope(&base_path)
+                    .wrap(middleware::from_fn(crate::api::rbac::rbac_middleware))
                     .wrap(auth_middleware)
-                    // Runs ahead of `auth_middleware` (last wrap = outermost):
-                    // browsers can't set the `Authorization` header on a
-                    // WebSocket handshake, so promote a token carried in a
-                    // `feldera-bearer.*` subprotocol to that header first.
                     .wrap(middleware::from_fn(
                         crate::auth::promote_websocket_subprotocol_auth,
                     ))
@@ -614,7 +875,8 @@ fn build_app(
             )
         }
         None => app.service(
-            api_scope()
+            api_scope(&base_path)
+                .wrap(middleware::from_fn(crate::api::rbac::rbac_middleware))
                 .wrap_fn(|req, srv| {
                     let req = crate::auth::tag_with_default_tenant_id(req);
                     srv.call(req)
@@ -623,46 +885,64 @@ fn build_app(
         ),
     };
 
+    // Served under both spellings when a base path is configured. The root
+    // spelling is what a probe reaching the manager directly uses (a kubelet, a
+    // load balancer targeting the pod), and what a crawler asks the origin for;
+    // the prefixed spelling is the only one a proxy that forwards just
+    // `<base-path>/*` can reach. Both are registered ahead of `public_scope`,
+    // whose catch-all answers unknown paths with the console's `index.html` and
+    // status 200, which would leave the liveness probe unable to ever fail.
+    let app = app
+        .service(web::resource("/healthz").route(web::get().to(healthz)))
+        .service(web::resource("/robots.txt").route(web::get().to(robots_txt)));
+    let app = if base_path.is_empty() {
+        app
+    } else {
+        app.service(web::resource(format!("{base_path}/healthz")).route(web::get().to(healthz)))
+            .service(
+                web::resource(format!("{base_path}/robots.txt")).route(web::get().to(robots_txt)),
+            )
+    };
+
     // `public_scope` MUST be the last `.service()` registered: it contains an
     // empty-prefix sub-scope (the catch-all that serves the bundled
     // web-console static files) that would shadow any service registered
     // after it. The `public_scope_shadows_anything_registered_after_it` test
     // pins this contract.
-    app.service(public_scope(api_config))
+    app.service(public_scope(api_config, &base_path))
 }
 
-// Unauthenticated public endpoints and static UI assets. CORS is scoped to
-// `/config/*` only — it's the unauthenticated API surface that browser clients
-// may need to reach cross-origin. Every other route here is same-origin in practice
-// (swagger UI, healthz monitoring, static bundle), and keeping CORS off them
-// is what allows Firefox to honor `Cache-Control: immutable` on the bundle
-// (no `Vary: Origin`, no `Access-Control-Allow-Credentials`).
+// Unauthenticated public endpoints and static UI assets, served under the
+// configured base path (empty for a root deployment). CORS is scoped to
+// `<base>/config/*` only — it's the unauthenticated API surface that browser
+// clients may need to reach cross-origin. The static bundle is same-origin in
+// practice, and keeping CORS off it is what allows Firefox to honor
+// `Cache-Control: immutable` on the bundle (no `Vary: Origin`, no
+// `Access-Control-Allow-Credentials`).
 //
 // Must be registered LAST in the App: the inner empty-prefix scope acts as the
 // SPA fallback and would otherwise shadow other top-level scopes.
-fn public_scope(api_config: &ApiServerConfig) -> Scope {
-    let openapi = ApiDoc::openapi();
-
-    web::scope("")
+fn public_scope(api_config: &ApiServerConfig, base_path: &str) -> Scope {
+    web::scope(base_path)
         .service(
             web::scope("/config")
                 .wrap(api_config.cors())
                 .service(endpoints::config::get_config_authentication),
         )
-        .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-doc/openapi.json", openapi))
-        .service(healthz)
-        .service(robots_txt)
         .service(
             web::scope("")
                 .wrap(middleware::from_fn(add_cache_headers))
-                .service(ResourceFiles::new("/", generate()).resolve_not_found_to_root()),
+                .service(
+                    ResourceFiles::new("/", webconsole_resources(base_path))
+                        .resolve_not_found_to_root(),
+                ),
         )
 }
 
 // The scope for all authenticated API endpoints
-fn api_scope() -> Scope {
-    // Make APIs available under the /v0/ prefix
-    web::scope("/v0")
+fn api_scope(base_path: &str) -> Scope {
+    // Make APIs available under the `<base-path>/v0/` prefix
+    web::scope(&format!("{base_path}/v0"))
         // Pipeline management endpoints
         .service(endpoints::pipeline_management::list_pipelines)
         .service(endpoints::pipeline_management::get_pipeline)
@@ -698,6 +978,9 @@ fn api_scope() -> Scope {
         .service(endpoints::pipeline_interaction::get_pipeline_input_connector_status)
         .service(endpoints::pipeline_interaction::get_pipeline_output_connector_status)
         .service(endpoints::pipeline_interaction::post_pipeline_output_connector_command)
+        // Registered after `/command`, whose path this route's `{action}`
+        // placeholder would otherwise claim.
+        .service(endpoints::pipeline_interaction::post_pipeline_output_connector_action)
         .service(endpoints::pipeline_interaction::get_pipeline_stats)
         .service(endpoints::pipeline_interaction::get_pipeline_metrics)
         .service(endpoints::pipeline_interaction::get_pipeline_time_series)
@@ -722,16 +1005,32 @@ fn api_scope() -> Scope {
         .service(endpoints::api_key::get_api_key)
         .service(endpoints::api_key::post_api_key)
         .service(endpoints::api_key::delete_api_key)
+        // OIDC trust relationship endpoints
+        .service(endpoints::oidc_trust::list_oidc_trust)
+        .service(endpoints::oidc_trust::get_oidc_trust)
+        .service(endpoints::oidc_trust::post_oidc_trust)
+        .service(endpoints::oidc_trust::delete_oidc_trust)
         // Configuration endpoints
         .service(endpoints::config::get_config)
         .service(endpoints::config::get_config_demos)
         .service(endpoints::config::get_config_session)
+        .service(endpoints::config::get_config_owners)
         // Metrics of all pipelines belonging to this tenant
         .service(endpoints::metrics::get_metrics)
         // Cluster health check
         .service(endpoints::cluster::list_cluster_events)
         .service(endpoints::cluster::get_cluster_event)
         .service(endpoints::cluster::get_cluster_health)
+        // Tenant and user management (RBAC)
+        .service(endpoints::tenant::list_tenant_users)
+        .service(endpoints::tenant::add_tenant_user)
+        .service(endpoints::tenant::put_tenant_user)
+        .service(endpoints::tenant::delete_tenant_user)
+        .service(endpoints::tenant::list_tenants)
+        .service(endpoints::tenant::get_tenant)
+        .service(endpoints::tenant::create_tenant)
+        .service(endpoints::tenant::patch_tenant)
+        .service(endpoints::tenant::delete_tenant)
 }
 
 struct SecurityAddon;
@@ -757,6 +1056,48 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// Annotates each gated operation with its minimum RBAC role, sourced from
+/// `ROUTE_MIN_ROLE` (rbac.rs) so the API reference cannot drift from the
+/// enforced policy.
+struct MinRoleAddon;
+
+impl Modify for MinRoleAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::PathItemType;
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, operation) in item.operations.iter_mut() {
+                let http = match method {
+                    PathItemType::Get => "GET",
+                    PathItemType::Post => "POST",
+                    PathItemType::Put => "PUT",
+                    PathItemType::Delete => "DELETE",
+                    PathItemType::Patch => "PATCH",
+                    _ => continue,
+                };
+                // Only gated routes appear in the table; leave anything else
+                // (public infra endpoints) untouched.
+                let Some(required) = crate::api::rbac::min_role_for(http, path.as_str()) else {
+                    continue;
+                };
+                // Prepended to the operation description, which the docs site
+                // renders as markdown.
+                let note = if required == crate::db::types::role::Role::Owner {
+                    // `owner` is the highest role, so "or higher" would be misleading.
+                    "Required role: `owner`.".to_string()
+                } else {
+                    format!("Required role: `{required}` or higher.")
+                };
+                operation.description = Some(match operation.description.take() {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{note}\n\n{existing}")
+                    }
+                    _ => note,
+                });
+            }
+        }
+    }
+}
+
 // The below types and methods are used for running the api-server
 
 pub(crate) struct ServerState {
@@ -767,6 +1108,17 @@ pub(crate) struct ServerState {
     pub common_config: CommonConfig,
     pub config: ApiServerConfig,
     pub jwk_cache: Arc<Mutex<JwkCache>>,
+    pub issuer_jwk_cache: Arc<Mutex<IssuerJwkCache>>,
+    /// Which logins have had their profile read from the identity provider
+    /// recently, and where each issuer's UserInfo endpoint lives.
+    pub user_profiles: Arc<Mutex<UserProfileCache>>,
+    /// Roots an OIDC fetch trusts on top of the platform's, read once here so
+    /// that authenticating a request never touches the filesystem.
+    pub oidc_root_certs: Vec<reqwest::Certificate>,
+    /// The HTTP clients OIDC fetches use, built once: constructing one loads
+    /// the platform's root certificate store, which is far too slow to do per
+    /// request.
+    pub oidc_clients: OidcClients,
     probe: Arc<Mutex<DbProbe>>,
     pub demos: Vec<Demo>,
     pub license_check: Arc<RwLock<Option<LicenseCheck>>>,
@@ -782,12 +1134,17 @@ impl ServerState {
         let runner = RunnerInteraction::new(common_config.clone(), db.clone());
         let db_copy = db.clone();
         let demos = read_demos_from_directories(&config.demos_dir);
+        let oidc_root_certs = common_config.configured_root_certificates().await?;
         Ok(Self {
             db,
             runner,
             common_config,
             config,
             jwk_cache: Arc::new(Mutex::new(JwkCache::new())),
+            issuer_jwk_cache: Arc::new(Mutex::new(IssuerJwkCache::new())),
+            user_profiles: Arc::new(Mutex::new(UserProfileCache::new())),
+            oidc_clients: OidcClients::new(&oidc_root_certs)?,
+            oidc_root_certs,
             probe: DbProbe::new(db_copy).await,
             demos,
             license_check,
@@ -850,6 +1207,9 @@ pub async fn run(
     api_config: ApiServerConfig,
     license_check: Arc<RwLock<Option<LicenseCheck>>>,
 ) -> AnyResult<()> {
+    if let Err(reason) = api_config.validate_authorization() {
+        return Err(anyhow::anyhow!(reason));
+    }
     let listener = TcpListener::bind((common_config.bind_address.clone(), common_config.api_port))
         .unwrap_or_else(|_| {
             panic!(
@@ -864,7 +1224,7 @@ pub async fn run(
         crate::config::AuthProviderType::None => None,
         crate::config::AuthProviderType::AwsCognito => Some(crate::auth::aws_auth_config()),
         crate::config::AuthProviderType::GenericOidc => {
-            match crate::auth::generic_oidc_auth_config(&api_config).await {
+            match crate::auth::generic_oidc_auth_config(&api_config, &state.oidc_root_certs).await {
                 Ok(config) => Some(config),
                 Err(e) => {
                     error!("Failed to configure generic OIDC authentication: {}", e);
@@ -912,6 +1272,10 @@ pub async fn run(
         common_config.api_port,
         common_config.http_workers,
     );
+    let base_path = api_config.normalized_http_base_path();
+    if !base_path.is_empty() {
+        info!("Serving the API and web console under base path '{base_path}'");
+    }
 
     let banner = if theme(Duration::from_millis(500)).unwrap_or(Theme::Light) == Theme::Dark {
         include_str!("../../light-banner.ascii")
@@ -919,15 +1283,19 @@ pub async fn run(
         include_str!("../../dark-banner.ascii")
     };
     let addr = env::var("BANNER_ADDR").unwrap_or("127.0.0.1".to_string());
+    // The base path is part of the reachable URL: with `--http-base-path` set,
+    // the console lives at `<origin><base>/` and the API at `<origin><base>/v0`,
+    // so a bare origin printed here would send the reader to a 404.
     let url = format!(
-        "{}://{}:{}",
+        "{}://{}:{}{}",
         if common_config.enable_https {
             "https"
         } else {
             "http"
         },
         addr,
-        common_config.api_port
+        common_config.api_port,
+        base_path
     );
 
     // Lock both out streams so that the banner is printed in one go
@@ -947,11 +1315,7 @@ Version: {} v{}{}
 ",
             url,
             url,
-            if cfg!(feature = "feldera-enterprise") {
-                "Enterprise"
-            } else {
-                "Open source"
-            },
+            crate::edition(),
             env!("CARGO_PKG_VERSION"),
             if env!("FELDERA_PLATFORM_VERSION_SUFFIX").is_empty() {
                 "".to_string()
@@ -1018,7 +1382,7 @@ Version: {} v{}{}
     });
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal as unix_signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal as unix_signal};
         let mut term_stream = unix_signal(SignalKind::terminate()).expect("SIGTERM handler");
         let server_handle_term = server.handle();
         tokio::spawn(async move {
@@ -1035,17 +1399,11 @@ Version: {} v{}{}
         let _ = collector_handle.join();
     }
 
-    if let Some(client) = sentry::Hub::current().client() {
-        info!("Shutting down sentry");
-        client.close(Some(Duration::from_secs(3)));
-    }
-
     server_result?;
     Ok(())
 }
 
 /// This is an internal endpoint and as such is not exposed via OpenAPI
-#[get("/healthz")]
 async fn healthz(state: WebData<ServerState>) -> Result<HttpResponse, ManagerError> {
     let probe = state.probe.lock().await;
     Ok(probe.as_http_response())
@@ -1054,7 +1412,6 @@ async fn healthz(state: WebData<ServerState>) -> Result<HttpResponse, ManagerErr
 /// Disallow all crawlers instance-wide. The web-console is a client-side SPA, so per-page robots
 /// hints never reach crawlers; a root disallow is the only reliable way to keep app URLs (e.g.
 /// the sandbox's `/create?...` deep-links) out of search indexes.
-#[get("/robots.txt")]
 async fn robots_txt() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain; charset=utf-8")
@@ -1120,10 +1477,11 @@ mod tests {
             "public, max-age=86400",
         );
         // Only the immutable branch emits ACAO/EXPIRES.
-        assert!(res
-            .headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .is_none());
+        assert!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
         assert!(res.headers().get(header::EXPIRES).is_none());
     }
 
@@ -1147,6 +1505,64 @@ mod tests {
         );
         let body = test::read_body(res).await;
         assert_eq!(&body[..], b"User-agent: *\nDisallow: /\n");
+    }
+
+    /// Under a base path the probe must answer at `<base-path>/healthz` too: a
+    /// proxy that forwards only `<base-path>/*` can reach no other spelling.
+    /// Dropping the prefixed registration sends the path to the console
+    /// catch-all, which serves `index.html` with status 200 and leaves the
+    /// probe unable to report an unhealthy manager.
+    #[actix_web::test]
+    async fn healthz_answers_under_the_base_path() {
+        let mut cfg = ApiServerConfig::test_config();
+        cfg.http_base_path = "/feldera".to_string();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        // Both spellings reach the same handler, which fails the same way in
+        // this `ServerState`-less test App. The point is that neither answer
+        // comes from the static bundle.
+        let root =
+            test::call_service(&app, test::TestRequest::get().uri("/healthz").to_request()).await;
+        let prefixed = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/feldera/healthz")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(prefixed.status(), root.status());
+
+        let prefixed_body = test::read_body(prefixed).await;
+        assert!(
+            !prefixed_body
+                .to_ascii_lowercase()
+                .starts_with(b"<!doctype html"),
+            "/feldera/healthz fell through to the web-console catch-all",
+        );
+        assert_eq!(prefixed_body, test::read_body(root).await);
+    }
+
+    /// Crawler rules follow the deployment: the origin root for a crawler that
+    /// reaches the manager directly, and `<base-path>/robots.txt` for one that
+    /// only ever sees the proxy's subpath.
+    #[actix_web::test]
+    async fn robots_txt_answers_under_both_spellings_of_a_base_path() {
+        let mut cfg = ApiServerConfig::test_config();
+        cfg.http_base_path = "/feldera".to_string();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        for uri in ["/robots.txt", "/feldera/robots.txt"] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                res.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8",
+                "{uri}",
+            );
+            let body = test::read_body(res).await;
+            assert_eq!(&body[..], b"User-agent: *\nDisallow: /\n", "{uri}");
+        }
     }
 
     // -------- CORS surface integration tests --------
@@ -1187,7 +1603,9 @@ mod tests {
         let res = test::call_service(&app, req).await;
 
         assert!(
-            res.headers().get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none(),
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none(),
             "static asset leaked Access-Control-Allow-Credentials — actix-cors regressed onto the static scope",
         );
         if let Some(vary) = res.headers().get(header::VARY) {
@@ -1280,6 +1698,35 @@ mod tests {
         );
     }
 
+    /// A JSON write (create/patch pipeline) carries `Content-Type:
+    /// application/json`, whose non-safelisted value forces the browser to
+    /// preflight and request the `content-type` header. If the server's CORS
+    /// allowlist drops `content-type`, actix-cors 400s the preflight and every
+    /// cross-origin write breaks while reads keep working.
+    #[actix_web::test]
+    async fn v0_preflight_allows_json_write_headers() {
+        let cfg = ApiServerConfig::test_config();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/v0/pipelines")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+            .insert_header((
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            ))
+            .to_request();
+        let res = test::call_service(&app, req).await;
+
+        assert!(
+            res.status().is_success(),
+            "JSON-write preflight returned {} — cross-origin create/patch will be blocked",
+            res.status(),
+        );
+    }
+
     /// Guards the static-asset middleware's blast radius: GET responses on
     /// the credentialed-CORS routes (`/v0/*`, `/config/authentication`) must
     /// never carry the static-only `ACAO: *` or `Cache-Control: immutable`.
@@ -1295,7 +1742,7 @@ mod tests {
         // handlers (which 500 on `WebData<ServerState>` extraction since this
         // test skips `app_data` — `actix-cors` still adds headers on the
         // response), api_scope param routes, the cors-wrapped `/config`
-        // sub-scope, and the unwrapped public routes (`/healthz`, swagger).
+        // sub-scope, and the unwrapped public routes (`/healthz`).
         // `/config/authentication` works through its real handler because
         // `auth_provider = None` in test_config returns early without state.
         for uri in [
@@ -1314,7 +1761,6 @@ mod tests {
             "/v0/cluster_healthz",
             "/config/authentication",
             "/healthz",
-            "/swagger-ui/index.html",
         ] {
             let req = test::TestRequest::get()
                 .uri(uri)
@@ -1373,6 +1819,149 @@ mod tests {
             &body[..],
             b"LEAKED",
             "a route registered after build_app() was reached — public_scope's SPA catch-all must shadow it",
+        );
+    }
+
+    /// Base-path normalization is lenient: whitespace and trailing slashes are
+    /// trimmed and a leading slash is added when missing, so both `/feldera`
+    /// and `feldera/` resolve to the same prefix and `""`/`"/"` mean "root".
+    // `#[actix_web::test]` (not `#[test]`) because `use actix_web::test`
+    // shadows the built-in test attribute in this module; the body is pure.
+    #[actix_web::test]
+    async fn base_path_normalization() {
+        let normalized = |raw: &str| {
+            let mut cfg = ApiServerConfig::test_config();
+            cfg.http_base_path = raw.to_string();
+            cfg.normalized_http_base_path()
+        };
+        assert_eq!(normalized(""), "");
+        assert_eq!(normalized("/"), "");
+        assert_eq!(normalized("  "), "");
+        assert_eq!(normalized("/feldera"), "/feldera");
+        assert_eq!(normalized("/feldera/"), "/feldera");
+        assert_eq!(normalized("feldera"), "/feldera");
+        assert_eq!(normalized("  /feldera/  "), "/feldera");
+        assert_eq!(normalized("/a/b/"), "/a/b");
+    }
+
+    /// With a configured base path, the API and the `/config` bootstrap mount
+    /// under the prefix, the un-prefixed paths stop routing, and `/healthz`
+    /// stays at the root for infrastructure probes. Drives the production
+    /// `build_app`, so a regression in the scope wiring fails here.
+    #[actix_web::test]
+    async fn base_path_mounts_scopes_under_prefix() {
+        use actix_web::http::StatusCode;
+
+        let mut cfg = ApiServerConfig::test_config();
+        cfg.http_base_path = "/feldera".to_string();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        // The API moves under the prefix: a credentialed CORS preflight to
+        // `/feldera/v0/*` succeeds, exactly as `/v0/*` does at the root.
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/feldera/v0/pipelines")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+        assert!(
+            test::call_service(&app, req).await.status().is_success(),
+            "/feldera/v0/* preflight failed — API not mounted under the base path",
+        );
+
+        // The `/config` auth bootstrap moves under the prefix too.
+        let req = test::TestRequest::default()
+            .method(Method::OPTIONS)
+            .uri("/feldera/config/authentication")
+            .insert_header((header::ORIGIN, "http://example.com"))
+            .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+            .to_request();
+        assert!(
+            test::call_service(&app, req).await.status().is_success(),
+            "/feldera/config/authentication preflight failed — config not mounted under the base path",
+        );
+
+        // The un-prefixed API path no longer routes to anything.
+        let req = test::TestRequest::get().uri("/v0/pipelines").to_request();
+        assert_eq!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::NOT_FOUND,
+            "/v0/* still routed despite a configured base path",
+        );
+
+        // Liveness stays at the root for direct infrastructure probes (a
+        // missing `ServerState` makes the handler error, but it must still be
+        // routed — i.e. not a 404).
+        let req = test::TestRequest::get().uri("/healthz").to_request();
+        assert_ne!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::NOT_FOUND,
+            "/healthz must remain at the root regardless of the base path",
+        );
+    }
+
+    /// A real API request under the base path must clear the RBAC guard. The
+    /// route table is authored root-relative (`/v0/pipelines`), so a guard that
+    /// classified the raw `/feldera/v0/pipelines` finds no entry and denies the
+    /// whole API — invisible to a preflight or a 404 probe, which is why this
+    /// drives a GET. Dropping the `BasePath` strip in `rbac_middleware` turns
+    /// this into a 403 and fails here.
+    /// Under a base path, an alternate spelling of a route keeps that route's
+    /// role floor and stays reachable: the guard classifies the decoded path
+    /// the router dispatches on, with the prefix stripped.
+    #[actix_web::test]
+    async fn base_path_keeps_the_role_floor_for_alternate_spellings() {
+        use actix_web::http::StatusCode;
+
+        let mut cfg = ApiServerConfig::test_config();
+        cfg.http_base_path = "/feldera".to_string();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        // Without auth the principal is the default admin, below the owner
+        // floor of `/v0/tenants`.
+        for uri in [
+            "/feldera/v0/tenants",
+            "/feldera/v0/%74enants",
+            "/%66eldera/v0/tenants",
+        ] {
+            let req = test::TestRequest::get().uri(uri).to_request();
+            assert_eq!(
+                test::call_service(&app, req).await.status(),
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        // The same spellings of a route within the admin's reach clear the
+        // guard (the handler then fails on the missing `ServerState`).
+        for uri in ["/feldera/v0/%70ipelines", "/%66eldera/v0/pipelines"] {
+            let req = test::TestRequest::get().uri(uri).to_request();
+            let status = test::call_service(&app, req).await.status();
+            assert!(
+                status != StatusCode::FORBIDDEN && status != StatusCode::NOT_FOUND,
+                "{uri}: {status}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn base_path_api_request_clears_rbac() {
+        use actix_web::http::StatusCode;
+
+        let mut cfg = ApiServerConfig::test_config();
+        cfg.http_base_path = "/feldera".to_string();
+        let app = test::init_service(build_app(&cfg, &None)).await;
+
+        // With no auth configured the request carries the default admin
+        // principal, which satisfies every route's role floor. `ServerState` is
+        // absent, so the handler itself fails — but with a server error, not the
+        // 403 an unclassified route returns.
+        let req = test::TestRequest::get()
+            .uri("/feldera/v0/pipelines")
+            .to_request();
+        assert_ne!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::FORBIDDEN,
+            "RBAC denied a base-path API request; the route table matches root-relative paths",
         );
     }
 }

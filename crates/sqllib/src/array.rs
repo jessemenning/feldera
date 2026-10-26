@@ -1,7 +1,7 @@
 // Array operations
 
 use crate::error::{SqlResult, SqlRuntimeError};
-use crate::{ConcatSemigroup, Semigroup, Weight, some_function1, some_function2};
+use crate::{ConcatSemigroup, Semigroup, Weight, some_function1, some_function2, some_function3};
 use dbsp::CmpFunc;
 use itertools::Itertools;
 use std::{collections::HashSet, fmt::Debug, hash::Hash, sync::Arc};
@@ -107,7 +107,7 @@ where
     match vec {
         // Treat like an error; the result will be unwrapped to None anyway
         None => Err(SqlRuntimeError::from_strng("")),
-        Some(vec) => array_map_safe__(vec.clone(), f),
+        Some(vec) => array_map_safe__(vec, f),
     }
 }
 
@@ -662,38 +662,6 @@ pub fn array_aggN<T>(
 }
 
 #[doc(hidden)]
-pub fn array_agg_opt<T>(
-    accumulator: &mut Vec<Option<T>>,
-    value: Option<T>,
-    weight: Weight,
-    distinct: bool,
-    keep: bool,
-    ignore_nulls: bool,
-) where
-    T: Clone,
-{
-    if !ignore_nulls || value.is_some() {
-        array_agg(accumulator, value, weight, distinct, keep);
-    }
-}
-
-#[doc(hidden)]
-pub fn array_agg_optN<T>(
-    accumulator: &mut Option<Vec<Option<T>>>,
-    value: Option<T>,
-    weight: Weight,
-    distinct: bool,
-    keep: bool,
-    ignore_nulls: bool,
-) where
-    T: Clone,
-{
-    if let Some(accumulator) = accumulator.as_mut() {
-        array_agg_opt(accumulator, value, weight, distinct, keep, ignore_nulls);
-    }
-}
-
-#[doc(hidden)]
 pub fn array_concat__<T>(left: Array<T>, right: Array<T>) -> Array<T>
 where
     T: Clone,
@@ -817,10 +785,13 @@ where
     let mut abs = num::abs(pos) as usize;
 
     if pos == 0 {
-        panic!("Index of 0 for 'array_insert");
+        panic!("'ARRAY_INSERT' called with position 0, but SQL array positions start at 1");
     }
     if abs > MAX_ARRAY_LENGTH {
-        panic!("Index {} too large for 'array_index'", pos);
+        panic!(
+            "'ARRAY_INSERT' called with position {pos}, which exceeds the maximum array length of {}",
+            MAX_ARRAY_LENGTH
+        );
     }
 
     let len = array.len();
@@ -988,4 +959,131 @@ where
 {
     let array = array?;
     Some(transform_(array, f))
+}
+
+#[doc(hidden)]
+pub fn array_filter__<T, F>(array: Array<T>, f: F) -> Array<T>
+where
+    T: Clone,
+    F: Fn(&T) -> bool,
+{
+    Arc::new(array.iter().filter(|e| f(e)).cloned().collect())
+}
+
+#[doc(hidden)]
+pub fn array_filterN_<T, F>(array: Option<Array<T>>, f: F) -> Option<Array<T>>
+where
+    T: Clone,
+    F: Fn(&T) -> bool,
+{
+    let array = array?;
+    Some(array_filter__(array, f))
+}
+
+/// A NULL predicate result drops the element, like `false`
+#[doc(hidden)]
+pub fn array_filter_N<T, F>(array: Array<T>, f: F) -> Array<T>
+where
+    T: Clone,
+    F: Fn(&T) -> Option<bool>,
+{
+    array_filter__(array, |e| f(e).unwrap_or(false))
+}
+
+#[doc(hidden)]
+pub fn array_filterNN<T, F>(array: Option<Array<T>>, f: F) -> Option<Array<T>>
+where
+    T: Clone,
+    F: Fn(&T) -> Option<bool>,
+{
+    let array = array?;
+    Some(array_filter_N(array, f))
+}
+
+/// `start` is 1-based, and counts from the end of the array when negative
+#[doc(hidden)]
+pub fn array_slice___<T>(array: Array<T>, start: i32, length: i32) -> Array<T>
+where
+    T: Clone,
+{
+    if start == 0 {
+        panic!("'ARRAY_SLICE' called with start 0, but SQL array positions start at 1");
+    }
+    if length < 0 {
+        panic!("'ARRAY_SLICE' called with negative length {length}");
+    }
+    let size = array.len() as i64;
+    let first = if start < 0 {
+        start as i64 + size
+    } else {
+        start as i64 - 1
+    };
+    if first < 0 || first >= size {
+        return Arc::new(Vec::new());
+    }
+    let last = (first + length as i64).min(size);
+    Arc::new(array[first as usize..last as usize].to_vec())
+}
+
+some_function3!(array_slice [T: Clone], Array<T>, i32, i32, Array<T>);
+
+#[doc(hidden)]
+pub fn array_flatten__<T>(array: Array<Array<T>>) -> Array<T>
+where
+    T: Clone,
+{
+    Arc::new(
+        array
+            .iter()
+            .flat_map(|inner| inner.iter().cloned())
+            .collect(),
+    )
+}
+
+#[doc(hidden)]
+pub fn array_flattenN_<T>(array: Option<Array<Array<T>>>) -> Option<Array<T>>
+where
+    T: Clone,
+{
+    Some(array_flatten__(array?))
+}
+
+/// A NULL inner array makes the result NULL
+#[doc(hidden)]
+pub fn array_flatten_N<T>(array: Array<Option<Array<T>>>) -> Option<Array<T>>
+where
+    T: Clone,
+{
+    let mut result = Vec::new();
+    for inner in array.iter() {
+        result.extend(inner.as_ref()?.iter().cloned());
+    }
+    Some(Arc::new(result))
+}
+
+#[doc(hidden)]
+pub fn array_flattenNN<T>(array: Option<Array<Option<Array<T>>>>) -> Option<Array<T>>
+where
+    T: Clone,
+{
+    array_flatten_N(array?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `first + length` is computed in `i64`.  In `i32` it overflows when the
+    /// slice starts near the end of the array and `length` is large.
+    #[test]
+    fn slice_does_not_overflow_at_i32_extremes() {
+        let array: Array<i32> = Arc::new(vec![1, 2, 3]);
+        assert!(array_slice___(array.clone(), i32::MIN, 1).is_empty());
+        assert!(array_slice___(array.clone(), i32::MAX, 1).is_empty());
+        assert_eq!(*array_slice___(array.clone(), 1, i32::MAX), vec![1, 2, 3]);
+        assert_eq!(*array_slice___(array, -1, i32::MAX), vec![3]);
+
+        let empty: Array<i32> = Arc::new(vec![]);
+        assert!(array_slice___(empty, i32::MIN, i32::MAX).is_empty());
+    }
 }

@@ -2,6 +2,7 @@
   import {
     CircuitProfile,
     type Dataflow,
+    type DiagramTheme,
     type JsonProfiles,
     type ProfilerCallbacks,
     Visualizer,
@@ -16,17 +17,43 @@
     dataflowData: Dataflow | undefined
     /** Lines of user SQL code */
     programCode: string[] | undefined
-    /** Callbacks from ProfilerLayout */
+    /** Callbacks the hosting layout listens on */
     callbacks: ProfilerCallbacks
+    /** Palette the diagram is drawn with; follows the application theme */
+    theme?: DiagramTheme
     /** Optional class for styling the container */
     class?: string
   }
 
-  const { profileData, dataflowData, programCode, callbacks, class: className }: Props = $props()
+  const {
+    profileData,
+    dataflowData,
+    programCode,
+    callbacks,
+    theme = 'light',
+    class: className
+  }: Props = $props()
 
   // DOM element references
+  let rootElement: HTMLDivElement | undefined = $state()
   let graphContainer: HTMLDivElement | undefined = $state()
   let navigatorContainer: HTMLDivElement | undefined = $state()
+
+  // Tracked from pointerdown rather than DOM focus because the visualizer consumes its own pointer
+  // events, so the graph never holds a focusable target.
+  let pointerOnGraph = $state(false)
+  $effect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      pointerOnGraph = !!rootElement && rootElement.contains(e.target as Node | null)
+    }
+    window.addEventListener('pointerdown', onPointerDown, { capture: true })
+    return () => window.removeEventListener('pointerdown', onPointerDown, { capture: true })
+  })
+
+  /** Whether the graph is the user's current focus. */
+  export function isFocused(): boolean {
+    return pointerOnGraph
+  }
 
   // Visualizer instance and profile data (combined as their lifecycle is connected)
   let instance = $state<{ visualizer: Visualizer; profile: CircuitProfile } | null>(null)
@@ -64,7 +91,8 @@
         const config: VisualizerConfig = {
           graphContainer: graphContainer!,
           navigatorContainer: navigatorContainer!,
-          callbacks
+          callbacks,
+          theme
         }
 
         // Create and render visualizer
@@ -78,6 +106,13 @@
         console.error('Failed to initialize visualizer:', e)
       }
     })
+  })
+
+  // Applied outside the init effect above: that effect disposes and rebuilds the Visualizer,
+  // so tracking `theme` there would reparse the profile and re-run the ELK layout on every
+  // theme toggle. `setTheme` only restyles what is already on screen.
+  $effect(() => {
+    instance?.visualizer.setTheme(theme)
   })
 
   // Public methods that proxy to visualizer-lib
@@ -118,7 +153,12 @@
   })
 </script>
 
-<div class="visualizer-wrapper {className || ''}" data-testid="visualizer-diagram">
+<div
+  bind:this={rootElement}
+  class="visualizer-wrapper {className || ''}"
+  data-diagram-theme={theme}
+  data-testid="visualizer-diagram"
+>
   <!-- Main graph visualization (full size) -->
   <div bind:this={graphContainer} class="visualizer-graph"></div>
 
@@ -153,10 +193,16 @@
     gap: 0.5rem;
   }
 
+  /* Sized by the minimap inside it, which has the shape of the circuit. */
   .visualizer-navigator {
-    width: 108px;
-    height: 108px;
+    width: fit-content;
+    height: fit-content;
     background-color: rgba(255, 255, 255, 0.95);
-    padding: 2px;
+    padding: 0px;
+  }
+
+  /* The minimap sits on top of the graph, so it needs its own ground in either palette. */
+  .visualizer-wrapper[data-diagram-theme='dark'] .visualizer-navigator {
+    background-color: rgba(34, 38, 43, 0.95);
   }
 </style>

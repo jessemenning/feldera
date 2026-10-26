@@ -21,6 +21,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     Catalog, CircuitCatalog, Controller,
+    controller::MAX_CONNECTOR_ERROR_LEN,
     integrated::postgres::test::pg::PostgresTestStructCdc,
     test::{TestStruct, wait},
 };
@@ -89,7 +90,7 @@ mod pg {
 
     use chrono::SubsecRound;
     use dbsp::{Runtime, utils::Tup1};
-    use feldera_macros::IsNone;
+    use feldera_macros::{IsNone, OrdRepr};
     use feldera_sqllib::{F32, F64, SqlDecimal, SqlString, Variant};
     use feldera_types::{
         config::PipelineConfig,
@@ -139,6 +140,7 @@ mod pg {
         rkyv::Serialize,
         rkyv::Deserialize,
         IsNone,
+        OrdRepr,
     )]
     #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
     pub(super) struct PostgresTestStruct {
@@ -264,6 +266,9 @@ mod pg {
     /// Connects a sync postgres client, with TLS if config is provided.
     pub(super) fn pg_connect(uri: &str, tls: &Option<PostgresTlsConfig>) -> postgres::Client {
         if let Some(tls) = tls {
+            // The binary installs the process-level provider at startup;
+            // tests must do it themselves.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             let connector = make_tls_connector(tls, "test")
                 .expect("failed to build TLS connector")
                 .expect("TLS config should produce a connector");
@@ -1066,6 +1071,928 @@ fn test_pg_insert_omitted_default_column() {
             .get::<_, Option<chrono::NaiveDateTime>>("served_at")
             .is_some()),
         "served_at should be populated by its DEFAULT"
+    );
+}
+
+/// Bytes reported by the `while executing ... statement for N record(s) (M
+/// bytes)` context that the connector attaches to a failed statement.
+fn payload_bytes_in_error(message: &str) -> Option<usize> {
+    message
+        .split(" record(s) (")
+        .nth(1)?
+        .split(" bytes)")
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A statement Postgres rejects must not carry the whole batch into the error
+/// message.
+///
+/// The payload of one statement is as large as `max_buffer_size` (1 MiB by
+/// default) and an endpoint retains up to `MAX_CONNECTOR_ERRORS` messages per
+/// tag, so quoting the payload in full grew `/stats` and
+/// `/output_endpoints/{name}/stats` past the size limit the pipeline manager
+/// applies while proxying them, failing the whole request.
+#[test]
+#[serial]
+fn test_pg_error_message_is_bounded() {
+    let table_name = unique_pg_name("test_pg_errmsg");
+    let url = postgres_url();
+
+    // One record is about 590 bytes, so 10000 records fill the connector's
+    // default 1 MiB buffer several times over.
+    let data: Vec<PostgresTestStruct> = (0..10000).map(|_| rand::random()).collect();
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    for datum in data.iter() {
+        let mut serializer = serde_json::Serializer::new(Vec::new());
+        datum
+            .serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        temp_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        temp_file.write_all(b"\n").unwrap();
+    }
+
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      // Step on large batches so that the connector fills its 1 MiB buffer,
+      // instead of flushing a handful of records at a time.
+      "min_batch_size_records": 5000,
+      "max_buffering_delay_usecs": 5000000,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": { "name": "file_input", "config": { "path": temp_file.path(), "byte_size_buffer": 8388608 } },
+          "format": { "name": "json", "config": { "update_format": "raw", "array": false } }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": { "name": "postgres_output", "config": { "uri": url, "table": &table_name } },
+          "index": "idx"
+        }
+      }
+    }))
+    .unwrap();
+
+    // `freshness_timestamp` is NOT NULL, has no DEFAULT, and is absent from the
+    // Feldera view, so every INSERT the connector issues violates the
+    // constraint.
+    let _table = PostgresTestStruct::create_table_with_extra_columns(
+        &table_name,
+        url,
+        true,
+        &None,
+        "freshness_timestamp TIMESTAMP NOT NULL",
+    );
+
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+    controller.start();
+
+    wait(
+        || {
+            controller
+                .status()
+                .output_status()
+                .values()
+                .any(|endpoint| {
+                    endpoint
+                        .metrics
+                        .num_transport_errors
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                })
+        },
+        60_000,
+    )
+    .expect("timeout: connector reported no transport error");
+
+    // Snapshot the errors and shut the pipeline down before asserting, so that a
+    // failing assertion does not race the table teardown.
+    let (errors, fatal_error) = {
+        let status = controller.status();
+        let outputs = status.output_status();
+        let endpoint = outputs.values().next().expect("output endpoint");
+        (
+            endpoint.transport_errors.lock().unwrap().to_api_type(),
+            endpoint.fatal_error(),
+        )
+    };
+    let _ = controller.stop();
+
+    assert!(!errors.is_empty(), "no transport error was recorded");
+
+    for error in &errors {
+        assert!(
+            !error.message.contains("bytes elided"),
+            "connector produced a {}-byte message that the status layer had to \
+             truncate: {}",
+            error.message.len(),
+            error.message
+        );
+        assert!(
+            error.message.len() <= MAX_CONNECTOR_ERROR_LEN,
+            "error message is {} bytes",
+            error.message.len()
+        );
+    }
+
+    // Truncating must keep the diagnosis, which Postgres reports at the end of
+    // the error chain: the SQLSTATE, the server's message, and the DETAIL
+    // naming the offending row.
+    let diagnosed = errors.iter().find(|e| e.message.contains("E23502"));
+    let diagnosed = diagnosed
+        .unwrap_or_else(|| panic!("no error reports the SQLSTATE: {errors:#?}"))
+        .message
+        .as_str();
+    assert!(
+        diagnosed.contains("violates not-null constraint"),
+        "error drops the server's message: {diagnosed}"
+    );
+    assert!(
+        diagnosed.contains("DETAIL: Failing row contains"),
+        "error drops the server's DETAIL: {diagnosed}"
+    );
+
+    // At least one failed statement has
+    // to have carried a payload far larger than the message describing it.
+    let largest_payload = errors
+        .iter()
+        .filter_map(|e| payload_bytes_in_error(&e.message))
+        .max()
+        .expect("no error reports its payload size");
+    assert!(
+        largest_payload > 64 * 1024,
+        "the connector never buffered a large batch (largest was {largest_payload} bytes), \
+         so this test would pass without truncation"
+    );
+
+    let fatal_error = fatal_error.expect("endpoint reported no fatal error");
+    assert!(
+        fatal_error.len() <= MAX_CONNECTOR_ERROR_LEN,
+        "fatal_error is {} bytes",
+        fatal_error.len()
+    );
+}
+
+/// Serializes `data` as the newline-delimited JSON into a temp file the file input reads.
+fn write_records_to_temp_file(data: &[PostgresTestStruct]) -> NamedTempFile {
+    let mut temp_file = NamedTempFile::new().unwrap();
+    for datum in data {
+        let mut serializer = serde_json::Serializer::new(Vec::new());
+        datum
+            .serialize_with_context(&mut serializer, &SqlSerdeConfig::default())
+            .unwrap();
+        temp_file
+            .as_file_mut()
+            .write_all(&serializer.into_inner())
+            .unwrap();
+        temp_file.write_all(b"\n").unwrap();
+    }
+    temp_file
+}
+
+/// Pipeline that feeds the records in `path` to a postgres output connector
+/// writing to `table_name` through `threads` connections.
+///
+/// `min_batch_size_records`, when set, makes the pipeline ingest that
+/// many records in one large batch.
+fn pg_output_test_config(
+    path: &Path,
+    url: &str,
+    table_name: &str,
+    threads: usize,
+    min_batch_size_records: Option<usize>,
+) -> PipelineConfig {
+    let mut config = json!({
+      "name": "test",
+      "workers": 4,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": { "name": "file_input", "config": { "path": path } },
+          "format": { "name": "json", "config": { "update_format": "raw", "array": false } }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": { "name": "postgres_output", "config": { "uri": url, "table": table_name, "threads": threads } },
+          "index": "idx"
+        }
+      }
+    });
+
+    if let Some(records) = min_batch_size_records {
+        config["min_batch_size_records"] = json!(records);
+        config["max_buffering_delay_usecs"] = json!(5_000_000);
+        config["inputs"]["ins"]["transport"]["config"]["byte_size_buffer"] = json!(8_388_608);
+    }
+
+    serde_json::from_value(config).unwrap()
+}
+
+fn pg_transmitted_totals(controller: &Controller) -> (u64, u64) {
+    let status = controller.status();
+    let outputs = status.output_status();
+    let endpoint = outputs.values().next().expect("output endpoint");
+    (
+        endpoint
+            .metrics
+            .transmitted_records
+            .load(std::sync::atomic::Ordering::Relaxed),
+        endpoint
+            .metrics
+            .transmitted_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn pg_total_processed_input_records(controller: &Controller) -> u64 {
+    let status = controller.status();
+    let outputs = status.output_status();
+    let endpoint = outputs.values().next().expect("output endpoint");
+    endpoint
+        .metrics
+        .total_processed_input_records
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many failures the reconnect loop has reported.
+///
+/// Only `retry_connecting_with_backoff` reports under this tag, so a non-zero
+/// count means a worker lost its connection and is waiting out a database it
+/// cannot reach. That is a state the tests below can wait for, unlike the
+/// sleeps they used to spend guessing at it.
+fn pg_conn_retry_failures(controller: &Controller) -> usize {
+    let status = controller.status();
+    let outputs = status.output_status();
+    let endpoint = outputs.values().next().expect("output endpoint");
+    let errors = endpoint.transport_errors.lock().unwrap().to_api_type();
+    errors
+        .iter()
+        .filter(|e| e.tag.as_deref() == Some("pg_conn_retry"))
+        .count()
+}
+
+fn pg_row_count(url: &str, table_name: &str) -> u64 {
+    let mut client = pg::pg_connect(url, &None);
+    let count: i64 = client
+        .query_one(&format!("SELECT count(*) FROM {table_name}"), &[])
+        .expect("failed to count rows")
+        .get(0);
+    count as u64
+}
+
+/// `transmitted_records` counts what Postgres committed, not what the connector
+/// buffered.
+///
+/// A failing statement aborts the whole transaction, and Postgres answers the
+/// following COMMIT with ROLLBACK instead of an error, so a commit that reports
+/// success proves nothing on its own.
+#[test]
+#[serial]
+fn test_pg_transmitted_records_excludes_rolled_back_rows() {
+    let table_name = unique_pg_name("test_pg_rollback_count");
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    let data: Vec<PostgresTestStruct> = (0..1000).map(|_| rand::random()).collect();
+    let temp_file = write_records_to_temp_file(&data);
+    let config = pg_output_test_config(temp_file.path(), &url, &table_name, 1, None);
+
+    // `freshness_timestamp` is NOT NULL, has no DEFAULT, and is absent from the
+    // Feldera view, so every INSERT the connector issues aborts its transaction
+    // and the batch writes nothing.
+    let _table = PostgresTestStruct::create_table_with_extra_columns(
+        &table_name,
+        url,
+        true,
+        &None,
+        "freshness_timestamp TIMESTAMP NOT NULL",
+    );
+
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+    controller.start();
+
+    // Wait until the connector has finished handling every record. `total_processed_input_records`
+    // reports what the connector handled whether or not the write succeeded, so
+    // it advances even though nothing reaches the table, which keeps the
+    // assertions below from passing against counters that have yet to move.
+    wait(
+        || pg_total_processed_input_records(&controller) >= data.len() as u64,
+        60_000,
+    )
+    .expect("timeout: connector did not finish handling the input");
+
+    let (records, bytes) = pg_transmitted_totals(&controller);
+    let _ = controller.stop();
+
+    assert_eq!(
+        records, 0,
+        "reported {records} records as transmitted, but every transaction was rolled back"
+    );
+    assert_eq!(
+        bytes, 0,
+        "reported {bytes} bytes as transmitted, but every transaction was rolled back"
+    );
+    assert_eq!(
+        pg_row_count(&verify_url, &table_name),
+        0,
+        "the table should have rejected every row"
+    );
+}
+
+/// Records reported by the `... statement for N record(s)` context that the
+/// connector attaches to a failed statement.
+fn records_in_error(message: &str) -> Option<usize> {
+    message
+        .split(" statement for ")
+        .nth(1)?
+        .split(" record(s)")
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A transaction that fails partway discards the statements that already
+/// succeeded, so none of the batch counts as transmitted.
+#[test]
+#[serial]
+fn test_pg_transmitted_records_excludes_rows_lost_to_a_later_failure() {
+    const RECORDS: usize = 3000;
+    const REJECTED: &str = "__reject__";
+
+    let table_name = unique_pg_name("test_pg_partial_rollback");
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    // Enough records to fill the connector's 1 MiB buffer more than once, so the
+    // batch issues several statements to postgres. Keys ascend and the cursor walks them in
+    // order, which puts the rejected record in the last statement and leaves
+    // every statement before it valid.
+    let mut data: Vec<PostgresTestStruct> = (0..RECORDS).map(|_| rand::random()).collect();
+    for (i, datum) in data.iter_mut().enumerate() {
+        datum.bigint_ = i as i64;
+    }
+    data.last_mut().unwrap().varchar_ = REJECTED.to_string().into();
+
+    let temp_file = write_records_to_temp_file(&data);
+
+    let config = serde_json::from_value(json!({
+      "name": "test",
+      "workers": 4,
+      // Step once over the whole input, so it becomes a single transaction.
+      "min_batch_size_records": RECORDS,
+      "max_buffering_delay_usecs": 5000000,
+      "inputs": {
+        "ins": {
+          "stream": "test_input1",
+          "transport": { "name": "file_input", "config": { "path": temp_file.path(), "byte_size_buffer": 8388608 } },
+          "format": { "name": "json", "config": { "update_format": "raw", "array": false } }
+        }
+      },
+      "outputs": {
+        "test_output1": {
+          "stream": "test_output1",
+          "transport": { "name": "postgres_output", "config": { "uri": url, "table": &table_name } },
+          "index": "idx"
+        }
+      }
+    }))
+    .unwrap();
+
+    let _table = PostgresTestStruct::create_table_with_extra_columns(
+        &table_name,
+        url,
+        true,
+        &None,
+        &format!("CHECK (varchar_ <> '{REJECTED}')"),
+    );
+
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+    controller.start();
+
+    wait(
+        || pg_total_processed_input_records(&controller) >= RECORDS as u64,
+        60_000,
+    )
+    .expect("timeout: connector did not finish handling the input");
+
+    let (records, bytes) = pg_transmitted_totals(&controller);
+    let errors = {
+        let status = controller.status();
+        let outputs = status.output_status();
+        outputs
+            .values()
+            .next()
+            .expect("output endpoint")
+            .transport_errors
+            .lock()
+            .unwrap()
+            .to_api_type()
+    };
+    let _ = controller.stop();
+
+    // Guard against the test going vacuous: the rejected record has to arrive in
+    // a statement that carries only part of the batch, so that an earlier
+    // statement succeeded and had rows to lose.
+    let failed_records = errors
+        .iter()
+        .filter_map(|e| records_in_error(&e.message))
+        .min()
+        .expect("no statement failure was reported");
+    assert!(
+        failed_records < RECORDS,
+        "the whole batch went out as one statement of {failed_records} records, so no earlier \
+         statement succeeded and this test would pass without the commit guard"
+    );
+
+    assert_eq!(
+        records, 0,
+        "reported {records} records as transmitted, but the transaction was rolled back"
+    );
+    assert_eq!(
+        bytes, 0,
+        "reported {bytes} bytes as transmitted, but the transaction was rolled back"
+    );
+    assert_eq!(
+        pg_row_count(&verify_url, &table_name),
+        0,
+        "the aborted transaction should have left the table empty"
+    );
+}
+
+/// Selects the backends that the connector under test is writing a batch
+/// through, which is where the tests below inject their faults. Callers bind
+/// `$1` to the pattern from [`statements_on`].
+///
+/// Postgres serves each connection from a process of its own, a backend, lists
+/// one row per backend in `pg_stat_activity`, and terminates one on
+/// `pg_terminate_backend(pid)`. That is the whole mechanism: a thread of the
+/// test connects as an ordinary client and terminates the connector's backends,
+/// which the connector sees as its connection dropping, taking with it the
+/// transaction it was writing the batch into. The backends to terminate are the
+/// ones connected to this database (`datname`), inside a transaction
+/// (`xact_start`), whose latest statement is one of the connector's writes,
+/// which all call `jsonb_populate_recordset` on the table under test;
+/// `pg_backend_pid` excludes the injecting thread's own backend.
+///
+/// Matching the table keeps the fault inside the test that injects it. These
+/// tests share one database, so a predicate that named only the connector's
+/// statements would match another test's connector just as readily: that fails
+/// a test which asked for no fault, and counts here as a fault this test landed,
+/// which is worse, since the count is how these tests know their fault arrived.
+///
+/// `xact_start` narrows the match to a backend with a statement in flight or a
+/// transaction open. It does not tell writing a statement apart from preparing
+/// one: preparing puts the statement's text through the parser, which reports it
+/// in `query` under a transaction of its own.
+///
+/// The window in which terminating a backend lands mid-batch runs from the
+/// connector's first write statement until its transaction ends. It covers the
+/// whole batch rather than the instant a statement is running, because Postgres
+/// keeps reporting the last statement in `query` while the backend sits idle
+/// inside its transaction. Terminating a backend before the window opens costs
+/// the connector no more than an idle connection, or statements it prepares
+/// again; terminating one after the window closes finds the batch already
+/// committed. Neither exercises the reconnect path under test.
+///
+/// The window is measured in milliseconds, so every caller arms its terminate
+/// loop before the batch starts and lets that loop do the finding. Watching for
+/// the window and acting on what it saw takes a second round trip, which the
+/// batch can commit inside of.
+const BATCH_BACKENDS: &str = "SELECT pid FROM pg_stat_activity \
+     WHERE pid <> pg_backend_pid() AND datname = current_database() \
+       AND xact_start IS NOT NULL \
+       AND query ILIKE '%jsonb_populate_recordset%' \
+       AND query LIKE $1";
+
+/// The pattern that matches the statements the connector writes to `table`,
+/// whose name it quotes in every one of them.
+fn statements_on(table: &str) -> String {
+    format!("%\"{table}\"%")
+}
+
+/// Terminates every backend that the connector under test has inside a batch
+/// transaction, and reports whether it found one to terminate.
+///
+/// Finding and terminating are one statement on purpose. The window is a matter
+/// of milliseconds, so checking first and terminating in a second round trip
+/// leaves a gap the batch can commit in.
+fn terminate_batch_backends(client: &mut postgres::Client, table: &str) -> bool {
+    let terminated: i64 = client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM \
+                 (SELECT pg_terminate_backend(pid) FROM ({BATCH_BACKENDS}) backends) terminated"
+            ),
+            &[&statements_on(table)],
+        )
+        .map(|row| row.get(0))
+        .unwrap_or(0);
+    terminated > 0
+}
+
+/// Polls for up to eight seconds until it terminates a backend of the connector
+/// writing to `table` inside a batch transaction.
+fn poll_and_terminate_batch_backends(client: &mut postgres::Client, table: &str) -> bool {
+    for _ in 0..40_000 {
+        if terminate_batch_backends(client, table) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    false
+}
+
+/// Drops the connector's connections mid-batch, `rounds` times over, and reports
+/// how many rounds landed.
+///
+/// A round lands when it terminates a backend inside the window. A round that
+/// misses ends the loop; the caller asserts on the count, so a test whose fault
+/// never landed fails instead of passing.
+fn terminate_connector_backends(url: &str, table: &str, rounds: usize) -> usize {
+    let mut client = pg::pg_connect(url, &None);
+    let mut landed = 0;
+
+    for _ in 0..rounds {
+        if !poll_and_terminate_batch_backends(&mut client, table) {
+            break;
+        }
+        landed += 1;
+    }
+
+    landed
+}
+
+/// Losing the connection in the middle of a batch must not lose the batch.
+///
+/// Reconnecting is not enough on its own: the dropped connection rolled its
+/// transaction back, and the payloads that carried those rows were drained from
+/// the buffers as they flushed, so the batch has to be encoded again from the
+/// cursor the worker retained.
+///
+/// `threads` is the number of connections the connector writes through, each
+/// with a transaction and a partition of the batch of its own. `kills` is how
+/// many connection drops to inject, one round after another: any drop past the
+/// first lands while the connector is writing the batch again.
+fn pg_reconnect_test(name: &str, threads: usize, kills: usize) {
+    // Enough records per connection to fill the connector's 1 MiB buffer more
+    // than once, so that statements have already written rows into the
+    // transaction by the time the connection drops.
+    //
+    // Scale with `threads`, because the batch is split between them: sizing the
+    // whole batch instead left each connection with less than a bufferful, so it
+    // wrote its partition in a single statement and committed. That shrank the
+    // window from 79ms to 15ms, narrow enough to miss on CI.
+    let records = 3000 * threads;
+
+    let table_name = unique_pg_name(name);
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    let mut data: Vec<PostgresTestStruct> = (0..records).map(|_| rand::random()).collect();
+    for (i, datum) in data.iter_mut().enumerate() {
+        datum.bigint_ = i as i64;
+    }
+    let temp_file = write_records_to_temp_file(&data);
+
+    let config = pg_output_test_config(temp_file.path(), &url, &table_name, threads, Some(records));
+
+    let _table = PostgresTestStruct::create_table(&table_name, url, true, &None);
+
+    // Build the pipeline before arming the killer: the connector connects and
+    // prepares its statements while the controller is being constructed.
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+
+    // The killer is the fault injector: a thread that terminates the connector's
+    // backends over SQL from a connection of its own, as `BATCH_BACKENDS` describes.
+    let killer_url = verify_url.clone();
+    let killer_table = table_name.clone();
+    let killer =
+        std::thread::spawn(move || terminate_connector_backends(&killer_url, &killer_table, kills));
+
+    controller.start();
+    let landed = killer.join().expect("killer thread panicked");
+
+    // The endpoint reports the batch as processed whether or not it wrote it, so
+    // this settles the test in both outcomes.
+    wait(
+        || pg_total_processed_input_records(&controller) >= records as u64,
+        120_000,
+    )
+    .expect("timeout: connector did not finish handling the input");
+
+    let (transmitted, _bytes) = pg_transmitted_totals(&controller);
+    let fatal_error = {
+        let status = controller.status();
+        let outputs = status.output_status();
+        outputs
+            .values()
+            .next()
+            .expect("output endpoint")
+            .fatal_error()
+    };
+    let _ = controller.stop();
+
+    assert_eq!(
+        landed, kills,
+        "landed {landed} of {kills} connection drops, so this test proves less than it should"
+    );
+    assert_eq!(
+        pg_row_count(&verify_url, &table_name),
+        records as u64,
+        "rows were lost when the connection dropped"
+    );
+    assert_eq!(
+        transmitted, records as u64,
+        "reported {transmitted} of {records} rows as transmitted"
+    );
+
+    assert_eq!(
+        fatal_error, None,
+        "the connector recovered, yet the endpoint is marked as fatally failed"
+    );
+}
+
+#[test]
+#[serial]
+fn test_pg_reconnect_does_not_lose_the_batch() {
+    pg_reconnect_test("test_pg_reconnect", 1, 1);
+}
+
+#[test]
+#[serial]
+fn test_pg_reconnect_does_not_lose_the_batch_multi_thread() {
+    pg_reconnect_test("test_pg_reconnect_mt", 3, 1);
+}
+
+#[test]
+#[serial]
+fn test_pg_reconnect_survives_repeated_drops() {
+    pg_reconnect_test("test_pg_reconnect_repeat", 1, 3);
+}
+
+/// Makes the connector's database refuse new connections, and lets them through
+/// again when dropped.
+///
+/// `ALTER DATABASE ... ALLOW_CONNECTIONS false` turns away even a superuser, so
+/// it stands in for a server that is restarting or under maintenance.
+///
+/// It turns away every connection to the database, not only the connector's,
+/// and the tests here share one database. So a test that closes the database
+/// fails any test that happens to be connecting, which is why every test that
+/// reaches postgres is `#[serial]`.
+struct RefusedConnections {
+    admin: postgres::Client,
+    database: String,
+    refusing: bool,
+}
+
+impl RefusedConnections {
+    /// Opens the connection this needs up front, so that starting to refuse is a
+    /// single statement once the moment arrives.
+    fn prepare(url: &str) -> Self {
+        let database: String = pg::pg_connect(url, &None)
+            .query_one("SELECT current_database()", &[])
+            .expect("failed to read the database name")
+            .get(0);
+
+        // ALTER DATABASE cannot run from a session connected to that database.
+        let admin = pg::pg_connect(&Self::other_database_url(url), &None);
+
+        Self {
+            admin,
+            database,
+            refusing: false,
+        }
+    }
+
+    fn refuse(&mut self) {
+        let refuse = Self::allow_connections(&self.database, false);
+        self.admin
+            .execute(&refuse, &[])
+            .expect("failed to make the database refuse connections");
+        self.refusing = true;
+    }
+
+    fn other_database_url(url: &str) -> String {
+        match url::Url::parse(url) {
+            Ok(mut parsed) => {
+                parsed.set_path("/template1");
+                parsed.to_string()
+            }
+            Err(_) => format!("{url}/template1"),
+        }
+    }
+
+    fn allow_connections(database: &str, allow: bool) -> String {
+        format!(r#"ALTER DATABASE "{database}" WITH ALLOW_CONNECTIONS {allow}"#)
+    }
+}
+
+/// Restoring on drop matters: leaving the database closed would fail every later test.
+impl Drop for RefusedConnections {
+    fn drop(&mut self) {
+        if !self.refusing {
+            return;
+        }
+        let restore = Self::allow_connections(&self.database, true);
+        self.admin
+            .execute(&restore, &[])
+            .expect("failed to let connections through again");
+    }
+}
+
+/// A database that refuses the reconnect must be waited out, not given up on.
+///
+/// This is the one path in the connector that dropping a backend does not reach:
+/// there the reconnect succeeds on the first try, so `retry_connecting_with_backoff` never
+/// enters its error branch. Refusing connections for a few seconds forces that
+/// branch, and the batch still has to arrive once they are let through.
+#[test]
+#[serial]
+fn test_pg_reconnect_waits_out_a_refusing_database() {
+    const RECORDS: usize = 3000;
+
+    let table_name = unique_pg_name("test_pg_refused");
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    let mut data: Vec<PostgresTestStruct> = (0..RECORDS).map(|_| rand::random()).collect();
+    for (i, datum) in data.iter_mut().enumerate() {
+        datum.bigint_ = i as i64;
+    }
+    let temp_file = write_records_to_temp_file(&data);
+    let config = pg_output_test_config(temp_file.path(), &url, &table_name, 1, Some(RECORDS));
+
+    let _table = PostgresTestStruct::create_table(&table_name, url, true, &None);
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+
+    // Every connection the test needs has to exist before the database starts
+    // turning connections away.
+    let mut watcher = pg::pg_connect(&verify_url, &None);
+    let mut refused = RefusedConnections::prepare(&verify_url);
+
+    // Close the database before the batch starts rather than once it is under
+    // way. The connector connected and prepared while the controller was built,
+    // and closing the database leaves an established connection alone, so this
+    // costs it nothing until it has to reconnect. What it buys is that the drop
+    // below no longer has to land in the stretch between the batch opening and
+    // `refuse()` returning, which is a matter of milliseconds.
+    refused.refuse();
+    controller.start();
+    assert!(
+        poll_and_terminate_batch_backends(&mut watcher, &table_name),
+        "never dropped the connector's connection while the database was refusing them, \
+         so this test proves nothing"
+    );
+
+    // Hold the refusal until the loop has failed twice, so that it outlasts the
+    // first backoff steps of one and two seconds instead of assuming they fit
+    // in a sleep.
+    wait(|| pg_conn_retry_failures(&controller) >= 2, 60_000)
+        .expect("the reconnect loop did not fail twice, so it was never exercised");
+    drop(refused);
+
+    wait(
+        || pg_total_processed_input_records(&controller) >= RECORDS as u64,
+        180_000,
+    )
+    .expect("timeout: connector did not finish handling the input");
+
+    let (records, _bytes) = pg_transmitted_totals(&controller);
+    let fatal_error = {
+        let status = controller.status();
+        let outputs = status.output_status();
+        outputs
+            .values()
+            .next()
+            .expect("output endpoint")
+            .fatal_error()
+    };
+    let _ = controller.stop();
+
+    assert_eq!(
+        pg_row_count(&verify_url, &table_name),
+        RECORDS as u64,
+        "rows were lost while the database refused connections"
+    );
+    assert_eq!(
+        records, RECORDS as u64,
+        "reported {records} of {RECORDS} rows as transmitted"
+    );
+    assert_eq!(
+        fatal_error, None,
+        "the connector recovered, yet the endpoint is marked as fatally failed"
+    );
+}
+
+/// The pipeline must be able to stop while postgres is unreachable.
+///
+/// A worker waiting out a database it cannot reach sits in a backoff loop, and
+/// the endpoint's drop joins that thread, so anything that keeps the loop from
+/// noticing the shutdown hangs the pipeline rather than merely stalling its
+/// output.
+#[test]
+#[serial]
+fn test_pg_stops_while_the_database_is_unreachable() {
+    const RECORDS: usize = 3000;
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let table_name = unique_pg_name("test_pg_stop_unreachable");
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    let mut data: Vec<PostgresTestStruct> = (0..RECORDS).map(|_| rand::random()).collect();
+    for (i, datum) in data.iter_mut().enumerate() {
+        datum.bigint_ = i as i64;
+    }
+    let temp_file = write_records_to_temp_file(&data);
+    let config = pg_output_test_config(temp_file.path(), &url, &table_name, 1, Some(RECORDS));
+
+    let _table = PostgresTestStruct::create_table(&table_name, url, true, &None);
+    let (controller, _err_receiver) = PostgresTestStruct::test_circuit(config);
+
+    // Both connections have to exist before the database starts turning them
+    // away. `refused` lets connections through again when it drops, including
+    // while this test unwinds, which releases the worker either way.
+    let mut watcher = pg::pg_connect(&verify_url, &None);
+    let mut refused = RefusedConnections::prepare(&verify_url);
+
+    // Close the database before the batch starts, as
+    // `test_pg_reconnect_waits_out_a_refusing_database` explains.
+    refused.refuse();
+    controller.start();
+    assert!(
+        poll_and_terminate_batch_backends(&mut watcher, &table_name),
+        "never dropped the connector's connection"
+    );
+
+    // The worker is in the backoff loop once a reconnect of its own has failed,
+    // which is the state to ask for a stop from.
+    wait(|| pg_conn_retry_failures(&controller) >= 1, 60_000)
+        .expect("the worker never entered the reconnect backoff loop");
+
+    let (stopped_sender, stopped) = crossbeam::channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = controller.stop();
+        let _ = stopped_sender.send(());
+    });
+
+    // Wait with a deadline rather than blocking: a regression here would
+    // otherwise hang the whole test run instead of failing this one test.
+    assert!(
+        stopped.recv_timeout(STOP_TIMEOUT).is_ok(),
+        "the pipeline did not stop within {STOP_TIMEOUT:?} while postgres was unreachable"
+    );
+}
+
+/// The `transmitted_records` counter still reports every row of a batch that commits.
+#[test]
+#[serial]
+fn test_pg_transmitted_records_counts_committed_rows() {
+    let table_name = unique_pg_name("test_pg_commit_count");
+    let url = postgres_url();
+    let verify_url = url.clone();
+
+    let data: Vec<PostgresTestStruct> = (0..1000).map(|_| rand::random()).collect();
+    let temp_file = write_records_to_temp_file(&data);
+    let config = pg_output_test_config(temp_file.path(), &url, &table_name, 1, None);
+
+    let _table = PostgresTestStruct::create_table(&table_name, url, true, &None);
+
+    let (controller, err_receiver) = PostgresTestStruct::test_circuit(config);
+    controller.start();
+
+    wait(
+        || pg_transmitted_totals(&controller).0 >= data.len() as u64 || !err_receiver.is_empty(),
+        60_000,
+    )
+    .expect("timeout: connector did not report the committed rows");
+
+    let (records, bytes) = pg_transmitted_totals(&controller);
+    let _ = controller.stop();
+
+    assert!(err_receiver.is_empty(), "connector reported an error");
+    assert_eq!(
+        records,
+        data.len() as u64,
+        "reported {records} of {} rows as transmitted",
+        data.len()
+    );
+    assert!(bytes > 0, "reported 0 bytes for {records} rows");
+    assert_eq!(
+        pg_row_count(&verify_url, &table_name),
+        records,
+        "the counter and the table disagree"
     );
 }
 
@@ -2074,12 +3001,14 @@ fn pg_simple(url: String, tls: Option<PostgresTlsConfig>) {
 }
 
 #[test]
+#[serial]
 fn test_pg_simple() {
     pg_simple(postgres_url(), None);
 }
 
 /// Same as `test_pg_simple` but over a TLS connection.
 #[test]
+#[serial]
 fn test_pg_simple_tls() {
     let (url, tls) = postgres_ssl_config();
     pg_simple(url, Some(tls));
@@ -2261,6 +3190,120 @@ fn test_pg_input_tls() {
         .unwrap();
 }
 
+/// A runtime failure of the connector's query must be reported to the
+/// controller as a fatal input error.
+///
+/// Regression test: initialization succeeds because the connection to
+/// PostgreSQL can be established, so by the time the query executes, the
+/// init-status channel has been consumed. The query error used to be sent on
+/// that channel and silently dropped, so the connector terminated without
+/// notifying the controller and the pipeline stalled forever.
+#[test]
+#[serial]
+fn test_pg_input_query_error() {
+    let url = postgres_url();
+
+    let output_file = NamedTempFile::new().unwrap();
+    let output_path = output_file.path().to_owned();
+
+    let config = serde_json::from_value(json!({
+        "name": "test",
+        "workers": 1,
+        "inputs": {
+            "pg_in": {
+                "stream": "test_input1",
+                "transport": {
+                    "name": "postgres_input",
+                    "config": {
+                        "uri": url,
+                        "query": "SELECT * FROM feldera_missing_table_regression",
+                    },
+                },
+            },
+        },
+        "outputs": {
+            "test_output1": {
+                "stream": "test_output1",
+                "transport": {
+                    "name": "file_output",
+                    "config": {
+                        "path": output_path,
+                    }
+                },
+                "format": {
+                    "name": "json",
+                    "config": {
+                        "update_format": "insert_delete",
+                        "array": false,
+                    }
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let (err_sender, err_receiver) = crossbeam::channel::unbounded();
+    let controller = Controller::with_test_config(
+        move |workers| {
+            Ok({
+                let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
+                    let mut catalog = Catalog::new();
+                    let (input, hinput) = circuit.add_input_zset::<TestStruct>();
+
+                    let input_schema = serde_json::to_string(&Relation::new(
+                        "test_input1".into(),
+                        TestStruct::schema(),
+                        false,
+                        BTreeMap::new(),
+                    ))
+                    .unwrap();
+
+                    let output_schema = serde_json::to_string(&Relation::new(
+                        "test_output1".into(),
+                        TestStruct::schema(),
+                        false,
+                        BTreeMap::new(),
+                    ))
+                    .unwrap();
+
+                    catalog.register_materialized_input_zset::<_, TestStruct>(
+                        input.clone(),
+                        hinput,
+                        &input_schema,
+                    );
+
+                    catalog
+                        .register_materialized_output_zset::<_, TestStruct>(input, &output_schema);
+
+                    Ok(catalog)
+                })
+                .unwrap();
+                (circuit, Box::new(catalog))
+            })
+        },
+        &config,
+        Box::new(move |e, _| {
+            err_sender
+                .send(format!("test_pg_input_query_error: {e}"))
+                .unwrap()
+        }),
+    )
+    .unwrap();
+
+    controller.start();
+
+    wait(|| !err_receiver.is_empty(), 10_000)
+        .expect("timeout: postgres input query error was not reported to the controller");
+
+    let error = err_receiver.recv().unwrap();
+    assert!(
+        error.contains("error executing query"),
+        "unexpected error: {error}"
+    );
+
+    controller.stop().unwrap();
+}
+
 /// Build an output circuit identical to [`PostgresTestStruct::test_circuit`]'s
 /// inner circuit, but without a baked-in error callback so that callers can
 /// supply their own.  Used by the non-unique-key test below.
@@ -2437,7 +3480,7 @@ fn test_pg_non_unique_keys_skipped() {
     // filters out conflicting keys before they reach postgres.
     let mut table = PostgresTestStruct::create_table(&table_name, url, true, &None);
 
-    let errors: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
     let errors_clone = errors.clone();
 
     let controller = Controller::with_test_config(
@@ -2511,24 +3554,38 @@ fn test_pg_non_unique_keys_skipped() {
 // ===================================================================
 
 #[cfg(feature = "with-postgres-cdc")]
+mod cdc_scenarios;
+
+#[cfg(feature = "with-postgres-cdc")]
+mod cdc_privileges;
+
+#[cfg(feature = "with-postgres-cdc")]
 mod cdc_tests {
     use super::*;
     use crate::test::wait;
+    use dbsp::DBData;
+    use etl::config::{PgConnectionConfig, TcpKeepaliveConfig, TlsConfig};
+    use etl::error::ErrorKind;
+    use etl::etl_error;
+    use etl::schema::TableId;
+    use etl::store::{CachedStore, PostgresStore, StateStore, TableRetryPolicy, TableState};
     use feldera_types::config::PipelineConfig;
+    use feldera_types::serde_with_context::DeserializeWithContext;
     use pg::pg_connect;
+    use std::time::{Duration, Instant};
 
     /// Helper: creates a table, publication, and sets REPLICA IDENTITY FULL.
     /// Returns a connected client for further DML operations.
     /// On drop, cleans up the publication and table.
-    struct CdcTestTable {
-        client: postgres::Client,
-        table_name: String,
-        publication_name: String,
-        url: String,
+    pub(super) struct CdcTestTable {
+        pub(super) client: postgres::Client,
+        pub(super) table_name: String,
+        pub(super) publication_name: String,
+        pub(super) url: String,
     }
 
     impl CdcTestTable {
-        fn new_simple(table_name: &str, publication_name: &str, url: &str) -> Self {
+        pub(super) fn new_simple(table_name: &str, publication_name: &str, url: &str) -> Self {
             Self::new_simple_with_tls(table_name, publication_name, url, None)
         }
 
@@ -2585,7 +3642,7 @@ mod cdc_tests {
         }
 
         /// Creates a table with many Postgres types for data type coverage testing.
-        fn new_all_types(table_name: &str, publication_name: &str, url: &str) -> Self {
+        pub(super) fn new_all_types(table_name: &str, publication_name: &str, url: &str) -> Self {
             let mut client = pg_connect(url, &None);
 
             let _ = client.execute(
@@ -2607,6 +3664,8 @@ mod cdc_tests {
     col_double      DOUBLE PRECISION,
     col_date        DATE,
     col_time        TIME,
+    col_timetz      TIMETZ,
+    col_timetz_array TIMETZ[],
     col_timestamp   TIMESTAMP,
     col_timestamptz TIMESTAMPTZ,
     col_uuid        UUID,
@@ -2643,7 +3702,7 @@ mod cdc_tests {
             }
         }
 
-        fn execute(&mut self, query: &str) {
+        pub(super) fn execute(&mut self, query: &str) {
             self.client
                 .execute(query, &[])
                 .unwrap_or_else(|e| panic!("failed to execute '{query}': {e}"));
@@ -2665,69 +3724,138 @@ mod cdc_tests {
 
     impl CdcTestTable {
         /// Drop the replication slots etl created for this pipeline.
-        ///
-        /// etl names slots after the *pipeline ID* (e.g.
-        /// `supabase_etl_apply_<id>` and `supabase_etl_table_sync_<id>_<oid>`),
-        /// not the publication, so we reconstruct that ID exactly as the
-        /// connector does. The slot limit is small (4 by default on
-        /// `debezium/postgres`); leaking even one slot per test exhausts it
-        /// within a couple of tests, so cleanup must be reliable.
         fn drop_replication_slots(&mut self) {
-            let connector_url = cdc_connector_url(&self.url);
             let source_table = format!("public.{}", self.table_name);
-            let pipeline_id = crate::integrated::postgres::cdc_input::pipeline_id(
-                &connector_url,
+            drop_pipeline_slots(
+                &mut self.client,
+                &self.url,
                 &self.publication_name,
                 &source_table,
-            )
-            .to_string();
-
-            // The pipeline ID appears as a `_`-delimited token in every slot
-            // name etl creates, so an exact-token match avoids dropping an
-            // unrelated slot whose ID merely shares these digits.
-            let owns_slot = |name: &str| name.split('_').any(|token| token == pipeline_id);
-
-            for _attempt in 0..20 {
-                let slots: Vec<(String, Option<i32>)> = self
-                    .client
-                    .query(
-                        "SELECT slot_name, active_pid FROM pg_replication_slots",
-                        &[],
-                    )
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.get::<_, String>("slot_name"),
-                            r.get::<_, Option<i32>>("active_pid"),
-                        )
-                    })
-                    .filter(|(name, _)| owns_slot(name))
-                    .collect();
-
-                if slots.is_empty() {
-                    return;
-                }
-
-                for (slot, active_pid) in &slots {
-                    if let Some(pid) = active_pid {
-                        let _ = self
-                            .client
-                            .execute(&format!("SELECT pg_terminate_backend({pid})"), &[]);
-                    }
-                    let _ = self
-                        .client
-                        .execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
-                }
-
-                // Any slots left over had a backend that has not detached yet;
-                // wait for it to clear, then retry.
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
+            );
         }
     }
 
-    fn cdc_connector_url(url: &str) -> String {
+    /// Drop the replication slots etl created for the pipeline that reads
+    /// `source_table` from `publication`.
+    ///
+    /// etl names slots after the *pipeline ID* (e.g.
+    /// `supabase_etl_apply_<id>` and `supabase_etl_table_sync_<id>_<oid>`),
+    /// not the publication, so we reconstruct that ID exactly as the
+    /// connector does. The slot limit is small (4 by default on
+    /// `debezium/postgres`); leaking even one slot per test exhausts it
+    /// within a couple of tests, so cleanup must be reliable.
+    fn drop_pipeline_slots(
+        client: &mut postgres::Client,
+        url: &str,
+        publication: &str,
+        source_table: &str,
+    ) {
+        let connector_url = cdc_connector_url(url);
+        let pipeline_id = crate::integrated::postgres::cdc_input::pipeline_id(
+            &connector_url,
+            publication,
+            source_table,
+        )
+        .to_string();
+
+        // The pipeline ID appears as a `_`-delimited token in every slot
+        // name etl creates, so an exact-token match avoids dropping an
+        // unrelated slot whose ID merely shares these digits.
+        let owns_slot = |name: &str| name.split('_').any(|token| token == pipeline_id);
+
+        for _attempt in 0..20 {
+            let slots: Vec<(String, Option<i32>)> = client
+                .query(
+                    "SELECT slot_name, active_pid FROM pg_replication_slots",
+                    &[],
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>("slot_name"),
+                        r.get::<_, Option<i32>>("active_pid"),
+                    )
+                })
+                .filter(|(name, _)| owns_slot(name))
+                .collect();
+
+            if slots.is_empty() {
+                return;
+            }
+
+            for (slot, active_pid) in &slots {
+                if let Some(pid) = active_pid {
+                    let _ = client.execute(&format!("SELECT pg_terminate_backend({pid})"), &[]);
+                }
+                let _ = client.execute(&format!("SELECT pg_drop_replication_slot('{slot}')"), &[]);
+            }
+
+            // Any slots left over had a backend that has not detached yet;
+            // wait for it to clear, then retry.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+
+    /// A table that inherits from a [`CdcTestTable`]'s table and is a member
+    /// of its publication.
+    ///
+    /// Declare it after the parent so that it drops first: PostgreSQL refuses
+    /// to drop a parent that still has a child.
+    struct InheritedChild {
+        client: postgres::Client,
+        table_name: String,
+        publication_name: String,
+        url: String,
+    }
+
+    impl InheritedChild {
+        fn new(parent: &mut CdcTestTable, table_name: &str) -> Self {
+            let parent_name = parent.table_name.clone();
+            let publication_name = parent.publication_name.clone();
+            let url = parent.url.clone();
+            parent.execute(&format!("DROP TABLE IF EXISTS {table_name}"));
+            parent.execute(&format!(
+                "CREATE TABLE {table_name} (PRIMARY KEY (id)) INHERITS ({parent_name})"
+            ));
+            parent.execute(&format!("ALTER TABLE {table_name} REPLICA IDENTITY FULL"));
+            // A child created after the publication is not a member of it, as
+            // PostgreSQL expands `FOR TABLE` only when the publication is
+            // created or altered.
+            parent.execute(&format!(
+                "ALTER PUBLICATION {publication_name} ADD TABLE {table_name}"
+            ));
+            InheritedChild {
+                client: pg_connect(&url, &None),
+                table_name: table_name.to_string(),
+                publication_name,
+                url,
+            }
+        }
+
+        fn execute(&mut self, query: &str) {
+            self.client
+                .execute(query, &[])
+                .unwrap_or_else(|e| panic!("failed to execute '{query}': {e}"));
+        }
+    }
+
+    impl Drop for InheritedChild {
+        fn drop(&mut self) {
+            let source_table = format!("public.{}", self.table_name);
+            drop_pipeline_slots(
+                &mut self.client,
+                &self.url,
+                &self.publication_name,
+                &source_table,
+            );
+            let _ = self
+                .client
+                .execute(&format!("DROP TABLE IF EXISTS {}", self.table_name), &[]);
+        }
+    }
+
+    pub(super) fn cdc_connector_url(url: &str) -> String {
         let Ok(mut url) = url::Url::parse(url) else {
             return url.to_string();
         };
@@ -2762,12 +3890,24 @@ mod cdc_tests {
         output_path: &Path,
         tls: Option<&PostgresTlsConfig>,
     ) -> (Controller, crossbeam::channel::Receiver<String>) {
+        try_cdc_simple_test_circuit_with_tls(url, publication, source_table, output_path, tls)
+            .unwrap()
+    }
+
+    /// Like `cdc_simple_test_circuit_with_tls`, for tests that expect the
+    /// connector to refuse its configuration while the controller is built.
+    fn try_cdc_simple_test_circuit_with_tls(
+        url: &str,
+        publication: &str,
+        source_table: &str,
+        output_path: &Path,
+        tls: Option<&PostgresTlsConfig>,
+    ) -> Result<(Controller, crossbeam::channel::Receiver<String>), crate::ControllerError> {
         if tls.is_some() {
             crate::ensure_default_crypto_provider();
         }
 
         let url = cdc_connector_url(url);
-        let schema = TestStruct::schema();
         let mut postgres_cdc_config = json!({
             "uri": url,
             "publication": publication,
@@ -2781,6 +3921,18 @@ mod cdc_tests {
                 .extend(tls_json.as_object().unwrap().clone());
         }
 
+        build_simple_cdc_test_circuit(postgres_cdc_config, output_path)
+    }
+
+    /// Build a CDC test circuit from a ready-made `postgres_cdc_input` config.
+    ///
+    /// Shared by the plain and the de-elevated-role scenarios: the input schema
+    /// matches the "simple" table (id, b, i, s) and the output is a JSON file.
+    pub(super) fn build_simple_cdc_test_circuit(
+        postgres_cdc_config: serde_json::Value,
+        output_path: &Path,
+    ) -> Result<(Controller, crossbeam::channel::Receiver<String>), crate::ControllerError> {
+        let schema = TestStruct::schema();
         let config = serde_json::from_value(json!({
             "name": "cdc_test",
             "workers": 1,
@@ -2864,10 +4016,9 @@ mod cdc_tests {
                 // send failure rather than panicking on a background thread.
                 let _ = err_sender.send(msg);
             }),
-        )
-        .unwrap();
+        )?;
 
-        (controller, err_receiver)
+        Ok((controller, err_receiver))
     }
 
     /// Helper struct for the all-types test. Uses simple JSON deserialization
@@ -2888,9 +4039,10 @@ mod cdc_tests {
         rkyv::Serialize,
         rkyv::Deserialize,
         feldera_macros::IsNone,
+        feldera_macros::OrdRepr,
     )]
     #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
-    struct CdcAllTypesStruct {
+    pub(super) struct CdcAllTypesStruct {
         id: i32,
         col_text: Option<String>,
         col_integer: Option<i32>,
@@ -2900,6 +4052,8 @@ mod cdc_tests {
         col_double: Option<feldera_sqllib::F64>,
         col_date: Option<String>,
         col_time: Option<String>,
+        col_timetz: Option<String>,
+        col_timetz_array: Option<Vec<Option<String>>>,
         col_timestamp: Option<String>,
         col_timestamptz: Option<String>,
         col_uuid: Option<String>,
@@ -2910,7 +4064,7 @@ mod cdc_tests {
         col_int_array: Option<Vec<Option<i32>>>,
     }
 
-    feldera_types::deserialize_table_record!(CdcAllTypesStruct["CdcAllTypesStruct", Variant, 17] {
+    feldera_types::deserialize_table_record!(CdcAllTypesStruct["CdcAllTypesStruct", Variant, 19] {
         (id, "id", false, i32, |_| None),
         (col_text, "col_text", true, Option<String>, |_| Some(None)),
         (col_integer, "col_integer", true, Option<i32>, |_| Some(None)),
@@ -2920,6 +4074,8 @@ mod cdc_tests {
         (col_double, "col_double", true, Option<feldera_sqllib::F64>, |_| Some(None)),
         (col_date, "col_date", true, Option<String>, |_| Some(None)),
         (col_time, "col_time", true, Option<String>, |_| Some(None)),
+        (col_timetz, "col_timetz", true, Option<String>, |_| Some(None)),
+        (col_timetz_array, "col_timetz_array", true, Option<Vec<Option<String>>>, |_| Some(None)),
         (col_timestamp, "col_timestamp", true, Option<String>, |_| Some(None)),
         (col_timestamptz, "col_timestamptz", true, Option<String>, |_| Some(None)),
         (col_uuid, "col_uuid", true, Option<String>, |_| Some(None)),
@@ -2930,7 +4086,7 @@ mod cdc_tests {
         (col_int_array, "col_int_array", true, Option<Vec<Option<i32>>>, |_| Some(None))
     });
 
-    feldera_types::serialize_table_record!(CdcAllTypesStruct[17]{
+    feldera_types::serialize_table_record!(CdcAllTypesStruct[19]{
         id["id"]: i32,
         col_text["col_text"]: Option<String>,
         col_integer["col_integer"]: Option<i32>,
@@ -2940,6 +4096,8 @@ mod cdc_tests {
         col_double["col_double"]: Option<feldera_sqllib::F64>,
         col_date["col_date"]: Option<String>,
         col_time["col_time"]: Option<String>,
+        col_timetz["col_timetz"]: Option<String>,
+        col_timetz_array["col_timetz_array"]: Option<Vec<Option<String>>>,
         col_timestamp["col_timestamp"]: Option<String>,
         col_timestamptz["col_timestamptz"]: Option<String>,
         col_uuid["col_uuid"]: Option<String>,
@@ -2951,7 +4109,7 @@ mod cdc_tests {
     });
 
     impl CdcAllTypesStruct {
-        fn schema() -> Vec<Field> {
+        pub(super) fn schema() -> Vec<Field> {
             vec![
                 Field::new("id".into(), ColumnType::int(false)),
                 Field::new("col_text".into(), ColumnType::varchar(true)),
@@ -2962,6 +4120,13 @@ mod cdc_tests {
                 Field::new("col_double".into(), ColumnType::double(true)),
                 Field::new("col_date".into(), ColumnType::varchar(true)),
                 Field::new("col_time".into(), ColumnType::varchar(true)),
+                // Feldera has no TIME WITH TIME ZONE, so TIMETZ arrives as
+                // Postgres text with the offset.
+                Field::new("col_timetz".into(), ColumnType::varchar(true)),
+                Field::new(
+                    "col_timetz_array".into(),
+                    ColumnType::array(true, ColumnType::varchar(true)),
+                ),
                 Field::new("col_timestamp".into(), ColumnType::varchar(true)),
                 Field::new("col_timestamptz".into(), ColumnType::varchar(true)),
                 Field::new("col_uuid".into(), ColumnType::varchar(true)),
@@ -3080,24 +4245,71 @@ mod cdc_tests {
     /// that no automatic checkpoint fires during the test.  With fault
     /// tolerance enabled the connector uses strict mode: the replication slot
     /// only advances after a durable checkpoint.
-    fn cdc_ft_test_circuit(
+    pub(super) fn cdc_ft_test_circuit(
         url: &str,
         publication: &str,
         source_table: &str,
         storage_dir: &Path,
         output_path: &Path,
     ) -> (Controller, crossbeam::channel::Receiver<String>) {
+        cdc_ft_test_circuit_for::<TestStruct>(
+            url,
+            publication,
+            source_table,
+            storage_dir,
+            output_path,
+            &TestStruct::schema(),
+            CircuitShape::default(),
+        )
+    }
+
+    /// How a fault-tolerant test circuit runs: how many workers it has, and
+    /// how many records its reader takes per step, which a test that needs a
+    /// write to reach the circuit over several steps sets to one.
+    #[derive(Clone, Copy)]
+    pub(super) struct CircuitShape {
+        pub workers: usize,
+        pub max_batch_size: Option<u64>,
+    }
+
+    impl Default for CircuitShape {
+        fn default() -> Self {
+            Self {
+                workers: 1,
+                max_batch_size: None,
+            }
+        }
+    }
+
+    /// Fault-tolerant CDC circuit for record type `T` with `schema`, in the
+    /// given `shape`. Checkpoints only when the test asks for one (interval
+    /// set to one hour).
+    pub(super) fn cdc_ft_test_circuit_for<T>(
+        url: &str,
+        publication: &str,
+        source_table: &str,
+        storage_dir: &Path,
+        output_path: &Path,
+        schema: &[Field],
+        shape: CircuitShape,
+    ) -> (Controller, crossbeam::channel::Receiver<String>)
+    where
+        T: DBData
+            + SerializeWithContext<SqlSerdeConfig>
+            + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+            + Sync,
+    {
         let url = cdc_connector_url(url);
-        let schema = TestStruct::schema();
         let config: PipelineConfig = serde_json::from_value(json!({
             "name": "cdc_ft_test",
-            "workers": 1,
+            "workers": shape.workers,
             "storage_config": { "path": storage_dir },
             "storage": true,
             "fault_tolerance": { "model": "at_least_once", "checkpoint_interval_secs": 3600 },
             "inputs": {
                 "cdc_in": {
                     "stream": "test_input1",
+                    "max_batch_size": shape.max_batch_size,
                     "transport": {
                         "name": "postgres_cdc_input",
                         "config": {
@@ -3125,40 +4337,18 @@ mod cdc_tests {
         .unwrap();
 
         let (err_sender, err_receiver) = crossbeam::channel::unbounded();
+        let schema = schema.to_vec();
         let controller = Controller::with_test_config(
-            move |workers| {
-                Ok({
-                    let (circuit, catalog) = Runtime::init_circuit(workers, move |circuit| {
-                        let mut catalog = Catalog::new();
-                        let (input, hinput) = circuit.add_input_zset::<TestStruct>();
-                        let input_schema = serde_json::to_string(&Relation::new(
-                            "test_input1".into(),
-                            schema.clone(),
-                            false,
-                            BTreeMap::new(),
-                        ))
-                        .unwrap();
-                        let output_schema = serde_json::to_string(&Relation::new(
-                            "test_output1".into(),
-                            schema,
-                            false,
-                            BTreeMap::new(),
-                        ))
-                        .unwrap();
-                        catalog.register_materialized_input_zset::<_, TestStruct>(
-                            input.clone(),
-                            hinput,
-                            &input_schema,
-                        );
-                        catalog.register_materialized_output_zset::<_, TestStruct>(
-                            input,
-                            &output_schema,
-                        );
-                        Ok(catalog)
-                    })
-                    .unwrap();
-                    (circuit, Box::new(catalog))
-                })
+            // `test_circuit` assigns persistent ids to every operator. A
+            // hand-built circuit without them fails to checkpoint, and that
+            // failure hangs the circuit thread instead of returning an error
+            // (#7075).
+            move |circuit_config| {
+                Ok(crate::test::test_circuit::<T>(
+                    circuit_config,
+                    &schema,
+                    &[Some("output")],
+                ))
             },
             &config,
             Box::new(move |e, _| {
@@ -3172,8 +4362,143 @@ mod cdc_tests {
         (controller, err_receiver)
     }
 
+    /// etl states in which a table's initial sync is complete: etl keeps the
+    /// table's data on a restart and streams changes instead of copying it
+    /// again. `sync_done` is the durable catchup handoff; `ready` follows only
+    /// once a later streamed write advances etl's replication checkpoint past
+    /// the handoff, so a table nobody writes to stays in `sync_done`.
+    pub(super) const ETL_SYNC_COMPLETED_STATES: [&str; 2] = ["sync_done", "ready"];
+
+    /// Wait until etl has completed the initial sync of a table of this
+    /// connector's pipeline, which is when a stop no longer makes the next
+    /// start read the table again. The publications these callers use hold
+    /// one table, the source table.
+    pub(super) fn wait_for_etl_sync_completed(table: &mut CdcTestTable) {
+        wait(
+            || {
+                etl_table_states(table)
+                    .iter()
+                    .any(|s| ETL_SYNC_COMPLETED_STATES.contains(&s.as_str()))
+            },
+            60_000,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "timeout waiting for etl to complete the table sync (one of \
+                 {ETL_SYNC_COMPLETED_STATES:?}); current states: {:?}",
+                etl_table_states(table)
+            )
+        });
+    }
+
+    /// Block until part of the initial copy of `table` has reached the
+    /// circuit, and report how much of it has if etl is still copying.
+    ///
+    /// `copied_so_far` returns the number of copied records the circuit has
+    /// taken from the connector; `row_count` is the size of the table.
+    ///
+    /// etl writes `init` for every published table at pipeline startup, before
+    /// any table-sync worker runs, so `init` says nothing about a running
+    /// copy. It writes `data_sync` immediately before it creates the copy
+    /// slot, so a `data_sync` state that has already delivered records places
+    /// the caller inside the copy, with the copy slot created.
+    ///
+    /// Returns `None` when the copy outran the measurement: etl had left
+    /// `data_sync`, or every row was already in the circuit. How fast the copy
+    /// runs is a property of the runner, not of the connector, so the caller
+    /// retries with a larger table instead of failing.
+    pub(super) fn wait_for_etl_copy_in_progress(
+        table: &mut CdcTestTable,
+        copied_so_far: impl Fn() -> u64,
+        row_count: u64,
+        what: &str,
+    ) -> Option<u64> {
+        // Stop on any state past `init`, so a copy that etl ran to completion
+        // between two polls reports `None` instead of waiting out the timeout.
+        wait(
+            || etl_table_states(table).iter().any(|s| s != "init"),
+            60_000,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "timeout waiting for etl to start the copy for {what}; etl states: {:?}",
+                etl_table_states(table)
+            )
+        });
+        let started = std::time::Instant::now();
+        wait(|| copied_so_far() > 0, 60_000)
+            .unwrap_or_else(|_| panic!("timeout waiting for the first copied rows of {what}"));
+        // Measure before re-reading the state, so the state decides whether
+        // the measurement describes a copy that was still running.
+        let copied = copied_so_far();
+        let states = etl_table_states(table);
+        // The margin the callers' row counts rest on is visible only here.
+        println!(
+            "{what}: {copied} copied records in the circuit {:?} after etl entered the copy, \
+             etl states: {states:?}",
+            started.elapsed()
+        );
+        let mid_copy = states.iter().any(|s| s == "data_sync") && copied < row_count;
+        mid_copy.then_some(copied)
+    }
+
+    /// Wait until every replication slot of `table`'s connector is inactive,
+    /// which is when a restarted connector can reattach to them. A fixed delay
+    /// here is a timing race: the walsender releases the slot some time after
+    /// the controller has stopped.
+    pub(super) fn wait_for_slots_released(table: &mut CdcTestTable) {
+        let pipeline_id = crate::integrated::postgres::cdc_input::pipeline_id(
+            &cdc_connector_url(&table.url),
+            &table.publication_name,
+            &format!("public.{}", table.table_name),
+        )
+        .to_string();
+        let active_slots = |table: &mut CdcTestTable| -> Vec<String> {
+            table
+                .client
+                .query(
+                    "SELECT slot_name::text FROM pg_replication_slots WHERE active",
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("querying pg_replication_slots failed: {e}"))
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .filter(|name| name.split('_').any(|token| token == pipeline_id))
+                .collect()
+        };
+        wait(|| active_slots(table).is_empty(), 60_000).unwrap_or_else(|_| {
+            panic!(
+                "timeout: replication slots still active after stop: {:?}",
+                active_slots(table)
+            )
+        });
+    }
+
+    /// Current `state` of every table etl tracks for this connector's pipeline.
+    ///
+    /// Reuses the table's client: `wait_for_etl_sync_completed` polls this every 10 ms.
+    /// A failed query panics rather than reading as "no tables", which would let
+    /// the `errored`-state assertions pass vacuously.
+    pub(super) fn etl_table_states(table: &mut CdcTestTable) -> Vec<String> {
+        let pipeline_id = crate::integrated::postgres::cdc_input::pipeline_id(
+            &cdc_connector_url(&table.url),
+            &table.publication_name,
+            &format!("public.{}", table.table_name),
+        ) as i64;
+        table
+            .client
+            .query(
+                "SELECT state::text FROM etl.replication_state WHERE pipeline_id = $1 AND is_current",
+                &[&pipeline_id],
+            )
+            .unwrap_or_else(|e| panic!("querying etl.replication_state failed: {e}"))
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    }
+
     /// Helper: read output file lines as JSON values.
-    fn read_output_json(path: &Path) -> Vec<serde_json::Value> {
+    pub(super) fn read_output_json(path: &Path) -> Vec<serde_json::Value> {
         let content = std::fs::read_to_string(path).unwrap_or_default();
         content
             .lines()
@@ -3199,6 +4524,16 @@ mod cdc_tests {
                 .and_then(|v| v.as_i64())
                 == Some(id)
         })
+    }
+
+    /// The `id` of every "insert" entry in the output, in ascending order.
+    fn sorted_insert_ids(rows: &[serde_json::Value]) -> Vec<i64> {
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.get("insert")?.get("id")?.as_i64())
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     // -------------------------------------------------------------------
@@ -3463,12 +4798,13 @@ mod cdc_tests {
         table.execute(&format!(
             r#"INSERT INTO {table_name} (
                 id, col_text, col_integer, col_bigint, col_boolean,
-                col_real, col_double, col_date, col_time,
+                col_real, col_double, col_date, col_time, col_timetz, col_timetz_array,
                 col_timestamp, col_timestamptz, col_uuid, col_jsonb,
                 col_bytea, col_numeric, col_smallint, col_int_array
             ) VALUES (
                 1, 'hello world', 42, 9876543210, true,
-                3.14, 2.718281828, '2024-06-15', '14:30:00',
+                3.5, 2.25, '2024-06-15', '14:30:00',
+                '14:30:00+02', ARRAY['08:30:00-05'::timetz, NULL],
                 '2024-01-01 12:00:00', '2024-01-01 12:00:00+00', '550e8400-e29b-41d4-a716-446655440000',
                 '{{"key": "value", "nested": {{"a": 1}}}}',
                 E'\\xDEADBEEF', 12345.67, 7, ARRAY[1, 2, 3]
@@ -3520,11 +4856,11 @@ mod cdc_tests {
         assert_eq!(row1["col_integer"], json!(42));
         assert_eq!(row1["col_bigint"], json!(9876543210i64));
         assert_eq!(row1["col_boolean"], json!(true));
-        // Float values: compare approximately
-        assert!(row1["col_real"].as_f64().unwrap() > 3.13);
-        assert!(row1["col_real"].as_f64().unwrap() < 3.15);
-        assert!(row1["col_double"].as_f64().unwrap() > 2.71);
-        assert!(row1["col_double"].as_f64().unwrap() < 2.72);
+        // REAL travels as f32, whose spacing at 3.5 is 2^-22 (about 2.4e-7),
+        // so 1e-6 forgives a few rounding steps and nothing more. The same
+        // tolerance guards this column in test_all_types_replayed_after_restart.
+        assert!((row1["col_real"].as_f64().unwrap() - 3.5).abs() < 1e-6);
+        assert!((row1["col_double"].as_f64().unwrap() - 2.25).abs() < 1e-9);
         // Date, time, timestamp are encoded as strings
         assert!(
             row1["col_date"].as_str().unwrap().contains("2024-06-15"),
@@ -3536,6 +4872,10 @@ mod cdc_tests {
             "col_time mismatch: {:?}",
             row1["col_time"]
         );
+        // TIMETZ keeps the offset it was inserted with: Postgres stores the
+        // offset with the time and never normalizes it to the session zone.
+        assert_eq!(row1["col_timetz"], json!("14:30:00+02"));
+        assert_eq!(row1["col_timetz_array"], json!(["08:30:00-05", null]));
         assert!(
             row1["col_timestamp"]
                 .as_str()
@@ -3580,6 +4920,8 @@ mod cdc_tests {
         assert!(row2["col_integer"].is_null());
         assert!(row2["col_bigint"].is_null());
         assert!(row2["col_boolean"].is_null());
+        assert!(row2["col_timetz"].is_null());
+        assert!(row2["col_timetz_array"].is_null());
         assert!(row2["col_uuid"].is_null());
         assert!(row2["col_jsonb"].is_null());
         assert!(row2["col_bytea"].is_null());
@@ -3801,6 +5143,41 @@ mod cdc_tests {
     // Test 3c: Dropping the primary key is rejected
     // -------------------------------------------------------------------
 
+    /// An unqualified `source_table` means `public`, so a pipeline that named
+    /// a table outside `public` by its bare name no longer matches anything.
+    /// Such a pipeline must fail at start with the publication's table list,
+    /// instead of ingesting nothing until the stall monitor speaks.
+    #[test]
+    #[serial]
+    fn test_cdc_source_table_not_in_publication_fails_at_start() {
+        let url = postgres_url();
+        let table_name = unique_pg_name("cdc_test_not_published");
+        let publication = unique_pg_name("cdc_pub_not_published");
+        let _table = CdcTestTable::new_simple(&table_name, &publication, &url);
+        let output_file = NamedTempFile::new().unwrap();
+
+        // The connector checks the publication while it opens, so the refusal
+        // comes out of the controller's constructor.
+        let err = match try_cdc_simple_test_circuit_with_tls(
+            &url,
+            &publication,
+            "no_such_table",
+            output_file.path(),
+            None,
+        ) {
+            Err(err) => err.to_string(),
+            Ok((controller, _)) => {
+                let _ = controller.stop();
+                panic!("a source table outside the publication started a pipeline");
+            }
+        };
+        assert!(
+            err.contains("'no_such_table' is not in publication")
+                && err.contains(&format!("public.{table_name}")),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Tests that dropping the source primary-key column (`id`), which is a
     /// required Feldera column, is surfaced as a fatal connector error.
     ///
@@ -3861,6 +5238,138 @@ mod cdc_tests {
         let _ = controller.stop();
     }
 
+    /// Stop the pipeline right after a row streamed in behind the initial
+    /// copy, and check that the replication slots are released at once.
+    ///
+    /// etl buffers streamed rows for up to its batch fill time before it hands
+    /// them over. Until etl discarded such a buffer at shutdown, the worker
+    /// holding it waited the fill time out with its slot active, and under CI
+    /// load the wait grew past the release timeout (#7170, #7201). Whether a
+    /// stop lands on a buffered row is a matter of timing, so the test stops
+    /// several pipelines. Every release must stay within the connector's
+    /// bound, and no stop may reach the grace that closes etl's connections
+    /// by force: that fallback releases the slots too, but late, and a
+    /// release is prompt only when etl stopped on its own.
+    #[test]
+    #[serial]
+    fn test_cdc_stop_with_buffered_rows_releases_slots_promptly() {
+        use crate::integrated::postgres::cdc_input::{
+            ETL_STOP_GRACE, RUNTIME_SHUTDOWN_TIMEOUT, STOPPED_PAST_GRACE, WATCHER_SHUTDOWN_TIMEOUT,
+            pipeline_id,
+        };
+
+        // The connector's bound on a stop, with room for PostgreSQL to notice
+        // a closed connection.
+        let release_bound = WATCHER_SHUTDOWN_TIMEOUT
+            + ETL_STOP_GRACE
+            + RUNTIME_SHUTDOWN_TIMEOUT
+            + Duration::from_secs(2);
+
+        let url = postgres_url();
+        for _ in 0..10 {
+            let table_name = unique_pg_name("cdc_test_prompt_release");
+            let publication = unique_pg_name("cdc_pub_prompt_release");
+            let mut table = CdcTestTable::new_simple(&table_name, &publication, &url);
+            table.execute(&format!(
+                "INSERT INTO {table_name} VALUES (1, true, NULL, 'first')"
+            ));
+            let output_file = NamedTempFile::new().unwrap();
+            let output_path = output_file.path().to_owned();
+            let (controller, err_receiver) = cdc_simple_test_circuit(
+                &url,
+                &publication,
+                &format!("public.{table_name}"),
+                &output_path,
+            );
+            controller.start();
+            wait(
+                || count_inserts(&read_output_json(&output_path)) >= 1 || !err_receiver.is_empty(),
+                60_000,
+            )
+            .expect("timeout: the copied row did not arrive");
+            // Commit a row as the copy lands, so that it streams in while etl
+            // is still handing the table over between its workers.
+            table.execute(&format!(
+                "INSERT INTO {table_name} VALUES (2, false, 42, 'second')"
+            ));
+            wait(
+                || count_inserts(&read_output_json(&output_path)) >= 2 || !err_receiver.is_empty(),
+                60_000,
+            )
+            .expect("timeout: the streamed row did not arrive");
+            assert!(err_receiver.is_empty(), "unexpected errors before stop");
+
+            controller.stop().unwrap();
+            let stopped = Instant::now();
+            wait_for_slots_released(&mut table);
+            let release = stopped.elapsed();
+            assert!(
+                release < release_bound,
+                "replication slots released {release:?} after stop"
+            );
+            let pipeline = pipeline_id(
+                &cdc_connector_url(&url),
+                &publication,
+                &format!("public.{table_name}"),
+            );
+            assert!(
+                !STOPPED_PAST_GRACE.lock().unwrap().contains(&pipeline),
+                "the stop ran past the grace: etl held its slots for more than {ETL_STOP_GRACE:?} \
+                 and the connector closed its connections by force"
+            );
+        }
+    }
+
+    /// Shutting the connector's runtime down closes the PostgreSQL connections
+    /// it hosts. That is what releases a replication slot when an etl worker
+    /// outlives the stop grace, so a backend held by a hosted connection must
+    /// be gone once the runtime is.
+    #[test]
+    #[serial]
+    fn test_cdc_runtime_shutdown_closes_hosted_connections() {
+        let url = postgres_url();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let backend_pid: i32 = runtime.block_on(async {
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("failed to connect");
+            tokio::spawn(connection);
+            let pid = client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get(0);
+            // A query that does not return stands in for an etl worker that
+            // does not stop.
+            tokio::spawn(async move {
+                let _ = client.execute("SELECT pg_sleep(600)", &[]).await;
+            });
+            // Let the hosted task send its query before the runtime goes.
+            tokio::task::yield_now().await;
+            pid
+        });
+        runtime.shutdown_timeout(crate::integrated::postgres::cdc_input::RUNTIME_SHUTDOWN_TIMEOUT);
+
+        let mut observer = pg_connect(&url, &None);
+        wait(
+            || {
+                observer
+                    .query(
+                        "SELECT 1 FROM pg_stat_activity WHERE pid = $1",
+                        &[&backend_pid],
+                    )
+                    .unwrap()
+                    .is_empty()
+            },
+            5_000,
+        )
+        .expect("the backend of a hosted connection outlived the runtime");
+    }
+
     // -------------------------------------------------------------------
     // Test 4: Restart/resume test
     // -------------------------------------------------------------------
@@ -3869,9 +5378,11 @@ mod cdc_tests {
     /// restart, instead of re-snapshotting the entire table.
     ///
     /// Requires: wal_level=logical, user with REPLICATION privilege.
+    // Flaked on the fork revision of etl with `Missing shared table state`;
+    // upstream removed the shared table cache, and the test passed ten runs
+    // in a row against the new pin, so it runs in CI as the regression check.
     #[test]
     #[serial]
-    #[ignore]
     fn test_cdc_restart_resumes_from_slot() {
         let url = postgres_url();
         let table_name = unique_pg_name("cdc_test_restart");
@@ -3927,9 +5438,7 @@ mod cdc_tests {
 
         // Stop the first pipeline.
         controller_1.stop().unwrap();
-
-        // Small delay to let the replication slot become inactive.
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        wait_for_slots_released(&mut table);
 
         // --- Second pipeline run (restart) ---
         let output_file_2 = NamedTempFile::new().unwrap();
@@ -3995,20 +5504,438 @@ mod cdc_tests {
         controller_2.stop().unwrap();
     }
 
-    // -------------------------------------------------------------------
-    // Fault-tolerance / strict-mode tests
-    // -------------------------------------------------------------------
-
-    /// With fault tolerance enabled the replication slot LSN is not
-    /// advanced until a Feldera checkpoint completes.  When the pipeline is
-    /// stopped before any checkpoint occurs and then restarted with the same
-    /// connection identity (same slot), Postgres replays all events from the
-    /// original slot position — guaranteeing at-least-once delivery.
+    /// A parent's initial read carries only the parent's own rows: etl reads
+    /// each table of an inheritance tree with `select ... from only`, and the
+    /// connector skips the rows of every publication table other than
+    /// `source_table`, in the initial read and in the change stream alike. A
+    /// child's rows reach Feldera through a connector of their own.
     ///
     /// Requires: wal_level=logical, user with REPLICATION privilege.
     #[test]
     #[serial]
-    #[ignore]
+    fn test_cdc_inherited_child_rows_need_their_own_connector() {
+        let url = postgres_url();
+        let parent_name = unique_pg_name("cdc_test_inherit_parent");
+        let child_name = unique_pg_name("cdc_test_inherit_child");
+        let publication = unique_pg_name("cdc_pub_inherit");
+
+        let mut parent = CdcTestTable::new_simple(&parent_name, &publication, &url);
+        let mut child = InheritedChild::new(&mut parent, &child_name);
+        parent.execute(&format!(
+            "INSERT INTO {parent_name} VALUES (1, true, NULL, 'parent')"
+        ));
+        child.execute(&format!(
+            "INSERT INTO {child_name} VALUES (10, true, NULL, 'child')"
+        ));
+
+        // --- A connector on the parent ---
+        let parent_output = NamedTempFile::new().unwrap();
+        let parent_output_path = parent_output.path().to_owned();
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            &publication,
+            &format!("public.{parent_name}"),
+            &parent_output_path,
+        );
+        controller.start();
+        wait(
+            || has_insert_id(&read_output_json(&parent_output_path), 1) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the parent's own row did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in CDC pipeline");
+
+        // The child's change precedes the parent's in the log, so once the
+        // parent's row is out the child's has been skipped, not merely delayed.
+        child.execute(&format!(
+            "INSERT INTO {child_name} VALUES (11, false, 42, 'child')"
+        ));
+        parent.execute(&format!(
+            "INSERT INTO {parent_name} VALUES (2, false, 42, 'parent')"
+        ));
+        wait(
+            || has_insert_id(&read_output_json(&parent_output_path), 2) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the parent's streamed row did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in CDC pipeline");
+        assert_eq!(
+            sorted_insert_ids(&read_output_json(&parent_output_path)),
+            vec![1, 2]
+        );
+        controller.stop().unwrap();
+        // Free the parent connector's slots before the child connector takes
+        // its own: CI's PostgreSQL allows four, and the child's start takes
+        // three at once, an apply slot and one per table of the publication.
+        wait_for_slots_released(&mut parent);
+        parent.drop_replication_slots();
+
+        // --- A connector on the child ---
+        let child_output = NamedTempFile::new().unwrap();
+        let child_output_path = child_output.path().to_owned();
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            &publication,
+            &format!("public.{child_name}"),
+            &child_output_path,
+        );
+        controller.start();
+        wait(
+            || has_insert_id(&read_output_json(&child_output_path), 11) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the child's rows did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in CDC pipeline");
+
+        parent.execute(&format!(
+            "INSERT INTO {parent_name} VALUES (3, true, 100, 'parent')"
+        ));
+        child.execute(&format!(
+            "INSERT INTO {child_name} VALUES (12, true, 100, 'child')"
+        ));
+        wait(
+            || has_insert_id(&read_output_json(&child_output_path), 12) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the child's streamed row did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in CDC pipeline");
+        assert_eq!(
+            sorted_insert_ids(&read_output_json(&child_output_path)),
+            vec![10, 11, 12]
+        );
+        controller.stop().unwrap();
+    }
+
+    /// etl's state store for the pipeline that reads `table` from its
+    /// publication, opened as the connector opens it.
+    fn etl_store(table: &CdcTestTable) -> (tokio::runtime::Runtime, PostgresStore) {
+        let connector_url = cdc_connector_url(&table.url);
+        let url = url::Url::parse(&connector_url).unwrap();
+        let pg_conn = PgConnectionConfig {
+            host: url.host_str().unwrap().to_string(),
+            hostaddr: None,
+            port: url.port().unwrap_or(5432),
+            name: url.path().trim_start_matches('/').to_string(),
+            username: url.username().to_string(),
+            password: url.password().map(|p| p.to_string().into()),
+            tls: TlsConfig::disabled(),
+            keepalive: TcpKeepaliveConfig::default(),
+        };
+        let pipeline_id = crate::integrated::postgres::cdc_input::pipeline_id(
+            &connector_url,
+            &table.publication_name,
+            &format!("public.{}", table.table_name),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = runtime.block_on(async {
+            let store = PostgresStore::new(pipeline_id, pg_conn).await.unwrap();
+            store.load_cache().await.unwrap();
+            store
+        });
+        (runtime, store)
+    }
+
+    /// Wait until etl has completed the sync of every table of `table`'s
+    /// publication, `tables` of them.
+    fn wait_for_etl_sync_completed_on(table: &mut CdcTestTable, tables: usize) {
+        wait(
+            || {
+                let states = etl_table_states(table);
+                states.len() == tables
+                    && states
+                        .iter()
+                        .all(|s| ETL_SYNC_COMPLETED_STATES.contains(&s.as_str()))
+            },
+            60_000,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "timeout waiting for etl to complete the sync of {tables} tables; current \
+                 states: {:?}",
+                etl_table_states(table)
+            )
+        });
+    }
+
+    /// An older connector refused the writes of every publication table at a
+    /// stop, and etl recorded the refusal as a manual-retry error on the
+    /// table it was writing, which may be one other than the source table.
+    /// etl never retries such an error, and the monitor reports it as fatal,
+    /// so the start after an upgrade must roll it back on every table.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
+    fn test_cdc_legacy_stop_error_on_another_table_is_cleared_at_start() {
+        let url = postgres_url();
+        let name_a = unique_pg_name("cdc_test_legacy_a");
+        let publication_a = unique_pg_name("cdc_pub_legacy_a");
+        let name_b = unique_pg_name("cdc_test_legacy_b");
+        let publication_b = unique_pg_name("cdc_pub_legacy_b");
+        let mut table_a = CdcTestTable::new_simple(&name_a, &publication_a, &url);
+        let mut table_b = CdcTestTable::new_simple(&name_b, &publication_b, &url);
+        table_a.execute(&format!(
+            "ALTER PUBLICATION {publication_a} ADD TABLE {name_b}"
+        ));
+        table_a.execute(&format!(
+            "INSERT INTO {name_a} VALUES (1, true, NULL, 'first')"
+        ));
+
+        // --- Run 1: etl syncs both tables under A's pipeline ---
+        let output_1 = NamedTempFile::new().unwrap();
+        let output_path_1 = output_1.path().to_owned();
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            &publication_a,
+            &format!("public.{name_a}"),
+            &output_path_1,
+        );
+        controller.start();
+        wait(
+            || has_insert_id(&read_output_json(&output_path_1), 1) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the copied row did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in run 1");
+        wait_for_etl_sync_completed_on(&mut table_a, 2);
+        controller.stop().unwrap();
+        wait_for_slots_released(&mut table_a);
+
+        // Leave on table B what an older connector left on the table it was
+        // writing when it stopped.
+        let oid: u32 = table_b
+            .client
+            .query_one("SELECT oid FROM pg_class WHERE relname = $1", &[&name_b])
+            .unwrap()
+            .get(0);
+        let (runtime, store) = etl_store(&table_a);
+        runtime
+            .block_on(
+                store.update_table_state(
+                    TableId::new(oid),
+                    TableState::Errored {
+                        reason: "Postgres CDC input connector terminated before accepting batch"
+                            .to_string(),
+                        solution: None,
+                        retry_policy: TableRetryPolicy::ManualRetry,
+                        source_err: etl_error!(ErrorKind::DestinationError, "left by a stop"),
+                    },
+                ),
+            )
+            .unwrap();
+        drop(store);
+        drop(runtime);
+        assert!(
+            etl_table_states(&mut table_a)
+                .iter()
+                .any(|s| s == "errored"),
+            "the planted error must be current"
+        );
+
+        // --- Run 2: the start clears the error and streams as before ---
+        let output_2 = NamedTempFile::new().unwrap();
+        let output_path_2 = output_2.path().to_owned();
+        let (controller, err_receiver) = cdc_simple_test_circuit(
+            &url,
+            &publication_a,
+            &format!("public.{name_a}"),
+            &output_path_2,
+        );
+        controller.start();
+        wait(
+            || {
+                let states = etl_table_states(&mut table_a);
+                !err_receiver.is_empty()
+                    || (states.len() == 2
+                        && states
+                            .iter()
+                            .all(|s| ETL_SYNC_COMPLETED_STATES.contains(&s.as_str())))
+            },
+            60_000,
+        )
+        .expect("timeout: etl neither cleared the error nor reported it");
+        assert!(
+            err_receiver.is_empty(),
+            "the start must clear the error an older connector left on another table: {:?}",
+            err_receiver.try_recv()
+        );
+        table_a.execute(&format!(
+            "INSERT INTO {name_a} VALUES (2, false, 42, 'second')"
+        ));
+        wait(
+            || has_insert_id(&read_output_json(&output_path_2), 2) || !err_receiver.is_empty(),
+            60_000,
+        )
+        .expect("timeout: the streamed row did not arrive");
+        assert!(err_receiver.is_empty(), "unexpected errors in run 2");
+        controller.stop().unwrap();
+    }
+
+    /// A record with the temporal types that have PostgreSQL values Feldera
+    /// cannot hold.
+    #[derive(
+        Debug,
+        Default,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        serde::Serialize,
+        serde::Deserialize,
+        Clone,
+        Hash,
+        size_of::SizeOf,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize,
+        feldera_macros::IsNone,
+        feldera_macros::OrdRepr,
+    )]
+    #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+    struct CdcTemporalStruct {
+        id: i32,
+        d: Option<feldera_sqllib::Date>,
+        t: Option<feldera_sqllib::Time>,
+    }
+
+    feldera_types::deserialize_table_record!(CdcTemporalStruct["CdcTemporalStruct", Variant, 3] {
+        (id, "id", false, i32, |_| None),
+        (d, "d", true, Option<feldera_sqllib::Date>, |_| Some(None)),
+        (t, "t", true, Option<feldera_sqllib::Time>, |_| Some(None))
+    });
+
+    feldera_types::serialize_table_record!(CdcTemporalStruct[3]{
+        id["id"]: i32,
+        d["d"]: Option<feldera_sqllib::Date>,
+        t["t"]: Option<feldera_sqllib::Time>
+    });
+
+    impl CdcTemporalStruct {
+        fn schema() -> Vec<Field> {
+            vec![
+                Field::new("id".into(), ColumnType::int(false)),
+                Field::new("d".into(), ColumnType::date(true)),
+                Field::new("t".into(), ColumnType::time(true)),
+            ]
+        }
+    }
+
+    /// PostgreSQL's `infinity` dates and `24:00:00` time have no Feldera
+    /// counterpart. A row that holds one is reported as a malformed record,
+    /// in the initial read and in the stream alike, and the rows around it
+    /// still arrive.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
+    fn test_cdc_temporal_special_values_fail_per_row() {
+        let url = postgres_url();
+        let table_name = unique_pg_name("cdc_test_temporal");
+        let publication = unique_pg_name("cdc_pub_temporal");
+        let mut table = CdcTestTable::new_simple(&table_name, &publication, &url);
+        table.execute(&format!(
+            "ALTER TABLE {table_name} ADD COLUMN d DATE, ADD COLUMN t TIME"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (1, true, NULL, 'x', 'infinity', '14:30:00')"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (2, true, NULL, 'x', '2024-06-15', '24:00:00')"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (3, true, NULL, 'x', '2024-06-15', '14:30:00')"
+        ));
+
+        let storage = tempfile::tempdir().unwrap();
+        let output = NamedTempFile::new().unwrap();
+        let output_path = output.path().to_owned();
+        let (controller, err_receiver) = cdc_ft_test_circuit_for::<CdcTemporalStruct>(
+            &url,
+            &publication,
+            &format!("public.{table_name}"),
+            storage.path(),
+            &output_path,
+            &CdcTemporalStruct::schema(),
+            CircuitShape::default(),
+        );
+        controller.start();
+
+        // The good row of the initial read arrives; the two bad ones are
+        // reported, one error each, and nothing is fatal.
+        wait(|| has_insert_id(&read_output_json(&output_path), 3), 60_000)
+            .expect("timeout: the well-formed copied row did not arrive");
+        let errors = collect_errors(&err_receiver, 2);
+        assert!(
+            errors.iter().any(|e| e.contains("infinity"))
+                && errors.iter().any(|e| e.contains("24:00:00")),
+            "each special value is reported once: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| !e.contains("FATAL")),
+            "a malformed row is not fatal: {errors:?}"
+        );
+
+        // The same in the stream. Stream only once etl has recorded the sync
+        // as done: under fault tolerance a change committed before that is
+        // delivered during catch-up, and its acknowledgment waits for a
+        // checkpoint the connector holds back until the sync is recorded, so
+        // etl never gets there (known issue, found while reviewing this test's
+        // PR).
+        wait_for_etl_sync_completed(&mut table);
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (4, true, NULL, 'x', '-infinity', '14:30:00')"
+        ));
+        table.execute(&format!(
+            "INSERT INTO {table_name} VALUES (5, true, NULL, 'x', '2024-06-16', '15:00:00')"
+        ));
+        wait(|| has_insert_id(&read_output_json(&output_path), 5), 60_000)
+            .expect("timeout: the well-formed streamed row did not arrive");
+        let errors = collect_errors(&err_receiver, 1);
+        assert!(
+            errors.iter().any(|e| e.contains("-infinity")),
+            "the streamed special value is reported: {errors:?}"
+        );
+        assert_eq!(
+            sorted_insert_ids(&read_output_json(&output_path)),
+            vec![3, 5]
+        );
+        controller.stop().unwrap();
+    }
+
+    /// Wait for at least `at_least` reported errors and return all of them.
+    fn collect_errors(
+        err_receiver: &crossbeam::channel::Receiver<String>,
+        at_least: usize,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        wait(
+            || {
+                errors.extend(err_receiver.try_iter());
+                errors.len() >= at_least
+            },
+            60_000,
+        )
+        .unwrap_or_else(|_| panic!("timeout: expected {at_least} errors, got {errors:?}"));
+        errors
+    }
+
+    // -------------------------------------------------------------------
+    // Fault-tolerance / strict-mode tests
+    // -------------------------------------------------------------------
+
+    /// With fault tolerance enabled, a pipeline stopped before any checkpoint
+    /// must deliver the initial snapshot again when restarted on fresh
+    /// storage, which holds none of the rows. Rows 1 and 2 are snapshot rows
+    /// that never came through the replication slot, so holding the slot
+    /// alone cannot bring them back; scenario 3 in `cdc_scenarios` covers
+    /// slot replay.
+    ///
+    /// Requires: wal_level=logical, user with REPLICATION privilege.
+    #[test]
+    #[serial]
     fn test_cdc_ft_mode_holds_slot() {
         let url = postgres_url();
         let table_name = unique_pg_name("cdc_test_strict_hold");
@@ -4045,9 +5972,13 @@ mod cdc_tests {
             errs_1.try_recv()
         );
 
-        // Stop without a checkpoint — slot LSN is still at the snapshot position.
+        // Stop without a checkpoint, but only once etl has persisted the copy
+        // as complete. Stopping earlier leaves etl in `data_sync` or
+        // `finished_copy`, and it redoes the copy on restart, which would
+        // hide a lost snapshot.
+        wait_for_etl_sync_completed(&mut table);
         ctrl_1.stop().unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        wait_for_slots_released(&mut table);
 
         // --- Run 2: fresh output, same slot (same url/publication/source_table) ---
         let out_2 = NamedTempFile::new().unwrap();
@@ -4087,14 +6018,14 @@ mod cdc_tests {
             })
             .collect();
 
-        // The slot was held back in run 1 — rows 1 and 2 must be redelivered.
+        // Run 1 never checkpointed, so run 2 must deliver the snapshot again.
         assert!(
             ids.contains(&1),
-            "row 1 must be redelivered (slot held); ids={ids:?}"
+            "row 1 must be redelivered (no checkpoint); ids={ids:?}"
         );
         assert!(
             ids.contains(&2),
-            "row 2 must be redelivered (slot held); ids={ids:?}"
+            "row 2 must be redelivered (no checkpoint); ids={ids:?}"
         );
         assert!(ids.contains(&3), "row 3 (new) must appear; ids={ids:?}");
 

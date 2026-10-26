@@ -8,7 +8,6 @@ use std::io::{Error as IoError, Read};
 use std::ops::{Add, AddAssign, Range};
 use std::sync::Arc;
 
-use actix_web::HttpRequest;
 use anyhow::Result as AnyResult;
 use dbsp::operator::input::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
@@ -22,8 +21,9 @@ use crate::ConnectorMetadata;
 use crate::catalog::{InputCollectionHandle, SerBatchReader};
 use crate::errors::controller::ControllerError;
 use crate::postprocess::Postprocessor;
-use crate::preprocess::Preprocessor;
+use crate::preprocess::{Preprocessor, PreprocessorWatchdog};
 use crate::transport::{OutputBatchType, Step};
+use crate::utils::transition_counter::TransitionCounter;
 
 /// Trait that represents a specific data format.
 ///
@@ -32,23 +32,18 @@ pub trait InputFormat: Send + Sync {
     /// Unique name of the data format.
     fn name(&self) -> Cow<'static, str>;
 
-    /// Extract parser configuration from an HTTP request.
+    /// Extract parser configuration from the query string of an HTTP request.
+    ///
+    /// `query` holds only the parameters that configure the format: the
+    /// `/ingress` handler has already removed the parameters it consumes
+    /// itself.
     ///
     /// Returns the extracted configuration cast to the `ErasedSerialize` trait
     /// object (to keep this trait object-safe).
-    ///
-    /// # Discussion
-    ///
-    /// We could rely on the `serde_urlencoded` crate to deserialize the config
-    /// from the HTTP request, which is what most implementations will do
-    /// internally; however allowing the implementation to override this
-    /// method enables additional flexibility. For example, an
-    /// implementation may use `Content-Type` and other request headers, set
-    /// HTTP-specific defaults for config fields, etc.
-    fn config_from_http_request(
+    fn config_from_http_query(
         &self,
         endpoint_name: &str,
-        request: &HttpRequest,
+        query: &str,
     ) -> Result<Box<dyn ErasedSerialize>, ControllerError>;
 
     /// Create a new parser for the format.
@@ -246,24 +241,26 @@ impl InputBuffer for Vec<Box<dyn InputBuffer>> {
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
         let mut result = Vec::new();
         let mut remaining = n;
-        // Index of first buffer that should be preserved
-        let mut index = 0;
+        // Number of leading buffers drained of all their records, which are the
+        // only ones safe to drop.
+        let mut drained = 0;
         for v in self.iter_mut() {
             if remaining == 0 {
                 break;
             }
-            let buf = v.take_some(remaining);
-            if let Some(ib) = buf {
-                let len = ib.len().records;
-                if remaining >= len {
-                    // This buffer will be completely used
-                    index += 1;
-                }
-                remaining = remaining.saturating_sub(len);
-                result.push(ib);
+            if let Some(buffer) = v.take_some(remaining) {
+                // A buffer with coarse granularity may hand back more than
+                // `remaining`, so use saturating subtraction.
+                remaining = remaining.saturating_sub(buffer.len().records);
+                result.push(buffer);
             }
+            if v.len().records > 0 {
+                // `v` kept records, so we cannot consider it drained.
+                break;
+            }
+            drained += 1;
         }
-        self.drain(0..index);
+        self.drain(0..drained);
         if result.is_empty() {
             None
         } else {
@@ -375,14 +372,22 @@ pub struct StreamingPreprocessedParser {
     preprocessor: Box<dyn Preprocessor>,
     stream_splitter: StreamSplitter,
     parser: Box<dyn Parser>,
+    watchdog: PreprocessorWatchdog,
+    transition_counter: TransitionCounter,
 }
 
 impl StreamingPreprocessedParser {
-    pub fn new(preprocessor: Box<dyn Preprocessor>, parser: Box<dyn Parser>) -> Self {
+    pub fn new(
+        preprocessor: Box<dyn Preprocessor>,
+        parser: Box<dyn Parser>,
+        watchdog: PreprocessorWatchdog,
+    ) -> Self {
         Self {
             preprocessor,
             stream_splitter: StreamSplitter::new(parser.splitter()),
             parser,
+            transition_counter: watchdog.new_counter(),
+            watchdog,
         }
     }
 }
@@ -393,9 +398,11 @@ impl Parser for StreamingPreprocessedParser {
         data: &[u8],
         metadata: Option<ConnectorMetadata>,
     ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
-        let (pre_data, mut pre_errors) = self
-            .preprocessor
-            .process_with_metadata(data, metadata.as_ref());
+        let (pre_data, mut pre_errors) = self.transition_counter.count(|| {
+            // Track the progress of the preprocessor call using transition_counter
+            self.preprocessor
+                .process_with_metadata(data, metadata.as_ref())
+        });
         self.stream_splitter.append(&pre_data);
         let mut parsed: Vec<Box<dyn InputBuffer>> = Vec::new();
         while let Some(chunk) = self.stream_splitter.next(true) {
@@ -428,6 +435,7 @@ impl Parser for StreamingPreprocessedParser {
         Box::new(StreamingPreprocessedParser::new(
             self.preprocessor.fork(),
             self.parser.fork(),
+            self.watchdog.clone(),
         ))
     }
 }
@@ -436,13 +444,21 @@ impl Parser for StreamingPreprocessedParser {
 pub struct MessageOrientedPreprocessedParser {
     preprocessor: Box<dyn Preprocessor>,
     parser: Box<dyn Parser>,
+    watchdog: PreprocessorWatchdog,
+    transition_counter: TransitionCounter,
 }
 
 impl MessageOrientedPreprocessedParser {
-    pub fn new(preprocessor: Box<dyn Preprocessor>, parser: Box<dyn Parser>) -> Self {
+    pub fn new(
+        preprocessor: Box<dyn Preprocessor>,
+        parser: Box<dyn Parser>,
+        watchdog: PreprocessorWatchdog,
+    ) -> Self {
         Self {
             preprocessor,
             parser,
+            transition_counter: watchdog.new_counter(),
+            watchdog,
         }
     }
 }
@@ -453,9 +469,11 @@ impl Parser for MessageOrientedPreprocessedParser {
         data: &[u8],
         metadata: Option<ConnectorMetadata>,
     ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
-        let (pre_data, mut pre_errors) = self
-            .preprocessor
-            .process_with_metadata(data, metadata.as_ref());
+        let (pre_data, mut pre_errors) = self.transition_counter.count(|| {
+            // Track the progress of the preprocessor call using transition_counter
+            self.preprocessor
+                .process_with_metadata(data, metadata.as_ref())
+        });
         let mut parser_splitter = self.parser.splitter();
         let mut parsed: Vec<Box<dyn InputBuffer>> = Vec::new();
         let mut remaining = pre_data.as_slice();
@@ -493,6 +511,7 @@ impl Parser for MessageOrientedPreprocessedParser {
         Box::new(MessageOrientedPreprocessedParser::new(
             self.preprocessor.fork(),
             self.parser.fork(),
+            self.watchdog.clone(),
         ))
     }
 }
@@ -645,14 +664,18 @@ pub trait OutputFormat: Send + Sync {
     /// Unique name of the data format.
     fn name(&self) -> Cow<'static, str>;
 
-    /// Extract encoder configuration from an HTTP request.
+    /// Extract encoder configuration from the query string of an HTTP request.
+    ///
+    /// `query` holds only the parameters that configure the format: the
+    /// `/egress` handler has already removed the parameters it consumes
+    /// itself.
     ///
     /// Returns the extracted configuration cast to the `ErasedSerialize` trait
     /// object (to keep this trait object-safe).
-    fn config_from_http_request(
+    fn config_from_http_query(
         &self,
         endpoint_name: &str,
-        request: &HttpRequest,
+        query: &str,
     ) -> Result<Box<dyn ErasedSerialize>, ControllerError>;
 
     /// Create a new encoder for the format.
@@ -715,6 +738,9 @@ pub trait OutputConsumer: Send {
         num_records: usize,
     );
     fn batch_end(&mut self);
+
+    /// See OutputEndpoint::steps_processed.
+    fn steps_processed(&mut self, _count: Step) {}
 
     /// Returns the approximate amount of memory used by the connector's
     /// underlying implementation.  For the Kafka connectors, for example, this
@@ -796,6 +822,10 @@ impl OutputConsumer for PostprocessedConsumer {
     fn batch_end(&mut self) {
         self.postprocessor.batch_end();
         self.inner.batch_end();
+    }
+
+    fn steps_processed(&mut self, count: Step) {
+        self.inner.steps_processed(count);
     }
 
     fn memory(&self) -> usize {
@@ -1118,5 +1148,126 @@ impl ParseErrorInner {
 
     pub fn get_error_tag(&self) -> Option<String> {
         self.tag.clone()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::hash::Hasher;
+    use std::sync::{Arc, Mutex};
+
+    use super::{BufferSize, InputBuffer};
+
+    const BYTES_PER_RECORD: usize = 10;
+
+    /// Minimal [InputBuffer] over a list of record ids. `flush` appends to a
+    /// shared sink so a test can tell dropped records from flushed ones.
+    struct TestBuffer {
+        records: Vec<u64>,
+        sink: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl TestBuffer {
+        fn boxed(records: &[u64], sink: &Arc<Mutex<Vec<u64>>>) -> Box<dyn InputBuffer> {
+            Box::new(Self {
+                records: records.to_vec(),
+                sink: sink.clone(),
+            })
+        }
+    }
+
+    impl InputBuffer for TestBuffer {
+        fn flush(&mut self) {
+            self.sink
+                .lock()
+                .unwrap()
+                .extend(std::mem::take(&mut self.records));
+        }
+
+        fn len(&self) -> BufferSize {
+            BufferSize {
+                records: self.records.len(),
+                bytes: self.records.len() * BYTES_PER_RECORD,
+            }
+        }
+
+        fn hash(&self, hasher: &mut dyn Hasher) {
+            for record in &self.records {
+                hasher.write_u64(*record);
+            }
+        }
+
+        fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
+            if self.records.is_empty() {
+                return None;
+            }
+            let n = n.min(self.records.len());
+            Some(Box::new(Self {
+                records: self.records.drain(0..n).collect(),
+                sink: self.sink.clone(),
+            }))
+        }
+    }
+
+    /// A take that ends inside an inner buffer must leave the remainder behind
+    /// rather than dropping it: the connector reports those records as received,
+    /// so losing them stalls `pipeline_complete` forever.
+    #[test]
+    fn take_some_keeps_partially_drained_buffer() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut nested = vec![
+            TestBuffer::boxed(&[1, 2, 3], &sink),
+            TestBuffer::boxed(&[4, 5, 6, 7, 8], &sink),
+        ];
+
+        // 5 records spans all of the first buffer and part of the second.
+        let mut head = nested.take_some(5).expect("buffer is not empty");
+        assert_eq!(head.len().records, 5);
+        assert_eq!(
+            InputBuffer::len(&nested).records,
+            3,
+            "records 6..8 were dropped"
+        );
+
+        head.flush();
+        nested.take_all().unwrap().flush();
+        assert_eq!(*sink.lock().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// Byte accounting must survive the same split; a leak here pins
+    /// `buffered_input_bytes` above zero.
+    #[test]
+    fn take_some_preserves_byte_accounting() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut nested = vec![
+            TestBuffer::boxed(&[1, 2, 3], &sink),
+            TestBuffer::boxed(&[4, 5, 6, 7, 8], &sink),
+        ];
+        let before = InputBuffer::len(&nested);
+
+        let head = nested.take_some(5).unwrap();
+        assert_eq!(head.len() + InputBuffer::len(&nested), before);
+    }
+
+    /// Repeatedly draining in batches that do not divide the buffer sizes must
+    /// still deliver every record exactly once.
+    #[test]
+    fn take_some_loses_no_records_across_batches() {
+        for batch in 1..=9 {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            let mut nested = vec![
+                TestBuffer::boxed(&[1, 2, 3], &sink),
+                TestBuffer::boxed(&[4, 5], &sink),
+                TestBuffer::boxed(&[6, 7, 8, 9], &sink),
+            ];
+            while let Some(mut head) = nested.take_some(batch) {
+                head.flush();
+            }
+            assert_eq!(
+                *sink.lock().unwrap(),
+                (1..=9).collect::<Vec<u64>>(),
+                "batch size {batch} lost records"
+            );
+        }
     }
 }

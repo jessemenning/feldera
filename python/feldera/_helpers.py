@@ -31,9 +31,9 @@ def sql_type_to_pandas_type(sql_type: str):
         case "DECIMAL":
             return None
         case "CHAR":
-            return "str"
+            return "string"
         case "VARCHAR":
-            return "str"
+            return "string"
         case "DATE" | "TIMESTAMP":
             return "datetime64[ns]"
         case "TIME" | "INTERVAL":
@@ -113,7 +113,11 @@ def dataframe_from_response(
                 if datum[col] is not None:
                     datum[col] = uuid.UUID(datum[col])
 
-    df = pd.DataFrame(data)
+    df = (
+        pd.DataFrame(data)
+        if data
+        else pd.DataFrame(columns=[*pd_schema, "insert_delete"])
+    )
     df = df.astype(pd_schema)
 
     return df

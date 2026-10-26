@@ -2,39 +2,42 @@ package org.dbsp.sqlCompiler.compiler.visitors.outer.expansion;
 
 import org.dbsp.sqlCompiler.circuit.operator.DBSPDelayedIntegralOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFilterOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSumOperator;
 
-import javax.annotation.Nullable;
 
+/** Expansion of a {@link org.dbsp.sqlCompiler.circuit.operator.DBSPJoinFilterMapOperator}, a join fused with the filter σ that
+ * follows it: σ(ΔL ⋈ z⁻¹R) + σ(z⁻¹L ⋈ ΔR) + σ(ΔL ⋈ ΔR). */
 public final class JoinFilterMapExpansion
         extends OperatorDeltaExpansion
         implements CommonJoinDeltaExpansion {
-    @Nullable public final DBSPDelayedIntegralOperator leftIntegrator;
-    @Nullable public final DBSPDelayedIntegralOperator rightIntegrator;
-    @Nullable public final DBSPStreamJoinOperator leftDelta;
-    @Nullable public final DBSPStreamJoinOperator rightDelta;
+    /** z⁻¹L, the delayed integral of ΔL */
+    public final DBSPDelayedIntegralOperator leftIntegrator;
+    /** z⁻¹R, the delayed integral of ΔR */
+    public final DBSPDelayedIntegralOperator rightIntegrator;
+    /** ΔL ⋈ z⁻¹R */
+    public final DBSPStreamJoinOperator leftDelta;
+    /** z⁻¹L ⋈ ΔR */
+    public final DBSPStreamJoinOperator rightDelta;
+    /** ΔL ⋈ ΔR */
     public final DBSPStreamJoinOperator both;
-    @Nullable public final DBSPFilterOperator leftFilter;
-    @Nullable public final DBSPFilterOperator rightFilter;
+    /** Filter of {@code leftDelta} */
+    public final DBSPFilterOperator leftFilter;
+    /** Filter of {@code rightDelta} */
+    public final DBSPFilterOperator rightFilter;
+    /** Filter of {@code both} */
     public final DBSPFilterOperator filter;
-    @Nullable public final DBSPMapOperator leftMap;
-    @Nullable public final DBSPMapOperator rightMap;
-    @Nullable public final DBSPMapOperator map;
+    /** The sum of the three filters */
     public final DBSPSumOperator sum;
 
-    public JoinFilterMapExpansion(@Nullable DBSPDelayedIntegralOperator leftIntegrator,
-                                  @Nullable DBSPDelayedIntegralOperator rightIntegrator,
-                                  @Nullable DBSPStreamJoinOperator leftDelta,
-                                  @Nullable DBSPStreamJoinOperator rightDelta,
+    public JoinFilterMapExpansion(DBSPDelayedIntegralOperator leftIntegrator,
+                                  DBSPDelayedIntegralOperator rightIntegrator,
+                                  DBSPStreamJoinOperator leftDelta,
+                                  DBSPStreamJoinOperator rightDelta,
                                   DBSPStreamJoinOperator both,
-                                  @Nullable DBSPFilterOperator leftFilter,
-                                  @Nullable DBSPFilterOperator rightFilter,
+                                  DBSPFilterOperator leftFilter,
+                                  DBSPFilterOperator rightFilter,
                                   DBSPFilterOperator filter,
-                                  @Nullable DBSPMapOperator leftMap,
-                                  @Nullable DBSPMapOperator rightMap,
-                                  @Nullable DBSPMapOperator map,
                                   DBSPSumOperator sum) {
         this.leftIntegrator = leftIntegrator;
         this.rightIntegrator = rightIntegrator;
@@ -44,19 +47,16 @@ public final class JoinFilterMapExpansion
         this.leftFilter = leftFilter;
         this.rightFilter = rightFilter;
         this.filter = filter;
-        this.leftMap = leftMap;
-        this.rightMap = rightMap;
-        this.map = map;
         this.sum = sum;
     }
 
     @Override
-    @Nullable public DBSPDelayedIntegralOperator getLeftIntegrator() {
+    public DBSPDelayedIntegralOperator getLeftIntegrator() {
         return this.leftIntegrator;
     }
 
     @Override
-    @Nullable public DBSPDelayedIntegralOperator getRightIntegrator() {
+    public DBSPDelayedIntegralOperator getRightIntegrator() {
         return this.rightIntegrator;
     }
 }

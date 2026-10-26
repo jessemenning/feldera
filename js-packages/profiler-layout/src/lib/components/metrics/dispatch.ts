@@ -4,7 +4,12 @@
 // (`ProfileMetricDescription::category`). Every block renders as a distribution.
 
 import type { NodeAttributes, TooltipRow } from 'profiler-lib'
-import { measurementCategory, measurementDescription } from 'profiler-lib'
+import {
+  compareMetrics,
+  measurementCategory,
+  measurementDescription,
+  measurementLabel
+} from 'profiler-lib'
 
 export type RenderableMetric = {
   row: TooltipRow
@@ -18,15 +23,6 @@ export type RenderableBlock = {
 }
 
 const UNCATEGORIZED = 'Other'
-
-const labelFor = (id: string): string => {
-  // Humanize id: replace separators with spaces, capitalize first letter.
-  const cleaned = id.replace(/[_.]/g, ' ').replace(/\s+/g, ' ').trim()
-  if (cleaned.length === 0) {
-    return id
-  }
-  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1)
-}
 
 const slugify = (s: string): string => s.toLowerCase().replace(/[^a-z0-9]+/g, '-')
 
@@ -45,24 +41,31 @@ export function buildBlocks(attrs: NodeAttributes, showAdvanced: boolean): Rende
     }
     bucket.push({
       row,
-      label: labelFor(row.metric)
+      label: measurementLabel(row.metric)
     })
   }
 
-  // Sort metrics inside each block by their displayed label so users can scan a long block
-  // without re-reading the whole thing. Locale-aware compare with `numeric: true`
-  // keeps numbered labels like "slot 2 ..." / "slot 10 ..." in their natural sequence.
-  const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true })
+  // Sort metrics inside each block by their displayed label, placing the current metric first.
+  // `compareMetrics` is the order the metric selector uses as well, so a metric sits in the same
+  // relative position in both.
   for (const entries of byCategory.values()) {
     entries.sort(
       (a, b) =>
-        collator.compare(a.label, b.label) || collator.compare(a.row.metric, b.row.metric)
+        Number(b.row.isCurrentMetric) - Number(a.row.isCurrentMetric) ||
+        compareMetrics({ id: a.row.metric, label: a.label }, { id: b.row.metric, label: b.label })
     )
   }
 
   const out: RenderableBlock[] = []
   for (const [category, entries] of byCategory) {
     out.push({ id: `category-${slugify(category)}`, title: category, entries })
+  }
+  // Its block leads the panel, so the current metric's value is the first on screen.
+  const holdsCurrent = out.findIndex((block) =>
+    block.entries.some((entry) => entry.row.isCurrentMetric)
+  )
+  if (holdsCurrent > 0) {
+    out.unshift(...out.splice(holdsCurrent, 1))
   }
   return out
 }

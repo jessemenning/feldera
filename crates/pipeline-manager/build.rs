@@ -1,12 +1,12 @@
 use change_detection::ChangeDetection;
-use static_files::{resource_dir, NpmBuild};
+use static_files::{NpmBuild, resource_dir};
 use std::env;
 use std::path::{Path, PathBuf};
 use vergen_gitcl::*;
 
 // These are touched during the build, so it would re-build every time if we
 // don't exclude them from change detection:
-const EXCLUDE_LIST: [&str; 13] = [
+const EXCLUDE_LIST: [&str; 15] = [
     "../../js-packages/web-console/node_modules",
     "../../js-packages/web-console/build",
     "../../js-packages/web-console/.svelte-kit",
@@ -17,18 +17,21 @@ const EXCLUDE_LIST: [&str; 13] = [
     "../../js-packages/profiler-layout/.svelte-kit",
     "../../js-packages/profiler-lib/node_modules",
     "../../js-packages/profiler-lib/dist",
+    "../../js-packages/common-lib/node_modules",
+    "../../js-packages/common-lib/dist",
     "../../js-packages/common-ui/node_modules",
     "../../js-packages/common-ui/dist",
     "../../js-packages/common-ui/.svelte-kit",
 ];
 
 // Directories to include in change detection and build tracking:
-const INCLUDE_LIST: [&str; 6] = [
+const INCLUDE_LIST: [&str; 7] = [
     "../../js-packages/web-console/",
     "../../js-packages/profiler-app/",
     "../../js-packages/profiler-layout/",
     "../../js-packages/feldera-theme/",
     "../../js-packages/profiler-lib/",
+    "../../js-packages/common-lib/",
     "../../js-packages/common-ui/",
 ];
 
@@ -83,6 +86,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This should be safe because the build-script is single-threaded
         unsafe {
             env::set_var("BUILD_DIR", nested_build_dir.clone());
+            // Bake a sentinel base path into the bundle so the manager can
+            // rewrite it to an operator-configured subpath at serve time
+            // (`--http-base-path`). This MUST match
+            // `WEBCONSOLE_BASE_PATH_PLACEHOLDER` in `src/api/main.rs`. When
+            // pre-building the bundle out-of-band (see `WEBCONSOLE_BUILD_DIR`
+            // below), set the same `WEBCONSOLE_BASE_PATH` so the cached build
+            // carries the placeholder too.
+            env::set_var("WEBCONSOLE_BASE_PATH", "/__FELDERA_BASE_PATH__");
         }
         let asset_path: PathBuf =
             Path::new("../../js-packages/web-console/").join(nested_build_dir);
@@ -92,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("Could not run `bun clean-install`. Follow set-up instructions in js-packages/web-console/README.md")
             .run("build")
             .expect("Could not run `bun run build`. Run it manually in js-packages/web-console/ to debug.")
-            .target(asset_path.clone())
+            .target(asset_path)
             .to_resource_dir();
         let _ = resource_dir.with_generated_filename(out_dir.join("generated.rs"));
         resource_dir.build().expect("SvelteKit app failed to build");

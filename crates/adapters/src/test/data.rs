@@ -4,7 +4,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use dbsp::utils::Tup2;
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use feldera_sqllib::{
     ByteArray, Date, F32, F64, SqlDecimal, SqlString, Time, Timestamp, TimestampTz, Uuid, Variant,
 };
@@ -39,6 +39,7 @@ use std::sync::Arc;
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct TestStruct {
@@ -135,6 +136,7 @@ serialize_struct!(TestStruct()[4]{
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct KeyStruct {
@@ -183,6 +185,49 @@ deserialize_without_context!(KeyStruct);
 
 serialize_struct!(KeyStruct()[1]{
     id["id"]: u32
+});
+
+/// One row of a `group by` count: the group key and the number of records in
+/// the group.  Used by [`crate::test::test_circuit_with_aggregate`].
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Hash,
+    SizeOf,
+    Arbitrary,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct CountRow {
+    pub key: i64,
+    pub n: i64,
+}
+
+impl CountRow {
+    pub fn schema() -> Vec<Field> {
+        vec![
+            Field::new("key".into(), ColumnType::bigint(false)),
+            Field::new("n".into(), ColumnType::bigint(false)),
+        ]
+    }
+}
+
+deserialize_without_context!(CountRow);
+
+serialize_struct!(CountRow()[2]{
+    key["key"]: i64,
+    n["n"]: i64
 });
 
 /// Generate a batch of records no larger that `size`.
@@ -278,6 +323,7 @@ pub fn generate_test_batches_with_weights(
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct TestStructMetadata {
@@ -298,7 +344,27 @@ deserialize_table_record!(TestStructMetadata["TestStructMetadata", Variant, 6] {
     (kafka_offset, "kafka_offset", false, i64, |__feldera_metadata: &Option<Variant>| __feldera_metadata.as_ref().and_then(|metadata| i64::try_from(metadata.index_string("kafka_offset")).ok()))
 });
 
+serialize_table_record!(TestStructMetadata[6]{
+    i["i"]: i32,
+    kafka_headers["kafka_headers"]: Variant,
+    kafka_topic["kafka_topic"]: SqlString,
+    kafka_timestamp["kafka_timestamp"]: Timestamp,
+    kafka_partition["kafka_partition"]: i32,
+    kafka_offset["kafka_offset"]: i64
+});
+
 impl TestStructMetadata {
+    pub fn schema() -> Vec<Field> {
+        vec![
+            Field::new("i".into(), ColumnType::int(false)),
+            Field::new("kafka_headers".into(), ColumnType::variant(false)),
+            Field::new("kafka_topic".into(), ColumnType::varchar(false)),
+            Field::new("kafka_timestamp".into(), ColumnType::timestamp(false)),
+            Field::new("kafka_partition".into(), ColumnType::int(false)),
+            Field::new("kafka_offset".into(), ColumnType::bigint(false)),
+        ]
+    }
+
     pub fn new(
         i: i32,
         kafka_headers: Variant,
@@ -315,6 +381,96 @@ impl TestStructMetadata {
             kafka_partition,
             kafka_offset,
         }
+    }
+}
+
+/// Row of a table fed by a connector with soft deletes enabled.
+///
+/// The `is_delete` column takes its value from record metadata, the way the SQL
+/// compiler generates it for a column declared as
+/// `is_delete BOOLEAN DEFAULT CAST(CONNECTOR_METADATA()['is_delete'] AS BOOLEAN)`.
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    Clone,
+    Hash,
+    SizeOf,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    IsNone,
+    OrdRepr,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+pub struct TestStructSoftDelete {
+    pub id: i64,
+    pub s: String,
+    pub is_delete: Option<bool>,
+}
+
+deserialize_table_record!(TestStructSoftDelete["TestStructSoftDelete", Variant, 3] {
+    (id, "id", false, i64, |_| None),
+    (s, "s", false, String, |_| None),
+    (is_delete, "is_delete", false, Option<bool>, |__feldera_metadata: &Option<Variant>| Some(__feldera_metadata.as_ref().and_then(|metadata| bool::try_from(metadata.index_string("is_delete")).ok())))
+});
+
+serialize_table_record!(TestStructSoftDelete[3]{
+    id["id"]: i64,
+    s["s"]: String,
+    is_delete["is_delete"]: Option<bool>
+});
+
+impl TestStructSoftDelete {
+    pub fn inserted(id: i64, s: &str) -> Self {
+        Self {
+            id,
+            s: s.to_string(),
+            is_delete: None,
+        }
+    }
+
+    pub fn deleted(id: i64, s: &str) -> Self {
+        Self {
+            id,
+            s: s.to_string(),
+            is_delete: Some(true),
+        }
+    }
+
+    pub fn schema() -> Vec<Field> {
+        vec![
+            Field::new("id".into(), ColumnType::bigint(false)),
+            Field::new("s".into(), ColumnType::varchar(false)),
+            Field::new("is_delete".into(), ColumnType::boolean(true)),
+        ]
+    }
+
+    /// Arrow schema of the records ingested by a connector, which does not
+    /// include the metadata-populated `is_delete` column.
+    pub fn arrow_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, false),
+            arrow::datatypes::Field::new("s", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Avro schema of the records ingested by a connector, which does not
+    /// include the metadata-populated `is_delete` column.
+    pub fn avro_schema() -> &'static str {
+        r#"{
+            "type": "record",
+            "name": "TestStructSoftDelete",
+            "fields": [
+                { "name": "id", "type": "long" },
+                { "name": "s", "type": "string" }
+            ]
+        }"#
     }
 }
 
@@ -336,6 +492,7 @@ impl TestStructMetadata {
     rkyv::Deserialize,
     Arbitrary,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -369,6 +526,7 @@ deserialize_table_record!(EmbeddedStruct["EmbeddedStruct", Variant, 1] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct TestStruct2 {
@@ -702,6 +860,7 @@ deserialize_table_record!(TestStruct2["TestStruct2", Variant, 8] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct DatabricksPeople {
@@ -768,6 +927,7 @@ deserialize_table_record!(DatabricksPeople["DatabricksPeople", Variant, 8] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct IcebergTestStruct {
@@ -785,6 +945,11 @@ pub struct IcebergTestStruct {
     pub fixed: ByteArray,
     pub varbin: ByteArray,
     pub tstz: TimestampTz,
+    pub string_array: Vec<String>,
+    pub struct1: TestStruct,
+    pub struct_array: Vec<TestStruct>,
+    pub string_string_map: BTreeMap<String, String>,
+    pub string_struct_map: BTreeMap<String, TestStruct>,
 }
 
 impl Arbitrary for IcebergTestStruct {
@@ -810,7 +975,7 @@ impl Arbitrary for IcebergTestStruct {
                 // Generate timestamps within a 1-year range
                 1704070800i64..1735693200,
                 // Generate timestamptz within a 1-year range (microseconds since epoch)
-                1704070800_000_000i64..1735693200_000_000,
+                1_704_070_800_000_000i64..1_735_693_200_000_000,
             ),
             // String in the range "0".."1000"
             (
@@ -846,6 +1011,14 @@ impl Arbitrary for IcebergTestStruct {
                         fixed: ByteArray::from_vec(fixed),
                         varbin: ByteArray::new(&varbin),
                         tstz: TimestampTz::from_microseconds(tstz),
+                        string_array: vec![format!("a{s}"), format!("b{s}")],
+                        struct1: TestStruct::for_id(s as u32),
+                        struct_array: vec![TestStruct::for_id(s as u32)],
+                        string_string_map: BTreeMap::from([(format!("k{s}"), format!("v{s}"))]),
+                        string_struct_map: BTreeMap::from([(
+                            format!("k{s}"),
+                            TestStruct::for_id(s as u32),
+                        )]),
                     }
                 },
             )
@@ -878,6 +1051,44 @@ impl IcebergTestStruct {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
+            arrow::datatypes::Field::new(
+                "string_array",
+                DataType::new_list(DataType::Utf8, false),
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                "struct1",
+                DataType::Struct(TestStruct::arrow_schema().fields.clone()),
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                "struct_array",
+                DataType::new_list(
+                    DataType::Struct(TestStruct::arrow_schema().fields.clone()),
+                    false,
+                ),
+                false,
+            ),
+            arrow::datatypes::Field::new_map(
+                "string_string_map",
+                "entries",
+                arrow::datatypes::Field::new("key", DataType::Utf8, false),
+                arrow::datatypes::Field::new("value", DataType::Utf8, false),
+                false,
+                false,
+            ),
+            arrow::datatypes::Field::new_map(
+                "string_struct_map",
+                "entries",
+                arrow::datatypes::Field::new("key", DataType::Utf8, false),
+                arrow::datatypes::Field::new(
+                    "value",
+                    DataType::Struct(TestStruct::arrow_schema().fields.clone()),
+                    false,
+                ),
+                false,
+                false,
+            ),
         ]))
     }
 
@@ -897,6 +1108,34 @@ impl IcebergTestStruct {
             Field::new("fixed".into(), ColumnType::fixed(5, false)),
             Field::new("varbin".into(), ColumnType::varbinary(false)),
             Field::new("tstz".into(), ColumnType::timestamp_tz(false)),
+            Field::new(
+                "string_array".into(),
+                ColumnType::array(false, ColumnType::varchar(false)),
+            ),
+            Field::new(
+                "struct1".into(),
+                ColumnType::structure(false, &TestStruct::schema()),
+            ),
+            Field::new(
+                "struct_array".into(),
+                ColumnType::array(false, ColumnType::structure(false, &TestStruct::schema())),
+            ),
+            Field::new(
+                "string_string_map".into(),
+                ColumnType::map(
+                    false,
+                    ColumnType::varchar(false),
+                    ColumnType::varchar(false),
+                ),
+            ),
+            Field::new(
+                "string_struct_map".into(),
+                ColumnType::map(
+                    false,
+                    ColumnType::varchar(false),
+                    ColumnType::structure(false, &TestStruct::schema()),
+                ),
+            ),
         ]
     }
 
@@ -917,6 +1156,34 @@ impl IcebergTestStruct {
             Field::new("fixed".into(), ColumnType::fixed(5, false)),
             Field::new("varbin".into(), ColumnType::varbinary(false)),
             Field::new("tstz".into(), ColumnType::timestamp_tz(false)),
+            Field::new(
+                "string_array".into(),
+                ColumnType::array(false, ColumnType::varchar(false)),
+            ),
+            Field::new(
+                "struct1".into(),
+                ColumnType::structure(false, &TestStruct::schema()),
+            ),
+            Field::new(
+                "struct_array".into(),
+                ColumnType::array(false, ColumnType::structure(false, &TestStruct::schema())),
+            ),
+            Field::new(
+                "string_string_map".into(),
+                ColumnType::map(
+                    false,
+                    ColumnType::varchar(false),
+                    ColumnType::varchar(false),
+                ),
+            ),
+            Field::new(
+                "string_struct_map".into(),
+                ColumnType::map(
+                    false,
+                    ColumnType::varchar(false),
+                    ColumnType::structure(false, &TestStruct::schema()),
+                ),
+            ),
         ];
 
         fields
@@ -933,7 +1200,7 @@ impl IcebergTestStruct {
     }
 }
 
-serialize_table_record!(IcebergTestStruct[13]{
+serialize_table_record!(IcebergTestStruct[18]{
     b["b"]: bool,
     i["i"]: i32,
     l["l"]: i64,
@@ -947,10 +1214,15 @@ serialize_table_record!(IcebergTestStruct[13]{
     // uuid["uuid"]: ByteArray,
     fixed["fixed"]: ByteArray,
     varbin["varbin"]: ByteArray,
-    tstz["tstz"]: TimestampTz
+    tstz["tstz"]: TimestampTz,
+    string_array["string_array"]: Vec<String>,
+    struct1["struct1"]: TestStruct,
+    struct_array["struct_array"]: Vec<TestStruct>,
+    string_string_map["string_string_map"]: BTreeMap<String, String>,
+    string_struct_map["string_struct_map"]: BTreeMap<String, TestStruct>
 });
 
-deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 13] {
+deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 18] {
     (b, "b", false, bool, |_| None),
     (i, "i", false, i32, |_| None),
     (l, "l", false, i64, |_| None),
@@ -964,7 +1236,12 @@ deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 13] {
     // (uuid, "uuid", false, ByteArray, None),
     (fixed, "fixed", false, ByteArray, |_| None),
     (varbin, "varbin", false, ByteArray, |_| None),
-    (tstz, "tstz", false, TimestampTz, |_| None)
+    (tstz, "tstz", false, TimestampTz, |_| None),
+    (string_array, "string_array", false, Vec<String>, |_| None),
+    (struct1, "struct1", false, TestStruct, |_| None),
+    (struct_array, "struct_array", false, Vec<TestStruct>, |_| None),
+    (string_string_map, "string_string_map", false, BTreeMap<String, String>, |_| None),
+    (string_struct_map, "string_struct_map", false, BTreeMap<String, TestStruct>, |_| None)
 });
 
 /// Records in the Amazon S3 Tables integration-test table (`dev.test_table`).
@@ -986,6 +1263,7 @@ deserialize_table_record!(IcebergTestStruct["IcebergTestStruct", Variant, 13] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct S3TablesTestStruct {
@@ -1037,6 +1315,7 @@ deserialize_table_record!(S3TablesTestStruct["S3TablesTestStruct", Variant, 3] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct IcebergSubsetTestStruct {
@@ -1082,6 +1361,7 @@ deserialize_table_record!(IcebergSubsetTestStruct["IcebergSubsetTestStruct", Var
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct DeltaTestStruct {
@@ -1097,6 +1377,7 @@ pub struct DeltaTestStruct {
     pub string: String,
     pub unused: Option<String>,
     pub timestamp_ntz: Timestamp,
+    pub timestamp_tz: TimestampTz,
     pub tinyint: i8,
     pub string_array: Vec<String>,
     pub struct1: TestStruct,
@@ -1179,6 +1460,9 @@ impl Arbitrary for DeltaTestStruct {
                         string: string.to_string(),
                         unused: Some(unused.to_string()),
                         timestamp_ntz: Timestamp::from_milliseconds(timestamp_ntz * 1000),
+                        timestamp_tz: TimestampTz::from(Timestamp::from_milliseconds(
+                            timestamp_ntz * 1000,
+                        )),
                         tinyint,
                         string_array,
                         struct1,
@@ -1218,6 +1502,11 @@ impl DeltaTestStruct {
             arrow::datatypes::Field::new(
                 "timestamp_ntz",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            arrow::datatypes::Field::new(
+                "timestamp_tz",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
             arrow::datatypes::Field::new("tinyint", DataType::Int8, false),
@@ -1278,6 +1567,7 @@ impl DeltaTestStruct {
             Field::new("string".into(), ColumnType::varchar(false)),
             Field::new("unused".into(), ColumnType::varchar(true)).with_unused(true),
             Field::new("timestamp_ntz".into(), ColumnType::timestamp(false)),
+            Field::new("timestamp_tz".into(), ColumnType::timestamp_tz(false)),
             Field::new("tinyint".into(), ColumnType::tinyint(false)),
             Field::new(
                 "string_array".into(),
@@ -1327,6 +1617,7 @@ impl DeltaTestStruct {
             Field::new("unused".into(), ColumnType::varchar(true)).with_unused(true),
             Field::new("timestamp_ntz".into(), ColumnType::timestamp(false))
                 .with_lateness("interval '10 days'"),
+            Field::new("timestamp_tz".into(), ColumnType::timestamp_tz(false)),
             Field::new("tinyint".into(), ColumnType::tinyint(false)),
             Field::new(
                 "string_array".into(),
@@ -1374,7 +1665,7 @@ impl DeltaTestStruct {
     }
 }
 
-serialize_table_record!(DeltaTestStruct[20]{
+serialize_table_record!(DeltaTestStruct[21]{
     bigint["bigint"]: i64,
     binary["binary"]: ByteArray,
     boolean["boolean"]: bool,
@@ -1387,6 +1678,7 @@ serialize_table_record!(DeltaTestStruct[20]{
     string["string"]: String,
     unused["unused"]: Option<String>,
     timestamp_ntz["timestamp_ntz"]: Timestamp,
+    timestamp_tz["timestamp_tz"]: TimestampTz,
     tinyint["tinyint"]: i8,
     string_array["string_array"]: Vec<String>,
     struct1["struct1"]: TestStruct,
@@ -1397,7 +1689,7 @@ serialize_table_record!(DeltaTestStruct[20]{
     uuid["uuid"]: Uuid
 });
 
-deserialize_table_record!(DeltaTestStruct["DeltaTestStruct", Variant, 20] {
+deserialize_table_record!(DeltaTestStruct["DeltaTestStruct", Variant, 21] {
     (bigint, "bigint", false, i64, |_| None),
     (binary, "binary", false, ByteArray, |_| None),
     (boolean, "boolean", false, bool, |_| None),
@@ -1410,6 +1702,7 @@ deserialize_table_record!(DeltaTestStruct["DeltaTestStruct", Variant, 20] {
     (string, "string", false, String, |_| None),
     (unused, "unused", false, Option<String>, |_| Some(None)),
     (timestamp_ntz, "timestamp_ntz", false, Timestamp, |_| None),
+    (timestamp_tz, "timestamp_tz", false, TimestampTz, |_| None),
     (tinyint, "tinyint", false, i8, |_| None),
     (string_array, "string_array", false, Vec<String>, |_| None),
     (struct1, "struct1", false, TestStruct, |_| None),
@@ -1435,6 +1728,7 @@ deserialize_table_record!(DeltaTestStruct["DeltaTestStruct", Variant, 20] {
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct DeltaTestKey {
@@ -1448,3 +1742,59 @@ serialize_table_record!(DeltaTestKey[1]{
 deserialize_table_record!(DeltaTestKey["DeltaTestKey", Variant, 1] {
     (bigint, "bigint", false, i64, |_| None)
 });
+
+/// Single-column keys for the Delta merge-mode tests, one per key type under test.
+///
+/// Merge mode finds the row to supersede by comparing a key Feldera holds against the same
+/// value read back from Parquet. Whether that comparison works depends on the key's type,
+/// so each type needs its own key struct. Each one names its column the way the view does,
+/// so the connector's `index` property resolves to it.
+macro_rules! delta_test_key {
+    ($name:ident, $column:ident, $column_name:literal, $ty:ty) => {
+        #[derive(
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Clone,
+            Hash,
+            SizeOf,
+            rkyv::Archive,
+            rkyv::Serialize,
+            rkyv::Deserialize,
+            IsNone,
+            OrdRepr,
+        )]
+        #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
+        pub struct $name {
+            pub $column: $ty,
+        }
+
+        serialize_table_record!($name[1]{ $column[$column_name]: $ty });
+
+        deserialize_table_record!($name[$column_name, Variant, 1] {
+            ($column, $column_name, false, $ty, |_| None)
+        });
+    };
+}
+
+delta_test_key!(DeltaTestKeyInt, int, "int", i32);
+delta_test_key!(DeltaTestKeyString, string, "string", String);
+delta_test_key!(DeltaTestKeyBinary, binary, "binary", ByteArray);
+delta_test_key!(
+    DeltaTestKeyTimestamp,
+    timestamp_ntz,
+    "timestamp_ntz",
+    Timestamp
+);
+delta_test_key!(DeltaTestKeyDecimal, decimal_10_3, "decimal_10_3", SqlDecimal<10, 3>);
+delta_test_key!(DeltaTestKeyDouble, double, "double", F64);
+delta_test_key!(DeltaTestKeyUuid, uuid, "uuid", Uuid);
+delta_test_key!(DeltaTestKeyDate, date, "date", Date);
+delta_test_key!(DeltaTestKeyTinyInt, tinyint, "tinyint", i8);
+delta_test_key!(DeltaTestKeySmallInt, smallint, "smallint", i16);
+delta_test_key!(DeltaTestKeyFloat, float, "float", F32);
+delta_test_key!(DeltaTestKeyUnused, unused, "unused", Option<String>);
+delta_test_key!(DeltaTestKeyStruct, struct1, "struct1", TestStruct);

@@ -1,7 +1,7 @@
 // Selector tool to decide which circuit metadata to use for visualizations
 
 import { SubList } from "./util.js";
-import { CircuitProfile } from "./profile.js";
+import { CircuitProfile, compareMetrics, measurementLabel } from "./profile.js";
 import type { ProfilerCallbacks, MetricOption, WorkerOption } from "./profiler.js";
 
 /** Describes which metadata from a circuit to display. */
@@ -15,6 +15,14 @@ export class MetadataSelection {
 }
 
 /** UI elements and state for selecting the profile metadata to display. */
+/** The name of a metric in the selector. If the id has `key:value` labels, the name starts at the
+ *  first label: `input_batches_stats.input:0.avg_size` becomes "Input:0 avg size". */
+export function optionLabel(metric: string): string {
+    const parts = metric.split(".");
+    const firstLabel = parts.findIndex(part => part.includes(":"));
+    return measurementLabel(firstLabel > 0 ? parts.slice(firstLabel).join(".") : metric);
+}
+
 export class MetadataSelector {
     private workersVisible: Array<boolean>;
     private readonly allMetrics: Set<string>;
@@ -63,10 +71,11 @@ export class MetadataSelector {
     }
 
     notifyMetricsChanged() {
-        const metrics: MetricOption[] = Array.from(this.allMetrics).sort().map(metric => ({
-            id: metric,
-            label: metric
-        }));
+        // Ordered the way the metrics tables order their rows: by the name shown, and by id
+        // where two ids spell the same name.
+        const metrics: MetricOption[] = Array.from(this.allMetrics)
+            .map(metric => ({ id: metric, label: optionLabel(metric) }))
+            .sort(compareMetrics);
         this.callbacks.onMetricsChanged(metrics, this.selectedMetric);
     }
 

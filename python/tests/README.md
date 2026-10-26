@@ -50,6 +50,23 @@ To run a specific test:
 uv run python -m pytest tests/platform/test_shared_pipeline.py::TestPipeline::test_adhoc_query_hash -v
 ```
 
+### RBAC and authentication tests
+
+The RBAC suite starts its own manager and HTTPS identity providers. Run it
+serially because the scenarios retain database state across manager restarts:
+
+```bash
+cargo build -p pipeline-manager
+cd python
+uv run python -m pytest -n0 tests/platform_rbac
+```
+
+`test_8_boundaries.py` also runs independently. It extends the route matrix with
+API keys, OIDC trusts, and encoded URLs, and checks malformed tenant headers,
+invalid signed tokens, and access across tenants. Set `FELDERA_TEST_BINARY` to
+test a different manager binary, or `FELDERA_TEST_IMAGE` for the container backend.
+Run only one native suite at a time: embedded Postgres binds port 8082.
+
 ### Reducing Compilation Cycles
 
 To reduce redundant compilation cycles during testing:
@@ -111,3 +128,21 @@ after the test completed.
 def test_some_property(pipeline_name):
     pass
 ```
+
+## Cleaning up after a run
+
+Teardown only runs while the test process is alive. A cancelled workflow run, an
+evicted runner or a job timeout kills pytest outright, and every pipeline that
+was running at that moment keeps consuming compute on the shared CI instance.
+
+`tests/stop_ci_run_pipelines.py` sweeps up what such a run left behind. It
+matches the prefix `unique_pipeline_name` stamps on every test pipeline.
+
+```bash
+cd python
+PYTHONPATH=`pwd` uv run python -m tests.stop_ci_run_pipelines --prefix <sha5>_
+```
+
+Whatever cleanup a test does itself should go through
+`feldera.testutils.reclaim_pipeline`: it bounds every wait, and it clears
+storage even when the stop failed instead of abandoning a running pipeline.

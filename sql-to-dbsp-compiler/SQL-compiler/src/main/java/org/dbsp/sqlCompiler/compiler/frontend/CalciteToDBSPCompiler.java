@@ -129,7 +129,7 @@ import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.RelColumnMetadata;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlToRelCompiler;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.SqlUserDefinedAggregationFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlUserDefinedAggregationFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
@@ -175,7 +175,6 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPDirectComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPEqualityComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPFlatmap;
-import org.dbsp.sqlCompiler.ir.expression.DBSPIfExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPNoComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPRawTupleExpression;
@@ -238,6 +237,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 
 import static org.dbsp.sqlCompiler.ir.type.DBSPTypeCode.*;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /**
  * The compiler is stateful: it compiles a sequence of SQL statements
@@ -267,7 +267,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
      */
     public CalciteToDBSPCompiler(CompilerOptions options, DBSPCompiler compiler,
                                  ProgramMetadata metadata) {
-        this.circuit = new DBSPCircuit(compiler.metadata);
+        this.circuit = new DBSPCircuit(compiler.metadata, false);
         this.compiler = compiler;
         this.nodeOperator = new HashMap<>();
         this.tableContents = new TableContents(compiler);
@@ -372,6 +372,42 @@ public class CalciteToDBSPCompiler extends RelVisitor
                 "It looks like the compiler could not decorrelate this query.", 2555, node);
     }
 
+    /** True if {@link #visitCorrelate} can implement this correlate
+     * (an INNER unnest-shaped correlate compiled into a flat_map). */
+    public static boolean isImplementableCorrelate(LogicalCorrelate correlate) {
+        if (correlate.getJoinType() != JoinRelType.INNER)
+            return false;
+        RelNode right = correlate.getRight();
+        if (right instanceof Project project)
+            right = project.getInput();
+        else if (right instanceof Filter filter)
+            right = filter.getInput();
+        return right instanceof Uncollect uncollect
+                && uncollect.getInput() instanceof LogicalProject uncollectInput
+                && uncollectInput.getProjects().size() == 1;
+    }
+
+    /** True if the plan contains a correlate that the compiler cannot
+     * implement; such a correlate means that the decorrelator has failed. */
+    public static boolean hasUnimplementableCorrelate(RelNode plan) {
+        class Finder extends RelVisitor {
+            boolean found = false;
+
+            @Override
+            public void visit(RelNode node, int ordinal, @org.checkerframework.checker.nullness.qual.Nullable RelNode parent) {
+                if (node instanceof LogicalCorrelate correlate
+                        && !isImplementableCorrelate(correlate)) {
+                    this.found = true;
+                    return;
+                }
+                super.visit(node, ordinal, parent);
+            }
+        }
+        Finder finder = new Finder();
+        finder.go(plan);
+        return finder.found;
+    }
+
     void visitCorrelate(LogicalCorrelate correlate) {
         /*
          We decorrelate queries using Calcite's optimizer, which doesn't always work.
@@ -414,12 +450,16 @@ public class CalciteToDBSPCompiler extends RelVisitor
         DBSPTypeTuple type = this.convertType(
                 node.getPositionRange(), correlate.getRowType(), false).to(DBSPTypeTuple.class);
 
-        if (correlate.getJoinType() != JoinRelType.INNER)
-            throw new UnimplementedException("LEFT JOIN UNNEST");
+        if (!isImplementableCorrelate(correlate)) {
+            if (correlate.getJoinType() != JoinRelType.INNER)
+                throw new UnimplementedException("LEFT JOIN UNNEST");
+            throw this.decorrelateError(node);
+        }
         this.visit(correlate.getLeft(), 0, correlate);
         DBSPSimpleOperator left = this.getInputAs(correlate.getLeft(), true);
         DBSPTypeTuple leftElementType = left.getOutputZSetElementType().to(DBSPTypeTuple.class);
 
+        // The casts below are safe: isImplementableCorrelate checked the shape.
         RelNode correlateRight = correlate.getRight();
         Project rightProject = null;
         Filter rightFilter = null;
@@ -430,13 +470,8 @@ public class CalciteToDBSPCompiler extends RelVisitor
             rightFilter = (Filter) correlateRight;
             correlateRight = rightFilter.getInput();
         }
-        if (!(correlateRight instanceof Uncollect uncollect))
-            throw this.decorrelateError(node);
-        RelNode uncollectInput = uncollect.getInput();
-        if (!(uncollectInput instanceof LogicalProject project))
-            throw this.decorrelateError(node);
-        if (project.getProjects().size() != 1)
-            throw this.decorrelateError(node);
+        Uncollect uncollect = (Uncollect) correlateRight;
+        LogicalProject project = (LogicalProject) uncollect.getInput();
         RexNode projection = project.getProjects().get(0);
         DBSPVariablePath dataVar = new DBSPVariablePath(leftElementType.ref());
         ExpressionCompiler eComp = new ExpressionCompiler(correlate, dataVar, this.compiler);
@@ -1011,6 +1046,11 @@ public class CalciteToDBSPCompiler extends RelVisitor
             // Try a view if no table with this name exists.
             DBSPViewOperator sourceView = this.getCircuit().getView(tableName);
             if (sourceView != null) {
+                if (sourceView.metadata.emitFinalColumn >= 0)
+                    throw new UnsupportedException("View " + tableName.singleQuote() +
+                            " has an 'emit_final' property, so it cannot be used as a source for a query. " +
+                            "Define an additional view without 'emit_final' instead.",
+                            node.getPositionRange());
                 Utilities.putNew(this.nodeOperator, scan, sourceView);
             } else {
                 if (!create)
@@ -1291,173 +1331,6 @@ public class CalciteToDBSPCompiler extends RelVisitor
         DBSPFilterOperator filter = new DBSPFilterOperator(relNode, filterFunc, input.outputPort());
         this.addOperator(filter);
         return filter;
-    }
-
-    /** Keeps track of the fields of a tuple that are used as key fields.
-     * Note that key fields may be duplicated.
-     * E.g., a key may contain fields 1, 3, and 1 of a tuple of size 5, in this order.
-     * [_, 0 and 2, _, 1, _]. */
-    static class KeyFields {
-        /** Indexes of fields that belong to the key, in the order they appear in the key: [1, 3, 1] */
-        private final List<Integer> keyFields;
-        private final Set<Integer> keyFieldSet;
-
-        public KeyFields() {
-            this.keyFieldSet = new HashSet<>();
-            this.keyFields = new ArrayList<>();
-        }
-
-        public KeyFields(KeyFields other) {
-            this.keyFieldSet = new HashSet<>(other.keyFieldSet);
-            this.keyFields = new ArrayList<>(other.keyFields);
-        }
-
-        public boolean isKeyField(int i) {
-            return this.keyFieldSet.contains(i);
-        }
-
-        /** Call this function to add key fields in the order they appear in the key */
-        public void add(int index) {
-            this.keyFieldSet.add(index);
-            this.keyFields.add(index);
-        }
-
-        public void addAll(List<Integer> indexes) {
-            for (int i: indexes)
-                this.add(i);
-        }
-
-        public void addAllUsed(@Nullable FieldUseMap map) {
-            if (map == null)
-                return;
-            if (map.isRef())
-                map = map.deref();
-            this.addAll(map.getUsedFields());
-        }
-
-        /** Extract the non-key fields from a value into a tuple, in the order they appear in the tuple.
-         * For our example, the result will be [e.0, e.2, e.4]
-         *
-         * @param e Expression that is a reference to a tuple.
-         * @return  A tuple containing just the non-key fields, in order.
-         */
-        DBSPTupleExpression nonKeyFields(DBSPExpression e) {
-            // Almost like nonKeyFields with 3 arguments, except we don't insert casts ever
-            // return this.nonKeyFields(var, e.getType().to(DBSPTypeTupleBase.class), 0);
-            List<DBSPExpression> fields = new ArrayList<>();
-            DBSPTypeTupleBase tuple = e.getType().to(DBSPTypeTupleBase.class);
-            for (int i = 0; i < tuple.size(); i++) {
-                if (this.isKeyField(i))
-                    continue;
-                fields.add(e.field(i).applyCloneIfNeeded());
-            }
-            return new DBSPTupleExpression(fields, false);
-        }
-
-        /** Extract the non-key fields from a value into a tuple, and insert casts if needed.
-         * For our example, the result will be [(desiredType[0])e.0, (desiredType[1])e.2, (desiredType[2])e.4]
-         *
-         * @param e        Expression that is a reference to a tuple.
-         * @param desiredType Type to cast resulting tuple to.
-         * @return          A tuple containing just the non-key fields, in order.
-         */
-        DBSPTupleExpression nonKeyFields(DBSPExpression e, DBSPTypeTupleBase desiredType) {
-            List<DBSPExpression> fields = new ArrayList<>();
-            Utilities.enforce(e.getType().getToplevelFieldCount() >= desiredType.size());
-            for (int i = 0; i < desiredType.size(); i++) {
-                if (this.isKeyField(i))
-                    continue;
-                fields.add(e.field(i)
-                        .applyCloneIfNeeded()
-                        .nullabilityCast(desiredType.getFieldType(i), DBSPCastExpression.CastType.SqlUnsafe));
-            }
-            return new DBSPTupleExpression(fields, false);
-        }
-
-        /** Extract the key fields from a value (e), in the order they have to appear in the key.
-         * For our example the result will be [(keyType[0])e.1, (keyType[1])e.3, (keyType[2])e.1]
-         *
-         * @param e       Expression that is a reference to a tuple.
-         * @param keyType Type for the key fields in the result; may introduce nullability casts.
-         * @return A tuple containing just the key fields, in order.
-         */
-        DBSPTupleExpression keyFields(DBSPExpression e, DBSPTypeTupleBase keyType) {
-            List<DBSPExpression> fields = new ArrayList<>();
-            Utilities.enforce(keyType.size() == this.size());
-            int index = 0;
-            for (int kf: this.keyFields) {
-                fields.add(e.field(kf)
-                        .applyCloneIfNeeded()
-                        .nullabilityCast(keyType.getFieldType(index), DBSPCastExpression.CastType.SqlUnsafe));
-                index++;
-            }
-            return new DBSPTupleExpression(fields, false);
-        }
-
-        /** Given a type for the row, return the type for the key */
-        DBSPTypeTuple keyType(DBSPTypeTupleBase row) {
-            List<DBSPType> fields = new ArrayList<>();
-            for (int kf: this.keyFields) {
-                fields.add(row.getFieldType(kf));
-            }
-            return new DBSPTypeTuple(fields);
-        }
-
-        /**
-         * Produce a list with original fields from two values: the key value, and the data value.
-         *
-         * @param key       Expression containing the key fields, in order.
-         * @param data      Expression containing the data fields, in order.
-         * @param result    A list of the unshuffled fields.  The result is
-         *                  [data.0, key.0, data.1, key.1, data.2]
-         *                  (In this case we expect key.0 == key.2 always)
-         */
-        void unshuffleKeyAndDataFields(DBSPExpression key, DBSPExpression data, List<DBSPExpression> result) {
-            Utilities.enforce(key.getType().getToplevelFieldCount() == this.size());
-            int size = this.keyFieldSet.size() + data.getType().getToplevelFieldCount();
-            int skipped = 0;
-            boolean nullableData = data.getType().deref().mayBeNull;
-            for (int i = 0; i < size; i++) {
-                @Nullable DBSPExpression checkNull = nullableData ? data.deref().is_null() : null;
-                if (this.isKeyField(i)) {
-                    int index = 0;
-                    for (int ki: this.keyFields) {
-                        // There could be multiple positions, stop at the first one
-                        if (ki == i)
-                            break;
-                        index++;
-                    }
-                    DBSPExpression keyField = key.deref().field(index).applyCloneIfNeeded();
-                    if (nullableData) {
-                        if (!keyField.getType().mayBeNull)
-                            keyField = keyField.some();
-                        keyField = new DBSPIfExpression(key.getNode(),
-                                checkNull, keyField.getType().none(), keyField);
-                    }
-                    result.add(keyField);
-                    skipped++;
-                } else {
-                    DBSPExpression dataField;
-                    dataField = data.deref().field(i - skipped).applyCloneIfNeeded();
-                    if (nullableData) {
-                        if (!dataField.getType().mayBeNull)
-                            dataField = dataField.some();
-                        dataField = new DBSPIfExpression(key.getNode(),
-                                checkNull, dataField.getType().none(), dataField);
-                    }
-                    result.add(dataField);
-                }
-            }
-        }
-
-        private int size() {
-            return this.keyFields.size();
-        }
-
-        @Override
-        public String toString() {
-            return "KeyFields: " + this.keyFields;
-        }
     }
 
     /** Create the AND of a list of boolean expressions */
@@ -1994,8 +1867,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
                 // The following loop is an adapted version of extendedRight.keyFields
                 final DBSPVariablePath joinRightVar = joinVar.getType().var();
                 final List<DBSPExpression> rightKeyFields = new ArrayList<>();
-                for (int i = 0; i < extendedRight.size(); i++) {
-                    int index = extendedRight.keyFields.get(i);
+                for (int index : extendedRight.keyFieldIndexes()) {
                     rightKeyFields.add(joinRightVar.deref().field(leftColumns + index)
                             .applyCloneIfNeeded()
                             .cast(node, rightResultType.getFieldType(index), DBSPCastExpression.CastType.SqlUnsafe));
@@ -2362,33 +2234,15 @@ public class CalciteToDBSPCompiler extends RelVisitor
     @Nullable
     ModifyTableTranslation modifyTableTranslation;
 
-    /**
-     * Visit a LogicalValue: a SQL literal, as produced by a VALUES expression.
-     * This can be invoked by a DDM statement, or by a SQL query that computes a constant result.
-     */
-    void visitLogicalValues(LogicalValues values) {
+    /** Convert the rows of a VALUES into a Z-set; each row is cast to 'resultType'. */
+    DBSPZSetExpression compileValues(LogicalValues values, DBSPTypeTuple resultType) {
         IntermediateRel node = CalciteObject.create(values);
         ExpressionCompiler expressionCompiler = new ExpressionCompiler(values, null, this.compiler);
-        DBSPTypeTuple sourceType = this.convertType(node.getPositionRange(), values.getRowType(), false).to(DBSPTypeTuple.class);
-        DBSPTypeTuple resultType;
-        if (this.modifyTableTranslation != null) {
-            resultType = this.modifyTableTranslation.getResultType();
-            if (sourceType.size() != resultType.size()) {
-                this.compiler.reportError(this.modifyTableTranslation.getPosition(),
-                        "Schema error",
-                        "VALUES has " + sourceType.size() + " columns but " + resultType.size() + " are expected");
-                // Ignore value
-                return;
-            }
-        } else {
-            resultType = sourceType;
-        }
-
         DBSPZSetExpression result = DBSPZSetExpression.emptyWithElementType(resultType);
         for (List<RexLiteral> t : values.getTuples()) {
             List<DBSPExpression> expressions = new ArrayList<>();
-            if (t.size() != sourceType.size())
-                throw new InternalCompilerError("Expected a tuple with " + sourceType.size() +
+            if (t.size() != resultType.size())
+                throw new InternalCompilerError("Expected a tuple with " + resultType.size() +
                         " values but got " + t, node);
             int i = 0;
             for (RexLiteral rl : t) {
@@ -2412,7 +2266,31 @@ public class CalciteToDBSPCompiler extends RelVisitor
             DBSPTupleExpression expression = new DBSPTupleExpression(node, expressions);
             result.append(expression);
         }
+        return result;
+    }
 
+    /**
+     * Visit a LogicalValue: a SQL literal, as produced by a VALUES expression.
+     * This can be invoked by a DDM statement, or by a SQL query that computes a constant result.
+     */
+    void visitLogicalValues(LogicalValues values) {
+        IntermediateRel node = CalciteObject.create(values);
+        DBSPTypeTuple sourceType = this.convertType(node.getPositionRange(), values.getRowType(), false).to(DBSPTypeTuple.class);
+        DBSPTypeTuple resultType;
+        if (this.modifyTableTranslation != null) {
+            resultType = this.modifyTableTranslation.getResultType();
+            if (sourceType.size() != resultType.size()) {
+                this.compiler.reportError(this.modifyTableTranslation.getPosition(),
+                        "Schema error",
+                        "VALUES has " + sourceType.size() + " columns but " + resultType.size() + " are expected");
+                // Ignore value
+                return;
+            }
+        } else {
+            resultType = sourceType;
+        }
+
+        DBSPZSetExpression result = this.compileValues(values, resultType);
         if (this.modifyTableTranslation != null) {
             this.modifyTableTranslation.setResult(result);
         } else {
@@ -2727,7 +2605,7 @@ public class CalciteToDBSPCompiler extends RelVisitor
             shuffle.add(inputRowType.size() + elementIndex);
             elementIndex++;
             index++;
-            previousPartitionKeys = ga.partitionKeys;
+            previousPartitionKeys = ga.partitionKeyIndexes();
         }
 
         shuffle.addAll(later);
@@ -3013,15 +2891,6 @@ public class CalciteToDBSPCompiler extends RelVisitor
                 lateness = null;
             }
         }
-        DBSPExpression watermark = null;
-        if (metadata.watermark != null) {
-            watermark = expressionCompiler.compile(metadata.watermark);
-            if (!watermark.getType().is(IHasZero.class)) {
-                this.compiler.reportError(watermark.getSourcePosition(), "Illegal expression",
-                        "Illegal expression for watermark value");
-                watermark = null;
-            }
-        }
         DBSPExpression defaultValue = null;
         if (metadata.defaultValue != null) {
             defaultValue = expressionCompiler.compile(metadata.defaultValue);
@@ -3039,11 +2908,13 @@ public class CalciteToDBSPCompiler extends RelVisitor
                         ", hint will be ignored");
         }
         return new InputColumnMetadata(metadata.getNode(), metadata.getName(), type,
-                metadata.isPrimaryKey, lateness, watermark, defaultValue, metadata.defaultValuePosition, metadata.interned);
+                metadata.isPrimaryKey, lateness, defaultValue, metadata.defaultValuePosition, metadata.interned);
     }
 
     private DBSPNode compileCreateView(CreateViewStatement view) {
         RelNode rel = view.getRel();
+        SourcePositionRange viewPosition = new SourcePositionRange(view.getParserPosition());
+        this.compiler().viewOrigins.add(rel, view.relationName, viewPosition);
         this.go(rel);
         DBSPSimpleOperator op = this.getOperator(rel);
 
@@ -3171,15 +3042,28 @@ public class CalciteToDBSPCompiler extends RelVisitor
             // the case where all project expressions are "constants".
             result = this.compileConstantProject((LogicalProject) modify.rel);
         } else if (modify.rel instanceof LogicalUnion union) {
+            // A VALUES with several rows becomes a union: a row that Calcite can represent
+            // as a literal is a LogicalValues, any other row needs a LogicalProject.
+            // Every input must contribute, otherwise rows are lost silently.
             result = null;
             for (RelNode node: union.getInputs()) {
+                DBSPZSetExpression lit;
                 if (node instanceof LogicalProject project) {
-                    DBSPZSetExpression lit = this.compileConstantProject(project);
-                    if (result == null)
-                        result = lit;
-                    else
-                        result.append(lit);
+                    lit = this.compileConstantProject(project);
+                } else if (node instanceof LogicalValues values) {
+                    DBSPTypeTuple rowType = this.convertType(
+                                    CalciteObject.create(values).getPositionRange(),
+                                    values.getRowType(), false)
+                            .to(DBSPTypeTuple.class);
+                    lit = this.compileValues(values, rowType);
+                } else {
+                    throw new UnimplementedException("statement of this form not supported",
+                            modify.getCalciteObject());
                 }
+                if (result == null)
+                    result = lit;
+                else
+                    result.append(lit);
             }
             Utilities.enforce(result != null);
         } else {
@@ -3301,7 +3185,12 @@ public class CalciteToDBSPCompiler extends RelVisitor
 
         // Skip unused columns is also set to TRUE if any connector sets it as true
         Properties properties = create.getProperties();
+        Long expectedSize = null;
         if (properties != null) {
+            String size = properties.getPropertyValue(CreateTableStatement.EXPECTED_SIZE);
+            if (size != null) {
+                expectedSize = Long.parseLong(size);
+            }
             String connectors = properties.getPropertyValue(CreateTableStatement.CONNECTORS);
             if (connectors != null) {
                 try {
@@ -3340,10 +3229,10 @@ public class CalciteToDBSPCompiler extends RelVisitor
         }
 
         TableMetadata tableMeta = new TableMetadata(
-                tableName, metadata, create.foreignKeys, materialized, appendOnly, skipUnusedColumns);
+                tableName, metadata, create.foreignKeys, expectedSize, materialized, appendOnly, skipUnusedColumns);
         DBSPSourceMultisetOperator result = new DBSPSourceMultisetOperator(
                 new RelAnd(), identifier, TypeCompiler.makeZSet(rowType), originalRowType,
-                tableMeta, tableName, def.getStatement());
+                tableMeta, tableName, StreamKind.COLLECTION, def.getStatement());
         this.addOperator(result);
         this.metadata.addTable(create);
         return result;
@@ -3358,10 +3247,10 @@ public class CalciteToDBSPCompiler extends RelVisitor
         CalciteObject identifier = CalciteObject.EMPTY;
         List<InputColumnMetadata> metadata = Linq.map(create.columns, this::convertMetadata);
         TableMetadata tableMeta = new TableMetadata(
-                tableName, metadata, new ArrayList<>(), false, false, null);
+                tableName, metadata, new ArrayList<>(), null, false, false, null);
         DBSPViewDeclarationOperator result = new DBSPViewDeclarationOperator(
                 create.getCalciteObject(), identifier, TypeCompiler.makeZSet(rowType), originalRowType,
-                tableMeta, tableName);
+                tableMeta, tableName, StreamKind.COLLECTION);
         this.addOperator(result);
         this.metadata.addTable(create);
         return result;
@@ -3408,17 +3297,38 @@ public class CalciteToDBSPCompiler extends RelVisitor
 
         DBSPTypeStruct keyStruct = TypeCompiler.asStruct(ci.getCalciteObject(), ci.indexName, keyColumns, false);
 
+        // Under --jit the index value drops the index-key columns, so key ++ value holds each
+        // column once (matching the deduped source); otherwise the value is the whole row.
+        boolean dedupKeys = this.compiler.options.ioOptions.gen2;
+        List<Integer> valueColumnIndexes = new ArrayList<>();
+        List<ViewColumnMetadata> valueColumns = new ArrayList<>();
+        if (dedupKeys) {
+            for (int c = 0; c < struct.fields.size(); c++) {
+                if (!keyColumnIndexes.contains(c)) {
+                    valueColumnIndexes.add(c);
+                    valueColumns.add(view.metadata.columns.get(c));
+                }
+            }
+        }
+
+        DBSPExpression valueTuple = dedupKeys
+                ? new DBSPTupleExpression(Linq.map(
+                        valueColumnIndexes, c -> var.deref().field(c).applyCloneIfNeeded()), false)
+                : DBSPTupleExpression.flatten(var.deref());
         DBSPExpression index = new DBSPRawTupleExpression(
                 new DBSPTupleExpression(Linq.map(
                         keyColumnIndexes, c -> var.deref().field(c).applyCloneIfNeeded()), false),
-                DBSPTupleExpression.flatten(var.deref()));
+                valueTuple);
         DBSPMapIndexOperator indexOp = new DBSPMapIndexOperator(CalciteEmptyRel.INSTANCE,
                 index.closure(var), view.outputPort());
         this.addOperator(indexOp);
 
+        DBSPTypeStruct valueStruct = dedupKeys
+                ? TypeCompiler.asStruct(ci.getCalciteObject(), ci.indexName, valueColumns, false)
+                : struct;
         DBSPSimpleOperator result = new DBSPSinkOperator(
                 CalciteEmptyRel.INSTANCE, ci.indexName,
-                ci.refersTo.toString(), new DBSPTypeRawTuple(keyStruct, struct),
+                ci.refersTo.toString(), new DBSPTypeRawTuple(keyStruct, valueStruct),
                 view.metadata, indexOp.outputPort());
         this.addOperator(result);
         return result;

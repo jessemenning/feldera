@@ -10,8 +10,6 @@ env:
   # Workload Identity (no secrets).
   SCCACHE_GCS_BUCKET: ${{ vars.SCCACHE_GCS_BUCKET }}
   SCCACHE_GCS_RW_MODE: READ_WRITE
-  AWS_ACCESS_KEY_ID: "${{ secrets.CI_GCS_HMAC_ACCESS_KEY_ID }}"
-  AWS_SECRET_ACCESS_KEY: "${{ secrets.CI_GCS_HMAC_SECRET_ACCESS_KEY }}"
 
 jobs:
   # Ideally this would just invoke `publish-python.yml`
@@ -42,7 +40,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@6dfebec6ddbcd197e02256fbdf54deb334fb7f06 # v2
         with:
-          version: "0.11.3"
+          version: "0.12.5"
           enable-cache: true
           cache-dependency-glob: "python/uv.lock"
       - name: "Set up Python"
@@ -90,7 +88,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@6dfebec6ddbcd197e02256fbdf54deb334fb7f06 # v2
         with:
-          version: "0.11.3"
+          version: "0.12.5"
           enable-cache: true
       - name: "Set up Python"
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -139,7 +137,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@6dfebec6ddbcd197e02256fbdf54deb334fb7f06 # v2
         with:
-          version: "0.11.3"
+          version: "0.12.5"
           enable-cache: true
       - name: "Set up Python"
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -170,7 +168,7 @@ jobs:
   adjust-versions:
     runs-on: [gke-runners-amd64]
     container:
-      image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
+      image: us-central1-docker.pkg.dev/feldera-ci/ghcr-remote/feldera/feldera-dev:sha-a112fd877176bba0f4e5f3475853f918b276d1ef
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -189,36 +187,90 @@ jobs:
       - name: Determine current version based on pipeline-manager
         run: |
           echo "CURRENT_VERSION=$(cargo metadata --no-deps | jq -r '.packages[]|select(.name == "pipeline-manager")|.version')" >> $GITHUB_ENV
+      # A backport release (published from an old release branch) must not
+      # bump main's version: main is already versions ahead of it. Bump only
+      # when the published release is at least main's current version. A
+      # manual workflow_dispatch carries no release tag and always bumps.
+      - name: Check that the published release is not a backport
+        id: bump-check
+        env:
+          RELEASED_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          released="${RELEASED_TAG#v}"
+          if [ -n "$released" ] && [ "$(printf '%s\n%s\n' "$released" "$CURRENT_VERSION" | sort -V | head -1)" = "$released" ] && [ "$released" != "$CURRENT_VERSION" ]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            echo "Release v$released is older than main's v$CURRENT_VERSION: skipping the version bump"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The release is built from one commit, and more pull requests may merge into
+      # main before this job runs.
+      - name: File changelog entries under the released version
+        id: filing
+        continue-on-error: true
+        if: ${{ steps.bump-check.outputs.bump == 'true' && github.event.release.tag_name != '' }}
+        env:
+          RELEASED_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          git fetch --no-tags --depth 1 origin "+refs/tags/$RELEASED_TAG:refs/tags/$RELEASED_TAG"
+          python3 scripts/file_changelog_release.py \
+            --tag "$RELEASED_TAG" \
+            --changelog docs.feldera.com/docs/changelog.md
+
       - name: Bump cargo versions
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
+        env:
+          # Compiling the manager runs postgresql_embedded's build script,
+          # which lists the releases of theseus-rs/postgresql-binaries through
+          # the GitHub API. Anonymous calls share the runners' egress address
+          # and its 60-per-hour limit, which fails the build with "403 rate
+          # limit exceeded"; postgresql_archive sends this token when it is set.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo set-version --bump ${{ vars.RELEASE_NEXT_VERSION }}
           cargo run --release --locked --bin pipeline-manager -- --dump-openapi
       - name: Determine next version based on pipeline-manager
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         run: |
           echo "NEXT_VERSION=$(cargo metadata --no-deps | jq -r '.packages[]|select(.name == "pipeline-manager")|.version')" >> $GITHUB_ENV
       - name: Adjust python version
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         working-directory: ./python
         run: |
           sed -i "s/version = \"${{ env.CURRENT_VERSION }}\"/version = \"${{ env.NEXT_VERSION }}\"/g" pyproject.toml
           uv sync
       - name: Adjust dbt-feldera version
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         working-directory: ./python/dbt-feldera
         run: |
           sed -i "s/version = \"${{ env.CURRENT_VERSION }}\"/version = \"${{ env.NEXT_VERSION }}\"/g" pyproject.toml
           sed -i "s/version: '${{ env.CURRENT_VERSION }}'/version: '${{ env.NEXT_VERSION }}'/g" dbt/include/feldera/dbt_project.yml
       - name: Adjust felderize version
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         working-directory: ./python/felderize
         run: |
           sed -i "s/version = \"${{ env.CURRENT_VERSION }}\"/version = \"${{ env.NEXT_VERSION }}\"/g" pyproject.toml
       - name: Adjust sql compiler version
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         working-directory: ./sql-to-dbsp-compiler/SQL-compiler
         run: |
           sed -i "s|<project.version>${{ env.CURRENT_VERSION }}|<project.version>${{ env.NEXT_VERSION }}|g" pom.xml
       - name: List changes
+        if: ${{ steps.bump-check.outputs.bump == 'true' }}
         run: |
           git diff
+      # Filing the changelog is cosmetic, the version bump is not: a changelog
+      # the filing cannot handle warns and leaves the entries unreleased, while
+      # the bump still commits and pushes.  The merge queue runs the same filing
+      # as a dry run, so a changelog that breaks it fails its own pull request.
+      - name: Warn when the job could not file the changelog
+        if: ${{ steps.filing.outcome == 'failure' }}
+        run: |
+          echo "::warning::the released entries stay under \`## Unreleased\`; file them by hand"
+
       - uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # a94899bca583c204427a224a7af87c02f9b325d5
-        if: ${{ vars.RELEASE_DRY_RUN == 'false' }}
+        if: ${{ vars.RELEASE_DRY_RUN == 'false' && steps.bump-check.outputs.bump == 'true' }}
         with:
           message: "ci: Prepare for v${{ env.NEXT_VERSION }}"
           push: origin main

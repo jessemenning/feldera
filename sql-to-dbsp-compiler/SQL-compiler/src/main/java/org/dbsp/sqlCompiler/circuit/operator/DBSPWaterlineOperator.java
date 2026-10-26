@@ -15,6 +15,7 @@ import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.util.List;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /** Given a stream, it computes function(extractTS(stream), delay(this, init)).
  * This operator is special: the output is replicated for all workers.
@@ -75,7 +76,8 @@ public final class DBSPWaterlineOperator extends DBSPUnaryOperator implements IS
         DBSPWaterlineOperator otherOperator = other.as(DBSPWaterlineOperator.class);
         if (otherOperator == null)
             return false;
-        return this.init.equivalent(otherOperator.init);
+        return this.init.equivalent(otherOperator.init) &&
+                this.extractTs.equivalent(otherOperator.extractTs);
     }
 
     @SuppressWarnings("unused")
@@ -87,5 +89,13 @@ public final class DBSPWaterlineOperator extends DBSPUnaryOperator implements IS
                 CalciteEmptyRel.INSTANCE, init, extractTs, info.getClosureFunction(),
                 info.getInput(0))
                 .addAnnotations(info.annotations(), DBSPWaterlineOperator.class);
+    }
+
+    /** The waterline is the running maximum over the rows seen, so it is defined for
+     * a stream of changes as well as for a stream of collections. */
+    @Override
+    protected StreamKind computeOutputKind() {
+        this.requireAllInputsAmong(StreamKind.DELTA, StreamKind.COLLECTION);
+        return StreamKind.WATERLINE;
     }
 }

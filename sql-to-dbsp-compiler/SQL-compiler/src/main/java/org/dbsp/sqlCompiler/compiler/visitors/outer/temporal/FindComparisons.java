@@ -11,7 +11,6 @@ import org.dbsp.sqlCompiler.ir.expression.DBSPBinaryExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
-import org.dbsp.sqlCompiler.ir.expression.DBSPUnaryExpression;
 import org.dbsp.util.Utilities;
 
 import java.util.ArrayList;
@@ -42,20 +41,15 @@ class FindComparisons {
             add(DBSPOpcode.LTE);
             add(DBSPOpcode.GTE);
             add(DBSPOpcode.GT);
-            add(DBSPOpcode.EQ);
+            // EQ is desugared by DesugarNowEquality
         }};
 
         DBSPClosureExpression clo = closure.to(DBSPClosureExpression.class);
         Utilities.enforce(clo.parameters.length == 1);
         this.parameter = clo.parameters[0];
 
-        DBSPExpression expression = clo.body;
-        if (expression.is(DBSPUnaryExpression.class)) {
-            DBSPUnaryExpression unary = expression.to(DBSPUnaryExpression.class);
-            // If the filter is wrap_bool(expression), analyze expression
-            if (unary.opcode == DBSPOpcode.WRAP_BOOL)
-                expression = unary.source;
-        }
+        // If the filter is wrap_bool(expression), analyze expression
+        DBSPExpression expression = clo.body.stripWrapBool();
         this.analyzeConjunction(expression);
     }
 
@@ -151,7 +145,7 @@ class FindComparisons {
         if (me == null || !me.mayBeMonotone())
             return false;
 
-        DBSPOpcode opcode = leftHasNow ? RewriteNow.inverse(binary.opcode) : binary.opcode;
+        DBSPOpcode opcode = leftHasNow ? RewriteNow.swappedOpcode(binary.opcode) : binary.opcode;
         TemporalFilter comp = new TemporalFilter(this.parameter, withoutNow, withNow, opcode);
         this.comparisons.add(comp);
         return true;

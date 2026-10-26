@@ -1,3 +1,4 @@
+use crate::cluster_monitor::MONITOR_STALE_AFTER;
 use crate::db::storage::Storage;
 use crate::db::types::monitor::{
     ClusterMonitorEvent, ClusterMonitorEventId, ExtendedClusterMonitorEvent, MonitorStatus,
@@ -7,10 +8,11 @@ use crate::{
     error::ManagerError,
 };
 use actix_web::http::header::{CacheControl, CacheDirective};
-use actix_web::{get, web, web::Data as WebData, HttpResponse};
+use actix_web::{HttpResponse, get, web, web::Data as WebData};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::time::Duration;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -20,6 +22,12 @@ use uuid::Uuid;
 pub struct ClusterMonitorEventSelectedInfo {
     pub id: ClusterMonitorEventId,
     pub recorded_at: DateTime<Utc>,
+    /// Whether the monitor stopped writing, making the statuses below the last recorded
+    /// ones. Reported for the latest event only: older events are old by design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    /// Whether every service was healthy when this event was recorded. Says nothing about
+    /// the cluster now: for that, read `stale` alongside it or call `GET /v0/cluster_healthz`.
     pub all_healthy: bool,
     pub api_status: MonitorStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,10 +47,12 @@ pub struct ClusterMonitorEventSelectedInfo {
 }
 
 impl ClusterMonitorEventSelectedInfo {
-    fn new_all(event: ExtendedClusterMonitorEvent) -> Self {
+    fn new_all(event: ExtendedClusterMonitorEvent, freshness_at: Option<DateTime<Utc>>) -> Self {
+        let stale = staleness(event.recorded_at, freshness_at);
         ClusterMonitorEventSelectedInfo {
             id: event.id,
             recorded_at: event.recorded_at,
+            stale,
             all_healthy: (event.api_status, event.compiler_status, event.runner_status)
                 == (
                     MonitorStatus::Healthy,
@@ -61,10 +71,12 @@ impl ClusterMonitorEventSelectedInfo {
         }
     }
 
-    fn new_status(event: ClusterMonitorEvent) -> Self {
+    fn new_status(event: ClusterMonitorEvent, freshness_at: Option<DateTime<Utc>>) -> Self {
+        let stale = staleness(event.recorded_at, freshness_at);
         ClusterMonitorEventSelectedInfo {
             id: event.id,
             recorded_at: event.recorded_at,
+            stale,
             all_healthy: (event.api_status, event.compiler_status, event.runner_status)
                 == (
                     MonitorStatus::Healthy,
@@ -138,7 +150,7 @@ pub(crate) async fn list_cluster_events(
         .list_cluster_monitor_events()
         .await?
         .into_iter()
-        .map(ClusterMonitorEventSelectedInfo::new_status)
+        .map(|event| ClusterMonitorEventSelectedInfo::new_status(event, None))
         .collect();
     Ok(HttpResponse::Ok()
         .insert_header(CacheControl(vec![CacheDirective::NoCache]))
@@ -177,6 +189,8 @@ pub(crate) async fn get_cluster_event(
     let event_id = path.into_inner();
     let selector = &query.selector;
     let event = if event_id == "latest" {
+        // Only the newest event can tell whether the monitor is still writing.
+        let now = Some(Utc::now());
         match selector {
             ClusterMonitorEventFieldSelector::All => ClusterMonitorEventSelectedInfo::new_all(
                 state
@@ -185,6 +199,7 @@ pub(crate) async fn get_cluster_event(
                     .await
                     .get_latest_cluster_monitor_event_extended()
                     .await?,
+                now,
             ),
             ClusterMonitorEventFieldSelector::Status => {
                 ClusterMonitorEventSelectedInfo::new_status(
@@ -194,6 +209,7 @@ pub(crate) async fn get_cluster_event(
                         .await
                         .get_latest_cluster_monitor_event_short()
                         .await?,
+                    now,
                 )
             }
         }
@@ -212,6 +228,7 @@ pub(crate) async fn get_cluster_event(
                     .await
                     .get_cluster_monitor_event_extended(event_id)
                     .await?,
+                None,
             ),
             ClusterMonitorEventFieldSelector::Status => {
                 ClusterMonitorEventSelectedInfo::new_status(
@@ -221,6 +238,7 @@ pub(crate) async fn get_cluster_event(
                         .await
                         .get_cluster_monitor_event_short(event_id)
                         .await?,
+                    None,
                 )
             }
         }
@@ -230,25 +248,104 @@ pub(crate) async fn get_cluster_event(
         .json(&event))
 }
 
+/// Health of the cluster as a whole and of each of its services.
 #[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct HealthStatus {
+    /// Whether every service is healthy and the monitoring data behind this report is fresh.
     pub all_healthy: bool,
+    /// Whether the cluster monitor stopped writing events, which makes the statuses below
+    /// the last recorded ones rather than current ones.
+    pub stale: bool,
+    /// Age at which monitoring data counts as stale.
+    pub stale_after_seconds: u64,
+    /// Health of the API server(s).
     pub api: ServiceStatus,
+    /// Health of the compiler server(s).
     pub compiler: ServiceStatus,
+    /// Health of the runner(s).
     pub runner: ServiceStatus,
 }
 
+/// Health of a single service derived from the retained cluster monitor events.
 #[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ServiceStatus {
+    /// Whether the service passed its most recent health check.
     pub healthy: bool,
+    /// Human-readable report from the most recent health check.
     pub message: String,
+    /// Approximate time the service last transitioned between healthy and unhealthy:
+    /// the timestamp of the oldest retained consecutive cluster monitor event with the
+    /// same `healthy` conclusion. Bounded by event retention.
     pub unchanged_since: DateTime<Utc>,
+    /// Timestamp of the most recent cluster monitor event.
     pub checked_at: DateTime<Utc>,
+}
+
+/// Whether the event is too old to reflect the cluster now, or `None` for an event whose
+/// age means nothing because it is not the newest one.
+fn staleness(recorded_at: DateTime<Utc>, freshness_at: Option<DateTime<Utc>>) -> Option<bool> {
+    freshness_at.map(|now| is_stale(recorded_at, now, MONITOR_STALE_AFTER))
+}
+
+/// Whether an event is too old to reflect the current cluster state. An event recorded in
+/// the future (clock skew between the database and this server) is never stale.
+fn is_stale(recorded_at: DateTime<Utc>, now: DateTime<Utc>, stale_after: Duration) -> bool {
+    now.signed_duration_since(recorded_at)
+        .to_std()
+        .is_ok_and(|age| age > stale_after)
+}
+
+/// Timestamp of the oldest event in the run of consecutive events (newest first) that
+/// share the health conclusion that `service_status` extracts from the event with
+/// `latest_event_id`. The run is bounded by event retention. Returns `None` if that
+/// event is not in the list.
+///
+/// # Example
+///
+/// ```ignore
+/// // Newest first:      e1         e2         e3
+/// // recorded_at:       100        90         80
+/// // api_status:        Unhealthy  Unhealthy  Healthy
+/// let events = [e1, e2, e3];
+///
+/// // Anchored at e1, the unhealthy run spans e1..=e2: the api service
+/// // became unhealthy at t=90.
+/// let since = service_unchanged_since(&events, e1.id, |event| event.api_status);
+/// assert_eq!(since, Some(e2.recorded_at));
+/// ```
+fn service_unchanged_since(
+    events_newest_first: &[ClusterMonitorEvent],
+    latest_event_id: ClusterMonitorEventId,
+    service_status: fn(&ClusterMonitorEvent) -> MonitorStatus,
+) -> Option<DateTime<Utc>> {
+    let mut run = events_newest_first
+        .iter()
+        .skip_while(|event| event.id != latest_event_id);
+    let latest_event = run.next()?;
+    let latest_healthy = service_status(latest_event) == MonitorStatus::Healthy;
+    let mut unchanged_since = latest_event.recorded_at;
+    for event in run {
+        if (service_status(event) == MonitorStatus::Healthy) != latest_healthy {
+            break;
+        }
+        unchanged_since = event.recorded_at;
+    }
+    Some(unchanged_since)
 }
 
 /// Check Cluster Health
 ///
 /// Determine the latest cluster health via the latest cluster monitor event.
+/// Each service's `unchanged_since` reports the approximate time it last transitioned
+/// between healthy and unhealthy, bounded by event retention.
+///
+/// The cluster monitor is the only writer of these events. In the enterprise edition it
+/// runs within the runner process, so when the runner dies the newest event keeps
+/// describing a cluster that no longer exists; elsewhere the monitor is a task in the
+/// process that answers this request. Either way a service cannot report its own death, so
+/// this endpoint additionally checks how old that event is. A `stale` response repeats the
+/// last recorded statuses instead of describing the cluster now, and counts as unhealthy:
+/// monitoring that has died cannot vouch for anything.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -262,38 +359,214 @@ pub struct ServiceStatus {
 pub(crate) async fn get_cluster_health(
     state: WebData<ServerState>,
 ) -> Result<HttpResponse, ManagerError> {
-    let latest_event = state
-        .db
-        .lock()
-        .await
-        .get_latest_cluster_monitor_event_extended()
-        .await?;
-    let health_status = HealthStatus {
-        all_healthy: latest_event.api_status == MonitorStatus::Healthy
+    let db = state.db.lock().await;
+    let latest_event = db.get_latest_cluster_monitor_event_extended().await?;
+    let events = db.list_cluster_monitor_events().await?;
+    drop(db);
+    Ok(health_response(health_status(
+        latest_event,
+        &events,
+        Utc::now(),
+    )))
+}
+
+/// Health of the cluster as the retained events describe it at time `now`.
+fn health_status(
+    latest_event: ExtendedClusterMonitorEvent,
+    events: &[ClusterMonitorEvent],
+    now: DateTime<Utc>,
+) -> HealthStatus {
+    let unchanged_since = |service_status| {
+        service_unchanged_since(events, latest_event.id, service_status)
+            .unwrap_or(latest_event.recorded_at)
+    };
+    let api_unchanged_since = unchanged_since(|event: &ClusterMonitorEvent| event.api_status);
+    let compiler_unchanged_since =
+        unchanged_since(|event: &ClusterMonitorEvent| event.compiler_status);
+    let runner_unchanged_since = unchanged_since(|event: &ClusterMonitorEvent| event.runner_status);
+    let stale = is_stale(latest_event.recorded_at, now, MONITOR_STALE_AFTER);
+    HealthStatus {
+        // The SDK clients read this field after a 502 to decide whether to retry at once.
+        // Stale monitoring therefore slows their retries down, however well the services
+        // themselves are serving. See `cluster_is_healthy` in the rest-api crate.
+        all_healthy: !stale
+            && latest_event.api_status == MonitorStatus::Healthy
             && latest_event.compiler_status == MonitorStatus::Healthy
             && latest_event.runner_status == MonitorStatus::Healthy,
+        stale,
+        stale_after_seconds: MONITOR_STALE_AFTER.as_secs(),
         api: ServiceStatus {
             healthy: latest_event.api_status == MonitorStatus::Healthy,
             message: latest_event.api_self_info,
-            unchanged_since: latest_event.recorded_at,
+            unchanged_since: api_unchanged_since,
             checked_at: latest_event.recorded_at,
         },
         compiler: ServiceStatus {
             healthy: latest_event.compiler_status == MonitorStatus::Healthy,
             message: latest_event.compiler_self_info,
-            unchanged_since: latest_event.recorded_at,
+            unchanged_since: compiler_unchanged_since,
             checked_at: latest_event.recorded_at,
         },
         runner: ServiceStatus {
             healthy: latest_event.runner_status == MonitorStatus::Healthy,
             message: latest_event.runner_self_info,
-            unchanged_since: latest_event.recorded_at,
+            unchanged_since: runner_unchanged_since,
             checked_at: latest_event.recorded_at,
         },
-    };
-    if health_status.api.healthy && health_status.compiler.healthy && health_status.runner.healthy {
-        Ok(HttpResponse::Ok().json(health_status))
+    }
+}
+
+/// A cluster that is unhealthy, or that nobody is watching, answers 503 so that clients can
+/// back off on the status code alone.
+fn health_response(health_status: HealthStatus) -> HttpResponse {
+    if health_status.all_healthy {
+        HttpResponse::Ok().json(health_status)
     } else {
-        Ok(HttpResponse::ServiceUnavailable().json(health_status))
+        HttpResponse::ServiceUnavailable().json(health_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extended_event(recorded_at: DateTime<Utc>) -> ExtendedClusterMonitorEvent {
+        ExtendedClusterMonitorEvent {
+            id: ClusterMonitorEventId(Uuid::from_u128(1)),
+            recorded_at,
+            api_status: MonitorStatus::Healthy,
+            api_self_info: "healthy".to_string(),
+            api_resources_info: "healthy".to_string(),
+            compiler_status: MonitorStatus::Healthy,
+            compiler_self_info: "healthy".to_string(),
+            compiler_resources_info: "healthy".to_string(),
+            runner_status: MonitorStatus::Healthy,
+            runner_self_info: "healthy".to_string(),
+            runner_resources_info: "healthy".to_string(),
+        }
+    }
+
+    fn event(id: u128, seconds: i64, api_status: MonitorStatus) -> ClusterMonitorEvent {
+        ClusterMonitorEvent {
+            id: ClusterMonitorEventId(Uuid::from_u128(id)),
+            recorded_at: DateTime::from_timestamp(seconds, 0).unwrap(),
+            api_status,
+            compiler_status: MonitorStatus::Healthy,
+            runner_status: MonitorStatus::Healthy,
+        }
+    }
+
+    /// Monitoring data counts as stale only once it is older than the threshold, and a
+    /// timestamp from the future never does.
+    #[test]
+    fn staleness_needs_an_event_older_than_the_threshold() {
+        let stale_after = Duration::from_secs(20 * 60);
+        let now = DateTime::from_timestamp(100_000, 0).unwrap();
+        let recorded_ago = |seconds: i64| now - chrono::TimeDelta::seconds(seconds);
+
+        assert!(!is_stale(recorded_ago(0), now, stale_after));
+        assert!(!is_stale(recorded_ago(20 * 60), now, stale_after));
+        assert!(is_stale(recorded_ago(20 * 60 + 1), now, stale_after));
+        assert!(is_stale(recorded_ago(24 * 60 * 60), now, stale_after));
+        // Clock skew between the database and this server must not read as stale.
+        assert!(!is_stale(recorded_ago(-60), now, stale_after));
+    }
+
+    /// Only the newest event reports freshness, and `all_healthy` keeps describing the
+    /// event itself rather than the cluster now.
+    #[test]
+    fn only_the_latest_event_reports_freshness() {
+        let now = Utc::now();
+        let healthy_but_old = ClusterMonitorEvent {
+            id: ClusterMonitorEventId(Uuid::from_u128(1)),
+            recorded_at: now - chrono::TimeDelta::seconds(MONITOR_STALE_AFTER.as_secs() as i64 + 1),
+            api_status: MonitorStatus::Healthy,
+            compiler_status: MonitorStatus::Healthy,
+            runner_status: MonitorStatus::Healthy,
+        };
+
+        let latest =
+            ClusterMonitorEventSelectedInfo::new_status(healthy_but_old.clone(), Some(now));
+        assert_eq!(latest.stale, Some(true));
+        assert!(latest.all_healthy);
+
+        let historical = ClusterMonitorEventSelectedInfo::new_status(healthy_but_old, None);
+        assert_eq!(historical.stale, None);
+        assert!(historical.all_healthy);
+    }
+
+    /// `service_unchanged_since` returns the start of the health run anchored at the
+    /// given latest event.
+    #[test]
+    fn unchanged_since_finds_run_start() {
+        let events = vec![
+            event(1, 100, MonitorStatus::Unhealthy),
+            event(2, 90, MonitorStatus::Unhealthy),
+            event(3, 80, MonitorStatus::InitialUnhealthy),
+            event(4, 70, MonitorStatus::Healthy),
+        ];
+        let at = |seconds| DateTime::from_timestamp(seconds, 0).unwrap();
+        let api_status = |event: &ClusterMonitorEvent| event.api_status;
+        let compiler_status = |event: &ClusterMonitorEvent| event.compiler_status;
+
+        // The unhealthy run spans events 1..=3 (`InitialUnhealthy` counts as unhealthy).
+        let since = service_unchanged_since(
+            &events,
+            ClusterMonitorEventId(Uuid::from_u128(1)),
+            api_status,
+        );
+        assert_eq!(since, Some(at(80)));
+        // Anchoring mid-list skips newer events; a single-element run yields its own timestamp.
+        let since = service_unchanged_since(
+            &events,
+            ClusterMonitorEventId(Uuid::from_u128(4)),
+            api_status,
+        );
+        assert_eq!(since, Some(at(70)));
+        // A run with no transition extends to the oldest retained event.
+        let since = service_unchanged_since(
+            &events,
+            ClusterMonitorEventId(Uuid::from_u128(1)),
+            compiler_status,
+        );
+        assert_eq!(since, Some(at(70)));
+        // An anchor absent from the list yields `None`.
+        let since = service_unchanged_since(
+            &events,
+            ClusterMonitorEventId(Uuid::from_u128(99)),
+            api_status,
+        );
+        assert_eq!(since, None);
+    }
+
+    /// A cluster nobody is watching is not a healthy cluster, whatever its last recorded
+    /// statuses were, so `cluster_healthz` answers 503.
+    #[test]
+    fn stale_health_status_answers_service_unavailable() {
+        let now = Utc::now();
+        let stale_after = MONITOR_STALE_AFTER.as_secs() as i64;
+        let all_healthy_but_old = extended_event(now - chrono::TimeDelta::seconds(stale_after + 1));
+
+        let status = health_status(all_healthy_but_old.clone(), &[], now);
+        assert!(status.stale);
+        assert!(!status.all_healthy);
+        assert!(status.api.healthy && status.compiler.healthy && status.runner.healthy);
+        assert_eq!(
+            health_response(status).status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        // The same event within the threshold is fresh, healthy and answers 200.
+        let fresh = ExtendedClusterMonitorEvent {
+            recorded_at: now - chrono::TimeDelta::seconds(stale_after - 1),
+            ..all_healthy_but_old
+        };
+        let status = health_status(fresh, &[], now);
+        assert!(!status.stale);
+        assert!(status.all_healthy);
+        assert_eq!(
+            health_response(status).status(),
+            actix_web::http::StatusCode::OK
+        );
     }
 }

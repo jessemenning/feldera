@@ -13,10 +13,11 @@ import org.dbsp.util.Logger;
 import javax.annotation.Nullable;
 
 /** Discovers whether an expression contains a call to the now() function. */
-class ContainsNow extends InnerVisitor {
+public class ContainsNow extends InnerVisitor {
     public boolean found;
     /** If true the 'found' is reset for each invocation. */
     public final boolean perExpression;
+    /** The last now() call found */
     @Nullable
     DBSPExpression nowExpression = null;
 
@@ -29,6 +30,12 @@ class ContainsNow extends InnerVisitor {
     static boolean isNow(DBSPApplyExpression node) {
         String name = node.getFunctionName();
         return name != null && name.equalsIgnoreCase("now") && node.arguments.length == 0;
+    }
+
+    static boolean find(DBSPCompiler compiler, DBSPExpression expression) {
+        ContainsNow containsNow = new ContainsNow(compiler, true);
+        containsNow.apply(expression);
+        return containsNow.found();
     }
 
     @Override

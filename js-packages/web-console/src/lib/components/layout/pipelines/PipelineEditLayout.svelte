@@ -1,5 +1,7 @@
 <script lang="ts">
   import { Progress } from '@skeletonlabs/skeleton-svelte'
+  import { singleton } from 'common-lib/array'
+  import { nonNull } from 'common-lib/function'
   import { Tooltip } from 'common-ui'
   import { Pane, type PaneAPI, PaneGroup, PaneResizer } from 'paneforge'
   import { untrack } from 'svelte'
@@ -29,12 +31,11 @@
   import { useLayoutSettings } from '$lib/compositions/layout/useLayoutSettings.svelte'
   import { usePipelineActionCallbacks } from '$lib/compositions/pipelines/usePipelineActionCallbacks.svelte'
   import { useAggregatePipelineStats } from '$lib/compositions/useAggregatePipelineStats.svelte'
+  import { usePermission } from '$lib/compositions/usePermission.svelte'
   import { getPipelineAction } from '$lib/compositions/usePipelineAction.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { useToast } from '$lib/compositions/useToastNotification'
   import type { WritablePipeline } from '$lib/compositions/useWritablePipeline.svelte'
-  import { singleton } from '$lib/functions/common/array'
-  import { nonNull } from '$lib/functions/common/function'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import { parsePipelineDiff } from '$lib/functions/pipelines/pipelineDiff'
   import { isPipelineCodeEditable } from '$lib/functions/pipelines/status'
@@ -61,8 +62,15 @@
     deleted?: boolean
   } = $props()
 
+  // Renaming needs write:pipeline_meta; without it the name stays visible but
+  // the double-click-to-edit affordance is inert.
+  const canRename = usePermission('write:pipeline_meta')
+  // Dismissing a deployment error acts on the pipeline, so it needs exec:pipeline.
+  const canDismissError = usePermission('exec:pipeline')
+
   let editNameDisabled = $derived(
-    !pipelineThumb ||
+    !canRename.allowed ||
+      !pipelineThumb ||
       deleted ||
       (nonNull(pipelineThumb.status) && !isPipelineCodeEditable(pipelineThumb.status))
   )
@@ -125,7 +133,9 @@
         header: `The last execution of the pipeline failed with the error code: ${pipelineThumb.deploymentError.error_code}`,
         message: pipelineThumb.deploymentError.message,
         style: 'error' as const,
-        onClose: () => pipelineThumb && api.dismissDeploymentError(pipelineThumb.name)
+        onClose: canDismissError.allowed
+          ? () => pipelineThumb && api.dismissDeploymentError(pipelineThumb.name)
+          : undefined
       }
     } else if (pipelineThumb.status === 'AwaitingApproval') {
       return {
@@ -189,6 +199,8 @@
       show: isScreenLg.current
     }
   ])
+
+  const sideGutters = 'px-2 md:px-5'
 </script>
 
 {#snippet reviewPipelineChanges()}
@@ -208,7 +220,7 @@
       >
         {#snippet titleEnd()}
           <button
-            class="fd fd-x btn-icon btn text-[24px]"
+            class="fd fd-x btn-icon btn text-[20px]"
             aria-label="Close"
             onclick={() => (contextDrawer.content = null)}
           ></button>
@@ -219,12 +231,13 @@
 {/snippet}
 
 <div class="flex h-full w-full flex-col">
-  <AppHeader>
+  <AppHeader class={sideGutters}>
     {#snippet afterStart()}
-      <div class="flex min-w-0 flex-1 flex-col gap-x-4 gap-y-1 sm:flex-row sm:items-center">
+      <!-- One row that wraps: the status chip drops under the name only when they don't fit. -->
+      <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
         <PipelineBreadcrumbs
-          class="-ml-3 pb-1 pl-3"
-          textClass="text-base"
+          class="-ml-3 items-center py-1 pl-3"
+          textClass="text-base font-semibold"
           breadcrumbs={[
             ...(isTablet.current
               ? []
@@ -249,10 +262,11 @@
                 })
               }}
               disabled={editNameDisabled}
-              class="inline overflow-hidden overflow-ellipsis"
-              inputClass="input flex -ml-1 mr-2 py-0 pl-1 text-base mt-1"
+              editLabel="Edit pipeline name"
+              class="flex min-w-0 items-center gap-1"
+              inputClass="input flex -ml-1 mr-2 py-0 pl-1 text-base"
             >
-              <span class="text-base">
+              <span class="truncate text-base font-semibold">
                 {pipelineName}
               </span>
             </DoubleClickInput>
@@ -260,6 +274,8 @@
               <Tooltip class="">
                 {#if deleted}
                   Cannot edit the deleted pipeline's name
+                {:else if !canRename.allowed}
+                  You have read-only access
                 {:else}
                   Cannot edit the pipeline's name while it's running
                 {/if}
@@ -270,7 +286,7 @@
         {#if pipelineThumb}
           <PipelineStatus
             data-testid="box-pipeline-status"
-            class="h-6"
+            class="shrink-0"
             status={pipelineThumb.status}
             {deleted}
           ></PipelineStatus>
@@ -289,7 +305,7 @@
       {#if drawer.isMobileDrawer}
         <button
           onclick={() => (drawer.value = !drawer.value)}
-          class="fd fd-book-open btn-icon flex preset-tonal-surface text-[20px]"
+          class="fd fd-book-open btn-icon flex preset-tonal-surface text-[16px]"
           aria-label="Open the right navigation drawer"
         >
         </button>
@@ -299,13 +315,14 @@
           <CreatePipelineButton inputClass="max-w-64" btnClass="preset-filled-surface-50-950"
           ></CreatePipelineButton>
         </div>
-        <BookADemo class="btn-icon preset-filled-surface-50-950" triggerLocation="pipeline_editor"
+        <BookADemo class="btn-icon preset-filled-surface-50-950" placement="pipeline_editor"
         ></BookADemo>
         <Tooltip class="">Book a demo</Tooltip>
       {/if}
     {/snippet}
   </AppHeader>
-  <PaneGroup direction="horizontal" class="!overflow-visible px-2 pb-4 md:pr-8 md:pl-8 xl:pl-4">
+  <!-- From xl the pipelines list pane's resizer adds 16px on the left, hence the 4px. -->
+  <PaneGroup direction="horizontal" class="!overflow-visible {sideGutters} pb-2 xl:pl-1">
     <Pane
       defaultSize={15}
       minSize={10}
@@ -373,7 +390,7 @@
                 ></PipelineCodePanel>
               {:else}
                 <div
-                  class="flex h-full flex-col justify-end rounded-container bg-surface-50-950 px-4 py-2"
+                  class="flex h-full flex-col justify-end rounded-lg bg-surface-50-950 px-2 pt-2 pb-0"
                 >
                   <div class="-mx-8 -mt-2 flex flex-1 flex-col items-center gap-4">
                     <Progress class="h-1 w-full px-4" value={null} max={100}>
@@ -384,9 +401,9 @@
                     <p class="text-surface-600-400">Loading pipeline...</p>
                   </div>
                   <div
-                    class="bg-white-dark mb-2 flex flex-wrap items-center gap-x-8 rounded-b border-t border-surface-50-950 p-2 pl-4"
+                    class="flex flex-wrap items-center gap-x-8 border-t border-surface-200-800 px-2 py-2 pl-4"
                   >
-                    <div class="flex h-9 flex-nowrap gap-3">
+                    <div class="flex h-6 flex-nowrap gap-3">
                       {@render statusBarCenter()}
                     </div>
                     <div class="ml-auto flex flex-nowrap gap-x-2">
@@ -407,7 +424,7 @@
                     bind:currentTab={currentInteractionTab}
                   ></InteractionPanel>
                 {:else}
-                  <div class="flex flex-1 rounded-container bg-surface-50-950 p-4 pt-3"></div>
+                  <div class="flex flex-1 rounded-lg bg-surface-50-950 px-2 pt-3 pb-2"></div>
                 {/if}
               </Pane>
             {/if}
@@ -415,7 +432,7 @@
         </Pane>
 
         {#if showMonitoringPanel.value}
-          <PaneResizer class="pane-divider-horizontal my-2" />
+          <PaneResizer class="pane-divider-horizontal my-[5px]" />
           <Pane minSize={15} class="flex flex-col !overflow-visible">
             {#if pipeline.current && metrics.current}
               <MonitoringPanel
@@ -426,7 +443,7 @@
                 bind:currentTab={currentMonitoringTab}
               ></MonitoringPanel>
             {:else}
-              <div class="flex flex-1 rounded-container bg-surface-50-950 p-4 pt-3"></div>
+              <div class="flex flex-1 rounded-lg bg-surface-50-950 px-2 pt-3 pb-2"></div>
             {/if}
           </Pane>
         {/if}
@@ -455,13 +472,13 @@
     {#each layoutControls as { icon, text, value, show }}
       {#if show !== false}
         <button
-          class="btn gap-2 p-2 text-surface-700-300 !brightness-100 hover:preset-tonal-surface"
+          class="btn btn-sm text-surface-700-300 hover:bg-surface-50-950 hover:text-surface-950-50"
           onclick={() => (value.value = !value.value)}
         >
           <span class="hidden sm:inline">
             {text}
           </span>
-          <div class="{icon} text-[20px] {value.value ? 'text-primary-500' : ''}"></div>
+          <div class="{icon} {value.value ? 'text-primary-500' : ''}"></div>
         </button>
         <div class="pointer-events-none w-0 -translate-x-0.5">|</div>
       {/if}

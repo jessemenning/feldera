@@ -15,7 +15,9 @@ use crate::storage::{
             BatchMetadata, BlockHeader, BloomFilterBlockRef, COMPATIBLE_FEATURE_FILTER64,
             COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT, DATA_BLOCK_MAGIC, DataBlockHeader,
             FILE_TRAILER_BLOCK_MAGIC, FileTrailer, FileTrailerColumn, FixedLen,
-            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader, NodeType,
+            INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN, INCOMPATIBLE_FEATURE_MODULAR_FILTERS,
+            INCOMPATIBLE_FEATURE_ROARING_FILTERS, INDEX_BLOCK_MAGIC, IndexBlockHeader,
+            MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ModularBloomFilterBlockRef, NodeType,
             ROARING_BITMAP_FILTER_BLOCK_MAGIC, RoaringBitmapFilterBlockRef, VERSION_NUMBER, Varint,
         },
         reader::TreeNode,
@@ -36,6 +38,7 @@ use crc32c::crc32c;
 use dyn_clone::clone_box;
 use feldera_buffer_cache::CacheEntry;
 use feldera_storage::StoragePath;
+use lz4_flex::block::{compress_into, get_maximum_output_size};
 use snap::raw::{Encoder, max_compress_len};
 use std::{cell::RefCell, sync::Arc};
 use std::{
@@ -43,6 +46,7 @@ use std::{
     mem::{replace, take},
     ops::Range,
 };
+use zstd::bulk::Compressor as ZstdCompressor;
 
 struct VarintWriter {
     varint: Varint,
@@ -86,8 +90,18 @@ impl VarintWriter {
 /// The default parameters should usually be good enough.
 #[derive(Clone, Debug)]
 pub struct Parameters {
-    /// Minimum size of a data block, in bytes.  Must be a power of 2 and at
-    /// least 4096.
+    /// Minimum size of a data block in column 0, in bytes.  Must be a power of
+    /// 2 and at least 4096.
+    ///
+    /// Column 0 holds the keys, and a cursor that walks keys without touching
+    /// values reads this column alone, one block per request, with the other
+    /// columns' blocks interleaved between them on disk.  A larger block here
+    /// means fewer requests for the same keys, at the price of more to
+    /// decompress per point lookup and coarser cache entries.
+    pub min_key_data_block: usize,
+
+    /// Minimum size of a data block in every column but the first, in bytes.
+    /// Must be a power of 2 and at least 4096.
     ///
     /// Larger data blocks reduce the size of the indexes (by allowing an
     /// individual index entry to span a wider range of data, reducing the
@@ -134,6 +148,9 @@ pub struct Parameters {
 
     /// How to compress input and data blocks in the output file.
     pub compression: Option<Compression>,
+
+    /// Compression level, for codecs that have one.
+    pub compression_level: Option<i32>,
 }
 
 impl Parameters {
@@ -156,10 +173,53 @@ impl Parameters {
         Self { max_branch, ..self }
     }
 
+    /// Set the minimum data block size of column 0 to `bytes`;
+    /// see [`min_key_data_block`](Self::min_key_data_block).
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - the minimum size, which must be a power of two.
+    pub fn with_min_key_data_block(self, bytes: usize) -> Self {
+        assert!(
+            bytes.is_power_of_two() && bytes >= 4096,
+            "a key data block minimum must be a power of two and at least 4096, not {bytes}",
+        );
+        Self {
+            min_key_data_block: bytes,
+            ..self
+        }
+    }
+
+    /// The minimum data block size for `column`.
+    ///
+    /// # Arguments
+    ///
+    /// * `column` - which column to size.
+    ///
+    /// # Returns
+    ///
+    /// [`min_key_data_block`](Self::min_key_data_block) for column 0 and
+    /// [`min_data_block`](Self::min_data_block) for the rest.
+    pub(crate) fn min_data_block_for(&self, column: usize) -> usize {
+        if column == 0 {
+            self.min_key_data_block
+        } else {
+            self.min_data_block
+        }
+    }
+
     /// Returns these parameters with `compression` updated.
     pub fn with_compression(self, compression: Option<Compression>) -> Self {
         Self {
             compression,
+            ..self
+        }
+    }
+
+    /// Returns these parameters with `compression_level` updated.
+    pub fn with_compression_level(self, compression_level: Option<i32>) -> Self {
+        Self {
+            compression_level,
             ..self
         }
     }
@@ -168,12 +228,14 @@ impl Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
+            min_key_data_block: 8192,
             min_data_block: 8192,
             min_index_block: 8192,
             min_branch: 32,
             #[cfg(test)]
             max_branch: usize::MAX,
-            compression: Some(Compression::Snappy),
+            compression: Some(Compression::Lz4),
+            compression_level: None,
         }
     }
 }
@@ -214,11 +276,11 @@ struct ColumnWriter {
 }
 
 impl ColumnWriter {
-    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>) -> Self {
+    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>, column: usize) -> Self {
         ColumnWriter {
             parameters: parameters.clone(),
             rows: 0..0,
-            data_block: DataBlockBuilder::new(factories, parameters),
+            data_block: DataBlockBuilder::new(factories, parameters, column),
             index_blocks: Vec::new(),
             factories: factories.clone(),
         }
@@ -453,6 +515,8 @@ impl StrideBuilder {
 
 struct DataBlockBuilder {
     parameters: Arc<Parameters>,
+    /// The column's minimum, resolved once from `parameters`.
+    min_data_block: usize,
     raw: FBuf,
     value_offsets: Vec<usize>,
     value_offset_stride: StrideBuilder,
@@ -485,11 +549,13 @@ where
 }
 
 impl DataBlockBuilder {
-    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>) -> Self {
-        let mut raw = FBuf::with_capacity(parameters.min_data_block);
+    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>, column: usize) -> Self {
+        let min_data_block = parameters.min_data_block_for(column);
+        let mut raw = FBuf::with_capacity(min_data_block);
         raw.resize(DataBlockHeader::LEN, 0);
         Self {
             parameters: parameters.clone(),
+            min_data_block,
             raw,
             row_groups: ContiguousRanges::with_capacity(parameters.min_branch),
             value_offsets: Vec::with_capacity(parameters.min_branch),
@@ -561,7 +627,7 @@ impl DataBlockBuilder {
                 self.specs()
                     .len
                     .next_multiple_of(512)
-                    .max(self.parameters.min_data_block),
+                    .max(self.min_data_block),
             );
         }
 
@@ -1032,23 +1098,43 @@ struct BlockWriter {
     cache: Arc<BufferCache>,
     file_handle: Box<dyn FileWriter>,
     encoder: Encoder,
+    /// Created on the first Zstd block, so that files using another codec
+    /// never allocate a zstd context. Reused afterwards, which is the whole
+    /// reason to hold it rather than call the free function per block.
+    zstd: Option<ZstdCompressor<'static>>,
+    zstd_level: i32,
     offset: u64,
 }
 
 impl BlockWriter {
-    fn new(cache: Arc<BufferCache>, file_handle: Box<dyn FileWriter>) -> Self {
+    fn new(
+        cache: Arc<BufferCache>,
+        file_handle: Box<dyn FileWriter>,
+        compression_level: Option<i32>,
+    ) -> Self {
         Self {
             cache,
             file_handle,
             encoder: Encoder::new(),
+            zstd: None,
+            // zstd treats 0 as "use the default level". A level outside what
+            // this zstd build accepts would make `Compressor::new` fail, and
+            // this one comes from user configuration, so clamp rather than
+            // panic on it later.
+            zstd_level: compression_level.map_or(0, |level| {
+                let range = zstd::compression_level_range();
+                level.clamp(*range.start(), *range.end())
+            }),
             offset: 0,
         }
     }
 
     fn complete(self) -> Result<Arc<dyn FileReader>, StorageError> {
-        let reader = self.file_handle.complete()?;
-        reader.commit()?;
-        Ok(reader)
+        // Not committed here. A layer file only has to be durable once a
+        // checkpoint references it, and the checkpoint commit phase syncs every
+        // batch it captures. Syncing on the writing thread instead would stall
+        // that thread on one fsync per file, including throughout a merge.
+        self.file_handle.complete()
     }
 
     fn write_block(
@@ -1080,6 +1166,28 @@ impl BlockWriter {
                         }
                         self.encoder
                             .compress(block.as_slice(), bounce.as_mut_slice())
+                            .unwrap()
+                    }
+                    Compression::Lz4 => {
+                        let max_len = 4 + get_maximum_output_size(block.len());
+                        if max_len > bounce.len() {
+                            bounce.resize(max_len, 0);
+                        }
+                        bounce[..4].copy_from_slice(&(block.len() as u32).to_le_bytes());
+                        4 + compress_into(block.as_slice(), &mut bounce[4..]).unwrap()
+                    }
+                    Compression::Zstd => {
+                        let max_len = 4 + zstd::zstd_safe::compress_bound(block.len());
+                        if max_len > bounce.len() {
+                            bounce.resize(max_len, 0);
+                        }
+                        bounce[..4].copy_from_slice(&(block.len() as u32).to_le_bytes());
+                        let level = self.zstd_level;
+                        let zstd = self.zstd.get_or_insert_with(|| {
+                            ZstdCompressor::new(level).expect("failed to create zstd compressor")
+                        });
+                        4 + zstd
+                            .compress_to_buffer(block.as_slice(), &mut bounce[4..])
                             .unwrap()
                     }
                 };
@@ -1154,7 +1262,8 @@ impl Writer {
         let parameters = Arc::new(parameters);
         let cws = factories
             .iter()
-            .map(|factories| ColumnWriter::new(factories, &parameters))
+            .enumerate()
+            .map(|(column, factories)| ColumnWriter::new(factories, &parameters, column))
             .collect();
         let finished_columns = Vec::with_capacity(n_columns);
         let worker = format!("w{}-", Runtime::worker_index());
@@ -1163,6 +1272,7 @@ impl Writer {
             writer: BlockWriter::new(
                 cache().expect("Should have a buffer cache"),
                 storage_backend.create_with_prefix(&worker.into())?,
+                parameters.compression_level,
             ),
             key_filter,
             cws,
@@ -1221,6 +1331,13 @@ impl Writer {
     ) -> Result<(Arc<dyn FileReader>, Option<BatchKeyFilter>), StorageError> {
         debug_assert_eq!(self.cws.len(), self.finished_columns.len());
 
+        // A file with no rows gets no filter. Every lookup misses such a file
+        // anyway, and its filter block would start at offset 0, which the
+        // trailer uses to mean that there is no filter block.
+        if self.n_rows() == 0 {
+            self.key_filter = None;
+        }
+
         if let Some(key_filter) = &mut self.key_filter {
             key_filter.finalize();
         }
@@ -1230,19 +1347,44 @@ impl Writer {
         let filter_location = if let Some(key_filter) = &self.key_filter {
             match key_filter {
                 BatchKeyFilter::Bloom(filter) => {
-                    let filter_block = BloomFilterBlockRef {
-                        header: BlockHeader::new(
-                            &crate::storage::file::format::BLOOM_FILTER_BLOCK_MAGIC,
-                        ),
-                        num_hashes: filter.num_hashes(),
-                        data: filter.as_slice(),
-                    };
-                    let estimated_block_size = (std::mem::size_of::<BloomFilterBlockRef>()
-                        + std::mem::size_of_val(filter_block.data))
-                    .next_multiple_of(512);
-                    self.writer
-                        .write_block(filter_block.into_block(estimated_block_size), None)?
-                        .1
+                    let layout = *filter.layout();
+                    let data: Vec<u64> = filter.module_words().concat();
+                    if layout.total_modules() == 1 {
+                        // A one-module filter is a plain fastbloom filter, so
+                        // writing it in the original encoding keeps the file
+                        // readable by binaries that predate modular filters.
+                        let filter_block = BloomFilterBlockRef {
+                            header: BlockHeader::new(
+                                &crate::storage::file::format::BLOOM_FILTER_BLOCK_MAGIC,
+                            ),
+                            num_hashes: layout.hashes_per_module(),
+                            data: &data,
+                        };
+                        let estimated_block_size = (std::mem::size_of::<BloomFilterBlockRef>()
+                            + std::mem::size_of_val(filter_block.data))
+                        .next_multiple_of(512);
+                        self.writer
+                            .write_block(filter_block.into_block(estimated_block_size), None)?
+                            .1
+                    } else {
+                        incompatible_features |= INCOMPATIBLE_FEATURE_MODULAR_FILTERS;
+                        let set_bits = filter.density().set_bits().to_vec();
+                        let filter_block = ModularBloomFilterBlockRef {
+                            header: BlockHeader::new(&MODULAR_BLOOM_FILTER_BLOCK_MAGIC),
+                            total_modules: layout.total_modules(),
+                            hashes_per_module: layout.hashes_per_module(),
+                            words_per_module: u64::from(layout.words_per_module()),
+                            set_bits: &set_bits,
+                            data: &data,
+                        };
+                        let estimated_block_size =
+                            (std::mem::size_of::<ModularBloomFilterBlockRef>()
+                                + std::mem::size_of_val(filter_block.data))
+                            .next_multiple_of(512);
+                        self.writer
+                            .write_block(filter_block.into_block(estimated_block_size), None)?
+                            .1
+                    }
                 }
                 BatchKeyFilter::RoaringU32(filter) => {
                     incompatible_features |= INCOMPATIBLE_FEATURE_ROARING_FILTERS;
@@ -1266,6 +1408,12 @@ impl Writer {
             BlockLocation { offset: 0, size: 0 }
         };
 
+        // A stamped value column is unreadable to a binary that does not know to
+        // hide the trailing column, so advertise it as incompatible.
+        if metadata.value_stamp.is_stamped() {
+            incompatible_features |= INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN;
+        }
+
         // Write the file trailer block.
 
         let mut file_trailer = FileTrailer {
@@ -1282,6 +1430,7 @@ impl Writer {
             metadata,
         };
         if filter_location.size > 0 {
+            debug_assert_ne!(filter_location.offset, 0, "offset 0 means no filter block");
             if let Ok(size) = u32::try_from(filter_location.size)
                 && size < i32::MAX as u32
             {
@@ -1417,7 +1566,10 @@ where
     }
 
     /// Finishes writing the layer file and returns the file handle, optional
-    /// bloom filter, and column-0 key bounds.
+    /// membership filter, and column-0 key bounds.
+    ///
+    /// The filter is `None` for a file with no rows, even if the writer was
+    /// created with one.
     ///
     /// # Arguments
     ///
@@ -1620,7 +1772,10 @@ where
     }
 
     /// Finishes writing the layer file and returns the file handle, optional
-    /// bloom filter, and column-0 key bounds.
+    /// membership filter, and column-0 key bounds.
+    ///
+    /// The filter is `None` for a file with no rows, even if the writer was
+    /// created with one.
     ///
     /// This function will panic if [`write1`](Self::write1) has been called
     /// without a subsequent call to [`write0`](Self::write0).

@@ -2,6 +2,7 @@ use crate::config::CompilerConfig;
 use crate::db::error::DBError;
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::utils::validate_connector_name;
+use crate::db::types::version::Version;
 use crate::has_unstable_feature;
 use clap::Parser;
 use feldera_ir::Dataflow;
@@ -235,8 +236,35 @@ impl SqlCompilationInfo {
     }
 }
 
-/// Rust compilation information.
+/// One rustc diagnostic (error or warning).
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq, ToSchema, Clone)]
+pub struct RustCompilerMessage {
+    pub(crate) file: Option<String>,
+    pub(crate) start_line_number: usize,
+    pub(crate) start_column: usize,
+    pub(crate) end_line_number: usize,
+    pub(crate) end_column: usize,
+    pub(crate) warning: bool,
+    pub(crate) error_type: String,
+    pub(crate) message: String,
+    pub(crate) rendered: Option<String>,
+}
+
+impl Display for RustCompilerMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{error_type}: {message} (line {start_line_number}, column {start_column})",
+            error_type = self.error_type,
+            message = self.message,
+            start_line_number = self.start_line_number,
+            start_column = self.start_column
+        )
+    }
+}
+
+/// Rust compilation information.
+#[derive(Debug, Deserialize, Serialize, Eq, PartialEq, ToSchema, Clone, Default)]
 pub struct RustCompilationInfo {
     /// Exit code of the `cargo` compilation command.
     pub exit_code: i32,
@@ -244,15 +272,23 @@ pub struct RustCompilationInfo {
     pub stdout: String,
     /// Output printed to stderr by the `cargo` compilation command.
     pub stderr: String,
+    /// Parsed rustc diagnostics. Older stored JSON omits this field.
+    #[serde(default)]
+    pub messages: Vec<RustCompilerMessage>,
 }
 
 impl RustCompilationInfo {
     #[cfg(test)]
-    pub(crate) fn success() -> Self {
+    pub(crate) fn from_process_output_streams(
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    ) -> Self {
         Self {
-            exit_code: 0,
-            stdout: "".to_string(),
-            stderr: "".to_string(),
+            exit_code,
+            stdout,
+            stderr,
+            ..Self::default()
         }
     }
 }
@@ -297,6 +333,9 @@ pub fn validate_program_status_transition(
             | (ProgramStatus::Pending, ProgramStatus::SystemError)
             | (ProgramStatus::CompilingSql, ProgramStatus::Pending)
             | (ProgramStatus::CompilingSql, ProgramStatus::SqlCompiled)
+            // The Gen-2 engine needs no Rust compilation, so the SQL compiler completes it
+            // directly instead of routing it through the Rust compiler queue.
+            | (ProgramStatus::CompilingSql, ProgramStatus::Success)
             | (ProgramStatus::CompilingSql, ProgramStatus::SqlError)
             | (ProgramStatus::CompilingSql, ProgramStatus::SystemError)
             | (ProgramStatus::SqlCompiled, ProgramStatus::Pending)
@@ -320,6 +359,34 @@ pub fn validate_program_status_transition(
     }
 }
 
+/// One compiled (or compiling) pipeline program, as artifact cleanup sees it.
+///
+/// Cleanup keeps the files these checksums name and removes the rest, so a field that is
+/// `None` widens what is kept: a program still `CompilingRust` has no checksums yet and is
+/// matched on a checksum-less prefix instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineProgramArtifacts {
+    pub pipeline_id: PipelineId,
+    pub program_version: Version,
+    /// Compilation status. The checksums below describe the artifacts on disk only once this
+    /// is [`ProgramStatus::Success`]; while a program is still compiling they belong to no
+    /// artifact yet, or to a previous version, so cleanup must not name a file from them.
+    pub program_status: ProgramStatus,
+    /// Checksum of the sources the binary was built from. `None` while `CompilingRust`, and
+    /// for a Gen-2 program without Rust UDFs, which builds nothing. For a Gen-2 program with
+    /// Rust UDFs, it describes the UDF library.
+    pub program_binary_source_checksum: Option<String>,
+    /// Checksum of the binary itself. `None` while `CompilingRust`, and for a Gen-2 program
+    /// without Rust UDFs.
+    pub program_binary_integrity_checksum: Option<String>,
+    /// Checksum of the delivered program info.
+    pub program_info_integrity_checksum: Option<String>,
+    /// Whether the Gen-2 engine runs this program. A Gen-2 program's program info is named by
+    /// the program-info checksum on both halves; the flag is what lets cleanup rebuild that
+    /// name rather than fall back to a prefix.
+    pub is_gen2: bool,
+}
+
 /// A selector for the runtime to use.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(try_from = "String", into = "Option<String>")]
@@ -336,6 +403,12 @@ pub enum RuntimeSelector {
     ///
     /// The string corresponds to the git SHA of feldera/feldera at the time of the build.
     Platform(String),
+    /// The Gen-2 engine runs the pipeline. The SQL compiler captures the JIT
+    /// circuit IR into the program info, and the Rust half compiles only the
+    /// Rust UDFs, into a shared library, so no runtime commit is selected.
+    ///
+    /// The optional git SHA (`gen2:<sha>`) selects the engine build of that commit.
+    Gen2(Option<String>),
 }
 
 impl From<RuntimeSelector> for Option<String> {
@@ -344,6 +417,8 @@ impl From<RuntimeSelector> for Option<String> {
             RuntimeSelector::Sha(sha) => Some(sha),
             RuntimeSelector::Version(version) => Some(version),
             RuntimeSelector::Platform(_platform_sha) => None,
+            RuntimeSelector::Gen2(None) => Some("gen2".to_string()),
+            RuntimeSelector::Gen2(Some(sha)) => Some(format!("gen2:{sha}")),
         }
     }
 }
@@ -351,7 +426,7 @@ impl From<RuntimeSelector> for Option<String> {
 impl RuntimeSelector {
     /// Returns a path to sources of the runtime which the compilation should be using.
     pub fn runtime_sources(&self, config: &CompilerConfig) -> String {
-        if self.is_platform() {
+        if self.is_platform() || self.is_gen2() {
             config.dbsp_override_path.clone()
         } else {
             assert!(has_unstable_feature("runtime_version"));
@@ -366,12 +441,27 @@ impl RuntimeSelector {
         matches!(self, RuntimeSelector::Platform(_))
     }
 
+    /// Is the Gen-2 engine selected?
+    pub fn is_gen2(&self) -> bool {
+        matches!(self, RuntimeSelector::Gen2(_))
+    }
+
+    /// The git SHA of the Gen2 engine build that `gen2:<sha>` selects.
+    pub fn gen2_engine_sha(&self) -> Option<&str> {
+        match self {
+            RuntimeSelector::Gen2(sha) => sha.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Bytes representation of the runtime selector (for hashing).
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             RuntimeSelector::Sha(sha) => sha.as_bytes(),
             RuntimeSelector::Version(version) => version.as_bytes(),
             RuntimeSelector::Platform(platform_sha) => platform_sha.as_bytes(),
+            // Compilation does not depend on the engine build.
+            RuntimeSelector::Gen2(_) => b"gen2",
         }
     }
 
@@ -381,6 +471,9 @@ impl RuntimeSelector {
             RuntimeSelector::Sha(sha) => sha,
             RuntimeSelector::Version(version) => version,
             RuntimeSelector::Platform(platform_sha) => platform_sha,
+            RuntimeSelector::Gen2(_) => {
+                unreachable!("the Gen-2 engine selects no runtime commit; no git operation applies")
+            }
         }
     }
 }
@@ -391,6 +484,8 @@ impl Display for RuntimeSelector {
             RuntimeSelector::Sha(sha) => write!(f, "{sha}"),
             RuntimeSelector::Version(version) => write!(f, "{version}"),
             RuntimeSelector::Platform(platform_sha) => write!(f, "{platform_sha}"),
+            RuntimeSelector::Gen2(None) => write!(f, "gen2"),
+            RuntimeSelector::Gen2(Some(sha)) => write!(f, "gen2:{sha}"),
         }
     }
 }
@@ -415,7 +510,17 @@ impl TryFrom<String> for RuntimeSelector {
             version_regex.is_match(s)
         }
 
-        if is_valid_git_sha(&value) {
+        if value == "gen2" {
+            Ok(RuntimeSelector::Gen2(None))
+        } else if let Some(sha) = value.strip_prefix("gen2:") {
+            if is_valid_git_sha(sha) {
+                Ok(RuntimeSelector::Gen2(Some(sha.to_string())))
+            } else {
+                Err(format!(
+                    "The requested runtime version '{value}' does not name a valid git hash after 'gen2:'.",
+                ))
+            }
+        } else if is_valid_git_sha(&value) {
             Ok(RuntimeSelector::Sha(value))
         } else if is_version_tag(&value) {
             Ok(RuntimeSelector::Version(value))
@@ -452,6 +557,11 @@ pub struct ProgramConfig {
     /// or SHA taken from the `feldera/feldera` repository main branch.
     ///
     /// Examples: `v0.96.0` or `f4dcac0989ca0fda7d2eb93602a49d007cb3b0ae`
+    ///
+    /// The value `gen2` names an engine rather than a runtime commit: the SQL
+    /// compiler captures the circuit IR and the runner launches the Gen-2
+    /// engine, so no pipeline binary is compiled. `gen2:<sha>` selects the
+    /// engine build of that commit, where the runner supports it.
     ///
     /// A platform of version `0.x.y` may be capable of running future and past
     /// runtimes with versions `>=0.x.y` and `<=0.x.y` until breaking API changes happen,
@@ -641,7 +751,7 @@ fn determine_connector_endpoint_names(
         if existing_endpoints.contains(&endpoint_name) {
             return Err(ConnectorGenerationError::RelationConnectorNameCollision {
                 position: origin_value.value_position,
-                relation: stream.clone(),
+                relation: stream,
                 connector_name,
             });
         }
@@ -674,6 +784,14 @@ pub struct ProgramInfo {
     #[serde(default)]
     pub dataflow: Option<Dataflow>,
 
+    /// JIT circuit IR (`allOperators`) captured by the SQL compiler for Gen-2
+    /// programs; the Gen-2 engine reads it to build the circuit.
+    ///
+    /// Not returned by the API. It runs to several MiB and reaches the pipeline
+    /// through the program info artifact, so a pipeline read never carries it.
+    #[serde(default)]
+    pub circuit_ir: Option<serde_json::Value>,
+
     /// Input connectors derived from the schema.
     pub input_connectors: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
 
@@ -684,10 +802,21 @@ pub struct ProgramInfo {
 impl ProgramInfo {
     /// Extract fields from `ProgramInfo` to create a `PipelineConfigProgramInfo` instance.
     pub fn to_pipeline_config_program_info(&self) -> PipelineConfigProgramInfo {
-        let program_ir = self.dataflow.as_ref().map(|d| ProgramIr {
-            mir: d.mir.clone(),
-            program_schema: self.schema.clone(),
-        });
+        // Either payload is enough to build the `ProgramIr`. Keying it on `dataflow` alone
+        // would make the circuit IR a passenger of an unrelated optional field: dropping
+        // `--dataflow` for the Gen-2 engine (the dataflow graph is large and the engine
+        // ignores it) would then start pipelines with no circuit and nothing to point at.
+        let program_ir =
+            (self.dataflow.is_some() || self.circuit_ir.is_some()).then(|| ProgramIr {
+                mir: self
+                    .dataflow
+                    .as_ref()
+                    .map(|d| d.mir.clone())
+                    .unwrap_or_default(),
+                program_schema: self.schema.clone(),
+                circuit_ir: self.circuit_ir.clone(),
+                udf_library: None,
+            });
 
         PipelineConfigProgramInfo {
             inputs: self.input_connectors.clone(),
@@ -704,6 +833,7 @@ pub fn generate_program_info(
     main_rust: String,
     udf_stubs: String,
     dataflow: Option<Dataflow>,
+    circuit_ir: Option<serde_json::Value>,
 ) -> Result<ProgramInfo, ConnectorGenerationError> {
     let program_schema_properties_only = ProgramSchemaPropertiesOnly::deserialize(&program_schema)
         .map_err(|e| ConnectorGenerationError::InvalidProgramSchema {
@@ -730,6 +860,7 @@ pub fn generate_program_info(
                 | TransportConfig::PostgresInput(_)
                 | TransportConfig::PostgresCdcInput(_)
                 | TransportConfig::IcebergInput(_)
+                | TransportConfig::S2Input(_)
                 | TransportConfig::Datagen(_)
                 | TransportConfig::Nexmark(_)
                 | TransportConfig::EmptyInput
@@ -781,9 +912,11 @@ pub fn generate_program_info(
                 | TransportConfig::KafkaOutput(_)
                 | TransportConfig::DeltaTableOutput(_)
                 | TransportConfig::DynamoDBOutput(_)
+                | TransportConfig::NatsOutput(_)
                 | TransportConfig::RedisOutput(_)
                 | TransportConfig::NullOutput
-                | TransportConfig::SolaceOutput(_) => {}
+                | TransportConfig::SolaceOutput(_)
+                | TransportConfig::S2Output(_) => {}
                 _ => {
                     return Err(ConnectorGenerationError::ExpectedOutputConnector {
                         position: origin_value.value_position,
@@ -821,6 +954,7 @@ pub fn generate_program_info(
         udf_stubs,
         main_rust,
         dataflow,
+        circuit_ir,
         input_connectors: inputs,
         output_connectors: outputs,
     })
@@ -862,11 +996,14 @@ pub fn generate_pipeline_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{determine_connector_endpoint_names, RuntimeSelector};
+    use super::{RuntimeSelector, determine_connector_endpoint_names, generate_program_info};
     use crate::db::types::program::ConnectorGenerationError::RelationConnectorNameCollision;
     use feldera_types::config::{ConnectorConfig, TransportConfig};
-    use feldera_types::program_schema::{PropertyValue, SourcePosition};
+    use feldera_types::program_schema::{
+        ProgramSchema, PropertyValue, Relation, SourcePosition, SqlIdentifier,
+    };
     use feldera_types::transport::datagen::DatagenInputConfig;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_runtime_version_validation() {
@@ -892,12 +1029,58 @@ mod tests {
         );
     }
 
+    /// `gen2` and `gen2:<sha>` both select the Gen2 engine, and both round-trip as strings.
+    #[test]
+    fn gen2_runtime_version_selects_an_engine_build() {
+        let sha = "d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b";
+        for (value, engine_sha) in [
+            ("gen2".to_string(), None),
+            (format!("gen2:{sha}"), Some(sha)),
+        ] {
+            let selector = RuntimeSelector::try_from(value.clone()).unwrap();
+            assert!(selector.is_gen2());
+            assert_eq!(selector.gen2_engine_sha(), engine_sha);
+            assert_eq!(selector.to_string(), value);
+            assert_eq!(Option::<String>::from(selector), Some(value));
+        }
+        for invalid in ["gen2:", "gen2:main", "gen2:d0b45d8", "gen2:v0.1.0"] {
+            assert!(
+                RuntimeSelector::try_from(invalid.to_string()).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            RuntimeSelector::try_from(sha.to_string())
+                .unwrap()
+                .gen2_engine_sha(),
+            None
+        );
+    }
+
+    #[test]
+    fn gen2_sql_stage_reaches_success_directly() {
+        use super::{ProgramStatus, validate_program_status_transition};
+        // A Gen-2 program without Rust UDFs skips Rust compilation: the SQL compiler moves
+        // the program from CompilingSql straight to Success.
+        assert!(
+            validate_program_status_transition(ProgramStatus::CompilingSql, ProgramStatus::Success)
+                .is_ok()
+        );
+        // A Rust pipeline still reaches Success only through CompilingRust; the
+        // SqlCompiled stage cannot jump straight to Success.
+        assert!(
+            validate_program_status_transition(ProgramStatus::SqlCompiled, ProgramStatus::Success)
+                .is_err()
+        );
+    }
+
     #[test]
     #[rustfmt::skip]
     fn test_connector_endpoint_name_determination() {
         // Reuse the configuration as it is not used in the function
         let config = ConnectorConfig {
             send_snapshot: false,
+            soft_delete: false,
             transport: TransportConfig::Datagen(DatagenInputConfig::default()),
             format: None,
             preprocessor: None,
@@ -907,10 +1090,11 @@ mod tests {
             max_batch_size: Some(0),
             max_worker_batch_size: None,
             max_queued_records: 0,
-            max_queued_bytes: None,
+            max_queued_size: None,
             paused: false,
             labels: vec![],
             start_after: None,
+            distributed: false,
         };
 
         // Reuse property value as it is only used in the errors
@@ -987,6 +1171,71 @@ mod tests {
                 relation: "t1".to_string(),
                 connector_name: "example".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_generate_program_info_accepts_s2_input() {
+        let connectors = serde_json::json!([{
+            "transport": {
+                "name": "s2_input",
+                "config": {
+                    "basin": "my-basin",
+                    "stream": "my-stream",
+                    "auth_token": "token",
+                    "start_from": "Beginning"
+                }
+            },
+            "format": {
+                "name": "json",
+                "config": {
+                    "update_format": "raw"
+                }
+            }
+        }])
+        .to_string();
+
+        let property_value = PropertyValue {
+            value: connectors,
+            key_position: SourcePosition {
+                start_line_number: 1,
+                start_column: 1,
+                end_line_number: 1,
+                end_column: 10,
+            },
+            value_position: SourcePosition {
+                start_line_number: 1,
+                start_column: 11,
+                end_line_number: 1,
+                end_column: 100,
+            },
+        };
+
+        let mut properties = BTreeMap::new();
+        properties.insert("connectors".to_string(), property_value);
+
+        let schema = ProgramSchema {
+            inputs: vec![Relation::new(
+                SqlIdentifier::from("events"),
+                vec![],
+                false,
+                properties,
+            )],
+            outputs: vec![],
+        };
+
+        let program_info = generate_program_info(
+            serde_json::to_value(schema).unwrap(),
+            String::new(),
+            String::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            program_info
+                .input_connectors
+                .contains_key("events.unnamed-0")
         );
     }
 }

@@ -1,9 +1,7 @@
-use actix_web::{
-    body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
-};
+use actix_web::{HttpResponse, ResponseError, body::BoxBody, http::StatusCode};
 use feldera_types::error::{DetailedError, ErrorResponse};
 use serde::Serialize;
-use serde::{ser::SerializeStruct, Serializer};
+use serde::{Serializer, ser::SerializeStruct};
 use std::backtrace::Backtrace;
 use std::io::Error as IOError;
 use std::{borrow::Cow, error::Error as StdError, fmt, fmt::Display};
@@ -181,6 +179,6 @@ impl ResponseError for CommonError {
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
-        HttpResponseBuilder::new(self.status_code()).json(ErrorResponse::from_error(self))
+        crate::error::json_error_response(self)
     }
 }

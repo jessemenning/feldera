@@ -36,6 +36,7 @@ num = { workspace = true }
 num-traits = { workspace = true, features = ["std"] }
 once_cell = { workspace = true }
 paste = { workspace = true }
+parquet-variant = { workspace = true }
 quick_cache = { workspace = true, features = ["stats"] }
 regex = { workspace = true }
 rkyv = { workspace = true, features = ["std", "size_64", "validation", "smallvec"] }
@@ -59,3 +60,11 @@ derive_more = { version = "1.0", features = ["not"] }
 proptest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 size-of = { workspace = true }
+
+[[bench]]
+name = "flat_variant_serialize"
+harness = false
+
+[package.metadata.cargo-machete]
+# The md-5 package's library is named md5, which cargo-machete cannot match.
+ignored = ["md-5"]

@@ -5,22 +5,20 @@
 </script>
 
 <script lang="ts">
-  import { SegmentedControl } from 'common-ui'
+  import type { ConnectorErrorFilter } from 'common-lib/connectorMetrics'
+  import { formatDateTime, formatQty } from 'common-lib/format'
+  import { sleep } from 'common-lib/promise'
+  import { ConnectorMetricsTables, SegmentedControl } from 'common-ui'
   import Dayjs from 'dayjs'
   import PipelineMemoryGraph from '$lib/components/layout/pipelines/PipelineMemoryGraph.svelte'
   import PipelineStorageGraph from '$lib/components/layout/pipelines/PipelineStorageGraph.svelte'
   import PipelineThroughputGraph from '$lib/components/layout/pipelines/PipelineThroughputGraph.svelte'
-  import MetricsTables from '$lib/components/pipelines/editor/performance/MetricsTables.svelte'
-  import ConnectorErrors, {
-    type ConnectorErrorFilter
-  } from '$lib/components/pipelines/editor/performance/ConnectorErrors.svelte'
+  import ConnectorErrors from '$lib/components/pipelines/editor/performance/ConnectorErrors.svelte'
   import CheckpointsStatus from '$lib/components/pipelines/editor/performance/CheckpointsStatus.svelte'
   import { useIsScreenXl } from '$lib/compositions/layout/useIsMobile.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
-  import { formatDateTime, formatQty } from '$lib/functions/format'
   import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
-  import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
-  import { pushAsCircularBuffer } from '$lib/functions/pipelines/changeStream'
+  import { staleSampleCount, type PipelineMetrics } from '$lib/functions/pipelineMetrics'
   import { JSONParser } from '@streamparser/json-whatwg'
   import type { ParsedElementInfo } from '@streamparser/json/utils/types/parsedElementInfo.js'
   import { getDeploymentStatusLabel, isMetricsAvailable } from '$lib/functions/pipelines/status'
@@ -28,12 +26,20 @@
   import type { ExtendedPipeline } from '$lib/services/pipelineManager'
   import type { TimeSeriesEntry } from '$lib/types/pipelineManager'
   import CheckpointsIndicator from './performance/CheckpointsIndicator.svelte'
-  import TransactionStatus from './performance/TransactionStatus.svelte'
+  import CommitProgressIndicator from './performance/CommitProgressIndicator.svelte'
   import Drawer from '$lib/components/layout/Drawer.svelte'
   import WarningBanner from './WarningBanner.svelte'
-  import { sleep } from '$lib/functions/common/promise'
 
   const RECONNECT_BACKOFF_MS = 1000
+  /** Time span the graphs plot. */
+  const GRAPH_WINDOW_MS = 60 * 1000
+  const RETAIN_MS = GRAPH_WINDOW_MS + 2000
+  /**
+   * Ceiling on samples kept in `timeSeries`, reached only if their timestamps
+   * stop advancing. Well above the rate any deployment reports: a 16-host
+   * pipeline sampling every second fills a fifth of it.
+   */
+  const MAX_SAMPLES = 5000
 
   const {
     pipeline,
@@ -90,7 +96,9 @@
   // When metrics are temporarily unavailable ('missing'), freeze graphs and stats until the pipeline is reachable again.
   const metricsDesired = $derived(metricsStatus === 'yes' || metricsStatus === 'missing')
   // Show the reconnect banner only after a live stream has dropped, never during the first connect.
-  const metricsStreamInterrupted = $derived(metricsAvailable && metricsStreamState === 'interrupted')
+  const metricsStreamInterrupted = $derived(
+    metricsAvailable && metricsStreamState === 'interrupted'
+  )
 
   // Keep reconnecting to time_series_stream for as long as the tab is mounted and metrics are desired
   // Reconnect on end-of-stream immediately, or with 1s backoff on mid-stream or stream-open errors
@@ -119,11 +127,17 @@
 
     const runMetricsStream = async () => {
       // Not routed through `parseStream`: the load shedding is unnecessary for the metrics stream.
-      const appendRow = pushAsCircularBuffer(
-        () => timeSeries,
-        63,
-        (v: TimeSeriesEntry) => v
-      )
+      // Retention goes by sample age, not by sample count: a multihost pipeline
+      // reports one sample per host per tick, so the sample rate depends on the
+      // deployment and a count-based buffer plots a shorter span the more hosts
+      // the pipeline runs on.
+      const appendSample = (sample: TimeSeriesEntry) => {
+        timeSeries.push(sample)
+        const stale = staleSampleCount(timeSeries, RETAIN_MS, MAX_SAMPLES)
+        if (stale > 0) {
+          timeSeries.splice(0, stale)
+        }
+      }
       while (!cancelled) {
         if (!metricsAvailable) {
           await sleep(RECONNECT_BACKOFF_MS)
@@ -161,7 +175,7 @@
                   pendingReplace = false
                   return
                 }
-                appendRow([entry])
+                appendSample(entry)
               }
             }),
             { signal: abortCtrl.signal }
@@ -249,7 +263,7 @@
               </WarningBanner>
             {/if}
             <div class="flex flex-wrap gap-4">
-              <div class="mt-1 flex flex-wrap items-center gap-4">
+              <div class="mt-2.5 flex flex-wrap items-center gap-4">
                 <div class="flex flex-col">
                   <div class="text-start text-sm text-nowrap">Records Ingested</div>
                   <div class="pt-2">
@@ -314,7 +328,7 @@
                         { value: 'age', label: 'Age' },
                         { value: 'updated', label: 'Last status update' }
                       ]}
-                      class="-mt-3"
+                      class="-mt-1"
                     />
                     {#if statusTab === 'age'}
                       {@render age()}
@@ -330,7 +344,7 @@
                   {pipeline}
                   metrics={timeSeries}
                   refetchMs={1000}
-                  keepMs={60 * 1000}
+                  keepMs={GRAPH_WINDOW_MS}
                 ></PipelineThroughputGraph>
               </div>
               <div class="bg-white-dark relative h-52 w-full max-w-[700px] rounded">
@@ -338,7 +352,7 @@
                   {pipeline}
                   metrics={timeSeries}
                   refetchMs={1000}
-                  keepMs={60 * 1000}
+                  keepMs={GRAPH_WINDOW_MS}
                   memoryPressure={global.memory_pressure}
                 ></PipelineMemoryGraph>
               </div>
@@ -347,7 +361,7 @@
                   {pipeline}
                   metrics={timeSeries}
                   refetchMs={1000}
-                  keepMs={60 * 1000}
+                  keepMs={GRAPH_WINDOW_MS}
                 ></PipelineStorageGraph>
               </div>
             </div>
@@ -358,11 +372,11 @@
               {checkpointStatus}
               onShowCheckpoints={() => (openDrawer = { kind: 'checkpoints' })}
             />
-            <TransactionStatus {metrics} class="w-full"></TransactionStatus>
+            <CommitProgressIndicator {metrics} class="w-full"></CommitProgressIndicator>
           </div>
           {#if metrics.current.views.size || metrics.current.tables.size}
             <div class="flex flex-wrap gap-4">
-              <MetricsTables {metrics} onConnectorSelect={handleConnectorSelect} />
+              <ConnectorMetricsTables {metrics} onConnectorSelect={handleConnectorSelect} />
             </div>
           {/if}
         </div>

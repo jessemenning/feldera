@@ -2,6 +2,7 @@ package org.dbsp.sqlCompiler.circuit.operator;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.frontend.ExpressionCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
@@ -11,6 +12,7 @@ import org.dbsp.sqlCompiler.compiler.visitors.monotone.IMaybeMonotoneType;
 import org.dbsp.sqlCompiler.compiler.visitors.monotone.PartiallyMonotoneTuple;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
+import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPOpcode;
 import org.dbsp.sqlCompiler.ir.expression.DBSPVariablePath;
@@ -22,6 +24,7 @@ import org.dbsp.util.Utilities;
 import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Objects;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /**
  * Represents multiple DBSP operators, all whose names start with
@@ -57,9 +60,12 @@ public final class DBSPIntegrateTraceRetainNValuesOperator
         this.which = which;
     }
 
+    /** Create an operator that retains the values at or above the control, the values that
+     * satisfy {@code alsoRetain}, and n of the other values.
+     * @param alsoRetain  Predicate on a value; null when no value is retained regardless of the control. */
     public static DBSPIntegrateTraceRetainNValuesOperator create(
-            CalciteRelNode node, OutputPort data, IMaybeMonotoneType dataProjection, OutputPort control,
-            int n, WhichN which) {
+            DBSPCompiler compiler, CalciteRelNode node, OutputPort data, IMaybeMonotoneType dataProjection,
+            OutputPort control, int n, WhichN which, @Nullable DBSPClosureExpression alsoRetain) {
         DBSPType controlType = control.outputType();
         Utilities.enforce(controlType.is(DBSPTypeTupleBase.class),
                 () -> "Control type is not a tuple: " + controlType);
@@ -74,13 +80,18 @@ public final class DBSPIntegrateTraceRetainNValuesOperator
         DBSPParameter param = new DBSPParameter(dataArg.variable, dataArg.getType());
         DBSPExpression project = dataProjection
                 .to(PartiallyMonotoneTuple.class)
-                .getField(1)
+                .getFieldType(1)
                 .projectExpression(dataArg.deref());
         DBSPExpression compare0 = controlArg.deref().field(0).not();
         DBSPExpression compare = DBSPControlledKeyFilterOperator.generateTupleCompare(
                 project, controlArg.deref().field(1), DBSPOpcode.CONTROLLED_FILTER_GTE);
         compare = ExpressionCompiler.makeBinaryExpression(
                 node, compare.getType(), DBSPOpcode.OR, compare0, compare);
+        if (alsoRetain != null) {
+            DBSPExpression retained = alsoRetain.call(dataArg.deepCopy()).reduce(compiler);
+            compare = ExpressionCompiler.makeBinaryExpression(
+                    node, compare.getType(), DBSPOpcode.OR, compare, retained);
+        }
         DBSPExpression closure = compare.closure(param, controlArg.asParameter());
         return new DBSPIntegrateTraceRetainNValuesOperator(node, closure, data, control, n, which);
     }
@@ -107,12 +118,17 @@ public final class DBSPIntegrateTraceRetainNValuesOperator
         visitor.pop(this);
     }
 
-    // equivalent inherited from parent
+    @Override
+    public boolean equivalent(DBSPOperator other) {
+        if (!super.equivalent(other))
+            return false;
+        DBSPIntegrateTraceRetainNValuesOperator otherOperator = other.as(DBSPIntegrateTraceRetainNValuesOperator.class);
+        return otherOperator != null && this.n == otherOperator.n && this.which == otherOperator.which;
+    }
 
     @SuppressWarnings("unused")
     public static DBSPIntegrateTraceRetainNValuesOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = commonInfoFromJson(node, decoder);
-        boolean accumulate = Utilities.getBooleanProperty(node, "accumulate");
         int n = Utilities.getIntProperty(node, "n");
         WhichN which = WhichN.valueOf(Utilities.getStringProperty(node, "which"));
 
@@ -124,5 +140,18 @@ public final class DBSPIntegrateTraceRetainNValuesOperator
     @Override
     public DBSPSimpleOperator asOperator() {
         return this;
+    }
+
+    @Override
+    public OutputPort data() {
+        return this.left();
+    }
+
+    /** The data passes through unchanged; the control input carries the bound. */
+    @Override
+    protected StreamKind computeOutputKind() {
+        this.requireInputAmong(0, StreamKind.DELTA, StreamKind.COLLECTION);
+        this.requireInputAmong(1, StreamKind.WATERLINE);
+        return this.inputs.get(0).kind();
     }
 }

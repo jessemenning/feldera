@@ -6,12 +6,16 @@ start from 1.  Array sizes are limited to 2^31 elements.  Array values
 can be nullable types, e.g., `INT ARRAY NULL`.  Multidimensional arrays
 are possible, e.g. `VARCHAR ARRAY ARRAY` is a two-dimensional array.
 
+Many array functions take an index or a length represented as a
+32-bit signed integer, which limits the practical size of an array.
+An argument outside the 32-bit range generally causes a runtime error.
+
 In `CREATE TABLE` and `CREATE TYPE` declarations there is no way to
 specify the nullability of the elements of an `ARRAY`.  The compiler
 will always assume that array elements are nullable:
 
 ```sql
-CREATE TABLE T(a INT ARRAY);
+CREATE TABLE t(a INT ARRAY);
 ```
 
 Table `T` will have a single column `a` whose values are nullable
@@ -36,24 +40,24 @@ duplicated values, the resulting table will be a multiset.
 The `UNNEST` operator can be used in self-joins as follows:
 
 ```sql
-CREATE TABLE data(CITIES VARCHAR ARRAY, COUNTRY VARCHAR);
+CREATE TABLE data(cities VARCHAR ARRAY, country VARCHAR);
 
-CREATE VIEW V AS SELECT city, country
+CREATE VIEW v AS SELECT city, country
 FROM data, UNNEST(cities) AS t (city);
 ```
 
 The previous query is a shortcut for a CROSS-JOIN query:
 
 ```sql
-CREATE VIEW V AS SELECT city, data.country
+CREATE VIEW v AS SELECT city, data.country
 FROM data CROSS JOIN UNNEST(data.cities) AS city;
 ```
 
 `CROSS APPLY` is another spelling for the same query:
 
 ```sql
-CREATE VIEW V AS SELECT city, data.country
-FROM data CROSS APPLY UNNEST(data.cities) AS city;
+CREATE VIEW v AS SELECT city, data.country
+FROM data CROSS apply UNNEST(data.cities) AS city;
 ```
 
 `UNNEST` applied to a `NULL` value returns an empty table.  As a
@@ -67,7 +71,7 @@ rows where the array is `NULL`, substitute a one-element array in the
 
 ```sql
 -- A row with a NULL cities array produces one row with a NULL city
-CREATE VIEW V AS SELECT city, country
+CREATE VIEW v AS SELECT city, country
 FROM data, UNNEST(COALESCE(cities, ARRAY[NULL])) AS t (city);
 ```
 
@@ -80,9 +84,19 @@ column.
 
 Comparison operations (`=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`) in arrays occur **lexicographically**, from left to right. The elements are compared one by one until a difference is found. Arrays can be compared even if they are different in size.
 
+A `NULL` array element is smaller than any other element,
+whatever the `NULLS FIRST` or `NULLS
+LAST` clause of an enclosing `ORDER BY` says.
+
+On arrays, `=` is equivalent to `IS NOT DISTINCT FROM` and `<>` is
+equivalent to `IS DISTINCT FROM`: two `NULL` elements compare as
+equal, so `ARRAY[1, NULL] = ARRAY[1, NULL]` is `true`.  See
+[comparing complex values](comparisons.md#comparing-complex-values).
+
 **Examples:**
 - `[45] > [22]`
 - `[23, 56, 16] > [23, NULL]`
+- `[NULL] < [1]`
 
 ## Predefined functions on array values
 
@@ -99,7 +113,9 @@ Comparison operations (`=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`) in arrays occur **
 | <a id="distinct"></a>`ARRAY_DISTINCT(` _array_ `)`                   | Returns `NULL` if _array_ is `NULL`. Returns a new array removing duplicate values from the _array_ and keeping the order of elements.                                                                                                                                                    | `ARRAY_DISTINCT(ARRAY [1, 1, 2, 2])` => `[1, 2]`                    |
 | <a id="except"></a>`ARRAY_EXCEPT(` _left_, _right_ `)`               | Returns `NULL` if any argument is `NULL`. Returns an array with all elements in the _left_ array that do not appear in the  _right_ array, removing duplicates. The result is sorted in ascending order.                                                                                                                           | `ARRAY_EXCEPT(ARRAY [1, 2, 3], ARRAY [3,1,4])` => `[2]`             |
 | <a id="array_exists"></a>`ARRAY_EXISTS(` _array_, _predicate_ `)`    | _predicate_ is a lambda expression with an argument that has the array element type, returning a Boolean. `ARRAY_EXISTS` returns `true` when the predicate returns `true` for at least one element. If the array is empty, returns `false`. If the result is not true and the predicate evaluates to NULL for any element, it returns NULL.  | `ARRAY_EXISTS(ARRAY[1, -2, 3], x -> x > 0)` => true                            |
-| <a id="insert"></a>`ARRAY_INSERT(` _array_, _pos_, _element_ `)`     | Returns `NULL` if _array_ or _pos_ are `NULL`. Insert _element_ in array at specified position, padding with `NULL`s if necessary. If _pos_ is negative, it is considered from the end of the array. Produces error when _pos_ is zero or very large                                      | `ARRAY_INSERT(ARRAY [1, 2, 3], 3, 4)` => `[1,2,4,3]` |
+| <a id="array_filter"></a>`ARRAY_FILTER(` _array_, _predicate_ `)`    | _predicate_ is a lambda expression with an argument that has the array element type, returning a Boolean. `ARRAY_FILTER` returns a new array with the elements of _array_ for which the predicate returns `true`, in their original order. Elements for which the predicate returns `false` or NULL are dropped. If _array_ is NULL, it returns NULL.                                                                | `ARRAY_FILTER(ARRAY[1, -2, 3], x -> x > 0)` => `[1, 3]`                         |
+| <a id="array_flatten"></a>`ARRAY_FLATTEN(` _array_ `)`               | _array_ must be an array of arrays.  Returns a new array holding the elements of each inner array, in order.  Only one level of nesting is removed.  Returns `NULL` if _array_ is `NULL`, or if any of its elements is `NULL`.                                                          | `ARRAY_FLATTEN(ARRAY[ARRAY[1, 2], ARRAY[3]])` => `[1, 2, 3]`                   |
+| <a id="insert"></a>`ARRAY_INSERT(` _array_, _pos_, _element_ `)`     | Returns `NULL` if _array_ or _pos_ are `NULL`. Insert _element_ in array at specified position, padding with `NULL`s if necessary. If _pos_ is negative, it is considered from the end of the array. Otherwise produces a runtime error when _pos_ is zero, or when its absolute value is very large                                      | `ARRAY_INSERT(ARRAY [1, 2, 3], 3, 4)` => `[1,2,4,3]` |
 | <a id="intersect"></a>`ARRAY_INTERSECT(` _left_, _right_ `)`         | Returns `NULL` if any argument is `NULL`. Returns an array with all elements that appear in common in both the _left_ array and _right_ arrays, with no duplicates. The result is sorted in ascending order.                                                                                                                       | `ARRAY_INTERSECT(ARRAY [1, 2, 3], ARRAY [3,1,4])` => `[1,3]`       |
 | <a id="join"></a>`ARRAY_JOIN`                                        | Another name for `ARRAY_TO_STRING`                                                                                                                                                                                                                                                        |                                                                     |
 | <a id="length"></a>`ARRAY_LENGTH(` _array_ `)`                       | Another name for `CARDINALITY`                                                                                                                                                                                                                                                            | `ARRAY_LENGTH( ARRAY [1, 2, 3])` => `3`                             |
@@ -112,6 +128,7 @@ Comparison operations (`=`, `<>`, `!=`, `>`, `<`, `>=`, `<=`) in arrays occur **
 | <a id="reverse"></a>`ARRAY_REVERSE(` _array_ `)`                     | Returns `NULL` if _array_ is `NULL`. Returns array with the elements in reverse order.                                                                                                                                                                                                    | `ARRAY_REVERSE(ARRAY [2, 2, 6, 8])` => `[8, 6, 2, 2]`               |
 | <a id="repeat"></a>`ARRAY_REPEAT(` _element_ `, ` _count_ `)`        | Returns the array containing _element_ _count_ times. If _count_ is negative, an empty array is returned. If _count_ is `NULL`, `NULL` is returned. If _element_ is `NULL`, an array containing _count_ number of `NULL`s is returned.                                                    | `ARRAY_REPEAT(3, 4)` => `[3, 3, 3, 3]`                              |
 | <a id="size"></a>`ARRAY_SIZE(` _array_ `)`                           | Another name for `CARDINALITY`                                                                                                                                                                                                                                                            | `ARRAY_SIZE( ARRAY [1, 2, 3])` => `3`                               |
+| <a id="array_slice"></a>`ARRAY_SLICE(` _array_, _start_, _length_ `)`  | Returns at most _length_ elements of _array_ starting at position _start_.  The first element is at position 1; a negative _start_ counts from the end of the array.  The slice stops at the end of the array, and is empty if _start_ is outside the array.  Returns `NULL` if any argument is `NULL`.  Otherwise produces a runtime error if _start_ is zero or _length_ is negative.   | `ARRAY_SLICE(ARRAY[1, 2, 3, 4], 2, 2)` => `[2, 3]`                   |
 | <a id="to_string"></a>`ARRAY_TO_STRING(` _array_ `, ` _separator_ [`, ` _null_string_ ]`)` | Concatenates the elements of _array_, converted to strings, separated by the _separator_ string. If _null_string_ is given and is not `NULL`, then `NULL` array entries are represented by that string; otherwise, they are omitted.                                                             | `ARRAY_TO_STRING(ARRAY[1, 2, 3, NULL, 5], ',', '*')` => `1,2,3,*,5` |
 | <a id="union"></a>`ARRAY_UNION(` _left_, _right_ `)`                 | Returns `NULL` if any argument is `NULL`. Returns an array with all elements that are either in the _left_ array or the _right_ arrays, with no duplicates. The result is sorted in ascending order.                                                                                                                                   | `ARRAY_UNION(ARRAY [1, 2, 3], ARRAY [3,1,4])` => `[1,2,3,4]`        |
 | <a id="cardinality"></a>`CARDINALITY(` _array_ `)`                   | Returns the size of the _array_ expression (number of elements).                                                                                                                                                                                                                          | `CARDINALITY(ARRAY[2,3])` => 2                                      |

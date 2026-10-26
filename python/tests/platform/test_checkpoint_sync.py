@@ -6,7 +6,6 @@ import sys
 import time
 import warnings
 from typing import Optional
-from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from feldera import Pipeline
@@ -19,44 +18,43 @@ from feldera.testutils import (
 )
 from tests import enterprise_only
 from tests.shared_test_pipeline import SharedTestPipeline
-from tests.utils import (
-    MINIO_BUCKET,
-    MINIO_ENDPOINT,
-    MINIO_PROVIDER,
-    MINIO_REGION,
-    required_env,
-)
+from tests.utils import ObjectStore
 
 from .helper import wait_for_condition
 
 
 LOGGER = logging.getLogger(__name__)
+
+# An object store endpoint that cannot be reached: port 1 on the pipeline's
+# own loopback, where nothing listens.  A sync pointed here stays in progress
+# for as long as the test needs, because the sync retries a connection failure
+# rather than giving up on it.  A sync against a working endpoint, by contrast,
+# can finish before the first status request arrives, leaving no window to
+# observe.
+#
+# The window comes from that retrying, not from how the network treats the
+# address, so this holds wherever the tests run.  An unroutable address (say
+# TEST-NET-1) would rely on the network dropping the packets rather than
+# rejecting them; loopback never leaves the pod and is refused immediately
+# everywhere, which the retry loop then rides out just the same.
+UNREACHABLE_ENDPOINT = "http://127.0.0.1:1"
 _CHECKPOINT_SYNC_BUCKET_ARCH = platform.machine().lower()
 
 
 def checkpoint_sync_bucket(pipeline_name: str) -> str:
-    return f"{MINIO_BUCKET}/{_CHECKPOINT_SYNC_BUCKET_ARCH}/{pipeline_name}"
+    """``<bucket>/<prefix>`` a pipeline syncs its checkpoints to."""
+    return f"{ObjectStore.from_env().bucket}/{_CHECKPOINT_SYNC_BUCKET_ARCH}/{pipeline_name}"
 
 
 def checkpoint_sync_owner(bucket_name: str) -> Optional[dict]:
-    """Read the checkpoint-sync owner file from S3 if Python can access S3."""
+    """Read the checkpoint-sync owner file if Python can reach the object store."""
     try:
-        import pyarrow.fs as pafs
-
-        endpoint = MINIO_ENDPOINT.rstrip("/")
-        parsed = urlparse(endpoint)
-        s3 = pafs.S3FileSystem(  # type: ignore[attr-defined]
-            access_key=required_env("CI_K8S_MINIO_ACCESS_KEY_ID"),
-            secret_key=required_env("CI_K8S_MINIO_SECRET_ACCESS_KEY"),
-            endpoint_override=parsed.netloc,
-            scheme=parsed.scheme,
-            region=MINIO_REGION,
-        )
+        fs = ObjectStore.from_env().pyarrow_fs()
         owner_path = f"{checkpoint_sync_bucket(bucket_name)}/owner.json"
-        info = s3.get_file_info(owner_path)
+        info = fs.get_file_info(owner_path)
     except Exception as e:
         print(
-            f"S3 is not accessible from the Python SDK; skipping owner.json check: {e}",
+            f"object store not accessible from the Python SDK; skipping owner.json check: {e}",
             file=sys.stderr,
         )
         return None
@@ -64,7 +62,7 @@ def checkpoint_sync_owner(bucket_name: str) -> Optional[dict]:
     if not info.is_file:
         raise AssertionError(f"checkpoint ownership file not found: {owner_path}")
 
-    with s3.open_input_file(owner_path) as f:
+    with fs.open_input_file(owner_path) as f:
         owner = json.loads(f.read().decode("utf-8"))
 
     LOGGER.debug(
@@ -88,6 +86,7 @@ def storage_cfg(
     retention_min_count: int = 1,
     retention_min_age: int = 0,
     read_bucket: Optional[str] = None,
+    take_bucket_ownership: bool = False,
 ) -> dict:
     if standby:
         warnings.warn(
@@ -97,27 +96,28 @@ def storage_cfg(
             stacklevel=2,
         )
 
-    # MinIO credentials are read here (not at import time) so collection
-    # does not blow up in environments where they are unset.
-    access_key = required_env("CI_K8S_MINIO_ACCESS_KEY_ID")
-    secret_key = required_env("CI_K8S_MINIO_SECRET_ACCESS_KEY")
-
-    sync: dict = {
-        "bucket": checkpoint_sync_bucket(pipeline_name),
-        "access_key": access_key,
-        "secret_key": secret_key if not auth_err else secret_key + "extra",
-        "provider": MINIO_PROVIDER,
-        "endpoint": endpoint or MINIO_ENDPOINT,
-        "region": MINIO_REGION,
-        "start_from_checkpoint": start_from_checkpoint,
-        "fail_if_no_checkpoint": strict,
-        "pull_interval": pull_interval,
-        "push_interval": push_interval,
-        "retention_min_count": retention_min_count,
-        "retention_min_age": retention_min_age,
-    }
+    # The store (and any credentials it needs) is resolved here, not at
+    # import time, so collection does not blow up where the env is unset.
+    store = ObjectStore.from_env()
+    sync: dict = store.checkpoint_sync_connection(
+        checkpoint_sync_bucket(pipeline_name), auth_err=auth_err, endpoint=endpoint
+    )
+    sync.update(
+        {
+            "start_from_checkpoint": start_from_checkpoint,
+            "fail_if_no_checkpoint": strict,
+            "standby_pull_interval": f"{pull_interval}s",
+            "checkpoint_push_interval": None
+            if push_interval is None
+            else f"{push_interval}s",
+            "retention_min_count": retention_min_count,
+            "min_retention": f"{retention_min_age}d",
+        }
+    )
     if read_bucket is not None:
-        sync["read_bucket"] = read_bucket
+        sync["read_bucket"] = store.sync_bucket(read_bucket)
+    if take_bucket_ownership:
+        sync["take_bucket_ownership"] = True
     return {
         "backend": {
             "name": "file",
@@ -128,8 +128,47 @@ def storage_cfg(
     }
 
 
+# Logging filter that turns on h2 frame-level tracing, for the tests chasing the
+# multihost completion hang.
+#
+# test_owner_lock_allows_renamed_pipeline and other tests in this file, plus
+# test_iceberg_ordered_resume_skips_ingested, have hung in CI waiting for
+# /completion_status or /checkpoint_status to report done on a multihost pipeline
+# that had, per /stats, already finished (feldera/cloud#1897 is the same shape).
+# The completion/checkpoint counters are updated correctly and published to the
+# coordinator's watch channel, but the coordinator's cached view of them can go
+# stale if the underlying h2 stream stalls without erroring.  Frame-level tracing
+# on both the pipeline (h2 0.3.x via actix-http) and the coordinator (h2 0.4.x
+# via reqwest/hyper) shows the window updates, send capacity and wakers for
+# whichever stream gets stuck.
+#
+# The trace outruns the pipeline log buffer within seconds -- a 35-minute CI run
+# discarded 559,942 lines and left 1.4s of history, which is not enough to
+# diagnose anything else that goes wrong -- so tests opt in individually rather
+# than all of them paying for it.  Remove once the hang is understood and fixed.
+H2_TRACE_LOGGING = (
+    "object_store=warn,buoyant_kernel=warn,info,h2=trace,actix_http::h2=trace"
+)
+
+
+def build_runtime_config(*args, h2_trace: bool = False, **kwargs):
+    """Build a `RuntimeConfig`, with h2 frame-level tracing if *h2_trace*.
+
+    See `H2_TRACE_LOGGING` for what the tracing is for and what it costs.
+    """
+    if h2_trace:
+        kwargs.setdefault("logging", H2_TRACE_LOGGING)
+    return RuntimeConfig(*args, **kwargs)
+
+
 class TestCheckpointSync(SharedTestPipeline):
     def _wait_for_standby_checkpoint_pull(self, pipeline, timeout_s: float = 120):
+        """Block until the standby pipeline reports its first checkpoint pull.
+
+        A pipeline in standby has no controller yet, so neither /metrics nor
+        /checkpoints can report pull progress; the log line is the only signal.
+        The pipeline logs it again on every pull, so an evicted line recurs.
+        """
         end = time.monotonic() + timeout_s
         for log in pipeline.logs():
             if "checkpoint pulled successfully" in log:
@@ -138,12 +177,16 @@ class TestCheckpointSync(SharedTestPipeline):
                 raise TimeoutError(
                     f"{pipeline.name} timed out waiting to pull checkpoint"
                 )
+        raise RuntimeError(
+            f"{pipeline.name} log stream ended before it pulled a checkpoint"
+        )
 
     def _configure_and_start(
         self,
         ft_interval: int = 60,
         push_interval: Optional[int] = None,
         retention_min_age: int = 0,
+        h2_trace: bool = False,
     ):
         """Configure the pipeline with AtLeastOnce FT and start it."""
         storage_config = storage_cfg(
@@ -153,12 +196,13 @@ class TestCheckpointSync(SharedTestPipeline):
             retention_min_age=retention_min_age,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
                 storage=Storage(config=storage_config),
-                checkpoint_interval_secs=ft_interval,
+                checkpoint_interval=f"{ft_interval}s",
+                h2_trace=h2_trace,
             )
         )
         self.pipeline.start()
@@ -292,29 +336,51 @@ class TestCheckpointSync(SharedTestPipeline):
         )
 
     def _wait_for_automated_sync(self, chk_uuid=None, chk_steps=None):
-        """Poll until the periodic sync has uploaded a checkpoint at least as recent as *chk_uuid*."""
+        """Poll until the periodic sync has uploaded a checkpoint at least as recent as *chk_uuid*.
+
+        Reads the raw sync status rather than
+        `Pipeline.last_successful_checkpoint_sync`, which raises the same
+        `RuntimeError` whether the sync failed, was never attempted, or is still
+        in flight.  A timeout here reports the last status and the checkpoints
+        that were available, since the interesting failures are a `failure` the
+        sync kept retrying and a status that reports nothing at all.
+        """
+        last_status = None
 
         def checkpoint_sync_completed() -> bool:
-            try:
-                synced = self.pipeline.last_successful_checkpoint_sync()
-                print("Automatically synced checkpoint UUID:", synced, file=sys.stderr)
-                if synced is None:
-                    return False
-                if chk_uuid is None:
-                    return True
-                s_steps = self._checkpoint_steps(synced)
-                if chk_steps is not None and s_steps is not None:
-                    return s_steps >= chk_steps
-                return UUID(str(synced)) >= UUID(str(chk_uuid))
-            except RuntimeError:
+            nonlocal last_status
+            last_status = self.pipeline.client.sync_checkpoint_status(
+                self.pipeline.name
+            )
+            print(f"Automated sync status: {last_status}", file=sys.stderr)
+            uuids = [
+                UUID(u)
+                for u in (last_status.get("success"), last_status.get("periodic"))
+                if u is not None
+            ]
+            if not uuids:
                 return False
+            synced = max(uuids)
+            if chk_uuid is None:
+                return True
+            s_steps = self._checkpoint_steps(synced)
+            if chk_steps is not None and s_steps is not None:
+                return s_steps >= chk_steps
+            return synced >= UUID(str(chk_uuid))
 
-        wait_for_condition(
-            "automated checkpoint sync completes",
-            checkpoint_sync_completed,
-            timeout_s=30.0,
-            poll_interval_s=0.5,
-        )
+        try:
+            wait_for_condition(
+                "automated checkpoint sync completes",
+                checkpoint_sync_completed,
+                timeout_s=30.0,
+                poll_interval_s=0.5,
+            )
+        except TimeoutError as e:
+            chks = [chk.to_dict() for chk in self.pipeline.checkpoints()]
+            raise TimeoutError(
+                f"{e}; waited for {chk_uuid} (steps {chk_steps}),"
+                f" last sync status {last_status}, checkpoints {chks}"
+            ) from e
 
     def _sync_and_verify(self, chk_uuid=None, chk_steps=None):
         """Trigger a manual sync and assert it covers *chk_uuid*. Returns the synced UUID."""
@@ -349,12 +415,12 @@ class TestCheckpointSync(SharedTestPipeline):
             strict=strict,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
                 storage=Storage(config=storage_config),
-                checkpoint_interval_secs=ft_interval,
+                checkpoint_interval=f"{ft_interval}s",
             )
         )
 
@@ -365,6 +431,56 @@ class TestCheckpointSync(SharedTestPipeline):
             self._wait_for_standby_checkpoint_pull(self.pipeline, timeout_s=120)
             assert self.pipeline.status() == PipelineStatus.STANDBY
             self.pipeline.activate()
+
+    def _sync_status(self) -> dict:
+        """Return the raw `/checkpoint/sync_status` response.
+
+        The SDK's `sync_checkpoint_status` collapses the response into a
+        `CheckpointStatus`, which hides `running`.
+        """
+        return self.pipeline.client.sync_checkpoint_status(self.pipeline.name)
+
+    def _drain_sync(self, uuid, timeout_s: float = 120.0) -> tuple[dict, bool]:
+        """Poll `/checkpoint/sync_status` until the sync of *uuid* finishes.
+
+        Asserts on every sample that *uuid* is visible, that is, that it is
+        either in `running` or recorded in `success`/`failure`.  The pipeline
+        inserts *uuid* into `running` before answering the sync request, and
+        moves it from `running` to `success`/`failure` under a single lock, so
+        a caller that polls after a sync request can never see the UUID
+        disappear.
+
+        `running` alone decides when the sync is over.  `success` and `failure`
+        are sticky records of the last sync to reach each outcome, so re-syncing
+        a UUID that already failed starts out matching `running` and `failure`
+        at once; reading the sticky record as completion would report the new
+        sync as finished before it began.
+
+        Returns the final status, and whether the poll caught the sync in
+        `running`: a sync that ends within one status round-trip is already over
+        by the first sample.
+        """
+        saw_running = False
+        end = time.monotonic() + timeout_s
+        while True:
+            status = self._sync_status()
+            if uuid in (status.get("running") or []):
+                saw_running = True
+            else:
+                terminal = (
+                    status.get("success"),
+                    (status.get("failure") or {}).get("uuid"),
+                )
+                assert uuid in terminal, (
+                    f"sync '{uuid}' is neither running nor finished: {status}"
+                )
+                return status, saw_running
+
+            if time.monotonic() > end:
+                raise TimeoutError(
+                    f"timed out after {timeout_s}s waiting for sync '{uuid}': {status}"
+                )
+            time.sleep(0.05)
 
     # =========================================================================
     # Tests
@@ -503,7 +619,9 @@ class TestCheckpointSync(SharedTestPipeline):
         time.sleep(1)
         self._sync_and_verify()
 
-        with self.assertRaisesRegex(RuntimeError, "SignatureDoesNotMatch|Forbidden"):
+        with self.assertRaisesRegex(
+            RuntimeError, ObjectStore.from_env().auth_error_pattern
+        ):
             self._restart_from_checkpoint("latest", auth_err=True, strict=True)
 
     @enterprise_only
@@ -514,7 +632,9 @@ class TestCheckpointSync(SharedTestPipeline):
         time.sleep(1)
         self._sync_and_verify()
 
-        with self.assertRaisesRegex(RuntimeError, "SignatureDoesNotMatch|Forbidden"):
+        with self.assertRaisesRegex(
+            RuntimeError, ObjectStore.from_env().auth_error_pattern
+        ):
             self._restart_from_checkpoint("latest", auth_err=True, strict=False)
 
     @enterprise_only
@@ -529,7 +649,7 @@ class TestCheckpointSync(SharedTestPipeline):
         shared_storage = Storage(config=storage_cfg(owner.name))
 
         owner.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -543,7 +663,7 @@ class TestCheckpointSync(SharedTestPipeline):
         owner.sync_checkpoint(wait=True)
 
         intruder.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -579,6 +699,94 @@ class TestCheckpointSync(SharedTestPipeline):
         owner.clear_storage()
 
     @enterprise_only
+    def test_take_bucket_ownership_at_startup_only(self):
+        # `take_bucket_ownership` lets a pipeline take over a bucket that
+        # another pipeline owns, but only as it starts. Pushes never take
+        # ownership, so a pipeline that loses the bucket while it is running
+        # fails its next push, even if it set the flag itself.
+        ft = FaultToleranceModel.AtLeastOnce
+
+        first = self.new_pipeline_with_suffix("first")
+        second = self.new_pipeline_with_suffix("second")
+        bucket_name = first.name
+
+        def configure(pipeline: Pipeline, take_bucket_ownership: bool):
+            pipeline.set_runtime_config(
+                build_runtime_config(
+                    workers=FELDERA_TEST_NUM_WORKERS,
+                    hosts=FELDERA_TEST_NUM_HOSTS,
+                    fault_tolerance_model=ft,
+                    storage=Storage(
+                        config=storage_cfg(
+                            bucket_name, take_bucket_ownership=take_bucket_ownership
+                        )
+                    ),
+                )
+            )
+
+        def assert_owner(pipeline: Pipeline):
+            owner = checkpoint_sync_owner(bucket_name)
+            if owner is not None:
+                self.assertEqual(owner["pipeline_name"], f"pipeline-{pipeline.id()}")
+
+        def push(pipeline: Pipeline, start: int):
+            pipeline.input_json(
+                "t0",
+                [
+                    {"c0": i, "c1": f"{pipeline.name}_{i}"}
+                    for i in range(start, start + 5)
+                ],
+            )
+            pipeline.wait_for_completion()
+            pipeline.checkpoint(wait=True)
+            pipeline.sync_checkpoint(wait=True)
+
+        # `first` claims the bucket with its first push.
+        configure(first, take_bucket_ownership=False)
+        first.start()
+        push(first, 1)
+        assert_owner(first)
+
+        # `second` takes the bucket over as it starts, before pushing anything.
+        configure(second, take_bucket_ownership=True)
+        second.start()
+        assert_owner(second)
+        push(second, 6)
+        assert_owner(second)
+
+        # `first` lost the bucket while running, so its pushes now fail.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "S3 checkpoint bucket is already owned by [\\s\\S]*"
+            "Refusing to write checkpoint data",
+        ):
+            push(first, 11)
+        assert_owner(second)
+
+        # Restarted with the flag, `first` takes the bucket back as it starts...
+        first.stop(force=True)
+        configure(first, take_bucket_ownership=True)
+        first.start()
+        assert_owner(first)
+        push(first, 16)
+
+        # ...and `second`, which set the flag but is now running, fails its
+        # next push instead of taking the bucket back.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "S3 checkpoint bucket was taken over by [\\s\\S]*"
+            "while this pipeline [\\s\\S]*was running[\\s\\S]*"
+            "Refusing to write checkpoint data",
+        ):
+            push(second, 21)
+        assert_owner(first)
+
+        second.stop(force=True)
+        first.stop(force=True)
+        second.clear_storage()
+        first.clear_storage()
+
+    @enterprise_only
     def test_owner_lock_allows_renamed_pipeline(self):
         # Renaming a pipeline changes the user-visible name, but keeps the
         # system-generated pipeline name used for bucket ownership.
@@ -587,13 +795,14 @@ class TestCheckpointSync(SharedTestPipeline):
         system_name = f"pipeline-{pipeline_id}"
         bucket_name = f"{old_name}-{pipeline_id}"
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
                 storage=Storage(
                     config=storage_cfg(bucket_name, start_from_checkpoint="latest")
                 ),
+                h2_trace=True,
             )
         )
         self.pipeline.start()
@@ -711,12 +920,12 @@ class TestCheckpointSync(SharedTestPipeline):
             auth_err=True,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
                 storage=Storage(config=storage_config),
-                checkpoint_interval_secs=5,
+                checkpoint_interval="5s",
             )
         )
         self.pipeline.start()
@@ -753,12 +962,155 @@ class TestCheckpointSync(SharedTestPipeline):
         self.pipeline.clear_storage()
 
     @enterprise_only
+    @single_host_only
+    def test_sync_status_running(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # `push_interval` defaults to None, so no periodic sync competes for
+        # `running` and the only entry can be the manual sync below.
+        self._configure_and_start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        self.assertEqual(
+            self._sync_status().get("running"),
+            [],
+            "no sync has been requested yet",
+        )
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            status.get("success"), uuid, f"sync should have succeeded: {status}"
+        )
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
+    @single_host_only
+    def test_sync_status_in_flight(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # The sync cannot finish against an endpoint nothing answers on, so the
+        # window in which it is running is as wide as the test needs.  Without
+        # that, a sync can start and finish between the 202 and the first
+        # status request, and an implementation that never populated `running`
+        # would be indistinguishable from one that does.
+        self.pipeline.set_runtime_config(
+            build_runtime_config(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
+                storage=Storage(
+                    config=storage_cfg(
+                        self.pipeline.name, endpoint=UNREACHABLE_ENDPOINT
+                    )
+                ),
+                checkpoint_interval="60s",
+            )
+        )
+        self.pipeline.start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        def sync_is_running() -> bool:
+            return uuid in (self._sync_status().get("running") or [])
+
+        wait_for_condition(
+            f"checkpoint sync '{uuid}' is reported as running",
+            sync_is_running,
+            timeout_s=30.0,
+            poll_interval_s=0.2,
+        )
+
+        # Requesting the same checkpoint again while it is syncing coalesces
+        # with the sync in progress: same UUID back, and still one entry.
+        self.assertEqual(self.pipeline.sync_checkpoint(), uuid)
+        status = self._sync_status()
+        self.assertEqual(
+            status.get("running"),
+            [uuid],
+            f"a duplicate request must not add a second entry: {status}",
+        )
+        self.assertIsNone(
+            status.get("success"), f"nothing can have succeeded yet: {status}"
+        )
+
+        # Stopping while the sync is still in flight exercises the guard's
+        # release-on-drop path; the pipeline must stop rather than wait it out.
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
+    @single_host_only
+    def test_sync_status_running_after_failure(self):
+        """
+        CREATE TABLE t0 (c0 INT, c1 VARCHAR);
+        CREATE MATERIALIZED VIEW v0 AS SELECT * FROM t0;
+        """
+        # Bad credentials fail every sync, which checks that a sync releases
+        # its slot in `running` however it ends.  A leaked slot would wedge the
+        # checkpoint: later requests to sync it are dropped as duplicates, and
+        # the status keeps reporting a sync that is no longer running.
+        self.pipeline.set_runtime_config(
+            build_runtime_config(
+                workers=FELDERA_TEST_NUM_WORKERS,
+                hosts=FELDERA_TEST_NUM_HOSTS,
+                fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
+                storage=Storage(config=storage_cfg(self.pipeline.name, auth_err=True)),
+                checkpoint_interval="60s",
+            )
+        )
+        self.pipeline.start()
+        processed, _ = self._insert_data_and_wait()
+        self.pipeline.checkpoint(wait=True)
+        chk_uuid, _ = self._latest_checkpoint(processed)
+
+        uuid = self.pipeline.sync_checkpoint()
+        self.assertEqual(str(uuid), str(chk_uuid))
+
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            (status.get("failure") or {}).get("uuid"),
+            uuid,
+            f"sync should have failed on bad credentials: {status}",
+        )
+
+        # Re-syncing the same checkpoint is accepted rather than rejected as
+        # already-failed, and fails the same way.  A local MinIO 403 usually
+        # lands before the first status request, so this does not try to catch
+        # the second sync in `running`; `test_sync_status_in_flight` covers that
+        # against an endpoint that cannot answer.
+        self.assertEqual(self.pipeline.sync_checkpoint(), uuid)
+        status, _ = self._drain_sync(uuid)
+        self.assertEqual(
+            (status.get("failure") or {}).get("uuid"),
+            uuid,
+            f"re-sync should have failed too: {status}",
+        )
+
+        self.pipeline.stop(force=True)
+        self.pipeline.clear_storage()
+
+    @enterprise_only
     def test_standby_fallback(self, from_uuid: bool = False):
         # Step 1: Start main pipeline
         storage_config = storage_cfg(self.pipeline.name, retention_min_age=1)
         ft = FaultToleranceModel.AtLeastOnce
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -784,7 +1136,7 @@ class TestCheckpointSync(SharedTestPipeline):
         standby = self.new_pipeline_with_suffix("standby")
         pull_interval = 1
         standby.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -868,7 +1220,7 @@ class TestCheckpointSync(SharedTestPipeline):
 
         storage_config = storage_cfg(self.pipeline.name, retention_min_count=2)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -907,7 +1259,7 @@ class TestCheckpointSync(SharedTestPipeline):
             retention_min_count=2,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -942,7 +1294,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: push a checkpoint to the source pipeline's bucket (becomes read_bucket).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -974,7 +1326,7 @@ class TestCheckpointSync(SharedTestPipeline):
             pull_interval=2,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1035,7 +1387,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: push a checkpoint to the source pipeline (becomes read_bucket).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1055,7 +1407,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 2: push a checkpoint to the main pipeline's own bucket.
         storage_config = storage_cfg(self.pipeline.name)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1080,7 +1432,7 @@ class TestCheckpointSync(SharedTestPipeline):
             read_bucket=source_bucket,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1111,7 +1463,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: create the source pipeline (becomes read_bucket for standby).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1132,7 +1484,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # its own bucket during the test.
         storage_config = storage_cfg(self.pipeline.name)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1144,7 +1496,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 3: start the standby pipeline with empty bucket, read_bucket=source.
         standby = self.new_pipeline_with_suffix("standby")
         standby.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1185,15 +1537,11 @@ class TestCheckpointSync(SharedTestPipeline):
         # checkpoint by now.
         try:
             assert standby.status() == PipelineStatus.STANDBY
+            # activate() blocks until the manager reports RUNNING. Do not wait
+            # on the "pipeline activated" log line instead: it is logged once,
+            # and the manager's bounded log buffer evicts it under trace noise.
             standby.activate(timeout_s=(pull_interval * extra_ckpts) + 60)
-
-            start = time.monotonic()
-            end = start + 120
-            for log in standby.logs():
-                if "activated" in log:
-                    break
-                if time.monotonic() > end:
-                    raise TimeoutError("Timed out waiting for standby to activate")
+            assert standby.status() == PipelineStatus.RUNNING
 
             got = list(standby.query("SELECT * FROM v0"))
             print(
@@ -1224,7 +1572,7 @@ class TestCheckpointSync(SharedTestPipeline):
 
         storage_config = storage_cfg(self.pipeline.name, retention_min_count=2)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1268,7 +1616,7 @@ class TestCheckpointSync(SharedTestPipeline):
             retention_min_count=2,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1295,7 +1643,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: source pipeline creates a checkpoint (will become read_bucket).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1317,7 +1665,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # is read_bucket.
         storage_config = storage_cfg(self.pipeline.name)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1348,7 +1696,7 @@ class TestCheckpointSync(SharedTestPipeline):
             read_bucket=source_bucket,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1380,7 +1728,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: source pipeline creates a checkpoint (will become read_bucket).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1402,7 +1750,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # with a different UUID.
         storage_config = storage_cfg(self.pipeline.name, retention_min_count=2)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1437,7 +1785,7 @@ class TestCheckpointSync(SharedTestPipeline):
             retention_min_count=2,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1468,12 +1816,12 @@ class TestCheckpointSync(SharedTestPipeline):
             retention_min_count=2,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=FaultToleranceModel.AtLeastOnce,
                 storage=Storage(config=storage_config),
-                checkpoint_interval_secs=60,
+                checkpoint_interval="60s",
             )
         )
         self.pipeline.start()
@@ -1520,7 +1868,7 @@ class TestCheckpointSync(SharedTestPipeline):
             strict=True,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1540,7 +1888,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 1: source pipeline creates a checkpoint (will become read_bucket).
         source = self.new_pipeline_with_suffix("source")
         source.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1560,7 +1908,7 @@ class TestCheckpointSync(SharedTestPipeline):
         # Step 2: main pipeline creates and syncs its own checkpoint.
         storage_config = storage_cfg(self.pipeline.name)
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,
@@ -1591,7 +1939,7 @@ class TestCheckpointSync(SharedTestPipeline):
             read_bucket=source_bucket,
         )
         self.pipeline.set_runtime_config(
-            RuntimeConfig(
+            build_runtime_config(
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
                 fault_tolerance_model=ft,

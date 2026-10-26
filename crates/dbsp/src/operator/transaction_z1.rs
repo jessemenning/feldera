@@ -1,7 +1,8 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
-use feldera_storage::{FileCommitter, StoragePath};
+use feldera_storage::StoragePath;
 use rkyv::bytecheck;
+use rkyv::with::CopyOptimize;
 use size_of::SizeOf;
 
 use crate::{
@@ -9,7 +10,7 @@ use crate::{
     circuit::{
         GlobalNodeId, OwnershipPreference,
         checkpointer::Checkpoint,
-        operator_traits::{Operator, UnaryOperator},
+        operator_traits::{FileOperatorCheckpoint, Operator, OperatorCheckpoint, UnaryOperator},
     },
     operator::require_persistent_id,
     storage::file::to_bytes,
@@ -30,7 +31,7 @@ where
             .map(|pid| format!("{pid}.transaction_delay"));
 
         self.circuit()
-            .add_unary_operator(TransactionZ1::new(initial.clone()), self)
+            .add_unary_operator(TransactionZ1::new(initial), self)
             .set_persistent_id(delay_pid.as_deref())
     }
 }
@@ -45,10 +46,15 @@ pub struct TransactionZ1<T> {
     new_value: T,
 }
 
+// The blob is a whole serialized state, so it is copied in bulk: `Vec<u8>`'s own
+// rkyv impl resolves it byte by byte, one write call each. `CopyOptimize` keeps
+// the archived layout, an `ArchivedVec<u8>`, so existing checkpoints still read.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
 #[archive_attr(derive(rkyv::CheckBytes))]
 pub struct CommittedTransactionZ1 {
+    #[with(CopyOptimize)]
     old_value: Vec<u8>,
+    #[with(CopyOptimize)]
     new_value: Vec<u8>,
 }
 
@@ -77,18 +83,14 @@ where
             global_id: GlobalNodeId::root(),
             zero: zero.clone(),
             old_value: zero.clone(),
-            new_value: zero.clone(),
+            new_value: zero,
         }
     }
 
-    /// Return the absolute path of the file for this operator.
-    ///
-    /// # Arguments
-    /// - `cid`: The checkpoint id.
-    /// - `persistent_id`: The persistent id that identifies the spine within
-    ///   the circuit for a given checkpoint.
-    fn checkpoint_file<P: AsRef<str>>(base: &StoragePath, persistent_id: P) -> StoragePath {
-        base.child(format!("transaction-z1-{}.dat", persistent_id.as_ref()))
+    /// Return the name of the file for this operator given the persistent id
+    /// that identifies the spine within the circuit for a given checkpoint.
+    fn checkpoint_file<P: AsRef<str>>(persistent_id: P) -> String {
+        format!("transaction-z1-{}.dat", persistent_id.as_ref())
     }
 }
 
@@ -123,27 +125,19 @@ where
 
     fn checkpoint(
         &mut self,
-        base: &StoragePath,
         persistent_id: Option<&str>,
-        files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), Error> {
-        let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
-
+    ) -> Result<Option<Box<dyn OperatorCheckpoint>>, Error> {
         let committed: CommittedTransactionZ1 = (self as &Self).try_into()?;
-        let as_bytes =
-            to_bytes(&committed).expect("Serializing CommittedTransactionZ1 should work.");
-        files.push(
-            Runtime::storage_backend()
-                .unwrap()
-                .write(&Self::checkpoint_file(base, persistent_id), as_bytes)?,
-        );
-        Ok(())
+        Ok(Some(Box::new(FileOperatorCheckpoint {
+            name: Self::checkpoint_file(require_persistent_id(persistent_id, &self.global_id)?),
+            content: to_bytes(&committed).expect("Serializing CommittedTransactionZ1 should work."),
+        })))
     }
 
     fn restore(&mut self, base: &StoragePath, persistent_id: Option<&str>) -> Result<(), Error> {
         let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
 
-        let z1_path = Self::checkpoint_file(base, persistent_id);
+        let z1_path = base.clone().join(Self::checkpoint_file(persistent_id));
         let content = Runtime::storage_backend().unwrap().read(&z1_path)?;
         let committed =
             rkyv::check_archived_root::<CommittedTransactionZ1>(&content).map_err(|e| {

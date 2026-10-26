@@ -183,6 +183,36 @@ pub fn pull_once_with_backend(
     Ok(())
 }
 
+/// Takes ownership of the sync bucket for `pipeline` as it starts.
+///
+/// Called once per run, before the pipeline starts processing, when
+/// `take_bucket_ownership` is set; see
+/// [`CheckpointSynchronizer::take_ownership`].
+///
+/// # Arguments
+/// - `storage`: local storage, used to stage the ownership file.
+/// - `sync`: the pipeline's sync configuration.
+/// - `pipeline`: identity of this pipeline.
+///
+/// # Returns
+/// `Ok(())` once this pipeline owns the bucket; otherwise the error that fails
+/// pipeline startup.
+#[cfg(feature = "feldera-enterprise")]
+pub fn take_bucket_ownership(
+    storage: Arc<dyn StorageBackend>,
+    sync: &SyncConfig,
+    pipeline: &PipelineIdentity,
+) -> Result<(), ControllerError> {
+    SYNCHRONIZER
+        .take_ownership(storage, sync.to_owned(), pipeline.clone())
+        .map_err(|e| {
+            ControllerError::checkpoint_push_error(format!(
+                "cannot take ownership of bucket '{}' at startup: {e:?}",
+                sync.bucket
+            ))
+        })
+}
+
 #[cfg(not(feature = "feldera-enterprise"))]
 pub fn pull_once_with_backend(
     _storage: Arc<dyn StorageBackend>,
@@ -301,7 +331,7 @@ where
             // Continue to pull one more time to get the latest checkpoint
         }
 
-        std::thread::sleep(std::time::Duration::from_secs(sync.pull_interval));
+        std::thread::sleep(sync.standby_pull_interval().into());
     }
 
     tracing::debug!("creating activation marker file: {}", activation_file);

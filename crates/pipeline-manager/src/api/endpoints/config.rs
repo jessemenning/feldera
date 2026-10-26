@@ -1,16 +1,19 @@
 // Configuration API to retrieve the current authentication configuration and list of demos
 use actix_web::{
-    get,
+    HttpMessage, HttpRequest, HttpResponse, get,
     web::{Data as WebData, ReqData},
-    HttpRequest, HttpResponse,
 };
+use chrono::{DateTime, Utc};
 use feldera_cloud1_client::license::DisplaySchedule;
 use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::api::main::ServerState;
+use crate::auth::{AuthenticatedPrincipal, LoginIdentity, UnresolvedActingTenant};
 use crate::db::storage::Storage;
+use crate::db::types::role::Role;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::UserMembership;
 use crate::error::ManagerError;
 use crate::license::{LicenseCheck, LicenseValidity};
 use crate::unstable_features;
@@ -74,7 +77,7 @@ pub(crate) struct Configuration {
     pub conceptualhq: String,
     /// Product Fruits workspace code for in-app onboarding. Empty when disabled.
     pub product_fruits: String,
-    /// Feldera edition: "Open source" or "Enterprise"
+    /// Feldera edition: "Open source", "Enterprise" or "EnterpriseDev"
     pub edition: String,
     /// The version corresponding to the type of `edition`.
     /// Format is `x.y.z`.
@@ -113,12 +116,7 @@ impl Configuration {
             posthog: state.config.telemetry.clone(),
             conceptualhq: state.config.conceptualhq.clone(),
             product_fruits: state.config.product_fruits.clone(),
-            edition: if cfg!(feature = "feldera-enterprise") {
-                "Enterprise"
-            } else {
-                "Open source"
-            }
-            .to_string(),
+            edition: crate::edition().to_string(),
             version: version.clone(),
             revision: revision.to_string(),
             runtime_revision: runtime_revision.to_string(),
@@ -220,30 +218,56 @@ pub(crate) async fn get_config_demos(
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct SessionInfo {
-    /// Current user's tenant ID
-    pub tenant_id: TenantId,
-    /// Current user's tenant name
-    pub tenant_name: String,
+    /// Acting tenant id. `null` when the login resolved no acting tenant: the
+    /// user belongs to several tenants, or none, and sent no `Feldera-Tenant`
+    /// header. Pick a tenant from `memberships` and repeat requests with the
+    /// header.
+    pub tenant_id: Option<TenantId>,
+    /// Acting tenant name; `null` exactly when `tenant_id` is.
+    pub tenant_name: Option<String>,
+    /// The caller's effective role in the acting tenant; `null` exactly when
+    /// `tenant_id` is. The web console uses this to gate the admin UI (no role
+    /// claim lives in the JWT). A platform owner reports `owner` here.
+    pub role: Option<Role>,
+    /// The tenants this user may act in, from the membership table. Empty for
+    /// principals that are not human logins (API keys, federated workloads,
+    /// no-auth mode) and for platform owners without explicit memberships,
+    /// who act in any tenant regardless.
+    pub memberships: Vec<UserMembership>,
+    /// When the user got the first tenant membership, usually at the first
+    /// login. The web console uses it to report a signup. Is `null` for
+    /// principals that are not human logins, for users without memberships, and
+    /// for users with a membership from before the manager recorded this time.
+    pub user_created_at: Option<DateTime<Utc>>,
 }
 
 impl SessionInfo {
-    pub(crate) async fn gather(state: &ServerState, tenant_id: TenantId) -> Self {
-        let db = state.db.lock().await;
-        let tenant_name = db
-            .get_tenant_name(tenant_id)
-            .await
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        SessionInfo {
-            tenant_id,
-            tenant_name,
-        }
+    pub(crate) async fn gather(
+        state: &ServerState,
+        tenant_id: TenantId,
+        role: Role,
+        memberships: Vec<UserMembership>,
+        user_created_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, ManagerError> {
+        let tenant_name = state.db.lock().await.get_tenant_name(tenant_id).await?;
+        Ok(SessionInfo {
+            tenant_id: Some(tenant_id),
+            tenant_name: Some(tenant_name),
+            role: Some(role),
+            memberships,
+            user_created_at,
+        })
     }
 }
 
 /// Get Session
 ///
 /// Retrieve login session information for your current user session.
+///
+/// This is the one route that answers a login without a resolved acting
+/// tenant: when the user belongs to several tenants (or none) and no
+/// `Feldera-Tenant` header selects one, the acting-tenant fields are `null`
+/// and `memberships` lists the tenants to pick from.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -262,9 +286,99 @@ impl SessionInfo {
 pub(crate) async fn get_config_session(
     state: WebData<ServerState>,
     tenant_id: ReqData<TenantId>,
+    principal: ReqData<AuthenticatedPrincipal>,
+    req: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
-    let session_info = SessionInfo::gather(&state, *tenant_id).await;
+    let identity = req.extensions().get::<LoginIdentity>().cloned();
+    // An owner login creates no membership, so an owner has no signup time
+    // until an admin adds the owner to a tenant.
+    let (memberships, user_created_at) = match &identity {
+        Some(identity) => {
+            state
+                .db
+                .lock()
+                .await
+                .list_user_memberships(&identity.provider, &identity.subject)
+                .await?
+        }
+        None => (vec![], None),
+    };
+    let session_info = if req.extensions().get::<UnresolvedActingTenant>().is_some() {
+        SessionInfo {
+            tenant_id: None,
+            tenant_name: None,
+            role: None,
+            memberships,
+            user_created_at,
+        }
+    } else {
+        SessionInfo::gather(
+            &state,
+            *tenant_id,
+            principal.role,
+            memberships,
+            user_created_at,
+        )
+        .await?
+    };
     Ok(HttpResponse::Ok().json(session_info))
+}
+
+/// The platform owners configured at deploy time.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConfiguredOwners {
+    /// Identities granted `owner`, as configured through
+    /// `authorization.owners` / `FELDERA_OWNERS`. Each entry is a
+    /// provider-verified email, a bare OIDC subject, or an issuer and subject
+    /// separated by a space.
+    pub owners: Vec<String>,
+    /// Workload identities granted `owner`, as configured through
+    /// `authorization.ownerTrusts` / `FELDERA_OWNER_TRUSTS`.
+    pub owner_trusts: Vec<ConfiguredOwnerTrust>,
+}
+
+/// A workload identity granted `owner` by configuration.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConfiguredOwnerTrust {
+    pub issuer: String,
+    pub subject: String,
+    pub audience: Option<String>,
+}
+
+/// Get Configured Owners
+///
+/// List the identities that hold the platform-wide `owner` role.
+///
+/// Owner comes from deploy-time configuration and cannot be granted through the
+/// API, so this list is read-only: changing it means changing the deployment.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    responses(
+        (status = OK, description = "Configured owners retrieved", body = ConfiguredOwners),
+        (status = FORBIDDEN, description = "Caller's role is below the required role", body = ErrorResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse)
+    ),
+    tag = "Platform"
+)]
+#[get("/config/owners")]
+pub(crate) async fn get_config_owners(
+    state: WebData<ServerState>,
+) -> Result<HttpResponse, ManagerError> {
+    let config = &state.config;
+    Ok(HttpResponse::Ok().json(&ConfiguredOwners {
+        owners: config.owners.clone(),
+        owner_trusts: config
+            .owner_trusts
+            .0
+            .iter()
+            .map(|trust| ConfiguredOwnerTrust {
+                issuer: trust.issuer.clone(),
+                subject: trust.subject.clone(),
+                audience: trust.audience.clone(),
+            })
+            .collect(),
+    }))
 }
 
 #[derive(Serialize, ToSchema)]

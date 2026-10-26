@@ -39,7 +39,8 @@
 //! Layer files support cheap key-membership tests using a per-batch filter
 //! block. The default filter is Bloom-based; key types whose per-batch span
 //! fits in `u32` can alternatively use an exact roaring bitmap filter by
-//! storing keys relative to the batch minimum.
+//! storing each key's offset from a base no larger than the batch's first
+//! key.
 //!
 //! Layer files should support 1 TB data size.
 //!
@@ -118,8 +119,6 @@ pub use filter::{FilterKind, FilterStats, TrackingFilterStats};
 pub(crate) use filter::{TouchedWindowCounter, collect_roaring_metadata};
 pub use format::TouchedWindowCount;
 pub use item::{ArchivedItem, Item, ItemFactory, WithItemFactory};
-
-const BLOOM_FILTER_SEED: u128 = 42;
 
 /// Default false-positive rate for Bloom filters in newly created files.
 ///

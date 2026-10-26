@@ -2,8 +2,13 @@
 //!
 //! [`Reader`] is the top-level interface for reading layer files.
 
-use super::format::{BloomFilterBlock, Compression, FileTrailer, RoaringBitmapFilterBlock};
+use super::filter::{bloom_false_positive_rate, rate_can_evict, resident_modules};
+use super::format::MODULAR_BLOOM_FILTER_BLOCK_MAGIC;
+use super::format::{
+    BloomFilterBlock, Compression, FileTrailer, ModularBloomFilterHeader, RoaringBitmapFilterBlock,
+};
 use super::{AnyFactories, BatchKeyFilter, Deserializer, Factories};
+use crate::Runtime;
 use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::CacheAccess;
 use crate::storage::{
@@ -11,11 +16,12 @@ use crate::storage::{
     buffer_cache::{BufferCache, FBuf},
     file::format::{
         BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, DataBlockHeader, FileTrailerColumn,
-        IndexBlockHeader, MIN_SUPPORTED_VERSION, NodeType, ROARING_BITMAP_FILTER_BLOCK_MAGIC,
-        Varint,
+        INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN, IndexBlockHeader, MIN_SUPPORTED_VERSION,
+        NodeType, ROARING_BITMAP_FILTER_BLOCK_MAGIC, Varint,
     },
     file::item::ArchivedItem,
 };
+use crate::trace::cursor::AccessHint;
 use crate::{
     dynamic::{DataTrait, DeserializeDyn, DynData, Factory},
     storage::{
@@ -30,24 +36,25 @@ use binrw::{
 use crc32c::crc32c;
 use dyn_clone::clone_box;
 use feldera_buffer_cache::CacheEntry;
+use feldera_modular_bloom::{ModuleDensity, ModuleLayout};
 use feldera_storage::StoragePath;
 use feldera_storage::file::FileId;
 use size_of::SizeOf;
-use smallvec::SmallVec;
 use snap::raw::{Decoder, decompress_len};
 use std::mem::replace;
 use std::ops::Index;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     cmp::{
         Ordering::{self, *},
         max, min,
     },
+    collections::HashSet,
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem::size_of,
     ops::{Bound, Range, RangeBounds},
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex},
 };
 use thiserror::Error as ThisError;
 use tracing::info;
@@ -128,6 +135,31 @@ pub enum CorruptionError {
         /// Unsupported incompatible features
         u64,
     ),
+
+    /// A layer file's value layout does not match the factories opening it.
+    #[error(
+        "File value column is {} but the factories opening it expect {}",
+        if *found { "stamped" } else { "plain" },
+        if *expected { "stamped" } else { "plain" }
+    )]
+    ValueStampMismatch {
+        /// Whether the factories describe a stamped value column.
+        expected: bool,
+        /// Whether the file's value column is stamped.
+        found: bool,
+    },
+
+    /// The file is corrupted: the hidden-value-column feature bit and the
+    /// metadata flag disagree.
+    #[error(
+        "File is corrupted: the hidden-value-column feature bit is {bit} but the value stamp is {stamp}"
+    )]
+    InconsistentValueStamp {
+        /// Whether [`INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN`] is set.
+        bit: bool,
+        /// Whether the metadata records a stamped value column.
+        stamp: bool,
+    },
 
     /// [`mod@binrw`] reported a format violation.
     #[error("Binary read/write error reading {block_type} block ({location}): {inner}")]
@@ -320,6 +352,37 @@ pub enum CorruptionError {
         location: BlockLocation,
         /// Snappy error.
         error: snap::Error,
+    },
+
+    /// LZ4 decompression failed.
+    #[error("Compressed block ({location}) failed LZ4 decompression: {error}.")]
+    Lz4 {
+        /// Block location.
+        location: BlockLocation,
+        /// LZ4 error, rendered because `DecompressError` is not `Clone`.
+        error: String,
+    },
+
+    /// Zstd decompression failed.
+    #[error("Compressed block ({location}) failed Zstd decompression: {error}.")]
+    Zstd {
+        /// Block location.
+        location: BlockLocation,
+        /// Zstd error.
+        error: String,
+    },
+
+    /// A block's framed decompressed length is missing or implausible.
+    #[error(
+        "Compressed block ({location}) declares decompressed length {length}, which exceeds the {max_length}-byte limit."
+    )]
+    BadDecompressedLen {
+        /// Block location.
+        location: BlockLocation,
+        /// Declared decompressed length.
+        length: usize,
+        /// Largest length that could be valid.
+        max_length: usize,
     },
 
     /// Multiple paths to block.
@@ -568,27 +631,66 @@ where
     }
 
     fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
-        let start = Instant::now();
         let cache = file.cache();
-        #[allow(clippy::borrow_deref_ref)]
-        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => (
-                CacheAccess::Hit,
-                Self::from_cache_entry(entry, node.location)?,
-            ),
-            None => {
-                let block = file.read_block(node.location)?;
-                let entry = Self::from_raw_with_cache(
-                    block,
-                    node,
-                    &cache,
-                    file.file_handle.file_id(),
-                    file.version,
-                )?;
-                (CacheAccess::Miss, entry)
+        let offset = node.location.offset;
+        // When the first look missed, if it did.  A hit is much the commonest
+        // case and records no duration, so it should not pay for reading the
+        // clock; what follows a miss -- a read, or a wait for one already in
+        // flight -- is what the duration is there to measure.
+        let mut first_miss: Option<Instant> = None;
+        let entry = loop {
+            #[allow(clippy::borrow_deref_ref)]
+            if let Some(entry) = cache.get(&*file.file_handle, node.location) {
+                let entry = Self::from_cache_entry(entry, node.location)?;
+                match first_miss {
+                    None => file.stats.record_hit(node.location),
+                    // The block was in flight when this thread wanted it, and
+                    // the wait for that read is what has been timed.
+                    Some(since) => {
+                        file.stats
+                            .record(CacheAccess::Wait, since.elapsed(), node.location)
+                    }
+                }
+                break entry;
             }
+            let since = *first_miss.get_or_insert_with(Instant::now);
+
+            let claim = file.in_flight.claim(offset).then(|| Claim {
+                in_flight: file.in_flight.clone(),
+                offset,
+            });
+            // Unclaimed means a read-ahead has it.  Wait for that read, then
+            // look again; only a wait that runs out of patience reads the
+            // block itself, unclaimed, so nothing can wait on it in turn.
+            if claim.is_none() {
+                match file.in_flight.wait_for(offset) {
+                    Waited::Nothing | Waited::Landed => continue,
+                    Waited::TimedOut => {}
+                }
+            } else {
+                // A read-ahead puts its block in the cache before it gives up
+                // its claim, so one that finished between the look above and
+                // the claim left the block there.  Look again rather than read
+                // the block a second time; the look at the top of the loop
+                // counts it as a wait.
+                #[allow(clippy::borrow_deref_ref)]
+                if cache.get(&*file.file_handle, node.location).is_some() {
+                    continue;
+                }
+            }
+            let block = file.read_block(node.location)?;
+            let entry = Self::from_raw_with_cache(
+                block,
+                node,
+                &cache,
+                file.file_handle.file_id(),
+                file.version,
+            )?;
+            drop(claim);
+            file.stats
+                .record(CacheAccess::Miss, since.elapsed(), node.location);
+            break entry;
         };
-        file.stats.record(access, start.elapsed(), node.location);
 
         if entry.rows() != node.rows {
             return Err(CorruptionError::DataBlockWrongRows {
@@ -709,19 +811,20 @@ where
     /// `bias` is [Greater], the child is the last such child.  Returns `None`
     /// if there is no match.
     ///
-    /// The caller supplies `key` as storage for a key.  Before this function
+    /// `compare` sees each probed key in its archived form, so the search
+    /// deserializes only the key that it returns: before this function
     /// returns successfully, it sets `key` to the key for the row that it
     /// found.  On error, `key` might be changed.
     unsafe fn find_best_match<C>(
         &self,
         factories: &Factories<K, A>,
         target_rows: &Range<u64>,
-        compare: &C,
+        compare: &mut C,
         bias: Ordering,
         key: &mut K,
     ) -> Option<usize>
     where
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             let block_rows = self.rows();
@@ -731,73 +834,59 @@ where
             let mut best = None;
             let mut start = (max(block_rows.start, target_rows.start) - self.first_row) as usize;
             let mut end = (min(block_rows.end, target_rows.end) - self.first_row) as usize;
-            let mut mid = 0;
             while start < end {
-                mid = start.midpoint(end);
-                self.key(factories, mid, key);
-                let cmp = compare(key);
+                let mid = start.midpoint(end);
+                // SAFETY: `mid` is below `self.n_values()`, and the block's
+                // bytes were written as archived `(K, A)` items, which is the
+                // caller's obligation for this block (the checksum verified
+                // on read rules out corruption).
+                let cmp = compare(self.archived_item(factories, mid).fst());
 
                 match cmp {
                     Less => end = mid,
-                    Equal => return Some(mid),
+                    Equal => {
+                        self.key(factories, mid, key);
+                        return Some(mid);
+                    }
                     Greater => start = mid + 1,
                 };
                 if cmp == bias {
                     best = Some(mid);
                 }
             }
-            if let Some(best) = best
-                && best != mid
-            {
-                // We kept searching beyond the key that was ultimately best, so
-                // we have to re-deserialize the best one.  With some additional
-                // complication, we could avoid this if we had two different
-                // slots to deserialize keys and we could indicate to the caller
-                // which one was the right one.
+            if let Some(best) = best {
                 self.key(factories, best, key);
             }
             best
         }
     }
 
-    /// Searches this data block for `target` and returns whether it was
-    /// successful.
+    /// Searches this data block for `target`.  If it is found, deserializes
+    /// its key into `key` and returns its index.
     ///
-    /// Maintains `key_stack` and `index_stack` as a cache of the keys along a
-    /// binary search through the data block.  When successful, the index of the
-    /// child found and its key are at the top of `index_stack` and `key_stack`,
-    /// respectively.
-    unsafe fn find_with_cache<const N: usize>(
-        &self,
-        factories: &Factories<K, A>,
-        key_stack: &mut DynVec<K>,
-        index_stack: &mut SmallVec<[usize; N]>,
-        target: &K,
-    ) -> bool {
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe: the block's bytes are
+    /// read as archived `(K, A)` items, which they are when the file was
+    /// written for those types.
+    unsafe fn find(&self, factories: &Factories<K, A>, target: &K, key: &mut K) -> Option<usize> {
         unsafe {
             let mut start = 0;
             let mut end = self.n_values();
-            let mut i = 0;
             while start < end {
                 let mid = start.midpoint(end);
-                if index_stack.get(i) != Some(&mid) {
-                    index_stack.truncate(i);
-                    index_stack.push(mid);
-                    key_stack.truncate(i);
-                    key_stack.push_with(&mut |key| self.key(factories, mid, key));
-                };
-                match target.cmp(&key_stack[i]) {
-                    Less => end = mid,
+                // SAFETY: `mid` is below `self.n_values()`, and the block
+                // holds archived `(K, A)` items, as the caller guarantees.
+                match self.archived_item(factories, mid).fst().cmp_target(target) {
+                    Less => start = mid + 1,
                     Equal => {
-                        index_stack.truncate(i + 1);
-                        key_stack.truncate(i + 1);
-                        return true;
+                        self.key(factories, mid, key);
+                        return Some(mid);
                     }
-                    Greater => start = mid + 1,
+                    Greater => end = mid,
                 };
-                i += 1;
             }
-            false
+            None
         }
     }
 }
@@ -1051,21 +1140,22 @@ where
     }
 
     fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
-        let start = Instant::now();
         let cache = file.cache();
         let first_row = node.rows.start;
         #[allow(clippy::borrow_deref_ref)]
-        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
+        let entry = match cache.get(&*file.file_handle, node.location) {
             Some(entry) => {
+                file.stats.record_hit(node.location);
                 let entry = Self::from_cache_entry(entry, node.location)?;
                 if entry.first_row != first_row {
                     return Err(Error::Corruption(CorruptionError::MultiplePaths(
                         node.location,
                     )));
                 }
-                (CacheAccess::Hit, entry)
+                entry
             }
             None => {
+                let start = Instant::now();
                 let block = file.read_block(node.location)?;
                 let entry = Self::from_raw_with_cache(
                     block,
@@ -1074,10 +1164,10 @@ where
                     file.file_handle.file_id(),
                     file.version,
                 )?;
-                (CacheAccess::Miss, entry)
+                file.stats.record_miss(start.elapsed(), node.location);
+                entry
             }
         };
-        file.stats.record(access, start.elapsed(), node.location);
 
         let expected_rows = node.rows.end - node.rows.start;
         let n_rows = entry.row_totals.get(&entry.raw, entry.row_totals.count - 1);
@@ -1167,6 +1257,24 @@ where
         }
     }
 
+    /// Returns bound number `index` in its archived form.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe: the bytes at the
+    /// bound's offset are read as an archived `K`, which they are when the
+    /// file was written for that key type.  `index` must be below
+    /// `2 * self.n_children()`.
+    unsafe fn archived_bound(&self, key_factory: &dyn Factory<K>, index: usize) -> &K::Archived {
+        unsafe {
+            let offset = self.bounds.get(&self.raw, index) as usize;
+            // SAFETY: the writer stored at `offset` the archived `K` that
+            // `get_bound` deserializes from the same position; the caller
+            // guarantees the file's key type and the index.
+            key_factory.archived_value(&self.raw, offset)
+        }
+    }
+
     unsafe fn key_range(&self, min: &mut K, max: &mut K) {
         unsafe {
             self.get_bound(0, min);
@@ -1181,19 +1289,16 @@ where
     /// Returns the index of the child of this index block that contains a row
     /// in the range `target_rows` and which may contain a key for which
     /// `compare` returns `bias` or [Equal], or `None` if there is no such
-    /// child.
-    ///
-    /// The caller supplies `bound` as temporary storage for a key.  This
-    /// function might change it.
+    /// child.  `compare` sees each bound in its archived form.
     unsafe fn find_best_match<C>(
         &self,
+        key_factory: &dyn Factory<K>,
         target_rows: &Range<u64>,
-        compare: &C,
+        compare: &mut C,
         bias: Ordering,
-        bound: &mut K,
     ) -> Option<usize>
     where
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             let mut start = 0;
@@ -1204,8 +1309,9 @@ where
                 let row = self.get_row_bound(mid) + self.first_row;
                 let cmp = match range_compare(target_rows, row) {
                     Equal => {
-                        self.get_bound(mid, bound);
-                        let cmp = compare(bound);
+                        // SAFETY: `mid` is below `2 * self.n_children()`,
+                        // and the file's key type is the caller's obligation.
+                        let cmp = compare(self.archived_bound(key_factory, mid));
                         if cmp == Equal {
                             return Some(mid / 2);
                         }
@@ -1276,18 +1382,18 @@ where
     }
 
     /// Returns the comparison of the largest bound key using `compare`.
-    unsafe fn compare_max<C>(&self, key_factory: &dyn Factory<K>, compare: &C) -> Ordering
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe; see
+    /// [`Self::archived_bound`].
+    unsafe fn compare_max<C>(&self, key_factory: &dyn Factory<K>, compare: &mut C) -> Ordering
     where
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
-        unsafe {
-            let mut ordering = Equal;
-            key_factory.with(&mut |key| {
-                self.max_bound(key);
-                ordering = compare(key);
-            });
-            ordering
-        }
+        // SAFETY: the last bound's index is in range by construction, and
+        // the file's key type is the caller's obligation.
+        unsafe { compare(self.archived_bound(key_factory, self.last_bound_index())) }
     }
 }
 
@@ -1403,6 +1509,93 @@ impl Column {
     }
 }
 
+/// Blocks asked for ahead of need that have not yet reached the cache.
+///
+/// A cursor that catches up with its own read-ahead waits here for the block
+/// rather than reading it a second time, and a synchronous read claims its
+/// block here first, so that a read-ahead issued a moment later skips it.
+/// Either way a block crosses the device once.
+#[derive(Default)]
+struct InFlight {
+    offsets: Mutex<HashSet<u64>>,
+    landed: Condvar,
+}
+
+/// What [`InFlight::wait_for`] found.
+enum Waited {
+    /// No read of the block was under way.
+    Nothing,
+    /// The read under way finished.
+    Landed,
+    /// The read under way did not finish in time.  The caller reads the block
+    /// itself, so a read-ahead that never completes costs a duplicate read
+    /// rather than a hang.
+    TimedOut,
+}
+
+impl InFlight {
+    /// Claims `offset` for the caller to read.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - the block offset the caller means to read.
+    ///
+    /// # Returns
+    ///
+    /// True if the caller now owns the read, and false if another read of the
+    /// same offset is already under way, in which case the caller should leave
+    /// it alone.
+    fn claim(&self, offset: u64) -> bool {
+        self.offsets.lock().unwrap().insert(offset)
+    }
+
+    /// Marks the read of the block at `offset` as finished, and wakes every
+    /// thread waiting for a block.
+    ///
+    /// The read has either put the block in the cache or failed.  A woken
+    /// waiter looks in the cache again and reads the block itself if it is not
+    /// there.  Waiters for different blocks share one condition variable, so
+    /// all of them wake and each checks its own block.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - the offset of the block whose read finished.
+    fn release(&self, offset: u64) {
+        self.offsets.lock().unwrap().remove(&offset);
+        self.landed.notify_all();
+    }
+
+    fn wait_for(&self, offset: u64) -> Waited {
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        let mut offsets = self.offsets.lock().unwrap();
+        if !offsets.contains(&offset) {
+            return Waited::Nothing;
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while offsets.contains(&offset) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Waited::TimedOut;
+            };
+            offsets = self.landed.wait_timeout(offsets, left).unwrap().0;
+        }
+        Waited::Landed
+    }
+}
+
+/// A claim on a block being read, released when dropped, so that an error or a
+/// panic on the reading path cannot leave the block claimed forever.
+struct Claim {
+    in_flight: Arc<InFlight>,
+    offset: u64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.in_flight.release(self.offset);
+    }
+}
+
 /// Encapsulates storage and a file handle.
 #[derive(SizeOf)]
 struct ImmutableFileRef {
@@ -1412,11 +1605,13 @@ struct ImmutableFileRef {
     compression: Option<Compression>,
     stats: AtomicCacheStats,
     version: u32,
+    #[size_of(skip)]
+    in_flight: Arc<InFlight>,
 }
 
 impl Debug for ImmutableFileRef {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "ImmutableFileRef({:?})", &self.file_handle)
+        write!(f, "ImmutableFileRef({:?})", self.file_handle)
     }
 }
 impl Drop for ImmutableFileRef {
@@ -1443,6 +1638,7 @@ impl ImmutableFileRef {
             compression,
             stats,
             version,
+            in_flight: Arc::default(),
         }
     }
 
@@ -1464,6 +1660,10 @@ impl ImmutableFileRef {
     }
 }
 
+/// Upper bound on a block's decompressed size, used to reject a corrupt length
+/// prefix before it is turned into an allocation.
+const MAX_DECOMPRESSED_LEN: usize = 1 << 30;
+
 fn decompress(
     compression: Option<Compression>,
     location: BlockLocation,
@@ -1479,6 +1679,27 @@ fn decompress(
             }
             .into());
         };
+        let framed = |location| -> Result<(usize, &[u8]), Error> {
+            let Some(len_bytes) = compressed.get(..4) else {
+                return Err(CorruptionError::BadDecompressedLen {
+                    location,
+                    length: 0,
+                    max_length: MAX_DECOMPRESSED_LEN,
+                }
+                .into());
+            };
+            let length = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+            if length > MAX_DECOMPRESSED_LEN {
+                return Err(CorruptionError::BadDecompressedLen {
+                    location,
+                    length,
+                    max_length: MAX_DECOMPRESSED_LEN,
+                }
+                .into());
+            }
+            Ok((length, &compressed[4..]))
+        };
+
         match compression {
             Compression::Snappy => {
                 let decompressed_len = decompress_len(compressed).map_err(|error| {
@@ -1497,6 +1718,54 @@ fn decompress(
                         .into());
                     }
                     Err(error) => return Err(CorruptionError::Snappy { location, error }.into()),
+                }
+                Arc::new(decompressed)
+            }
+            Compression::Lz4 => {
+                let (decompressed_len, payload) = framed(location)?;
+                let mut decompressed = FBuf::with_capacity(decompressed_len);
+                decompressed.resize(decompressed_len, 0);
+                match lz4_flex::block::decompress_into(payload, decompressed.as_mut_slice()) {
+                    Ok(n) if n == decompressed_len => {}
+                    Ok(n) => {
+                        return Err(CorruptionError::UnexpectedDecompressionLength {
+                            location,
+                            length: n,
+                            expected_length: decompressed_len,
+                        }
+                        .into());
+                    }
+                    Err(error) => {
+                        return Err(CorruptionError::Lz4 {
+                            location,
+                            error: error.to_string(),
+                        }
+                        .into());
+                    }
+                }
+                Arc::new(decompressed)
+            }
+            Compression::Zstd => {
+                let (decompressed_len, payload) = framed(location)?;
+                let mut decompressed = FBuf::with_capacity(decompressed_len);
+                decompressed.resize(decompressed_len, 0);
+                match zstd::bulk::decompress_to_buffer(payload, decompressed.as_mut_slice()) {
+                    Ok(n) if n == decompressed_len => {}
+                    Ok(n) => {
+                        return Err(CorruptionError::UnexpectedDecompressionLength {
+                            location,
+                            length: n,
+                            expected_length: decompressed_len,
+                        }
+                        .into());
+                    }
+                    Err(error) => {
+                        return Err(CorruptionError::Zstd {
+                            location,
+                            error: error.to_string(),
+                        }
+                        .into());
+                    }
                 }
                 Arc::new(decompressed)
             }
@@ -1532,48 +1801,160 @@ fn parse_filter_block<T: for<'a> BinRead<Args<'a> = ()>>(
     })
 }
 
+/// Reads the first `size` bytes of the block at `location`.
+///
+/// `size` is rounded up to the 512-byte granularity the storage layer reads at,
+/// and clamped to the block, so the result may be longer than asked for and is
+/// never longer than the block.
+fn read_block_prefix(
+    file_handle: &dyn FileReader,
+    location: BlockLocation,
+    size: usize,
+) -> Result<Arc<FBuf>, Error> {
+    let size = size.next_multiple_of(512).min(location.size);
+    let prefix = if size == location.size {
+        location
+    } else {
+        BlockLocation::new(location.offset, size).expect("512-aligned by construction")
+    };
+    Ok(file_handle.read_block(prefix)?)
+}
+
+/// The whole block, reusing `head` when it already holds all of it.
+fn whole_block(
+    file_handle: &dyn FileReader,
+    location: BlockLocation,
+    head: &Arc<FBuf>,
+) -> Result<Arc<FBuf>, Error> {
+    if head.len() >= location.size {
+        return Ok(head.clone());
+    }
+    Ok(file_handle.read_block(location)?)
+}
+
+/// Reads a membership filter block.
+///
+/// Returns `None` when the current false positive rate asks for no Bloom filter
+/// at all, in which case the block is read but nothing is kept resident.
 fn read_filter_block(
     file_handle: &dyn FileReader,
     location: BlockLocation,
-    roaring_min: Option<&DynData>,
-) -> Result<BatchKeyFilter, Error> {
-    let block = file_handle.read_block(location)?;
-    if block.len() < 8 {
+    first_key: Option<&DynData>,
+) -> Result<Option<BatchKeyFilter>, Error> {
+    // Reading the header before the modules only pays off when the configured
+    // rate can drop some of them. When it cannot, that first read would be
+    // spent learning there is nothing to skip, and every byte gets read
+    // anyway, so take the block in one call instead.
+    let rate = bloom_false_positive_rate();
+    let head_bytes = if rate_can_evict(rate) {
+        512
+    } else {
+        location.size
+    };
+    let head = read_block_prefix(file_handle, location, head_bytes)?;
+    if head.len() < 8 {
         return Err(Error::Corruption(CorruptionError::InvalidFilterEncoding {
             location,
             kind: "unknown",
-            inner: format!("block too short: {} bytes", block.len()),
+            inner: format!("block too short: {} bytes", head.len()),
         }));
     }
 
     let mut magic = [0u8; 4];
-    magic.copy_from_slice(&block[4..8]);
+    magic.copy_from_slice(&head[4..8]);
 
     match magic {
         BLOOM_FILTER_BLOCK_MAGIC => {
+            let block = whole_block(file_handle, location, &head)?;
             let block: BloomFilterBlock = parse_filter_block(&block, location, "bloom filter")?;
             Ok(BatchKeyFilter::deserialize_bloom(
                 block.num_hashes,
                 block.data,
+                rate,
             ))
         }
+        MODULAR_BLOOM_FILTER_BLOCK_MAGIC => {
+            let bad = |e: String| {
+                Error::Corruption(CorruptionError::InvalidFilterEncoding {
+                    location,
+                    kind: "modular bloom",
+                    inner: e,
+                })
+            };
+
+            // The header records the layout and the bits set in every module,
+            // so the rate any prefix of them would give is known before a
+            // single module is read. It fits the sector in hand at every module
+            // count the writer emits; a file claiming more needs the block.
+            let front: ModularBloomFilterHeader =
+                match parse_filter_block(&head, location, "modular bloom filter") {
+                    Ok(front) => front,
+                    Err(_) => {
+                        let block = whole_block(file_handle, location, &head)?;
+                        parse_filter_block(&block, location, "modular bloom filter")?
+                    }
+                };
+            let layout = ModuleLayout::new(
+                front.total_modules,
+                u32::try_from(front.words_per_module).map_err(|_| {
+                    bad(format!(
+                        "words_per_module {} exceeds the u32 a module is sized in",
+                        front.words_per_module
+                    ))
+                })?,
+                front.hashes_per_module,
+            )
+            .map_err(|e| bad(e.to_string()))?;
+            let density = ModuleDensity::new(front.set_bits);
+
+            let resident = resident_modules(&layout, &density, rate);
+            if resident == 0 {
+                return Ok(None);
+            }
+
+            // Read the header plus the modules residency asks for, and stop.
+            let front_len = ModularBloomFilterHeader::len_for(front.total_modules);
+            let wanted = front_len + resident as usize * layout.bytes_per_module();
+            let bytes = if wanted <= head.len() {
+                head
+            } else {
+                read_block_prefix(file_handle, location, wanted)?
+            };
+            if bytes.len() < wanted {
+                return Err(bad(format!(
+                    "block holds {} bytes, {resident} modules need {wanted}",
+                    bytes.len()
+                )));
+            }
+
+            let words: Vec<u64> = bytes[front_len..wanted]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|word| u64::from_le_bytes(*word))
+                .collect();
+            Ok(BatchKeyFilter::from_modular(layout, &words, density))
+        }
         ROARING_BITMAP_FILTER_BLOCK_MAGIC => {
+            let block = whole_block(file_handle, location, &head)?;
             let block: RoaringBitmapFilterBlock =
                 parse_filter_block(&block, location, "roaring bitmap filter")?;
-            let roaring_min = roaring_min.ok_or_else(|| {
+            let first_key = first_key.ok_or_else(|| {
                 Error::Corruption(CorruptionError::InvalidFilterEncoding {
                     location,
                     kind: "roaring bitmap",
-                    inner: "roaring bitmap filter requires the batch minimum".to_string(),
+                    inner: "roaring bitmap filter requires the batch's first key".to_string(),
                 })
             })?;
-            BatchKeyFilter::deserialize_roaring_u32(&block.data, roaring_min).map_err(|e| {
-                Error::Corruption(CorruptionError::InvalidFilterEncoding {
-                    location,
-                    kind: "roaring bitmap",
-                    inner: e.to_string(),
+            BatchKeyFilter::deserialize_roaring_u32(&block.data, first_key)
+                .map(Some)
+                .map_err(|e| {
+                    Error::Corruption(CorruptionError::InvalidFilterEncoding {
+                        location,
+                        kind: "roaring bitmap",
+                        inner: e.to_string(),
+                    })
                 })
-            })
         }
         magic => Err(Error::Corruption(
             CorruptionError::UnknownFilterBlockMagic { location, magic },
@@ -1646,6 +2027,91 @@ where
     }
 }
 
+/// Reads and validates a layer file's trailer.
+///
+/// Reading the trailer does not require any factories, so a caller can learn a
+/// file's layout from [`read_metadata`] before it picks the factories that
+/// decode the file.
+///
+/// # Arguments
+///
+/// * `cache` - the buffer cache to use.
+/// * `file` - the open file, read from its end.
+/// * `stats` - counts the cache accesses this read makes.
+///
+/// # Returns
+///
+/// The trailer, or an error if the file is too short, was written by a later version,
+/// needs a feature this reader lacks, or records a layout inconsistently.
+fn read_trailer(
+    cache: fn() -> Option<Arc<BufferCache>>,
+    file: &dyn FileReader,
+    stats: &AtomicCacheStats,
+) -> Result<Arc<FileTrailer>, Error> {
+    let file_size = file.get_size()?;
+    if file_size < 512 || (file_size % 512) != 0 {
+        return Err(CorruptionError::InvalidFileSize(file_size).into());
+    }
+
+    let file_trailer = FileTrailer::new(
+        cache,
+        file,
+        BlockLocation::new(file_size - 512, 512).unwrap(),
+        stats,
+    )?;
+
+    if file_trailer.version < MIN_SUPPORTED_VERSION {
+        return Err(CorruptionError::InvalidVersion {
+            version: file_trailer.version,
+            min_supported_version: MIN_SUPPORTED_VERSION,
+        }
+        .into());
+    }
+
+    if let Some(features) = file_trailer.unsupported_compatible_features() {
+        info!(
+            "{}: storage file uses unsupported compatible features {features:#x}",
+            file.path(),
+        );
+    }
+
+    if let Some(features) = file_trailer.unknown_incompatible_features() {
+        return Err(CorruptionError::UnsupportedIncompatibleFeatures(features).into());
+    }
+
+    // The bit and the flag are written together, so if they disagree, the file
+    // is corrupted.  In particular, we want to avoid treating a stamped value
+    // column as a plain one when the bit is set but the flag is clear.
+    let stamp = file_trailer.metadata.value_stamp.is_stamped();
+    let bit = file_trailer.has_incompatible_feature(INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN);
+    if stamp != bit {
+        return Err(CorruptionError::InconsistentValueStamp { bit, stamp }.into());
+    }
+
+    Ok(file_trailer)
+}
+
+/// Reads only a layer file's metadata.
+///
+/// # Arguments
+///
+/// * `cache` - the buffer cache to use.
+/// * `storage_backend` - where the file lives.
+/// * `path` - the file to read.
+///
+/// # Returns
+///
+/// The file's metadata, or an error if its trailer cannot be read.
+pub fn read_metadata(
+    cache: fn() -> Option<Arc<BufferCache>>,
+    storage_backend: &dyn StorageBackend,
+    path: &StoragePath,
+) -> Result<BatchMetadata, Error> {
+    let file = storage_backend.open(path)?;
+    let stats = AtomicCacheStats::default();
+    Ok(read_trailer(cache, &*file, &stats)?.metadata.clone())
+}
+
 impl<T> Reader<T>
 where
     T: ColumnSpec,
@@ -1666,37 +2132,8 @@ where
         file: Arc<dyn FileReader>,
         membership_filter: Option<BatchKeyFilter>,
     ) -> Result<(Self, Option<BatchKeyFilter>), Error> {
-        let file_size = file.get_size()?;
-        if file_size < 512 || (file_size % 512) != 0 {
-            return Err(CorruptionError::InvalidFileSize(file_size).into());
-        }
-
         let stats = AtomicCacheStats::default();
-        let file_trailer = FileTrailer::new(
-            cache,
-            &*file,
-            BlockLocation::new(file_size - 512, 512).unwrap(),
-            &stats,
-        )?;
-
-        if file_trailer.version < MIN_SUPPORTED_VERSION {
-            return Err(CorruptionError::InvalidVersion {
-                version: file_trailer.version,
-                min_supported_version: MIN_SUPPORTED_VERSION,
-            }
-            .into());
-        }
-
-        if let Some(features) = file_trailer.unsupported_compatible_features() {
-            info!(
-                "{}: storage file uses unsupported compatible features {features:#x}",
-                file.path(),
-            );
-        }
-
-        if let Some(features) = file_trailer.unknown_incompatible_features() {
-            return Err(CorruptionError::UnsupportedIncompatibleFeatures(features).into());
-        }
+        let file_trailer = read_trailer(cache, &*file, &stats)?;
 
         assert_eq!(factories.len(), file_trailer.columns.len());
 
@@ -1842,14 +2279,15 @@ where
 {
     /// Reads and deserializes the per-batch membership filter, if present.
     ///
-    /// For roaring filters this also threads the batch minimum into the
-    /// min-offset decoder, so the returned filter can be queried directly.
+    /// A roaring filter also needs the batch's first key to locate the base
+    /// of its offsets, so the returned filter can be queried directly.
     pub fn membership_filter(&self) -> Result<Option<BatchKeyFilter>, Error> {
         let key_range = self.key_range()?;
-        let roaring_min = key_range.as_ref().map(|(min, _)| min.as_ref().as_data());
+        let first_key = key_range.as_ref().map(|(min, _)| min.as_ref().as_data());
         self.membership_filter_location
-            .map(|location| read_filter_block(&*self.file.file_handle, location, roaring_min))
+            .map(|location| read_filter_block(&*self.file.file_handle, location, first_key))
             .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn open_with_filter(
@@ -1996,7 +2434,30 @@ where
     factories: Factories<K, A>,
     column: usize,
     rows: Range<u64>,
+    read_ahead: ReadAhead,
     _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+/// How far a cursor reads ahead of its position, in data blocks.
+///
+/// Zero unless the cursor declared a sequential walk; see [`AccessHint`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ReadAhead {
+    blocks: usize,
+}
+
+impl ReadAhead {
+    const OFF: Self = Self { blocks: 0 };
+
+    fn for_hint(hint: AccessHint) -> Self {
+        match hint {
+            AccessHint::Unknown => Self::OFF,
+            AccessHint::Sequential => Self {
+                blocks: Runtime::with_dev_tweaks(|tweaks| tweaks.layer_file_read_ahead_blocks())
+                    as usize,
+            },
+        }
+    }
 }
 
 impl<K, A, N, T> Clone for RowGroup<'_, K, A, N, T>
@@ -2010,6 +2471,7 @@ where
             factories: self.factories.clone(),
             column: self.column,
             rows: self.rows.clone(),
+            read_ahead: self.read_ahead,
             _phantom: PhantomData,
         }
     }
@@ -2037,8 +2499,26 @@ where
             factories: reader.columns[column].factories.factories(),
             column,
             rows,
+            read_ahead: ReadAhead::OFF,
             _phantom: PhantomData,
         }
+    }
+
+    /// Tells the cursors made from this row group how they will be moved, so
+    /// that a sequential walk reads its blocks ahead of itself.  Cursors made
+    /// from this row group's later columns inherit it.
+    ///
+    /// # Arguments
+    ///
+    /// * `hint` - how the cursors will be moved; see [`AccessHint`].
+    pub fn with_hint(mut self, hint: AccessHint) -> Self {
+        self.read_ahead = ReadAhead::for_hint(hint);
+        self
+    }
+
+    fn with_read_ahead(mut self, read_ahead: ReadAhead) -> Self {
+        self.read_ahead = read_ahead;
+        self
     }
 
     /// # Safety
@@ -2051,6 +2531,7 @@ where
             row_group: self.clone(),
             key,
             position,
+            scratch: None,
         }
     }
 
@@ -2268,6 +2749,11 @@ where
     /// When `position.has_value()`, this is the deserialized key at that row.
     /// Otherwise, it can have any value.
     key: Box<K>,
+
+    /// Where a predicate seek deserializes each probed key.  Allocated by the
+    /// first such seek and kept for the next, so that a seek per input record
+    /// does not cost an allocation per record.
+    scratch: Option<Box<K>>,
 }
 
 impl<K, A, N, T> Clone for Cursor<'_, K, A, N, T>
@@ -2280,6 +2766,8 @@ where
             row_group: self.row_group.clone(),
             key: clone_box(&self.key),
             position: self.position.clone(),
+            // A cache, so the clone allocates its own when it needs one.
+            scratch: None,
         }
     }
 }
@@ -2453,10 +2941,30 @@ where
     where
         P: Fn(&K) -> bool + Clone,
     {
+        // The predicate takes an unarchived key, so every probe deserializes
+        // into the cursor's scratch key.  The closure borrows the scratch
+        // while the search borrows the position and the key, so the fields
+        // are taken apart here rather than going through
+        // `Self::advance_to_first_ge`.
+        let Self {
+            row_group,
+            position,
+            key,
+            scratch,
+        } = self;
+        let scratch = scratch.get_or_insert_with(|| row_group.factories.key_factory.default_box());
+        // SAFETY: the caller's obligation (see `# Safety`) is the one that
+        // `Position::advance_to_first_ge` has; the closure itself only calls
+        // safe methods on the archived key it is handed.
         unsafe {
-            self.advance_to_first_ge(&|key| {
-                if predicate(key) { Less } else { Greater }
-            })
+            position.advance_to_first_ge(
+                row_group,
+                &mut |archived: &K::Archived| {
+                    archived.deserialize(&mut **scratch);
+                    if predicate(&**scratch) { Less } else { Greater }
+                },
+                &mut **key,
+            )
         }
     }
 
@@ -2468,12 +2976,15 @@ where
     ///
     /// Unsafe because `rkyv` deserialization is unsafe.
     pub unsafe fn advance_to_value_or_larger(&mut self, target: &K) -> Result<(), Error> {
-        unsafe { self.advance_to_first_ge(&|key| target.cmp(key)) }
+        // SAFETY: the caller's obligation (see `# Safety`) is the one that
+        // `advance_to_first_ge` has.
+        unsafe { self.advance_to_first_ge(&mut |archived| archived.cmp_target(target).reverse()) }
     }
 
     /// Moves the cursor forward past rows for which `compare` returns [`Less`],
     /// where `compare` is a function such that if it returns [`Equal`] or
     /// [`Greater`] for a given key, it returns [`Greater`] for all larger keys.
+    /// `compare` sees each key in its archived form.
     ///
     /// This function does not move the cursor if `compare` returns [`Equal`] or
     /// [`Greater`] for the current row or a previous row.
@@ -2486,9 +2997,9 @@ where
     /// # Safety
     ///
     /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn advance_to_first_ge<C>(&mut self, compare: &C) -> Result<(), Error>
+    pub unsafe fn advance_to_first_ge<C>(&mut self, compare: &mut C) -> Result<(), Error>
     where
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             self.position
@@ -2510,10 +3021,30 @@ where
     where
         P: Fn(&K) -> bool + Clone,
     {
+        // See `seek_forward_until` for the scratch key and the split.
+        let Self {
+            row_group,
+            position,
+            key,
+            scratch,
+        } = self;
+        let scratch = scratch.get_or_insert_with(|| row_group.factories.key_factory.default_box());
+        // SAFETY: as in `seek_forward_until`: the caller's obligation is the
+        // one that `Position::rewind_to_last_le` has, and the closure is
+        // safe code.
         unsafe {
-            self.rewind_to_last_le(&|key| {
-                if !predicate(key) { Less } else { Greater }
-            })
+            position.rewind_to_last_le(
+                row_group,
+                &mut |archived: &K::Archived| {
+                    archived.deserialize(&mut **scratch);
+                    if !predicate(&**scratch) {
+                        Less
+                    } else {
+                        Greater
+                    }
+                },
+                &mut **key,
+            )
         }
     }
 
@@ -2528,13 +3059,15 @@ where
     where
         K: Ord,
     {
-        unsafe { self.rewind_to_last_le(&|key| target.cmp(key)) }
+        // SAFETY: the caller's obligation (see `# Safety`) is the one that
+        // `rewind_to_last_le` has.
+        unsafe { self.rewind_to_last_le(&mut |archived| archived.cmp_target(target).reverse()) }
     }
 
     /// Moves the cursor backward past rows for which `compare` returns
     /// [`Greater`], where `compare` is a function such that if it returns
     /// [`Equal`] or [`Less`] for a given key, it returns [`Less`] for all
-    /// lesser keys.
+    /// lesser keys.  `compare` sees each key in its archived form.
     ///
     /// This function does not move the cursor if `compare` returns [`Equal`] or
     /// [`Less`] for the current row or a previous row.
@@ -2542,18 +3075,14 @@ where
     /// # Safety
     ///
     /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn rewind_to_last_le<C>(&mut self, compare: &C) -> Result<(), Error>
+    pub unsafe fn rewind_to_last_le<C>(&mut self, compare: &mut C) -> Result<(), Error>
     where
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
-        let position = unsafe {
-            Position::best_match::<N, T, _>(&self.row_group, compare, Greater, &mut *self.key)
-        }?;
-        if position < self.position {
-            self.position = position;
+        unsafe {
+            self.position
+                .rewind_to_last_le(&self.row_group, compare, &mut *self.key)
         }
-        unsafe { self.position.key(&self.row_group.factories, &mut self.key) };
-        Ok(())
     }
 }
 
@@ -2576,7 +3105,8 @@ where
             self.row_group.reader,
             self.row_group.column + 1,
             self.position.row_group()?,
-        ))
+        )
+        .with_read_ahead(self.row_group.read_ahead))
     }
 }
 
@@ -2614,6 +3144,69 @@ impl<K: DataTrait + ?Sized, A: DataTrait + ?Sized> Clone for Path<K, A> {
             indexes: self.indexes.clone(),
             data: self.data.clone(),
         }
+    }
+}
+
+/// Asks storage for the data blocks after `child` in `index`, as many as the
+/// row group's read-ahead depth, so that a cursor walking forward finds them in
+/// the cache when it gets there.  Blocks the cache already holds, or that
+/// another read already has in flight, are skipped.
+///
+/// Each block is its own request rather than one request for all of them:
+/// the backend serves the blocks of one request one after another on a single
+/// thread, and the point is to have the round trips overlap.
+///
+/// The completion builds the same cache entry the synchronous path builds,
+/// on the thread that did the read, so decompression moves off the worker.
+/// An error there is dropped; the synchronous path surfaces it if it is real.
+///
+/// # Arguments
+///
+/// * `row_group` - the row group being walked, which sets the depth and takes the
+///   statistics.
+/// * `index` - the index block whose children to read.
+/// * `child` - the child the cursor is entering; the blocks after it are the ones read.
+fn read_ahead<K, A, N, T>(row_group: &RowGroup<'_, K, A, N, T>, index: &IndexBlock<K>, child: usize)
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    let file = &row_group.reader.file;
+    let cache = file.cache();
+    let last = (child + row_group.read_ahead.blocks).min(index.n_children().saturating_sub(1));
+    for next in child + 1..=last {
+        let Ok(node) = index.get_child(next) else {
+            return;
+        };
+        #[allow(clippy::borrow_deref_ref)]
+        if cache.get(&*file.file_handle, node.location).is_some()
+            || !file.in_flight.claim(node.location.offset)
+        {
+            continue;
+        }
+        file.stats
+            .record(CacheAccess::Prefetch, Duration::ZERO, node.location);
+        let claim = Claim {
+            in_flight: file.in_flight.clone(),
+            offset: node.location.offset,
+        };
+        let cache = cache.clone();
+        let (file_id, version, compression) =
+            (file.file_handle.file_id(), file.version, file.compression);
+        file.file_handle.read_async(
+            vec![node.location],
+            Box::new(move |mut results| {
+                let _claim = claim;
+                let Some(Ok(raw)) = results.pop() else {
+                    return;
+                };
+                let Ok(block) = decompress(compression, node.location, raw) else {
+                    return;
+                };
+                let _ =
+                    DataBlock::<K, A>::from_raw_with_cache(block, &node, &cache, file_id, version);
+            }),
+        );
     }
 }
 
@@ -2676,6 +3269,10 @@ where
                     return Ok(Self { row, indexes, data });
                 }
                 TreeBlock::Index(index) => {
+                    if row_group.read_ahead.blocks > 0 && matches!(index.child_type, NodeType::Data)
+                    {
+                        read_ahead(row_group, &index, index.find_row(row)?);
+                    }
                     push_index_block(&mut indexes, index)?;
                 }
             };
@@ -2701,7 +3298,14 @@ where
         }
         for (idx, index_block) in hint.indexes.iter().enumerate().rev() {
             if index_block.rows().contains(&row) {
-                let node = index_block.get_child_by_row(row)?;
+                let child = index_block.find_row(row)?;
+                let node = index_block.get_child(child)?;
+                // The next data block of a walk is found right here, in the
+                // parent the hint already holds, so this is where a
+                // sequential cursor learns what it will want after it.
+                if row_group.read_ahead.blocks > 0 && matches!(node.node_type, NodeType::Data) {
+                    read_ahead(row_group, index_block, child);
+                }
                 return Self::for_row_from_ancestor(
                     row_group,
                     hint.indexes[0..=idx].to_vec(),
@@ -2755,13 +3359,13 @@ where
     /// found.  On error, `key` might be changed.
     unsafe fn best_match<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
-        compare: &C,
+        compare: &mut C,
         bias: Ordering,
         key: &mut K,
     ) -> Result<Option<Self>, Error>
     where
         T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             let mut indexes = Vec::new();
@@ -2771,9 +3375,12 @@ where
             loop {
                 match node.read(&row_group.reader.file)? {
                     TreeBlock::Index(index_block) => {
-                        let Some(child_idx) =
-                            index_block.find_best_match(&row_group.rows, compare, bias, key)
-                        else {
+                        let Some(child_idx) = index_block.find_best_match(
+                            row_group.factories.key_factory,
+                            &row_group.rows,
+                            compare,
+                            bias,
+                        ) else {
                             return Ok(None);
                         };
                         node = index_block.get_child(child_idx)?;
@@ -2829,29 +3436,35 @@ where
     unsafe fn advance_to_first_ge<N, T, C>(
         &mut self,
         row_group: &RowGroup<'_, K, A, N, T>,
-        compare: &C,
+        compare: &mut C,
         key: &mut K,
     ) -> Result<bool, Error>
     where
         T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             // Check the current position first. We might already be done.
-            if compare(key) != Greater {
+            // SAFETY: a path's data block holds its row, and the file's item
+            // types are the caller's obligation.
+            let current = self
+                .data
+                .archived_item_for_row(&row_group.factories, self.row);
+            if compare(current.fst()) != Greater {
                 return Ok(true);
             }
 
             // If the last item in `rows` in the current data block is greater than
             // or equal to the target, then the position must be in the current data
             // block.
-            self.data.key_for_row(
-                &row_group.factories,
-                min(self.data.rows().end, row_group.rows.end) - 1,
-                key,
-            );
+            let last_row = min(self.data.rows().end, row_group.rows.end) - 1;
+            // SAFETY: `last_row` is in this data block, since the block
+            // holds `self.row`, which the row group's range contains.
+            let last = self
+                .data
+                .archived_item_for_row(&row_group.factories, last_row);
             let mut rows = self.row + 1..row_group.rows.end;
-            if compare(key) != Greater {
+            if compare(last.fst()) != Greater {
                 let child_idx = self
                     .data
                     .find_best_match(&row_group.factories, &rows, compare, Less, key)
@@ -2873,7 +3486,12 @@ where
                 }
 
                 // Otherwise, our target (if any) must be below `index_block`.
-                let Some(child_idx) = index_block.find_best_match(&rows, compare, Less, key) else {
+                let Some(child_idx) = index_block.find_best_match(
+                    row_group.factories.key_factory,
+                    &rows,
+                    compare,
+                    Less,
+                ) else {
                     // `rows.end` is inside `index_block` but the largest key is
                     // less than the target.
                     return Ok(false);
@@ -2884,9 +3502,12 @@ where
                 loop {
                     match node.read::<K, A>(&row_group.reader.file)? {
                         TreeBlock::Index(index_block) => {
-                            let Some(child_idx) =
-                                index_block.find_best_match(&rows, compare, Less, key)
-                            else {
+                            let Some(child_idx) = index_block.find_best_match(
+                                row_group.factories.key_factory,
+                                &rows,
+                                compare,
+                                Less,
+                            ) else {
                                 return Ok(false);
                             };
                             node = index_block.get_child(child_idx)?;
@@ -3163,13 +3784,13 @@ where
     }
     unsafe fn best_match<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
-        compare: &C,
+        compare: &mut C,
         bias: Ordering,
         key: &mut K,
     ) -> Result<Self, Error>
     where
         T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             match Path::best_match(row_group, compare, bias, key)? {
@@ -3219,12 +3840,12 @@ where
     unsafe fn advance_to_first_ge<N, T, C>(
         &mut self,
         row_group: &RowGroup<'_, K, A, N, T>,
-        compare: &C,
+        compare: &mut C,
         key: &mut K,
     ) -> Result<(), Error>
     where
         T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
+        C: FnMut(&K::Archived) -> Ordering,
     {
         unsafe {
             match self {
@@ -3251,5 +3872,39 @@ where
             }
             Ok(())
         }
+    }
+
+    /// Moves this position backward, past rows in `row_group` for which
+    /// `compare` returns [`Greater`], where `compare` is a function such that
+    /// if it returns [`Equal`] or [`Less`] for a given key, it returns
+    /// [`Less`] for all lesser keys.
+    ///
+    /// On return, if the position is on a row, `key` is its key.
+    ///
+    /// This function does not change the position if `compare` returns
+    /// [`Equal`] or [`Less`] for the current row or a previous row.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe.
+    unsafe fn rewind_to_last_le<N, T, C>(
+        &mut self,
+        row_group: &RowGroup<'_, K, A, N, T>,
+        compare: &mut C,
+        key: &mut K,
+    ) -> Result<(), Error>
+    where
+        T: ColumnSpec,
+        C: FnMut(&K::Archived) -> Ordering,
+    {
+        // Backward seeks have no equivalent of the forward search from the
+        // current path, so this starts from the root every time.
+        let position = unsafe { Self::best_match::<N, T, _>(row_group, compare, Greater, key) }?;
+        if position < *self {
+            *self = position;
+        }
+        // SAFETY: the caller's obligation covers reading the row's key.
+        unsafe { self.key(&row_group.factories, key) };
+        Ok(())
     }
 }

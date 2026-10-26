@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { Datatable, TableHandler } from '@vincjo/datatables'
+  import { TableHandler } from '@vincjo/datatables'
+  import { dateMax } from 'common-lib/date'
+  import { formatDateTime } from 'common-lib/format'
+  import { matchesSubstring } from 'common-lib/string'
+  import { type NamesInUnion, unionName } from 'common-lib/union'
   import { Popover, Select, Tooltip } from 'common-ui'
   import { match } from 'ts-pattern'
   import { page } from '$app/state'
@@ -8,10 +12,7 @@
   import { useElapsedTime } from '$lib/compositions/common/useElapsedTime'
   import { useLayoutSettings } from '$lib/compositions/layout/useLayoutSettings.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
-  import { dateMax } from '$lib/functions/common/date'
-  import { matchesSubstring } from '$lib/functions/common/string'
-  import { type NamesInUnion, unionName } from '$lib/functions/common/union'
-  import { formatDateTime } from '$lib/functions/format'
+  import { resolve } from '$lib/functions/svelte'
   import type {
     PipelineStatus as PipelineStatusType,
     PipelineThumb
@@ -77,7 +78,8 @@
     ['Paused', ['Paused']],
     ['Ready To Start', ['Stopped']],
     ['Compiling', ['Queued', 'CompilingSql', 'SqlCompiled', 'CompilingRust']],
-    ['Failed', ['SystemError', 'SqlError', 'RustError']]
+    ['Failed', ['SystemError', 'SqlError', 'RustError']],
+    ['Unavailable', ['Unavailable']]
   ]
 
   let nameSearch = $state('')
@@ -100,7 +102,10 @@
   const api = usePipelineManager()
 
   const { formatElapsedTime } = useElapsedTime()
-  const td = 'py-1 text-base border-t-[0.5px]'
+  const td = 'h-10 text-base border-t-[0.5px]'
+  // The last row also gets a bottom border, closing off the table instead of
+  // leaving its final row's underside open.
+  const rowTd = `${td} group-last:border-b-[0.5px]`
 
   // Persist the active sort and restore it on the matching column. Each ThSort
   // owns the upstream `direction`/`onSort` API; the column identity lives here.
@@ -114,27 +119,32 @@
 
 <div class="pipeline-table-wrapper bg-white-dark w-fit min-w-full">
   <div class="bg-white-dark sticky top-0 z-10 pb-2" bind:clientHeight={controlsHeight}>
-    <div class="sticky left-0 max-w-[100cqi] px-2 md:px-8">
+    <!-- The header and the controls share one wrapping row: the controls sit beside the
+         header and drop to their own line only when they no longer fit next to it. -->
+    <div
+      class="sticky left-0 flex max-w-[100cqi] flex-wrap items-center gap-x-4 gap-y-2 px-2 md:px-5"
+    >
       {#if header}
         {@render header()}
       {/if}
-      <div
-        class="relative mt-2 flex flex-row items-center gap-2 sm:justify-end sm:gap-4"
-        class:lg:-mt-7={!!header}
-        class:lg:mb-0={!!header}
-      >
+      <!-- The page reserves a scrollbar gutter that the header above it doesn't have; the
+           negative margin carries the controls into it so they end where the header's
+           buttons do. -->
+      <div class="relative -mr-[var(--scrollbar-width)] ml-auto flex flex-row items-center gap-2">
         <input
           data-testid="input-pipeline-search"
-          class="input h-9 sm:w-60"
+          class="input sm:w-60"
           type="search"
           placeholder="Search pipelines..."
           oninput={(e) => {
             nameSearch = e.currentTarget.value
           }}
         />
+        <!-- Same fill as the New Pipeline button next to it (`preset-filled-surface-50-950`).
+             `!` because `Select`'s own background utility would otherwise win by CSS order. -->
         <Select
           data-testid="select-pipeline-status"
-          class="h-9 text-base! sm:w-40"
+          class="bg-surface-50-950! sm:w-40"
           onchange={(e) => {
             statusFilter.value = filterStatuses.find((v) => e.currentTarget.value === v[0])![0]
             statusFilter.set()
@@ -148,36 +158,38 @@
       </div>
     </div>
   </div>
-  <Datatable headless {table}>
-    <table class="bg-inherit md:px-6">
-      <thead style="top: {controlsHeight}px; z-index: 1;">
+  <div class="flex md:px-3">
+    <table class="w-full border-separate border-spacing-0">
+      <thead class="bg-white-dark sticky" style="top: {controlsHeight}px; z-index: 1;">
         <tr>
-          <th class="w-10 px-2 text-left"
-            ><input
-              class="checkbox"
-              type="checkbox"
-              checked={table.isAllSelected}
-              onclick={() => table.selectAll()}
-            /></th
+          <th class="w-10 px-3 text-left"
+            ><div class="flex h-full items-center">
+              <input
+                class="checkbox"
+                type="checkbox"
+                checked={table.isAllSelected}
+                onclick={() => table.selectAll()}
+              />
+            </div></th
           >
-          <ThSort class="px-1 py-1" {table} field="name" {...sortColumn('name')}
+          <ThSort class="h-10 px-3" {table} field="name" {...sortColumn('name')}
             ><span class="text-base font-normal text-surface-950-50">Pipeline name</span></ThSort
           >
-          <th class="px-1 py-1 text-left"
+          <th class="h-10 px-3 text-left"
             ><span class="text-base font-normal text-surface-950-50">Storage</span></th
           >
-          <ThSort {table} class="px-1 py-1" field="status" {...sortColumn('status')}
-            ><span class="ml-8 text-base font-normal text-surface-950-50">Status</span></ThSort
+          <ThSort {table} class="h-10 px-3" field="status" {...sortColumn('status')}
+            ><span class="text-base font-normal text-surface-950-50">Status</span></ThSort
           >
-          <th class="px-1 py-1 text-left"
+          <th class="h-10 px-3 text-left"
             ><span class="text-base font-normal text-surface-950-50">Message</span></th
           >
-          <th class="px-1 py-1 text-left"
+          <th class="h-10 px-3 text-left"
             ><span class="text-base font-normal text-surface-950-50">Tags</span></th
           >
           <ThSort
             {table}
-            class="w-20 px-1 py-1 xl:w-32"
+            class="h-10 w-20 px-3 xl:w-32"
             field="platformVersion"
             {...sortColumn('platformVersion')}
           >
@@ -187,7 +199,7 @@
           </ThSort>
           <ThSort
             {table}
-            class="w-20 py-1 pr-4 text-right xl:w-32"
+            class="h-10 w-20 px-3 xl:w-32"
             field={(p) => p.connectors?.numErrors}
             {...sortColumn('numErrors')}
           >
@@ -198,14 +210,14 @@
           </ThSort>
           <ThSort
             {table}
-            class="px-1 py-1"
+            class="h-10 px-3"
             field="lastStatusSince"
             {...sortColumn('lastStatusSince')}
             ><span class="text-base font-normal text-surface-950-50">Status changed</span></ThSort
           >
           <ThSort
             {table}
-            class="px-1 py-1"
+            class="h-10 px-3"
             field="deploymentResourcesStatusSince"
             {...sortColumn('deploymentResourcesStatusSince')}
             ><span class="text-base font-normal text-surface-950-50">Deployed on</span></ThSort
@@ -215,25 +227,29 @@
       <tbody>
         {#each table.rows as pipeline}
           <tr class="group" data-testid="box-row-{pipeline.name}"
-            ><td class="{td} border-surface-100-900 px-2 group-hover:bg-surface-50-950">
-              <input
-                class="checkbox"
-                type="checkbox"
-                checked={table.selected.includes(pipeline.name)}
-                onclick={() => table.select(pipeline.name)}
-              />
+            ><td class="{rowTd} border-surface-100-900 px-3 group-hover:bg-surface-50-950">
+              <div class="flex h-full items-center">
+                <input
+                  class="checkbox"
+                  type="checkbox"
+                  checked={table.selected.includes(pipeline.name)}
+                  onclick={() => table.select(pipeline.name)}
+                />
+              </div>
             </td>
-            <td class="{td} relative w-3/12 border-surface-100-900 group-hover:bg-surface-50-950"
+            <td class="{rowTd} relative w-3/12 border-surface-100-900 group-hover:bg-surface-50-950"
               ><a
-                class=" absolute top-2 w-full overflow-hidden overflow-ellipsis whitespace-nowrap"
-                href="/pipelines/{pipeline.name}/">{pipeline.name}</a
+                class=" absolute inset-x-3 top-2.5 overflow-hidden overflow-ellipsis whitespace-nowrap"
+                href={resolve(`/pipelines/${encodeURI(pipeline.name)}/`)}>{pipeline.name}</a
               ></td
             >
-            <td class="{td} relative w-12 border-surface-100-900 group-hover:bg-surface-50-950">
+            <td
+              class="{rowTd} relative w-12 border-surface-100-900 px-3 group-hover:bg-surface-50-950"
+            >
               <div
                 class="fd {pipeline.storageStatus === 'Cleared'
                   ? 'fd-database-off text-surface-500'
-                  : 'fd-database'} text-center text-[20px]"
+                  : 'fd-database'} text-center text-[16px]"
               ></div>
               <Tooltip
                 >{match(pipeline.storageStatus)
@@ -243,33 +259,37 @@
                   .exhaustive()}</Tooltip
               >
             </td>
-            <td class="pr-2 {td} w-36 border-surface-100-900 group-hover:bg-surface-50-950"
+            <td
+              class="px-3 {rowTd} w-36 border-surface-100-900 text-left group-hover:bg-surface-50-950"
               ><PipelineStatus status={pipeline.status}></PipelineStatus></td
             >
             <td
-              class="{td} relative border-surface-100-900 whitespace-pre-wrap group-hover:bg-surface-50-950"
+              class="{rowTd} relative border-surface-100-900 whitespace-pre-wrap group-hover:bg-surface-50-950"
             >
-              <span
-                class="absolute top-1.5 w-full overflow-hidden align-middle overflow-ellipsis whitespace-nowrap"
-              >
+              <span class="absolute inset-x-3 top-2.5 flex items-center gap-2 whitespace-nowrap">
                 {#if pipeline.deploymentError}
                   {@const message = pipeline.deploymentError.message}
-                  <span class="fd fd-circle-alert pr-2 text-[20px] text-error-500"></span>
-                  <Popover class="z-10" strategy="fixed">
+                  <span class="fd fd-circle-alert shrink-0 text-[16px] text-error-500"></span>
+                  <Popover class="z-20" strategy="fixed">
                     <div
                       class="scrollbar flex max-h-[50vh] max-w-[80vw] overflow-auto whitespace-pre-wrap"
                     >
                       {message}
                     </div>
                   </Popover>
-                  {message.slice(0, ((idx) => (idx > 0 ? idx : undefined))(message.indexOf('\n')))}
+                  <span class="truncate">
+                    {message.slice(
+                      0,
+                      ((idx) => (idx > 0 ? idx : undefined))(message.indexOf('\n'))
+                    )}
+                  </span>
                 {/if}
               </span>
             </td>
-            <td class="pr-2 {td} w-36 border-surface-100-900 group-hover:bg-surface-50-950"
+            <td class="px-3 {rowTd} w-36 border-surface-100-900 group-hover:bg-surface-50-950"
               ><Tags pipelineName={pipeline.name} tags={pipeline.tags} {knownTags} {api}></Tags></td
             >
-            <td class="{td} relative border-surface-100-900 group-hover:bg-surface-50-950">
+            <td class="{rowTd} relative border-surface-100-900 px-3 group-hover:bg-surface-50-950">
               <div class="flex w-full flex-nowrap items-center gap-2 text-nowrap">
                 <PipelineVersion
                   pipelineName={pipeline.name}
@@ -279,18 +299,22 @@
                 ></PipelineVersion>
               </div>
             </td>
-            <td class="{td} border-surface-100-900 pr-4 group-hover:bg-surface-50-950">
-              <div class="text-right text-nowrap">
+            <td class="{rowTd} border-surface-100-900 px-3 group-hover:bg-surface-50-950">
+              <div class="text-nowrap">
                 {pipeline.connectors?.numErrors ?? '-'}
               </div>
             </td>
-            <td class="{td} relative w-28 border-surface-100-900 group-hover:bg-surface-50-950">
-              <div class="w-32 text-right text-nowrap">
+            <td
+              class="{rowTd} relative w-28 border-surface-100-900 px-3 group-hover:bg-surface-50-950"
+            >
+              <div class="text-nowrap">
                 {formatElapsedTime(pipeline.lastStatusSince, 'dhm')} ago
               </div>
             </td>
-            <td class="{td} relative w-40 border-surface-100-900 group-hover:bg-surface-50-950">
-              <div class="pr-1 text-right text-nowrap">
+            <td
+              class="{rowTd} relative w-40 border-surface-100-900 px-3 group-hover:bg-surface-50-950"
+            >
+              <div class="text-nowrap">
                 {pipeline.deploymentResourcesStatus === 'Provisioned'
                   ? formatDateTime(pipeline.deploymentResourcesStatusSince)
                   : ''}
@@ -299,19 +323,11 @@
           </tr>
         {:else}
           <tr>
-            <td class={td}></td>
-            <td class={td} colspan={99}>No pipelines found</td>
+            <td class="{td} border-b-[0.5px]"></td>
+            <td class="{td} border-b-[0.5px] px-3" colspan={99}>No pipelines found</td>
           </tr>
         {/each}
       </tbody>
     </table>
-  </Datatable>
+  </div>
 </div>
-
-<style>
-  /* Datatable wraps our <table> in an <article class="thin-scrollbar"> whose default
-     overflow:auto would clip the sticky header. Reach in via :global to override. */
-  .pipeline-table-wrapper :global(article.thin-scrollbar) {
-    overflow: visible !important;
-  }
-</style>

@@ -11,14 +11,15 @@
 </script>
 
 <script lang="ts">
+  import { enclosure, reclosureKey } from 'common-lib/function'
   import { type ExtendedPipeline } from '$lib/services/pipelineManager'
-  import Query, { type Row, type QueryData } from '$lib/components/adhoc/Query.svelte'
+  import Query, { type QueryData } from '$lib/components/adhoc/Query.svelte'
+  import { isDataRow, type Row } from '$lib/types/adhocQuery'
   import { isPipelineInteractive } from '$lib/functions/pipelines/status'
   import { arrowIpcBatchToJS, arrowSchemaToFelderaFields } from '$lib/functions/apacheArrow'
   import { type AsyncRecordBatchStreamReader, RecordBatchReader } from 'apache-arrow'
   import invariant from 'tiny-invariant'
   import WarningBanner from '$lib/components/pipelines/editor/WarningBanner.svelte'
-  import { enclosure, reclosureKey } from '$lib/functions/common/function'
   import { useReverseScrollContainer } from 'common-ui'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { getSelectedTenant } from '$lib/services/auth'
@@ -43,8 +44,6 @@
   })
   const api = usePipelineManager()
 
-  const isDataRow = (row: Row): row is { cells: unknown[] } & Row => 'cells' in row
-
   const onSubmitQuery =
     (tenantName: string, pipelineName: string, i: number) => async (query: string) => {
       const request = api.adHocQuery(pipelineName, query)
@@ -67,6 +66,13 @@
         return
       }
       const bufferSize = 1000
+      let cancelled = false
+      let arrowReader: AsyncRecordBatchStreamReader | null = null
+      const stopReading = () => {
+        cancelled = true
+        arrowReader?.cancel().catch(() => {})
+        result.cancel()
+      }
       const appendRows = (rows: Row[]) => {
         if (!adhocQueries[tenantName][pipelineName].queries[i]?.result) {
           return
@@ -89,21 +95,22 @@
               })
               reclosureKey(adhocQueries[tenantName][pipelineName].queries[i].result, 'rows')
             }
-            adhocQueries[tenantName][pipelineName].queries[i].result?.endResultStream()
+            stopReading()
           })
         }
       }
       // Adhoc results are capped at `bufferSize` rows on the consumer side, so the
       // generic `parseStream` orchestrator (flush cadence + shedding budget) is
       // unnecessary here — drive the arrow reader directly.
-      let cancelled = false
-      let arrowReader: AsyncRecordBatchStreamReader | null = null
-      const cancel = () => {
-        cancelled = true
-        arrowReader?.cancel().catch(() => {})
-        result.cancel()
+      // Only the user's stop marks the query `stopped`: the row cap above also stops reading,
+      // but leaves its own notice among the rows.
+      adhocQueries[tenantName][pipelineName].queries[i].result.endResultStream = () => {
+        const result = adhocQueries[tenantName][pipelineName].queries[i]?.result
+        if (result) {
+          result.stopped = true
+        }
+        stopReading()
       }
-      adhocQueries[tenantName][pipelineName].queries[i].result.endResultStream = cancel
       try {
         arrowReader = (await RecordBatchReader.from(
           result.stream

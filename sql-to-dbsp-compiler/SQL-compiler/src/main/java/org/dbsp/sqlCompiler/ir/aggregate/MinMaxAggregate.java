@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
@@ -61,10 +62,19 @@ public class MinMaxAggregate extends NonLinearAggregate {
         }
         visitor.property("emptySetResult");
         this.emptySetResult.accept(visitor);
-        visitor.property("aggregatedValue");
+        visitor.property("comparedValue");
         this.comparedValue.accept(visitor);
         visitor.pop(this);
         visitor.postorder(this);
+    }
+
+    @Override
+    public boolean equivalent(EquivalenceContext context, DBSPExpression other) {
+        if (!super.equivalent(context, other))
+            return false;
+        MinMaxAggregate otherAggregate = other.to(MinMaxAggregate.class);
+        return this.operation == otherAggregate.operation &&
+                context.equivalent(this.comparedValue, otherAggregate.comparedValue);
     }
 
     @Override
@@ -106,14 +116,15 @@ public class MinMaxAggregate extends NonLinearAggregate {
 
     @SuppressWarnings("unused")
     public static MinMaxAggregate fromJson(JsonNode node, JsonDecoder decoder) {
+        // Read in the order accept(InnerVisitor) writes
+        DBSPTypeUser semigroup = fromJsonInner(node, "semigroup", decoder, DBSPTypeUser.class);
         DBSPExpression zero = fromJsonInner(node, "zero", decoder, DBSPExpression.class);
         DBSPClosureExpression increment = fromJsonInner(node, "increment", decoder, DBSPClosureExpression.class);
-        DBSPExpression emptySetResult = fromJsonInner(node, "emptySetResult", decoder, DBSPExpression.class);
-        DBSPTypeUser semigroup = fromJsonInner(node, "semigroup", decoder, DBSPTypeUser.class);
-        DBSPClosureExpression comparedValue = fromJsonInner(node, "comparedValue", decoder, DBSPClosureExpression.class);
         DBSPClosureExpression postProcessing = null;
-        if (node.has("postProcessing"))
-            postProcessing = fromJsonInner(node, "postProcessing", decoder, DBSPClosureExpression.class);
+        if (node.has("postProcess"))
+            postProcessing = fromJsonInner(node, "postProcess", decoder, DBSPClosureExpression.class);
+        DBSPExpression emptySetResult = fromJsonInner(node, "emptySetResult", decoder, DBSPExpression.class);
+        DBSPClosureExpression comparedValue = fromJsonInner(node, "comparedValue", decoder, DBSPClosureExpression.class);
         Operation operation = Operation.valueOf(Utilities.getStringProperty(node, "operation"));
         return new MinMaxAggregate(CalciteObject.EMPTY, zero, increment, emptySetResult, semigroup, comparedValue, postProcessing, operation);
     }

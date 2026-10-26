@@ -16,12 +16,27 @@ public class KafkaInputConfig implements IValidateConfig {
     @JsonProperty("topic")
     public String topic = "";
 
+    /** Legacy form of {@link #topic}, accepted with exactly one element. */
+    @Nullable
+    @JsonProperty("topics")
+    public List<String> topics = null;
+
     @Nullable
     @JsonProperty("log_level")
     public KafkaLogLevel logLevel = null;
 
+    /**
+     * Maximum time to wait for the endpoint to join the Kafka consumer group during
+     * initialization, for example {@code "10s"}.
+     */
+    @Nullable
+    @JsonProperty("group_join_timeout")
+    public JsonNode groupJoinTimeout = null;
+
+    /** Deprecated; use {@link #groupJoinTimeout}. */
     @JsonProperty("group_join_timeout_secs")
-    public int groupJoinTimeoutSecs = 10;
+    @Nullable
+    public JsonNode groupJoinTimeoutSecs = null;
 
     @Nullable
     @JsonProperty("poller_threads")
@@ -72,10 +87,25 @@ public class KafkaInputConfig implements IValidateConfig {
 
     @Override
     public boolean validate(ConfigReporter reporter) {
-        boolean ok = true;
-        if (topic.isBlank()) {
-            reporter.warn("Invalid configuration",
-                    "required field \"topic\" is missing or empty");
+        boolean ok = ConfigDuration.check(reporter,
+                "group_join_timeout", this.groupJoinTimeout,
+                "group_join_timeout_secs", this.groupJoinTimeoutSecs);
+        List<String> topicList = topics != null ? topics : List.of();
+        if (topicList.isEmpty()) {
+            if (topic.isBlank()) {
+                reporter.warn("Invalid configuration",
+                        "required field \"topic\" is missing or empty"
+                                + " (or use the legacy \"topics\" form)");
+                ok = false;
+            }
+        } else if (!topic.isBlank()) {
+            reporter.warnPath("topics", "Invalid configuration",
+                    "\"topic\" and the legacy \"topics\" are mutually exclusive");
+            ok = false;
+        } else if (topicList.size() > 1) {
+            reporter.warnPath("topics", "Invalid configuration",
+                    "the legacy \"topics\" accepts exactly one topic, not "
+                            + topicList.size());
             ok = false;
         }
         return ok;

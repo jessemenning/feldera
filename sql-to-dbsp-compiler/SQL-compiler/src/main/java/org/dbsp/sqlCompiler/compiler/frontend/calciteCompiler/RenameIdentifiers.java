@@ -22,6 +22,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.util.SqlShuttle;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.ExternalFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateFunctionDeclaration;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateView;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlExtendedColumnDeclaration;
@@ -183,7 +184,7 @@ public class RenameIdentifiers extends SqlShuttle {
             return new SqlExtendedColumnDeclaration(ecd.getParserPosition(),
                     name, (SqlDataTypeSpec) type, ecd.expression, ecd.strategy,
                     foreignKeyTables, foreignKeyColumns, ecd.primaryKey,
-                    ecd.lateness, ecd.watermark, ecd.defaultValue, ecd.interned);
+                    ecd.lateness, ecd.defaultValue, ecd.interned);
         } else if (call instanceof SqlCreateView cv) {
             SqlIdentifier name = this.renameIdentifier(cv.name);
             SqlNodeList columnList = cv.columnList == null ? null : (SqlNodeList) super.visit(cv.columnList);

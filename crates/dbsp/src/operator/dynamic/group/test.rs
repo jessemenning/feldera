@@ -2,6 +2,7 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
+use crate::utils::test::CIRCUIT_CASES;
 use crate::{
     DBData, DynZWeight, RootCircuit, Runtime, ZWeight,
     circuit::CircuitConfig,
@@ -9,7 +10,7 @@ use crate::{
     indexed_zset,
     operator::{CmpFunc, IndexedZSetHandle, OutputHandle},
     trace::{
-        Cursor, SpineSnapshot as DynSpineSnapshot, Trace,
+        Cursor, SpineSnapshot as DynSpineSnapshot, Trace, TraceRole,
         test::test_batch::{TestBatch, TestBatchFactories, assert_batch_eq, assert_typed_batch_eq},
     },
     typed_batch::{
@@ -380,7 +381,11 @@ fn lead_test(trace: Vec<Vec<(i32, i32, ZWeight)>>, transaction: bool) {
     )
     .unwrap();
 
-    let mut ref_trace = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut ref_trace = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     if transaction {
         dbsp.start_transaction().unwrap();
@@ -435,7 +440,11 @@ fn lag_test(trace: Vec<Vec<(i32, i32, ZWeight)>>, transaction: bool) {
     )
     .unwrap();
 
-    let mut ref_trace = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut ref_trace = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     if transaction {
         dbsp.start_transaction().unwrap();
@@ -821,7 +830,11 @@ fn test_topk(trace: Vec<Vec<(i32, i32, ZWeight)>>, transaction: bool) {
     )
     .unwrap();
 
-    let mut ref_trace = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+    let mut ref_trace = TestBatch::new(
+        &TestBatchFactories::new(),
+        Arc::new(String::from("Test")),
+        TraceRole::Integral,
+    );
 
     if transaction {
         dbsp.start_transaction().unwrap();
@@ -879,6 +892,8 @@ fn test_topk(trace: Vec<Vec<(i32, i32, ZWeight)>>, transaction: bool) {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
     #[test]
     fn test_topk_small_step(trace in input_trace(5, 1_000, 200, 20)) {
         test_topk(trace, false)

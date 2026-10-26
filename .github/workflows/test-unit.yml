@@ -29,7 +29,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     container:
-      image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
+      image: us-central1-docker.pkg.dev/feldera-ci/ghcr-remote/feldera/feldera-dev:sha-a112fd877176bba0f4e5f3475853f918b276d1ef
 
     steps:
       - name: Checkout repository
@@ -69,6 +69,16 @@ jobs:
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/unit -vv ${{ vars.PYTEST_EXTRA }}
         working-directory: python
+
+      - name: Changelog filing unit-tests and dry run
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: |
+          set -eu
+          python3 scripts/tests/test_file_changelog_release.py
+          git fetch --depth 1 origin "+refs/tags/v*:refs/tags/v*"
+          newest=$(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          python3 scripts/file_changelog_release.py --dry-run \
+            --tag "$newest" --changelog docs.feldera.com/docs/changelog.md
 
       - name: dbt-feldera unit-tests
         if: ${{ vars.CI_DRY_RUN != 'true' }}
@@ -120,6 +130,14 @@ jobs:
       - name: feldera-storage
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: ./build/feldera_storage-*
+
+      - name: feldera-modular-bloom
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        # The lib tests plus every bloom_* integration test, so a test file
+        # added later needs no change here. A bare glob would not do: it
+        # expands to several paths, and the shell would run the first and hand
+        # it the rest as arguments.
+        run: for t in ./build/feldera_modular_bloom-* ./build/bloom_*; do "$t"; done
 
       - name: readers
         if: ${{ vars.CI_DRY_RUN != 'true' }}

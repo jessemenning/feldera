@@ -7,11 +7,23 @@ export type UserProfile = {
   picture?: string | null
 }
 
+/**
+ * A tenant the logged-in user may act in, from the session payload's
+ * membership list (see `SessionInfo.memberships`).
+ */
+export type TenantMembership = {
+  tenantId: string
+  name: string
+  role: string
+}
+
 export type SignInDetails = {
   logout: (params: { callbackUrl: string | undefined }) => Promise<void>
   userInfo: OidcUserInfo
   profile: UserProfile
   accessToken: string
+  /** The `auth_time` claim: when the user last authenticated at the identity provider. */
+  authTime?: number
 }
 
 export type AuthDetails =

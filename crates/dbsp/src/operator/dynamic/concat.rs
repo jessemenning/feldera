@@ -219,7 +219,7 @@ impl<Z: IndexedZSet> StreamingNaryOperator<Option<Spine<Z>>, Z> for AccumulateCo
             if let Some(snapshot) = snapshot {
                 let mut input_batch_stats = self.input_batch_stats.borrow_mut();
                 input_batch_stats.resize_with(inputs.len(), BatchSizeStats::new);
-                input_batch_stats[i].add_batch(snapshot.len());
+                input_batch_stats[i].add_batch(snapshot.len_upper_bound());
 
                 snapshots[i] = Some(snapshot);
             }
@@ -273,7 +273,7 @@ impl<Z: IndexedZSet> StreamingNaryOperator<Option<Spine<Z>>, Z> for AccumulateCo
                         has_val = false;
 
                         let result = builder.done();
-                        self.output_batch_stats.borrow_mut().add_batch(result.len());
+                        self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                         yield (result, false, cursor.position());
                         builder = Z::Builder::with_capacity(&factories, chunk_size, chunk_size);
                     }
@@ -286,7 +286,7 @@ impl<Z: IndexedZSet> StreamingNaryOperator<Option<Spine<Z>>, Z> for AccumulateCo
             }
 
             let result = builder.done();
-            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
 
             yield (result, true, cursor.position())
         }
@@ -298,6 +298,7 @@ mod test {
 
     use proptest::{collection::vec, prelude::*};
 
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{DBData, Runtime, ZWeight, algebra::NegByRef, circuit::CircuitConfig, utils::Tup2};
 
     fn test_zset<K: DBData>(inputs: Vec<(Vec<Vec<Tup2<K, ZWeight>>>, bool)>, transaction: bool) {
@@ -510,6 +511,8 @@ mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn proptest_concat_zset_big_step(inputs in generate_test_zsets(10, 3, 100)) {
             let (inputs1, inputs2, inputs3) = inputs;

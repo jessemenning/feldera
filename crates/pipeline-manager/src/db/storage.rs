@@ -1,19 +1,29 @@
 use crate::api::support_data_collector::SupportBundleData;
 use crate::db::error::DBError;
-use crate::db::types::api_key::{ApiKeyDescr, ApiPermission};
+use crate::db::types::api_key::ApiKeyDescr;
+use crate::db::types::deployment::PipelineDeploymentConfig;
 use crate::db::types::monitor::{
     ClusterMonitorEvent, ClusterMonitorEventId, ExtendedClusterMonitorEvent,
     ExtendedPipelineMonitorEvent, NewClusterMonitorEvent, PipelineMonitorEvent,
     PipelineMonitorEventId,
 };
+use crate::db::types::oidc_trust::OidcTrustDescr;
 use crate::db::types::pipeline::{
     ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PatchClientMetadata, PipelineDescr,
     PipelineId,
 };
-use crate::db::types::program::{RustCompilationInfo, SqlCompilationInfo};
+use crate::db::types::program::{
+    PipelineProgramArtifacts, RustCompilationInfo, SqlCompilationInfo,
+};
+use crate::db::types::role::{MintableKeyRole, Role};
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::{
+    MembershipOrigin, TenantInfo, TenantMember, UserId, UserMembership, UserProfile,
+};
 use crate::db::types::version::Version;
+use crate::oidc::destination::TenantIssuerPolicy;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use feldera_types::error::ErrorResponse;
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
 use uuid::Uuid;
@@ -45,6 +55,7 @@ impl ExtendedPipelineDescrRunner {
                 program_status: pipeline.program_status,
                 program_status_since: pipeline.program_status_since,
                 deployment_error: pipeline.deployment_error.clone(),
+                deployment_config: pipeline.deployment_config.clone(),
                 deployment_location: pipeline.deployment_location.clone(),
                 refresh_version: pipeline.refresh_version,
                 storage_status: pipeline.storage_status,
@@ -91,6 +102,157 @@ pub(crate) trait Storage {
     /// Retrieves the tenant name for a given tenant ID.
     async fn get_tenant_name(&self, tenant_id: TenantId) -> Result<String, DBError>;
 
+    /// Strict resolution of a `Feldera-Tenant` selector (a tenant UUID or name)
+    /// for an owner acting cross-tenant. Never creates a tenant; errors on
+    /// miss. See
+    /// [`crate::db::operations::tenant::resolve_tenant_selector`].
+    async fn resolve_tenant_selector(&self, selector: &str) -> Result<TenantId, DBError>;
+
+    /// Retrieves a single tenant by selector (a tenant UUID or name). Errors
+    /// with `UnknownTenantName` on miss.
+    /// See [`crate::db::operations::tenant::get_tenant`].
+    async fn get_tenant(&self, selector: &str) -> Result<TenantInfo, DBError>;
+
+    /// Looks a tenant up by name alone, `None` on miss; a name that parses as
+    /// a UUID is still a name. For callers that hold a known tenant name, not
+    /// a user-supplied selector.
+    async fn find_tenant_id_by_name(&self, name: &str) -> Result<Option<TenantId>, DBError>;
+
+    /// Retrieves the tenant with this name, creating it if absent. The second
+    /// component is `true` if this call created the tenant.
+    /// See [`crate::db::operations::tenant::get_or_create_tenant`].
+    async fn get_or_create_tenant(
+        &self,
+        new_id: Uuid, // Used only if the tenant does not yet exist
+        name: &str,
+        provider: &str,
+    ) -> Result<(TenantInfo, bool), DBError>;
+
+    /// Renames a tenant, failing with `DuplicateName` if the name is already
+    /// taken, unless `displace_existing` lets it take the name from the tenant
+    /// holding it. Returns the displaced tenant, if any.
+    /// See [`crate::db::operations::tenant::rename_tenant`].
+    async fn rename_tenant(
+        &self,
+        tenant_id: TenantId,
+        new_name: &str,
+        displace_existing: bool,
+    ) -> Result<Option<TenantInfo>, DBError>;
+
+    /// Deletes a tenant, failing with `TenantNotEmpty` unless it holds no
+    /// pipelines, API keys or OIDC trust relationships.
+    /// See [`crate::db::operations::tenant::delete_tenant`].
+    async fn delete_tenant(&self, tenant_id: TenantId) -> Result<(), DBError>;
+
+    /// Lists all tenants in the installation.
+    async fn list_tenants(&self) -> Result<Vec<TenantInfo>, DBError>;
+
+    /// Resolves a login to its acting tenant and effective role, ensuring the
+    /// user and membership records exist. Owners skip this: their role comes
+    /// from configuration rather than a membership, so `auth` resolves them
+    /// before reaching here. See
+    /// [`crate::db::operations::user::resolve_login`].
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_login(
+        &self,
+        new_tenant_id: Uuid,
+        new_user_id: Uuid,
+        tenant_name: String,
+        provider: String,
+        subject: String,
+        email: Option<String>,
+        default_role: Role,
+        first_user_role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(TenantId, UserId, Role), DBError>;
+
+    /// Lists the tenants a user may act in, with the user's role in each, and
+    /// when the user got the first tenant membership.
+    /// See [`crate::db::operations::user::list_user_memberships`].
+    async fn list_user_memberships(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(Vec<UserMembership>, Option<DateTime<Utc>>), DBError>;
+
+    /// Enrolls a user into the listed tenants where the tenant exists and the
+    /// user is not yet a member; never creates tenants or changes existing
+    /// memberships. See
+    /// [`crate::db::operations::user::enroll_in_existing_tenants`].
+    #[allow(clippy::too_many_arguments)]
+    async fn enroll_in_existing_tenants(
+        &self,
+        new_user_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        names: &[String],
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(), DBError>;
+
+    /// Ensures a user record exists for an OIDC `(provider, subject)` and
+    /// refreshes its stored email. The login path with provisioning off calls
+    /// this instead of [`Storage::resolve_login`].
+    async fn get_or_create_user(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> Result<UserId, DBError>;
+
+    /// Claims the right to refresh an identity's profile from its provider,
+    /// reporting whether this caller won it. See
+    /// [`crate::db::operations::user::claim_profile_refresh`].
+    async fn claim_profile_refresh(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        auth_time: Option<i64>,
+        ttl_seconds: i64,
+    ) -> Result<bool, DBError>;
+
+    /// Stores what the identity provider reports about an identity.
+    /// See [`crate::db::operations::user::store_user_profile`].
+    async fn store_user_profile(
+        &self,
+        provider: &str,
+        subject: &str,
+        profile: &UserProfile,
+    ) -> Result<(), DBError>;
+
+    /// Lists the members of a tenant with their roles.
+    async fn list_tenant_members(&self, tenant_id: TenantId) -> Result<Vec<TenantMember>, DBError>;
+
+    /// Assigns or updates a member's role within a tenant. `origin` records
+    /// provenance on a fresh row; an existing row keeps its recorded origin.
+    async fn upsert_member_role(
+        &self,
+        tenant_id: TenantId,
+        user_id: UserId,
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(), DBError>;
+
+    /// Pre-provisions a tenant member by identity `(provider, subject)`: ensures
+    /// the user record exists and assigns the role, so an admin can grant access
+    /// before the user's first login. Returns the user id.
+    #[allow(clippy::too_many_arguments)]
+    async fn preprovision_member(
+        &self,
+        new_user_id: Uuid,
+        tenant_id: TenantId,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        role: Role,
+    ) -> Result<UserId, DBError>;
+
+    /// Removes a user from a tenant.
+    async fn remove_member(&self, tenant_id: TenantId, user_id: UserId) -> Result<(), DBError>;
+
     /// Retrieves the list of all API keys.
     async fn list_api_keys(&self, tenant_id: TenantId) -> Result<Vec<ApiKeyDescr>, DBError>;
 
@@ -100,19 +262,71 @@ pub(crate) trait Storage {
     /// Deletes an API key by name.
     async fn delete_api_key(&self, tenant_id: TenantId, name: &str) -> Result<(), DBError>;
 
-    /// Persists an SHA-256 hash of an API key in the database.
+    /// Persists a SHA-256 hash of an API key in the database. The role is a
+    /// [`MintableKeyRole`] (read/write only), so `admin`/`owner` cannot be
+    /// persisted as a static key by construction.
     async fn store_api_key_hash(
         &self,
         tenant_id: TenantId,
         id: Uuid,
         name: &str,
         key: &str,
-        permissions: Vec<ApiPermission>,
+        role: MintableKeyRole,
     ) -> Result<(), DBError>;
 
     /// Validates an API key against the database by comparing its SHA-256 hash
     /// against the stored value.
-    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Vec<ApiPermission>), DBError>;
+    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role), DBError>;
+
+    /// Lists OIDC trust relationships in a scope: `Some(tenant)` for that
+    /// tenant's trusts, `None` for the platform-wide owner trusts.
+    async fn list_oidc_trust(&self, tenant_id: TenantId) -> Result<Vec<OidcTrustDescr>, DBError>;
+
+    /// Retrieves a trust relationship by name within a scope (see `list_oidc_trust`).
+    async fn get_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        name: &str,
+    ) -> Result<OidcTrustDescr, DBError>;
+
+    /// Deletes a trust relationship by name within a scope (see `list_oidc_trust`).
+    async fn delete_oidc_trust(&self, tenant_id: TenantId, name: &str) -> Result<(), DBError>;
+
+    /// Persists a new trust relationship. `tenant_id` is `None` for a
+    /// platform-wide owner trust, `Some` for a tenant-scoped one.
+    ///
+    /// `issuer_policy` is deploy-time configuration, like the roles
+    /// `resolve_login` takes: it decides whether this issuer may name an
+    /// address inside the manager's network.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        issuer: &str,
+        subject: &str,
+        audience: Option<&str>,
+        role: Role,
+        issuer_policy: TenantIssuerPolicy,
+    ) -> Result<(), DBError>;
+
+    /// Whether at least one trust relationship names this issuer. Called before
+    /// any OIDC discovery/JWKS fetch so an unregistered issuer never triggers an
+    /// outbound request (SSRF/DoS gate).
+    async fn is_trusted_issuer(&self, issuer: &str) -> Result<bool, DBError>;
+
+    /// Every tenant that trusts a federated token, with the token's role in each
+    /// (see [`crate::db::operations::oidc_trust::match_oidc_trust`]). Empty when
+    /// no trust matches; more than one entry means the caller must pick a tenant
+    /// via the `Feldera-Tenant` header.
+    async fn match_oidc_trust(
+        &self,
+        issuer: &str,
+        subject: &str,
+        audiences: &[String],
+    ) -> Result<Vec<(TenantId, Role)>, DBError>;
 
     /// Retrieves a list of pipelines as extended descriptors.
     async fn list_pipelines(
@@ -199,6 +413,15 @@ pub(crate) trait Storage {
         platform_version: &str,
     ) -> Result<(), DBError>;
 
+    /// Applies `patch` to the deployment config of a running pipeline, and returns the updated
+    /// pipeline.
+    async fn patch_pipeline_deployment(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        patch: &PipelineDeploymentConfig,
+    ) -> Result<ExtendedPipelineDescr, DBError>;
+
     /// Updates an existing pipeline.
     ///
     /// # Arguments
@@ -277,6 +500,21 @@ pub(crate) trait Storage {
         rust_compilation: &RustCompilationInfo,
         program_binary_source_checksum: &str,
         program_binary_integrity_checksum: &str,
+        program_info_integrity_checksum: &str,
+    ) -> Result<(), DBError>;
+
+    /// Transitions program status from `CompilingSql` to `Success` for a Gen-2
+    /// program without Rust UDFs, which the SQL compiler completes without Rust
+    /// compilation. It carries the SQL log and program info (neither is stored yet at
+    /// `CompilingSql`), delivers no pipeline binary (both binary checksums stay
+    /// cleared), and stores no Rust log.
+    async fn transit_program_status_to_success_no_binary(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        program_version_guard: Version,
+        sql_compilation: &SqlCompilationInfo,
+        program_info: &serde_json::Value,
         program_info_integrity_checksum: &str,
     ) -> Result<(), DBError>;
 
@@ -508,21 +746,18 @@ pub(crate) trait Storage {
         total_workers: usize,
     ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError>;
 
-    /// Retrieves the list of fully compiled pipeline programs (pipeline identifier, program version,
-    /// program binary source checksum, program binary integrity checksum) AND pipeline programs that
-    /// are currently being compiled (pipeline identifier, program version) across all tenants.
+    /// Counts pipelines with outstanding compilation work: stopped pipelines
+    /// whose program status is `Pending`, `CompilingSql`, `SqlCompiled`, or
+    /// `CompilingRust`. The predicate must stay the union of the four worker
+    /// queries; the full invariant is documented at
+    /// `operations::pipeline::count_pipelines_needing_compilation`.
+    async fn count_pipelines_needing_compilation(&self) -> Result<u64, DBError>;
+
+    /// Retrieves every pipeline program that is fully compiled or currently compiling, across
+    /// all tenants, with the checksums naming its artifacts. Feeds artifact cleanup.
     async fn list_pipeline_programs_across_all_tenants(
         &self,
-    ) -> Result<
-        Vec<(
-            PipelineId,
-            Version,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )>,
-        DBError,
-    >;
+    ) -> Result<Vec<PipelineProgramArtifacts>, DBError>;
 
     async fn get_support_bundle_data(
         &self,

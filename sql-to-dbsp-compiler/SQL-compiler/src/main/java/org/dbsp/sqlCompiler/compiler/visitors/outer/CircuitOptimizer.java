@@ -29,26 +29,28 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.compiler.AnalyzedSet;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
-import org.dbsp.sqlCompiler.compiler.backend.MerkleOuter;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
+import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.CanonicalForm;
-import org.dbsp.sqlCompiler.compiler.visitors.inner.EliminateDump;
-import org.dbsp.sqlCompiler.compiler.visitors.inner.SimplifyConditionals;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.expandCasts.ExpandCasts;
-import org.dbsp.sqlCompiler.compiler.visitors.inner.ExpandWriteLog;
-import org.dbsp.sqlCompiler.compiler.visitors.inner.ImplementStatics;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.CreateRuntimeErrorWrappers;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.ImplementStatics;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.Simplify;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.SimplifyConditionals;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.SimplifyWaterline;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.expandCasts.ExpandCasts;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.indexSharing.ShareIndexes;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.indexSharing.ShareInputIndexes;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.indexSharing.ShareOutputIntegrators;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.intern.Intern;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.keys.LeftJoinChains;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.merkle.MerkleHashes;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity.MonotoneAnalyzer;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.recursive.RecursiveComponents;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.recursive.ValidateRecursiveOperators;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.temporal.ImplementNow;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.windowSharing.ShareWindowIntegrals;
 import org.dbsp.sqlCompiler.compiler.visitors.unusedFields.UnusedFields;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity.MonotoneAnalyzer;
 import org.dbsp.sqlCompiler.ir.IDBSPOuterNode;
+import org.dbsp.util.Utilities;
 
 /** All optimizations applied to circuits. */
 public class CircuitOptimizer extends Passes {
@@ -75,9 +77,12 @@ public class CircuitOptimizer extends Passes {
         // Example dumping circuit to a png file
         // this.dump(3);
         // First part of optimizations may still synthesize some circuit components
+        this.add(new UDFInliner(compiler).getCircuitRewriter(false));
+        // Runs before ImplementNow so temporal filters compare fields instead of
+        // expensive computations, which makes them implementable as windows
+        this.add(new DecomposeExpensiveFilters(compiler));
         this.add(new ImplementNow(compiler));
-        if (compiler.options.ioOptions.correlatedColumns)
-            this.add(new Lineage(compiler));
+        this.add(new Conditional(compiler, new Lineage(compiler, true), () -> compiler.options.ioOptions.correlatedColumns));
         this.add(new DeterministicFunctions(compiler));
         this.add(new NoConnectorMetadata(compiler).getCircuitVisitor(true));
         this.add(new StopOnError(compiler));
@@ -93,15 +98,17 @@ public class CircuitOptimizer extends Passes {
         AnalyzedSet<DBSPOperator> operatorsAnalyzed = new AnalyzedSet<>();
         this.add(new OptimizeWithGraph(compiler,
                 g -> new OptimizeProjections(compiler, true, g, operatorsAnalyzed), 1));
+        this.add(new FuseExpensiveMaps(compiler));
         this.add(new RemoveViewOperators(compiler, false));
+        this.add(new LeftJoinChains(compiler));
         this.add(new UnusedFields(compiler));
+        this.add(new RemoveUselessLeftJoins(compiler));
         this.add(new Intern(compiler));
         this.add(new CSE(compiler));
         this.add(new ExpandAggregates(compiler, compiler.weightVar));
         this.add(new ExpandAggregateZero(compiler));
         this.add(new Conditional(compiler, new RemoveStarJoins(compiler), this.compiler.metadata::noStarJoins));
         this.add(new DeadCode(compiler, true));
-        this.add(new OptimizeWithGraph(compiler, g -> new PullFilterVisitor(compiler, g)));
         this.add(new PropagateEmptySources(compiler));
         this.add(new OptimizeDistinctVisitor(compiler));
         // This is useful even without incrementalization if we have recursion
@@ -115,12 +122,23 @@ public class CircuitOptimizer extends Passes {
         this.add(new DeadCode(compiler, true));
         this.add(new Simplify(compiler).circuitRewriter(true));
         this.add(new RemoveConstantFilters(compiler));
+        // RemoveConstantFilters has just turned constant-false filters into empty constants
+        this.add(new PropagateEmptySources(compiler));
         this.add(new OptimizeWithGraph(compiler, g -> new OptimizeProjectionVisitor(compiler, g)));
+        this.add(new OptimizeWithGraph(compiler, g -> new PullFilterVisitor(compiler, g)));
         this.add(new OptimizeWithGraph(compiler,
                 g -> new OptimizeProjections(compiler, true, g, operatorsAnalyzed)));
         this.add(new ShareIndexes(compiler));
+        // Windows share an input only if the operators computing it are shared.  For the filters
+        // that ImplementNow generates this happens once the projections above them have been
+        // fused, which is after the CSE earlier in this pipeline.
+        this.add(new CSE(compiler));
+        this.add(new ShareWindowIntegrals(compiler));
         // Combining Joins with subsequent filters can improve the precision of the monotonicity analysis
         this.add(new OptimizeWithGraph(compiler, g -> new FilterJoinVisitor(compiler, g)));
+        // Runs before MonotoneAnalyzer, whose SeparateIntegrators gives the join its own integral
+        // wherever garbage collection needs it
+        this.add(new ShareOutputIntegrators(compiler));
         this.add(new MonotoneAnalyzer(compiler));
         // Can remove this table after the monotone analysis only
         this.add(new RemoveTable(compiler, DBSPCompiler.ERROR_TABLE_NAME));
@@ -129,6 +147,8 @@ public class CircuitOptimizer extends Passes {
         this.add(new OptimizeWithGraph(compiler, g -> new CloneOperatorsWithFanout(compiler, g)));
         this.add(new LinearPostprocessRetainKeys(compiler));
         this.add(new ExpandIndexedInputs(compiler));
+        // Needs the GC operators of MonotoneAnalyzer and the primary-key indexes of ExpandIndexedInputs
+        this.add(new FindUnboundedState(compiler));
         this.add(new Conditional(compiler, new InsertWeightValidation(compiler),
                 this.compiler.metadata::enforcePositiveInputs));
         this.add(new OptimizeWithGraph(compiler, g -> new FilterJoinVisitor(compiler, g)));
@@ -141,15 +161,12 @@ public class CircuitOptimizer extends Passes {
         this.add(new RemoveDeindexOperators(compiler));
         this.add(new OptimizeWithGraph(compiler, g -> new RemoveNoops(compiler, g)));
         this.add(new RemoveIdentityOperators(compiler));
-        this.add(new ShareInputIndexes(compiler));
         this.add(new OptimizeWithGraph(compiler, g -> new ChainVisitor(compiler, g)));
         this.add(new OptimizeWithGraph(compiler,
                 g -> new OptimizeProjections(compiler, false, g, operatorsAnalyzed)));
         this.add(new SimplifyWaterline(compiler)
                 .circuitRewriter(node -> node.hasAnnotation(a -> a.is(Waterline.class))));
-        this.add(new EliminateDump(compiler).circuitRewriter(false));
         this.add(new Simplify(compiler).circuitRewriter(true));
-        this.add(new ExpandWriteLog(compiler).circuitRewriter(false));
         this.add(new CSE(compiler));
         this.add(new ValidateRecursiveOperators(compiler));
         this.add(new LowerAsof(compiler));
@@ -170,20 +187,82 @@ public class CircuitOptimizer extends Passes {
         this.add(new OptimizeWithGraph(compiler, g -> new StrayGC(compiler, g)));
         // The canonical form is needed if we want the Merkle hashes to be "stable".
         this.add(new CanonicalForm(compiler).getCircuitRewriter(false));
-        this.add(new StaticDeclarations(compiler, new ImplementStatics(compiler, !compiler.options.ioOptions.multiCrates())));
+        this.add(new ConstantViews(compiler));
+        // A static spares the Rust code from rebuilding a constant on every call; the Gen-2 engine
+        // evaluates a closure over a whole batch, and a constant kept inline leaves the closure
+        // self-contained.
+        this.add(new Conditional(compiler,
+                new StaticDeclarations(compiler, new ImplementStatics(compiler, !options.ioOptions.multiCrates())),
+                () -> !options.ioOptions.gen2));
         // From now on we cannot really change the graph anymore.
 
         // this.add(new TestSerialize(compiler));
         this.add(new CheckHints(compiler));
         this.add(new ComparatorDeclarations(compiler, new DeclareComparators(compiler)));
+        // Before the Merkle hashes, so that they hash the circuit the Gen-2 engine reads
+        this.add(new Conditional(compiler, new Gen2Passes(compiler), () -> options.ioOptions.gen2));
         this.add(new CompactNames(compiler));
-        this.add(new MerkleOuter(compiler, true));
-        this.add(new MerkleOuter(compiler, false));
+        this.add(new MerkleHashes(compiler));
         this.add(new TagRegions(compiler));
         this.add(new CircuitStatistics(compiler));
     }
 
+    /** Every pass must leave a circuit with consistent stream kinds; when the testing option
+     * asks for it, the circuit must also survive a round trip through JSON. */
+    @Override
+    protected void afterPass(DBSPCircuit circuit) {
+        new ValidateStreamKinds(this.compiler).apply(circuit);
+        if (this.compiler.options.ioOptions.checkSerialization)
+            new TestSerialize(this.compiler).apply(circuit);
+    }
+
     public DBSPCircuit optimize(DBSPCircuit input) {
-        return this.apply(input);
+        DBSPCircuit result = this.apply(input);
+        boolean requested = this.compiler.options.languageOptions.incrementalize;
+        Utilities.enforce(result.incremental == requested, () -> "The circuit is " +
+                (result.incremental ? "" : "not ") + "incremental, but the compilation " +
+                (requested ? "requires" : "does not allow") + " an incremental circuit");
+        return result;
+    }
+
+    /** Index of the {@code occurrence}-th pass of class {@code anchor}, counting from 1 */
+    private int indexOf(Class<? extends CircuitTransform> anchor, int occurrence) {
+        Utilities.enforce(occurrence >= 1, () -> "Occurrence " + occurrence + " is not positive");
+        int seen = 0;
+        for (int i = 0; i < this.passes.size(); i++) {
+            if (!anchor.isInstance(this.passes.get(i)))
+                continue;
+            seen++;
+            if (seen == occurrence)
+                return i;
+        }
+        throw new InternalCompilerError("Only " + seen + " passes of class " + anchor.getSimpleName() +
+                " in " + this.name + ", occurrence " + occurrence + " requested");
+    }
+
+    /** Insert {@code pass} before the first pass of class {@code anchor}, which must be present.
+     * Testing hook: production code adds its passes in order and must not use it. */
+    public void insertBefore(Class<? extends CircuitTransform> anchor, CircuitTransform pass) {
+        this.insertBefore(anchor, 1, pass);
+    }
+
+    /** Insert {@code pass} before the {@code occurrence}-th pass of class {@code anchor}, counting
+     * from 1; at least that many must be present.  Testing hook, like
+     * {@link #insertBefore(Class, CircuitTransform)}. */
+    public void insertBefore(Class<? extends CircuitTransform> anchor, int occurrence, CircuitTransform pass) {
+        this.passes.add(this.indexOf(anchor, occurrence), pass);
+    }
+
+    /** Insert {@code pass} after the first pass of class {@code anchor}, which must be present.
+     * Testing hook, like {@link #insertBefore(Class, CircuitTransform)}. */
+    public void insertAfter(Class<? extends CircuitTransform> anchor, CircuitTransform pass) {
+        this.insertAfter(anchor, 1, pass);
+    }
+
+    /** Insert {@code pass} after the {@code occurrence}-th pass of class {@code anchor}, counting
+     * from 1; at least that many must be present.  Testing hook, like
+     * {@link #insertBefore(Class, CircuitTransform)}. */
+    public void insertAfter(Class<? extends CircuitTransform> anchor, int occurrence, CircuitTransform pass) {
+        this.passes.add(this.indexOf(anchor, occurrence) + 1, pass);
     }
 }

@@ -40,7 +40,7 @@ impl Journal {
     }
 
     pub fn read(&self, step: Step) -> Result<Option<StepMetadata>, StepError> {
-        let path = self.path.child(format!("{step}.bin"));
+        let path = self.path.clone().join(format!("{step}.bin"));
         let data = match self.backend.read(&path) {
             Ok(data) => data,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -63,14 +63,18 @@ impl Journal {
     }
 
     pub fn write(&self, record: &StepMetadata) -> Result<(), StepError> {
-        let path = self.path.child(format!("{}.bin", record.step));
+        let path = self.path.clone().join(format!("{}.bin", record.step));
         let mut data = FBuf::new();
         rmp_serde::encode::write(&mut data, record).map_err(|error| StepError::EncodeError {
             path: self.path.as_ref().into(),
             error,
         })?;
+        // Commit before returning: a step is replayable only if its journal
+        // record survives a crash, and `write` alone leaves the record in the
+        // page cache.
         self.backend
             .write(&path, data)
+            .and_then(|record| record.commit())
             .map_err(|error| StepError::storage_error(&path, error))?;
         Ok(())
     }
@@ -183,6 +187,18 @@ pub struct StepMetadata {
     /// A given endpoint is included if it existed before the step and is not in
     /// `remove_inputs`, or if it is included in `add_inputs`.
     pub input_logs: HashMap<String, InputLog>,
+
+    /// Changes to existing output endpoints within the step.
+    ///
+    /// Currently we only log changes to the endpoint's paused state, so that
+    /// replay drops the output of a paused endpoint exactly as the recorded
+    /// run did.
+    ///
+    /// This field must stay last: records are encoded as arrays, so a journal
+    /// written before this field existed is one element short, and only a
+    /// trailing field can be defaulted.
+    #[serde(default)]
+    pub changed_outputs: HashMap<String, bool>,
 }
 
 /// A journal record for a single endpoint for a single step.
@@ -252,16 +268,20 @@ mod tests {
     };
 
     use dbsp::{
-        circuit::StorageCacheConfig,
+        circuit::{StorageCacheConfig, metrics::FILES_SYNCED},
         storage::backend::{StoragePath, posixio_impl::PosixBackend},
     };
+    use std::sync::atomic::Ordering;
 
     use feldera_types::config::FileBackendConfig;
     use tempfile::TempDir;
 
     use crate::{controller::journal::Journal, test::init_test_logger};
+    use feldera_adapterlib::transport::Step;
+    use feldera_types::{config::InputEndpointConfig, transaction::TransactionId};
+    use serde::Serialize;
 
-    use super::StepMetadata;
+    use super::{InputLog, StepMetadata};
 
     /// Create and write a steps file and then read it back.
     #[test]
@@ -284,6 +304,7 @@ mod tests {
                 add_inputs: HashMap::new(),
                 changed_inputs: HashMap::new(),
                 input_logs: HashMap::new(),
+                changed_outputs: HashMap::new(),
             })
             .collect::<Vec<_>>();
 
@@ -299,5 +320,84 @@ mod tests {
 
         let last_record = records.last().unwrap();
         assert_eq!(journal.read(last_record.step + 1).unwrap(), None);
+    }
+
+    /// Every journal record must be fsynced before `write` returns.
+    ///
+    /// A step is replayable only if its record survives a crash, and
+    /// `StorageBackend::write` leaves the record in the page cache: durability
+    /// is the caller's job. `Journal::write` used to rely on the POSIX
+    /// backend's `complete` happening to fsync, which it no longer does.
+    ///
+    /// `FILES_SYNCED` counts the whole process, and other tests in this binary
+    /// run concurrently, so this asserts a lower bound. Concurrent tests can
+    /// only inflate the count, never deflate it, so the assertion never fails
+    /// spuriously; dropping the commit takes the contribution to zero.
+    #[test]
+    fn write_commits_every_record() {
+        init_test_logger();
+
+        let tempdir = TempDir::new().unwrap();
+        let backend = Arc::new(PosixBackend::new(
+            tempdir,
+            StorageCacheConfig::default(),
+            &FileBackendConfig::default(),
+        ));
+        let journal = Journal::create(backend, &StoragePath::from("journal")).unwrap();
+
+        const RECORDS: u64 = 10;
+        let before = FILES_SYNCED.load(Ordering::Relaxed);
+        for step in 0..RECORDS {
+            journal
+                .write(&StepMetadata {
+                    step,
+                    transaction_id: step as i64,
+                    remove_inputs: HashSet::new(),
+                    add_inputs: HashMap::new(),
+                    changed_inputs: HashMap::new(),
+                    input_logs: HashMap::new(),
+                    changed_outputs: HashMap::new(),
+                })
+                .unwrap();
+        }
+        let synced = FILES_SYNCED.load(Ordering::Relaxed) - before;
+        assert!(
+            synced >= RECORDS,
+            "{RECORDS} journal records must produce at least {RECORDS} fsyncs, saw {synced}"
+        );
+    }
+
+    /// A record written before [StepMetadata::changed_outputs] existed is one
+    /// element short of the current struct.  It must still decode, with no
+    /// output endpoint changes to replay.
+    #[test]
+    fn test_read_record_without_changed_outputs() {
+        /// [StepMetadata] as it was before `changed_outputs` was added.
+        #[derive(Serialize)]
+        struct OldStepMetadata {
+            step: Step,
+            transaction_id: TransactionId,
+            remove_inputs: HashSet<String>,
+            add_inputs: HashMap<String, InputEndpointConfig>,
+            changed_inputs: HashMap<String, bool>,
+            input_logs: HashMap<String, InputLog>,
+        }
+
+        let old = OldStepMetadata {
+            step: 7,
+            transaction_id: 3,
+            remove_inputs: HashSet::from(["gone".into()]),
+            add_inputs: HashMap::new(),
+            changed_inputs: HashMap::from([("paused_input".to_string(), true)]),
+            input_logs: HashMap::new(),
+        };
+
+        let mut encoded = Vec::new();
+        rmp_serde::encode::write(&mut encoded, &old).unwrap();
+        let decoded = rmp_serde::decode::from_slice::<StepMetadata>(&encoded).unwrap();
+
+        assert_eq!(decoded.step, 7);
+        assert_eq!(decoded.changed_inputs, old.changed_inputs);
+        assert!(decoded.changed_outputs.is_empty());
     }
 }

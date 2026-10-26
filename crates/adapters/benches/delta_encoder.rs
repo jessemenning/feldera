@@ -8,6 +8,7 @@ use feldera_adapterlib::transport::OutputBatchType;
 use feldera_types::transport::delta_table::{DeltaTableWriteMode, DeltaTableWriterConfig};
 use std::sync::Weak;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Delta-specific helpers
@@ -17,12 +18,17 @@ fn create_indexed_writer(threads: usize, table_uri: &str) -> DeltaTableWriter {
     let config = DeltaTableWriterConfig {
         uri: table_uri.to_string(),
         mode: DeltaTableWriteMode::Truncate,
+        variant_encoding: Default::default(),
         max_retries: Some(0),
         threads: Some(threads),
         object_store_config: Default::default(),
         checkpoint_interval: None,
         log_retention_duration: None,
         enable_expired_log_cleanup: None,
+        update_mode: Default::default(),
+        lookup_chunk_size: feldera_types::size::ConfigSize::from_mib(1),
+        max_concurrent_probes: 4,
+        auto_compact: false,
     };
     let key_schema = Some(BenchKeyStruct::relation_schema());
     let mut value_schema = BenchTestStruct::relation_schema();
@@ -34,7 +40,9 @@ fn create_indexed_writer(threads: usize, table_uri: &str) -> DeltaTableWriter {
         &key_schema,
         &value_schema,
         Weak::new(),
+        CancellationToken::new(),
         false,
+        true,
         true,
     )
     .unwrap()

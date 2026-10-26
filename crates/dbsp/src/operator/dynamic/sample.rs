@@ -130,7 +130,7 @@ where
             .apply2_owned(num_quantiles, move |sample, num_quantiles| {
                 let num_quantiles = min(*num_quantiles, MAX_QUANTILES);
 
-                let sample_size = sample.key_count();
+                let sample_size = sample.key_count_upper_bound();
 
                 if sample_size <= num_quantiles {
                     sample
@@ -165,7 +165,7 @@ where
             .apply2_owned(num_quantiles, move |sample, num_quantiles| {
                 let num_quantiles = min(*num_quantiles, MAX_QUANTILES);
 
-                let sample_size = sample.key_count();
+                let sample_size = sample.key_count_upper_bound();
 
                 if sample_size <= num_quantiles {
                     sample
@@ -333,12 +333,13 @@ where
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 mod test {
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
         DynZWeight, RootCircuit, Runtime, ZWeight,
         dynamic::{DowncastTrait, DynData, DynPair},
         operator::{IndexedZSetHandle, InputHandle, MapHandle, OutputHandle, Update},
         trace::{
-            Cursor, Trace,
+            Cursor, Trace, TraceRole,
             test::test_batch::{TestBatch, TestBatchFactories, batch_to_tuples},
         },
         typed_batch::{
@@ -448,13 +449,15 @@ mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn sample_keys_proptest(trace in input_trace(100, 5, 200, 20)) {
 
             let (mut dbsp, (sample_size_handle, input_handle, output_sample_handle, output_quantile_handle)) =
                 Runtime::init_circuit(4, test_circuit).unwrap();
 
-            let mut ref_trace: TestBatch<DynData/*<i32>*/, DynData/*<i32>*/, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")));
+            let mut ref_trace: TestBatch<DynData/*<i32>*/, DynData/*<i32>*/, (), DynZWeight> = TestBatch::new(&TestBatchFactories::new(), Arc::new(String::from("Test")), TraceRole::Integral);
 
             for (batch, sample_size) in trace.into_iter() {
 
@@ -487,8 +490,8 @@ mod test {
                 }
                 let all_keys_set = all_keys.iter().cloned().collect::<BTreeSet<_>>();
 
-                assert!(output_sample.key_count() <= all_keys_set.len());
-                assert!(output_sample.key_count() <= sample_size);
+                assert!(output_sample.key_count_upper_bound() <= all_keys_set.len());
+                assert!(output_sample.key_count_upper_bound() <= sample_size);
 
                 let mut cursor = output_sample.cursor();
                 while cursor.key_valid() {
@@ -496,8 +499,8 @@ mod test {
                     cursor.step_key();
                 }
 
-                assert!(output_quantile.key_count() <= all_keys_set.len());
-                assert!(output_quantile.key_count() <= sample_size);
+                assert!(output_quantile.key_count_upper_bound() <= all_keys_set.len());
+                assert!(output_quantile.key_count_upper_bound() <= sample_size);
 
                 let mut cursor = output_quantile.cursor();
                 while cursor.key_valid() {
@@ -548,8 +551,8 @@ mod test {
                 }
                 let all_keys_set = all_keys.iter().cloned().collect::<BTreeSet<_>>();
 
-                assert!(output_sample.key_count() <= all_keys_set.len());
-                assert!(output_sample.key_count() <= sample_size);
+                assert!(output_sample.key_count_upper_bound() <= all_keys_set.len());
+                assert!(output_sample.key_count_upper_bound() <= sample_size);
 
                 let mut cursor = output_sample.cursor();
                 while cursor.key_valid() {
@@ -557,8 +560,8 @@ mod test {
                     cursor.step_key();
                 }
 
-                assert!(output_quantile.key_count() <= all_keys_set.len());
-                assert!(output_quantile.key_count() <= sample_size);
+                assert!(output_quantile.key_count_upper_bound() <= all_keys_set.len());
+                assert!(output_quantile.key_count_upper_bound() <= sample_size);
 
                 let mut cursor = output_quantile.cursor();
                 while cursor.key_valid() {

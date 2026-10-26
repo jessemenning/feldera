@@ -2,11 +2,12 @@ use chrono::{DateTime, Utc};
 use dbsp::storage::backend::{StorageBackend, StoragePath};
 use feldera_types::{
     adapter_stats::ConnectorError, checkpoint::CheckpointMetadata, config::PipelineConfig,
+    coordination::InputDistribution,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -66,6 +67,16 @@ pub struct Checkpoint {
     /// Statistics for the output endpoints.
     #[serde(default)]
     pub output_statistics: HashMap<String, CheckpointOutputEndpointMetrics>,
+
+    /// The distribution of the distributed input connectors that this host
+    /// used (see `CoordinationActivate::input_distribution`).
+    ///
+    /// A distributed connector's resume state on each host covers only the
+    /// part of the input that its distribution gave that host, so resuming
+    /// from this checkpoint must keep the distribution.  This is empty without
+    /// a coordinator and in checkpoints that predate distributed connectors.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_distribution: BTreeMap<String, InputDistribution>,
 }
 
 impl Checkpoint {
@@ -237,16 +248,12 @@ impl CheckpointOutputEndpointMetrics {
     pub fn from_endpoint_status(status: &OutputEndpointStatus, snapshot_sent: bool) -> Self {
         let snapshot = status.metrics.snapshot();
         Self {
-            // Includes all the records that have been transmitted plus all
-            // of the records that will be transmitted by the time we commit
-            // the checkpoint.
-            transmitted_records: snapshot.transmitted_records
-                + snapshot.buffered_records
-                + snapshot.queued_records,
-
-            // Only the bytes and errors already transmitted, not including
-            // those that will be transmitted by the time we commit the
-            // checkpoint (we don't have proper statistics for those).
+            // What the endpoint had transmitted when the checkpoint started.
+            // `CheckpointThread` replaces both figures with what it had
+            // transmitted once it caught up with the checkpoint, which is what
+            // the checkpoint needs; these stand only for an endpoint that goes
+            // away before it gets there.
+            transmitted_records: snapshot.transmitted_records,
             transmitted_bytes: snapshot.transmitted_bytes,
 
             // We can't predict how many errors there will be by the time we
@@ -306,7 +313,7 @@ impl Checkpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointInputEndpointMetrics, CheckpointOutputEndpointMetrics};
+    use super::{Checkpoint, CheckpointInputEndpointMetrics, CheckpointOutputEndpointMetrics};
     use crate::controller::stats::{ConnectorErrorList, MAX_CONNECTOR_ERRORS};
     use chrono::{TimeZone, Utc};
     use feldera_types::adapter_stats::ConnectorError;
@@ -397,6 +404,34 @@ mod tests {
                 .to_api_type()
                 .is_empty()
         );
+    }
+
+    /// A checkpoint written before output connectors could be paused has no
+    /// `paused` field in its output connector configurations.  It must still
+    /// open, with the connectors coming back running, which is how those
+    /// pipelines behaved.
+    #[test]
+    fn checkpoint_backcompat_defaults_output_connector_to_running() {
+        let old_format = serde_json::json!({
+            "circuit": null,
+            "step": 3,
+            "config": {
+                "workers": 4,
+                "outputs": {
+                    "v.c": {
+                        "stream": "v",
+                        "transport": { "name": "file_output", "config": { "path": "/dev/null" } },
+                    },
+                },
+            },
+            "processed_records": 100,
+            "input_metadata": {},
+        });
+
+        let checkpoint: Checkpoint = serde_json::from_value(old_format).unwrap();
+        let connector = &checkpoint.config.outputs["v.c"];
+
+        assert!(!connector.connector_config.paused);
     }
 
     #[test]

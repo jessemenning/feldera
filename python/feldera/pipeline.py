@@ -1,6 +1,7 @@
 import logging
 import pathlib
 import time
+import warnings
 from collections import deque
 from datetime import datetime
 from threading import Event
@@ -39,6 +40,7 @@ from feldera.enums import (
 from feldera.output_handler import OutputHandler
 from feldera.rest.errors import FelderaAPIError
 from feldera.rest.feldera_client import FelderaClient
+from feldera.rest.logs import LogStream
 from feldera.rest.pipeline import Pipeline as InnerPipeline
 from feldera.rest.sql_table import SQLTable
 from feldera.rest.sql_view import SQLView
@@ -114,12 +116,56 @@ class Pipeline:
 
         return PipelineStatistics.from_dict(self.client.get_pipeline_stats(self.name))
 
+    def metrics(self, format: str = "prometheus"):
+        """Gets the pipeline circuit metrics.
+
+        :param format: The metrics format, "prometheus" (default) or "json".
+        :return: Prometheus exposition text as `str`, or a `dict` for "json".
+        """
+
+        return self.client.get_pipeline_metrics(self.name, format=format)
+
     def logs(self) -> Generator[str, None, None]:
         """Gets the pipeline logs."""
 
         return self.client.get_pipeline_logs(self.name)
 
-    def input_pandas(self, table_name: str, df: pandas.DataFrame, force: bool = False):
+    def resume_logs(self, cursor: Optional[str] = None) -> LogStream:
+        """
+        Open the pipeline logs stream, starting from the last read line (cursor).
+
+        Where :meth:`logs` replays the whole retained buffer on every connection, this
+        delivers only the lines following `cursor`.
+
+        The logs buffer is discarded when the runner restarts or the pipeline is deleted,
+        and survives a pipeline being stopped and started. A cursor issued during an
+        earlier lifetime of the buffer is not an error: the stream starts at the beginning
+        of the retained buffer, and `LogPosition.gap` names the lines that were lost.
+
+        For example, to keep reading the logs across dropped connections::
+
+            cursor = None
+            while True:
+                with pipeline.resume_logs(cursor) as stream:
+                    for line in stream:
+                        print(line)
+                    cursor = stream.cursor()
+
+        :param cursor: The position to resume after, as returned by
+            :meth:`feldera.rest.logs.LogStream.cursor`. `None` starts at the beginning of
+            the retained buffer.
+        :return: The open stream. Close it when done reading.
+        """
+
+        return self.client.resume_pipeline_logs(self.name, cursor)
+
+    def input_pandas(
+        self,
+        table_name: str,
+        df: pandas.DataFrame,
+        force: bool = False,
+        connector_metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[str]:
         """
         Push all rows in a pandas DataFrame to the pipeline.
 
@@ -131,6 +177,12 @@ class Pipeline:
         :param table_name: The name of the table to insert data into.
         :param df: The pandas DataFrame to be pushed to the pipeline.
         :param force: `True` to push data even if the pipeline is paused. `False` by default.
+        :param connector_metadata: Connector metadata for every row of the DataFrame,
+            as a dict of attribute names to values. ``CONNECTOR_METADATA()`` returns it
+            for the rows. None by default.
+
+        :returns: The completion token of the last chunk pushed, which also covers
+            the earlier chunks, or None if the DataFrame is empty and nothing was pushed.
 
         :raises ValueError: If the table does not exist in the pipeline.
         :raises RuntimeError: If the pipeline is not in a valid state to push data.
@@ -161,8 +213,9 @@ class Pipeline:
             )
         else:
             # consider validating the schema here
+            token = None
             for datum in chunk_dataframe(df):
-                self.client.push_to_pipeline(
+                token = self.client.push_to_pipeline(
                     self.name,
                     table_name,
                     "json",
@@ -171,8 +224,9 @@ class Pipeline:
                     array=True,
                     serialize=False,
                     force=force,
+                    connector_metadata=connector_metadata,
                 )
-            return
+            return token
 
     def input_json(
         self,
@@ -181,6 +235,7 @@ class Pipeline:
         update_format: str = "raw",
         force: bool = False,
         wait: bool = True,
+        connector_metadata: Optional[Mapping[str, Any]] = None,
         **kwargs,
     ) -> str:
         """
@@ -196,6 +251,11 @@ class Pipeline:
             "raw", "insert_delete". https://docs.feldera.com/formats/json#the-insertdelete-format
         :param force: `True` to push data even if the pipeline is paused. `False` by default.
         :param wait: If True, blocks until this input has been processed by the pipeline
+        :param connector_metadata: Connector metadata for every record of this request,
+            as a dict of attribute names to values. ``CONNECTOR_METADATA()`` returns it
+            for the records, so a column declared with
+            ``DEFAULT CAST(CONNECTOR_METADATA()['name'] AS type)`` takes its value from
+            the ``name`` attribute. None by default.
         :param kwargs: Additional key word arguments forwarded to the Client push_to_pipeline method
 
         :returns: The completion token to this input.
@@ -222,19 +282,19 @@ class Pipeline:
             array=array,
             force=force,
             wait=wait,
+            connector_metadata=connector_metadata,
             **kwargs,
         )
 
-    def pause_connector(self, table_name: str, connector_name: str):
+    def pause_input_connector(self, table_name: str, connector_name: str):
         """
         Pause the specified input connector.
 
-        Connectors allow feldera to fetch data from a source or write data to a sink.
-        This method allows users to **PAUSE** a specific **INPUT** connector.
-        All connectors are RUNNING by default.
+        A paused input connector stops fetching data from its source. All
+        connectors are RUNNING by default.
 
         Refer to the connector documentation for more information:
-            https://docs.feldera.com/connectors/#input-connector-orchestration
+            https://docs.feldera.com/connectors/orchestration#input-connectors
 
         :param table_name: The name of the table that the connector is attached to.
         :param connector_name: The name of the connector to pause.
@@ -242,26 +302,89 @@ class Pipeline:
         :raises FelderaAPIError: If the connector is not found, or if the pipeline is not running.
         """
 
-        self.client.pause_connector(self.name, table_name, connector_name)
+        self.client.pause_input_connector(self.name, table_name, connector_name)
 
-    def resume_connector(self, table_name: str, connector_name: str):
+    def start_input_connector(self, table_name: str, connector_name: str):
         """
-        Resume the specified connector.
-
-        Connectors allow feldera to fetch data from a source or write data to a sink.
-        This method allows users to **RESUME / START** a specific **INPUT** connector.
-        All connectors are RUNNING by default.
+        Start (resume) the specified input connector.
 
         Refer to the connector documentation for more information:
-            https://docs.feldera.com/connectors/#input-connector-orchestration
+            https://docs.feldera.com/connectors/orchestration#input-connectors
 
         :param table_name: The name of the table that the connector is attached to.
-        :param connector_name: The name of the connector to resume.
+        :param connector_name: The name of the connector to start.
 
         :raises FelderaAPIError: If the connector is not found, or if the pipeline is not running.
         """
 
-        self.client.resume_connector(self.name, table_name, connector_name)
+        self.client.start_input_connector(self.name, table_name, connector_name)
+
+    def pause_connector(self, table_name: str, connector_name: str):
+        """
+        Pause the specified input connector.
+
+        .. deprecated::
+            Use :meth:`.pause_input_connector`, which names the kind of
+            connector it acts on, like :meth:`.pause_output_connector`.
+        """
+        warnings.warn(
+            "pause_connector is deprecated; use pause_input_connector.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.pause_input_connector(table_name, connector_name)
+
+    def resume_connector(self, table_name: str, connector_name: str):
+        """
+        Start (resume) the specified input connector.
+
+        .. deprecated::
+            Use :meth:`.start_input_connector`, which names the kind of
+            connector it acts on, like :meth:`.start_output_connector`.
+        """
+        warnings.warn(
+            "resume_connector is deprecated; use start_input_connector.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.start_input_connector(table_name, connector_name)
+
+    def pause_output_connector(self, view_name: str, connector_name: str):
+        """
+        Pause the specified output connector.
+
+        A paused output connector discards the output it receives instead of
+        writing it to its sink. Output produced while the connector is paused is
+        gone for good. All connectors are RUNNING by default.
+
+        Refer to the connector documentation for more information:
+            https://docs.feldera.com/connectors/orchestration#output-connectors
+
+        :param view_name: The name of the view that the connector is attached to.
+        :param connector_name: The name of the connector to pause.
+
+        :raises FelderaAPIError: If the connector is not found, or if the pipeline is not running.
+        """
+
+        self.client.pause_output_connector(self.name, view_name, connector_name)
+
+    def start_output_connector(self, view_name: str, connector_name: str):
+        """
+        Start (resume) the specified output connector.
+
+        The connector resumes with the output the pipeline produces from this
+        point on; output produced while it was paused is not replayed.
+
+        Refer to the connector documentation for more information:
+            https://docs.feldera.com/connectors/orchestration#output-connectors
+
+        :param view_name: The name of the view that the connector is attached to.
+        :param connector_name: The name of the connector to start.
+
+        :raises FelderaAPIError: If the connector is not found, or if the pipeline is not running.
+        """
+
+        self.client.start_output_connector(self.name, view_name, connector_name)
 
     def input_connector_stats(
         self, table_name: str, connector_name: str
@@ -293,6 +416,9 @@ class Pipeline:
         The handle will only receive changes from the point in time when the listener is created.
         In order to receive all changes since the pipeline started, you can create the pipeline in the `PAUSED` state
         using :meth:`start_paused`, attach listeners and unpause the pipeline using :meth:`resume`.
+
+        To read the changes that one input caused, pass the input's completion
+        token to :meth:`.OutputHandler.wait_for_token` before reading the handle.
 
         :param view_name: The name of the view to listen to.
         """
@@ -387,11 +513,19 @@ class Pipeline:
             raise RuntimeError("Pipeline must be running to wait for completion")
 
         start_time = time.monotonic()
-        long_op = LongOperationWarning(
+        # Reused by the warning message below; is_complete() would fetch and
+        # discard the same stats, hiding whether the wait is stalled or just
+        # slow (e.g. mid-transaction-commit).
+        latest_stats: Optional[PipelineStatistics] = None
+        wait_for_completion = LongOperationWarning(
             logger,
-            lambda elapsed: f"still waiting for pipeline {self.name} to complete, "
-            f"waited {elapsed:.1f} seconds",
-            lambda elapsed: f"pipeline {self.name} completed after {elapsed:.1f} seconds",
+            lambda elapsed: (
+                f"still waiting for pipeline {self.name} to complete, "
+                f"waited {elapsed:.1f} seconds ({latest_stats.global_metrics.progress_summary()})"
+            ),
+            lambda elapsed: (
+                f"pipeline {self.name} completed after {elapsed:.1f} seconds"
+            ),
         )
 
         while True:
@@ -403,16 +537,19 @@ class Pipeline:
                         f" pipeline '{self.name}' to complete"
                     )
 
-            pipeline_complete: bool = self.is_complete()
+            latest_stats = self.stats()
+            pipeline_complete: Optional[bool] = (
+                latest_stats.global_metrics.pipeline_complete
+            )
             if pipeline_complete is None:
                 raise RuntimeError(
                     "received unknown metrics from the pipeline, pipeline_complete is None"
                 )
             elif pipeline_complete:
-                long_op.done()
+                wait_for_completion.done()
                 break
 
-            long_op.check()
+            wait_for_completion.check()
             time.sleep(1)
 
         if force_stop:
@@ -579,6 +716,7 @@ metrics"""
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
+        reloadable_tables: Optional[List[str]] = None,
     ):
         """
         .. _start:
@@ -600,7 +738,22 @@ metrics"""
         :param wait: Set True to wait for the pipeline to start. True by default
         :param dismiss_error: Set True to dismiss any deployment error before starting;
             set False to make it fail in that case. True by default.
+        :param reloadable_tables: Tables that bootstrapping may reload. Use it
+            with `bootstrap_policy=BootstrapPolicy.ALLOW` and `wait=True`.
+            If a table is modified, bootstrapping will reload the table: it truncates the table and
+            resets its input connectors. Write each name exactly as the pipeline
+            reports it in the approval diff: an unquoted SQL name in lowercase,
+            a quoted name without its quotes. For example, write `t1` for
+            `CREATE TABLE T1` and `MyTable` for `CREATE TABLE "MyTable"`.
+            None by default: ALLOW bootstraps without a check. If no tables are
+            acceptable to reload, set `reloadable_tables=[]`.
         :raises RuntimeError: If the pipeline is not in STOPPED state.
+        :raises TableReloadNotAllowedError: If a modified table is not in
+            `reloadable_tables`, or the pipeline cannot compute the program
+            diff. The pipeline stays in the AWAITINGAPPROVAL state: call
+            `approve()` to bootstrap or `stop(force=True)` to reject.
+        :raises ValueError: If `reloadable_tables` is set with a bootstrap
+            policy other than ALLOW, or with `wait=False`.
         """
 
         self.client.start_pipeline(
@@ -611,6 +764,7 @@ metrics"""
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
+            reloadable_tables=reloadable_tables,
         )
 
     def start_paused(
@@ -621,6 +775,7 @@ metrics"""
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
+        reloadable_tables: Optional[List[str]] = None,
     ):
         """
         Starts the pipeline in the paused state.
@@ -636,6 +791,8 @@ metrics"""
             pipeline to start (defaults to `None` = no timeout is enforced).
         :param dismiss_error: Set True to dismiss any deployment error before starting;
             set False to make it fail in that case. True by default.
+        :param reloadable_tables: Tables that bootstrapping may reload. See
+            :meth:`start`.
         """
 
         return self.client.start_pipeline_as_paused(
@@ -646,6 +803,7 @@ metrics"""
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
+            reloadable_tables=reloadable_tables,
         )
 
     def start_standby(
@@ -656,6 +814,7 @@ metrics"""
         wait: bool = True,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
+        reloadable_tables: Optional[List[str]] = None,
     ):
         """
         Starts the pipeline in the standby state.
@@ -671,6 +830,8 @@ metrics"""
             pipeline to start (defaults to `None` = no timeout is enforced).
         :param dismiss_error: Set True to dismiss any deployment error before starting;
             set False to make it fail in that case. True by default.
+        :param reloadable_tables: Tables that bootstrapping may reload. See
+            :meth:`start`.
         """
 
         self.client.start_pipeline_as_standby(
@@ -681,6 +842,7 @@ metrics"""
             wait=wait,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
+            reloadable_tables=reloadable_tables,
         )
 
     def restart(
@@ -690,6 +852,7 @@ metrics"""
         concurrent_bootstrap: bool = False,
         timeout_s: Optional[float] = None,
         dismiss_error: bool = True,
+        reloadable_tables: Optional[List[str]] = None,
     ):
         """
         Restarts the pipeline.
@@ -708,6 +871,8 @@ metrics"""
             pipeline to restart.
         :param dismiss_error: Set True to dismiss any deployment error before starting;
             set False to make it fail in that case. True by default.
+        :param reloadable_tables: Tables that bootstrapping may reload. See
+            :meth:`start`.
         """
 
         self.stop(force=True, timeout_s=timeout_s)
@@ -717,6 +882,7 @@ metrics"""
             concurrent_bootstrap=concurrent_bootstrap,
             timeout_s=timeout_s,
             dismiss_error=dismiss_error,
+            reloadable_tables=reloadable_tables,
         )
 
     def pause(self, wait: bool = True, timeout_s: Optional[float] = None):
@@ -985,7 +1151,14 @@ metrics"""
 
     def checkpoint(self, wait: bool = False, timeout_s: Optional[float] = None) -> int:
         """
-        Checkpoints this pipeline.
+        Checkpoints this pipeline, returning just the checkpoint sequence
+        number.
+
+        This is for backward compatibility: `checkpoint_response` is a
+        better choice for a caller that plans to check the checkpoint's
+        status itself later (e.g. after this call returns with
+        `wait=False`), since it also returns the `incarnation_uuid` needed
+        for that later check to detect a pipeline restart in between.
 
         :param wait: If true, will block until the checkpoint completes.
         :param timeout_s: The maximum time (in seconds) to wait for the
@@ -994,14 +1167,42 @@ metrics"""
         :return: The checkpoint sequence number.
 
         :raises FelderaAPIError: If enterprise features are not enabled.
+        :raises RuntimeError: If `wait` is true and the checkpoint fails.
         """
 
-        seq = self.client.checkpoint_pipeline(self.name)
+        return int(
+            self.checkpoint_response(wait=wait, timeout_s=timeout_s)[
+                "checkpoint_sequence_number"
+            ]
+        )
+
+    def checkpoint_response(
+        self, wait: bool = False, timeout_s: Optional[float] = None
+    ) -> dict:
+        """
+        Checkpoints this pipeline, returning the full response.
+
+        :param wait: If true, will block until the checkpoint completes.
+        :param timeout_s: The maximum time (in seconds) to wait for the
+            checkpoint to complete (defaults to `None` = no timeout is enforced).
+
+        :return: dict with `checkpoint_sequence_number` and
+            `incarnation_uuid`; pass the latter to `checkpoint_status` to
+            detect a pipeline restart between this call and a later status
+            check.
+
+        :raises FelderaAPIError: If enterprise features are not enabled.
+        :raises RuntimeError: If `wait` is true and the checkpoint fails.
+        """
+
+        resp = self.client.checkpoint_pipeline_response(self.name)
+        seq = int(resp["checkpoint_sequence_number"])
+        incarnation_uuid = resp.get("incarnation_uuid")
 
         if not wait:
-            return seq
+            return resp
 
-        start = time.time()
+        start = time.monotonic()
 
         while True:
             elapsed = time.monotonic() - start
@@ -1010,21 +1211,44 @@ metrics"""
                     f"""timeout ({timeout_s}s) reached while waiting for \
 pipeline '{self.name}' to make checkpoint '{seq}'"""
                 )
-            status = self.checkpoint_status(seq)
+            try:
+                status = self.checkpoint_status(seq, incarnation_uuid)
+            except FelderaAPIError as e:
+                if e.error_code == "IncarnationUuidMismatch":
+                    # The pipeline restarted since the checkpoint was
+                    # requested; that request is gone, so start over. Sleep
+                    # first so a crash-looping pipeline doesn't turn this
+                    # into a tight retry loop.
+                    time.sleep(0.1)
+                    resp = self.client.checkpoint_pipeline_response(self.name)
+                    seq = int(resp["checkpoint_sequence_number"])
+                    incarnation_uuid = resp.get("incarnation_uuid")
+                    continue
+                raise
+            if status == CheckpointStatus.Failure:
+                raise RuntimeError(
+                    f"failed to make checkpoint '{seq}': {status.get_error()}"
+                )
+
             if status == CheckpointStatus.InProgress:
                 time.sleep(0.1)
                 continue
 
-            return seq
+            return resp
 
-    def checkpoint_status(self, seq: int) -> CheckpointStatus:
+    def checkpoint_status(
+        self, seq: int, incarnation_uuid: Optional[str] = None
+    ) -> CheckpointStatus:
         """
         Checks the status of the given checkpoint.
 
         :param seq: The checkpoint sequence number.
+        :param incarnation_uuid: The `incarnation_uuid` returned alongside
+            `seq` by `checkpoint`, if known, to allow pipeline restarts
+            to be clearly reported as `IncarnationUuidMismatch`.
         """
 
-        resp = self.client.checkpoint_pipeline_status(self.name)
+        resp = self.client.checkpoint_pipeline_status(self.name, incarnation_uuid)
         success = resp.get("success")
         if seq == success:
             return CheckpointStatus.Success
@@ -1045,7 +1269,14 @@ pipeline '{self.name}' to make checkpoint '{seq}'"""
         self, wait: bool = False, timeout_s: Optional[float] = None
     ) -> str:
         """
-        Syncs this checkpoint to object store.
+        Syncs this checkpoint to object store, returning just the
+        checkpoint uuid.
+
+        This is for backward compatibility: `sync_checkpoint_response` is
+        a better choice for a caller that plans to check the sync's status
+        itself later (e.g. after this call returns with `wait=False`),
+        since it also returns the `incarnation_uuid` needed for that later
+        check to detect a pipeline restart in between.
 
         :param wait: If true, will block until the checkpoint sync operation
             completes.
@@ -1056,12 +1287,37 @@ pipeline '{self.name}' to make checkpoint '{seq}'"""
         :raises RuntimeError: If syncing the checkpoint fails.
         """
 
-        uuid = self.client.sync_checkpoint(self.name)
+        return self.sync_checkpoint_response(wait=wait, timeout_s=timeout_s)[
+            "checkpoint_uuid"
+        ]
+
+    def sync_checkpoint_response(
+        self, wait: bool = False, timeout_s: Optional[float] = None
+    ) -> dict:
+        """
+        Syncs this checkpoint to object store, returning the full response.
+
+        :param wait: If true, will block until the checkpoint sync operation
+            completes.
+        :param timeout_s: The maximum time (in seconds) to wait for the
+            checkpoint to complete syncing.
+
+        :return: dict with `checkpoint_uuid` and `incarnation_uuid`; pass
+            the latter to `sync_checkpoint_status` to detect a pipeline
+            restart between this call and a later status check.
+
+        :raises FelderaAPIError: If no checkpoints have been made.
+        :raises RuntimeError: If syncing the checkpoint fails.
+        """
+
+        resp = self.client.sync_checkpoint_response(self.name)
+        uuid = resp["checkpoint_uuid"]
+        incarnation_uuid = resp.get("incarnation_uuid")
 
         if not wait:
-            return uuid
+            return resp
 
-        start = time.time()
+        start = time.monotonic()
 
         while True:
             elapsed = time.monotonic() - start
@@ -1070,10 +1326,23 @@ pipeline '{self.name}' to make checkpoint '{seq}'"""
                     f"""timeout ({timeout_s}s) reached while waiting for \
 pipeline '{self.name}' to sync checkpoint '{uuid}'"""
                 )
-            status = self.sync_checkpoint_status(uuid)
+            try:
+                status = self.sync_checkpoint_status(uuid, incarnation_uuid)
+            except FelderaAPIError as e:
+                if e.error_code == "IncarnationUuidMismatch":
+                    # The pipeline restarted since the sync was requested;
+                    # that request is gone, so start over. Sleep first so a
+                    # crash-looping pipeline doesn't turn this into a tight
+                    # retry loop.
+                    time.sleep(0.1)
+                    resp = self.client.sync_checkpoint_response(self.name)
+                    uuid = resp["checkpoint_uuid"]
+                    incarnation_uuid = resp.get("incarnation_uuid")
+                    continue
+                raise
             if status == CheckpointStatus.Failure:
                 raise RuntimeError(
-                    f"failed to sync checkpoint '{uuid}': ", status.get_error()
+                    f"failed to sync checkpoint '{uuid}': {status.get_error()}"
                 )
 
             if status in [CheckpointStatus.InProgress, CheckpointStatus.Unknown]:
@@ -1082,7 +1351,7 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
 
             break
 
-        return uuid
+        return resp
 
     def remote_checkpoints(self) -> list[dict]:
         """
@@ -1096,23 +1365,39 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         """
         return self.client.get_remote_checkpoints(self.name)
 
-    def sync_checkpoint_status(self, uuid: str) -> CheckpointStatus:
-        """
-        Checks the status of the given checkpoint sync operation.
+    def sync_checkpoint_status(
+        self, uuid: UUID | str, incarnation_uuid: Optional[str] = None
+    ) -> CheckpointStatus:
+        """Checks the status of the given checkpoint sync operation.
         If the checkpoint is currently being synchronized, returns
-        `CheckpointStatus.Unknown`.
+        `CheckpointStatus.InProgress`.
+
+        `CheckpointStatus.Unknown` means either that the pipeline is
+        too old to report whether checkpoint sync is in progress, or
+        such a sync never started, or its success or failure
+        indication was displaced by the sync of a different
+        checkpoint.
 
         Failures are not raised as runtime errors and must be explicitly
         checked.
 
         :param uuid: The checkpoint uuid.
+        :param incarnation_uuid: The `incarnation_uuid` returned alongside
+            `uuid` by `sync_checkpoint`, if known, to allow pipeline restarts
+            to be clearly reported as `IncarnationUuidMismatch`.
+
         """
 
-        resp = self.client.sync_checkpoint_status(self.name)
+        # Allow a UUID object to be passed in.
+        uuid = str(uuid)
+
+        resp = self.client.sync_checkpoint_status(self.name, incarnation_uuid)
         success = resp.get("success")
         periodic = resp.get("periodic")
 
-        fail = resp.get("failure") or {}
+        running = resp.get("running")
+        if running is not None and uuid in running:
+            return CheckpointStatus.InProgress
 
         if uuid == success or uuid == periodic:
             return CheckpointStatus.Success
@@ -1124,8 +1409,11 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             logging.error(f"failed to sync checkpoint '{uuid}': {failure.error}")
             return failure
 
-        if (success is None) or UUID(uuid) > UUID(success):
-            return CheckpointStatus.InProgress
+        if running is None:
+            # The pipeline is too old to report the running checkpoint
+            # sync operations, but we can make an educated guess.
+            if (success is None) or UUID(uuid) > UUID(success):
+                return CheckpointStatus.InProgress
 
         return CheckpointStatus.Unknown
 
@@ -1297,6 +1585,12 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
             For a stable hash, the query must be deterministic which means
             it should be sorted.
 
+        Note:
+            The hash identifies a result set within one Feldera release. It
+            is built on DataFusion's row hash, so a Feldera upgrade can
+            change it for unchanged data; compare hashes taken from the same
+            release.
+
         :param query: The SQL query to be executed.
 
         :raises FelderaAPIError: If the pipeline is not in a RUNNING or PAUSED
@@ -1319,8 +1613,9 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
         an exception will be raised.
 
         Important:
-            If you try to ``INSERT`` or ``DELETE`` data from a table while the
-            pipeline is paused, it will block until the pipeline is resumed.
+            If you try to ``INSERT`` data into a table while the pipeline is
+            paused, it will block until the pipeline is resumed.  Ad-hoc
+            queries cannot delete data.
 
         :param query: The SQL query to be executed.
         :param wait: When ``True``, block until the query's writes have been
@@ -1917,6 +2212,10 @@ pipeline '{self.name}' to sync checkpoint '{uuid}'"""
     def wait_for_token(self, token: str):
         """
         Blocks until the pipeline processes all inputs represented by the completion token.
+
+        The pipeline has then handed the resulting changes to every output
+        connector.  A handle from :meth:`listen` may still be receiving them;
+        :meth:`.OutputHandler.wait_for_token` waits until it has.
         """
 
         self.client.wait_for_token(self.name, token)

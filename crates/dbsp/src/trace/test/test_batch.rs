@@ -3,17 +3,18 @@
 //! So far, only methods/traits used in tests have been implemented.
 #![allow(clippy::type_complexity)]
 
+use crate::circuit::operator_traits::OperatorCheckpoint;
 use crate::storage::file::FilterStats;
 use crate::trace::BatchLocation;
 use crate::{
-    DBData, DBWeight, NumEntries, Timestamp,
+    DBData, DBWeight, DynZWeight, NumEntries, Timestamp,
     dynamic::{
         DataTrait, DowncastTrait, DynDataTyped, DynVec, DynWeightedPairs, Erase, Factory, Vector,
         WeightTrait, pair::DynPair,
     },
     trace::{
         Batch, BatchFactories, BatchReader, BatchReaderFactories, Batcher, Builder, Cursor, Filter,
-        GroupFilter, Trace, cursor::Position,
+        GroupFilter, Trace, TraceRole, WithSnapshot, cursor::Position,
     },
 };
 use dyn_clone::clone_box;
@@ -167,6 +168,79 @@ where
         .collect::<Vec<_>>()
 }
 
+/// A key's tuples grouped by distinct value, in value order.
+fn by_value<V: DataTrait + ?Sized, T, R: WeightTrait + ?Sized>(
+    tuples: Vec<(Box<V>, T, Box<R>)>,
+) -> Vec<(Box<V>, Vec<(T, Box<R>)>)> {
+    let mut grouped: BTreeMap<Box<V>, Vec<(T, Box<R>)>> = BTreeMap::new();
+    for (value, time, weight) in tuples {
+        grouped.entry(value).or_default().push((time, weight));
+    }
+    grouped.into_iter().collect()
+}
+
+/// Which end of a group of values `retain_n_unsatisfying` retains.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Extreme {
+    Largest,
+    Smallest,
+}
+
+/// Models `GroupFilter::TopN` and `GroupFilter::BottomN`.
+///
+/// Retains, for each key, every value that satisfies `filter`, plus the `n` values
+/// that do not satisfy it and that are largest (`Extreme::Largest`) or smallest
+/// (`Extreme::Smallest`) within the key's group.  A group with fewer than `n`
+/// values that fail the filter retains all of them.
+fn retain_n_unsatisfying<
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    T,
+    R: WeightTrait + ?Sized,
+>(
+    tuples: Vec<((Box<K>, Box<V>, T), Box<R>)>,
+    filter: &Filter<V>,
+    n: usize,
+    extreme: Extreme,
+) -> Vec<((Box<K>, Box<V>, T), Box<R>)> {
+    let mut tuples_by_key: BTreeMap<Box<K>, Vec<(Box<V>, T, Box<R>)>> = BTreeMap::new();
+    for ((k, v, t), w) in tuples.into_iter() {
+        tuples_by_key.entry(k).or_default().push((v, t, w));
+    }
+
+    let mut result = Vec::new();
+    for (k, group) in tuples_by_key.into_iter() {
+        let group = by_value(group);
+
+        // Walk the group from the end that `extreme` names, keeping every value
+        // that satisfies the filter and the first `n` values that do not.
+        let mut retain = vec![false; group.len()];
+        let mut unsatisfying = 0;
+        let indexes: Box<dyn Iterator<Item = usize>> = match extreme {
+            Extreme::Largest => Box::new((0..group.len()).rev()),
+            Extreme::Smallest => Box::new(0..group.len()),
+        };
+        for i in indexes {
+            if (filter.filter_func())(group[i].0.as_ref()) {
+                retain[i] = true;
+            } else if unsatisfying < n {
+                retain[i] = true;
+                unsatisfying += 1;
+            }
+        }
+
+        for ((value, times), retain) in group.into_iter().zip(retain) {
+            if retain {
+                for (time, weight) in times {
+                    result.push(((clone_box(&*k), clone_box(&*value), time), weight));
+                }
+            }
+        }
+    }
+
+    result
+}
+
 pub fn filter<K: DataTrait + ?Sized, V: DataTrait + ?Sized, T, R: WeightTrait + ?Sized>(
     mut tuples: Vec<((Box<K>, Box<V>, T), Box<R>)>,
     key_filter: &Option<Filter<K>>,
@@ -193,31 +267,27 @@ pub fn filter<K: DataTrait + ?Sized, V: DataTrait + ?Sized, T, R: WeightTrait + 
 
                 let mut result = Vec::new();
 
-                for (k, mut tuples) in tuples_by_key.into_iter() {
-                    let index = tuples
+                for (k, tuples) in tuples_by_key.into_iter() {
+                    let group = by_value(tuples);
+                    let index = group
                         .iter()
-                        .position(|(v, _t, _w)| (filter.filter_func())(v.as_ref()))
-                        .unwrap_or(tuples.len());
+                        .position(|(value, _times)| (filter.filter_func())(value.as_ref()))
+                        .unwrap_or(group.len());
                     let first_index = index.saturating_sub(*n);
-                    tuples
-                        .drain(first_index..)
-                        .for_each(|(v, t, w)| result.push(((clone_box(&*k), v, t), w)));
+                    for (value, times) in group.into_iter().skip(first_index) {
+                        for (time, weight) in times {
+                            result.push(((clone_box(&*k), clone_box(&*value), time), weight));
+                        }
+                    }
                 }
 
                 return result;
             }
             GroupFilter::TopN(n, filter, _val_factory) => {
-                tuples.retain(|((_k, v, _t), _r)| (filter.filter_func())(v.as_ref()));
-                // take the last n elements of tuples only
-                if tuples.len() > *n {
-                    tuples.drain(..tuples.len() - *n);
-                }
-                return tuples;
+                return retain_n_unsatisfying(tuples, filter, *n, Extreme::Largest);
             }
             GroupFilter::BottomN(n, filter, _vals_factory) => {
-                tuples.retain(|((_k, v, _t), _r)| (filter.filter_func())(v.as_ref()));
-                tuples.truncate(*n);
-                return tuples;
+                return retain_n_unsatisfying(tuples, filter, *n, Extreme::Smallest);
             }
         }
     }
@@ -359,7 +429,86 @@ where
         .collect::<Vec<_>>()
 }
 
-/// Panic if `batch1` and `batch2` contain different tuples.
+/// Panic unless the size bounds and emptiness of `batch` agree with its cursor.
+///
+/// [`BatchReader::key_count_upper_bound`] and [`BatchReader::len_upper_bound`]
+/// may exceed the keys and the (key, value) pairs that a cursor over `batch`
+/// yields, but never fall short of them, and [`BatchReader::is_empty`] is true
+/// exactly when the cursor yields nothing.
+///
+/// # Arguments
+///
+/// * `batch` - the batch or trace to check.
+pub fn assert_bounds_match_cursor<B>(batch: &B)
+where
+    B: BatchReader,
+{
+    let mut cursor = batch.cursor();
+    let mut keys = 0;
+    let mut pairs = 0;
+    while cursor.key_valid() {
+        keys += 1;
+        while cursor.val_valid() {
+            pairs += 1;
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    assert!(
+        batch.key_count_upper_bound() >= keys,
+        "key_count_upper_bound() is {}, but the cursor yields {keys} keys",
+        batch.key_count_upper_bound()
+    );
+    assert!(
+        batch.len_upper_bound() >= pairs,
+        "len_upper_bound() is {}, but the cursor yields {pairs} (key, value) pairs",
+        batch.len_upper_bound()
+    );
+    assert_eq!(
+        batch.is_empty(),
+        keys == 0,
+        "is_empty() disagrees with the cursor, which yields {keys} keys"
+    );
+}
+
+/// Panic if `batch` reports fewer negative weights than its cursor yields.
+///
+/// [`Batch::negative_weight_count`] may exceed the negative weights that a
+/// cursor over `batch` yields, but never fall short of them: a caller that sees
+/// `Some(0)` may conclude that the batch holds no negative weight at all.  A
+/// batch that reports `None` does not count them, and passes.
+///
+/// # Arguments
+///
+/// * `batch` - the batch to check.
+pub fn assert_negative_weights_counted<B>(batch: &B)
+where
+    B: Batch<R = DynZWeight>,
+{
+    let Some(count) = batch.negative_weight_count() else {
+        return;
+    };
+    let mut negative = 0u64;
+    let mut cursor = batch.cursor();
+    while cursor.key_valid() {
+        while cursor.val_valid() {
+            cursor.map_times(&mut |_time, weight| {
+                if **weight < 0 {
+                    negative += 1;
+                }
+            });
+            cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    assert!(
+        count >= negative,
+        "negative_weight_count() is {count}, but the cursor yields {negative} negative weights"
+    );
+}
+
+/// Panic if `batch1` and `batch2` contain different tuples, or if either one's
+/// size bounds or emptiness disagree with its cursor.
 pub fn assert_batch_eq<B1, B2>(batch1: &B1, batch2: &B2)
 where
     B1: BatchReader,
@@ -374,6 +523,9 @@ where
     assert_eq!(tuples2, batch_to_tuples_reverse_vals(batch2));
 
     assert_eq!(tuples1, tuples2);
+
+    assert_bounds_match_cursor(batch1);
+    assert_bounds_match_cursor(batch2);
 }
 
 /// Panic if `batch1` and `batch2` contain different tuples.
@@ -393,7 +545,7 @@ where
 
 pub fn assert_trace_eq<T1, T2>(trace1: &T1, trace2: &T2)
 where
-    T1: Trace,
+    T1: Trace + WithSnapshot,
     T2: Trace<Key = T1::Key, Val = T1::Val, Time = T1::Time, R = T1::R>,
 {
     let tuples1 = filter(
@@ -440,6 +592,11 @@ where
         )
     );
     assert_eq!(tuples1, tuples2);
+
+    // A spine merges in the background, which can change its batches between
+    // reading its bounds and walking its cursor; a snapshot's batches stay put.
+    assert_bounds_match_cursor(&trace1.ro_snapshot());
+    assert_bounds_match_cursor(trace2);
 }
 
 pub fn assert_batch_cursors_eq<C, B>(mut cursor: C, ref_batch: &B, seed: u64)
@@ -825,7 +982,11 @@ where
     fn new_batcher(factories: &TestBatchFactories<K, V, T, R>, time: T) -> Self {
         Self {
             time,
-            result: TestBatch::new(factories, Arc::new(String::from("Test"))),
+            result: TestBatch::new(
+                factories,
+                Arc::new(String::from("Test")),
+                TraceRole::Integral,
+            ),
         }
     }
 
@@ -851,7 +1012,7 @@ where
     }
 
     fn tuples(&self) -> usize {
-        self.result.len()
+        self.result.len_upper_bound()
     }
 
     fn seal(mut self) -> TestBatch<K, V, T, R> {
@@ -889,7 +1050,11 @@ where
         _location: Option<BatchLocation>,
     ) -> Self {
         Self {
-            result: TestBatch::new(factories, Arc::new(String::from("Test"))),
+            result: TestBatch::new(
+                factories,
+                Arc::new(String::from("Test")),
+                TraceRole::Integral,
+            ),
             time_diffs: Vec::new(),
             vals: BTreeMap::new(),
             num_keys: 0,
@@ -1018,6 +1183,20 @@ where
     R: WeightTrait + ?Sized,
     T: Timestamp,
 {
+    fn value_count_upper_bound(&self) -> usize {
+        if !self.key_valid() {
+            return 0;
+        }
+        // The reference model holds one entry per key, value and time, so
+        // counting the current key's entries bounds its values from above,
+        // which is what the trait asks for.
+        let current_key = clone_box(self.data[self.index].0.0.as_ref());
+        self.data[self.index..]
+            .iter()
+            .take_while(|((key, _, _), _)| *key == current_key)
+            .count()
+    }
+
     // fn key_factory(&self) -> &'static Factory<K> {
     //     &K::VTABLE
     // }
@@ -1235,6 +1414,12 @@ where
     R: WeightTrait + ?Sized,
     T: Timestamp,
 {
+    fn is_empty(&self) -> bool {
+        // `len_upper_bound` counts a (key, value) pair once per time for this batch
+        // type, but it is zero exactly when the batch is empty: the batch stores no
+        // zero weights.
+        self.len_upper_bound() == 0
+    }
     type Key = K;
     type Val = V;
     type Time = T;
@@ -1259,7 +1444,7 @@ where
         todo!()
     }*/
 
-    fn key_count(&self) -> usize {
+    fn key_count_upper_bound(&self) -> usize {
         self.data
             .keys()
             .map(|(k, _, _)| clone_box(k.as_ref()))
@@ -1267,7 +1452,7 @@ where
             .len()
     }
 
-    fn len(&self) -> usize {
+    fn len_upper_bound(&self) -> usize {
         self.data.len()
     }
 
@@ -1322,7 +1507,7 @@ where
 {
     type Batch = Self;
 
-    fn new(_factories: &Self::Factories, _name: Arc<String>) -> Self {
+    fn new(_factories: &Self::Factories, _name: Arc<String>, _role: TraceRole) -> Self {
         Self {
             data: BTreeMap::new(),
             lower_key_bound: None,
@@ -1409,12 +1594,7 @@ where
         &self.value_filter
     }
 
-    fn save(
-        &mut self,
-        _base: &feldera_storage::StoragePath,
-        _pid: &str,
-        _files: &mut Vec<std::sync::Arc<dyn feldera_storage::FileCommitter>>,
-    ) -> Result<(), crate::Error> {
+    fn save(&mut self, _pid: &str) -> Result<Box<dyn OperatorCheckpoint>, crate::Error> {
         todo!()
     }
 
@@ -1458,21 +1638,35 @@ where
     assert!(sample.is_empty());
     sample.clear();
 
-    // Sample size == batch size - must return all keys in the batch.
-    batch.sample_keys(&mut thread_rng(), batch.key_count(), sample.as_mut());
+    // Sample size == key count bound - must return all keys in the batch.
+    batch.sample_keys(
+        &mut thread_rng(),
+        batch.key_count_upper_bound(),
+        sample.as_mut(),
+    );
     assert_eq!(&sample, &all_keys);
     sample.clear();
 
-    // Sample size > batch size - must return all keys in the batch.
-    batch.sample_keys(&mut thread_rng(), batch.key_count() << 1, sample.as_mut());
+    // Sample size > key count bound - must return all keys in the batch.
+    batch.sample_keys(
+        &mut thread_rng(),
+        batch.key_count_upper_bound() << 1,
+        sample.as_mut(),
+    );
     assert_eq!(&sample, &all_keys);
     sample.clear();
 
     // Sample size < batch size - return the exact number of keys requested,
     // no duplicates, all returned keys must belong to the batch.
-    let sample_size = batch.key_count() >> 1;
+    let sample_size = batch.key_count_upper_bound() >> 1;
     batch.sample_keys(&mut thread_rng(), sample_size, sample.as_mut());
-    assert_eq!(sample.len(), sample_size);
+    if batch.key_count_upper_bound() == all_keys.len() {
+        assert_eq!(sample.len(), sample_size);
+    } else {
+        // A batch that counts keys it does not hold can draw them and then
+        // drop them, which leaves its sample short.
+        assert!(sample.len() <= sample_size);
+    }
     assert!(sample.is_sorted_by(&|k1, k2| k1.cmp(k2)));
     let sample_set = sample.dyn_iter().map(clone_box).collect::<BTreeSet<_>>();
     assert_eq!(sample_set.len(), sample.len());
@@ -1523,18 +1717,26 @@ pub fn test_trace_sampling<T: Trace<Time = ()>>(trace: &T) {
     assert!(sample.is_empty());
     sample.clear();
 
-    // Sample size == size - must return all keys in the batch.
+    // Sample size == key count bound - must return all keys in the trace.
     let (all_keys, sample) = retry_until_stable(trace, || {
         let mut sample = trace.factories().keys_factory().default_box();
-        trace.sample_keys(&mut thread_rng(), trace.key_count(), sample.as_mut());
+        trace.sample_keys(
+            &mut thread_rng(),
+            trace.key_count_upper_bound(),
+            sample.as_mut(),
+        );
         sample
     });
     assert_eq!(&sample, &all_keys);
 
-    // Sample size > trace size - must return all keys in the trace.
+    // Sample size > key count bound - must return all keys in the trace.
     let (all_keys, sample) = retry_until_stable(trace, || {
         let mut sample = trace.factories().keys_factory().default_box();
-        trace.sample_keys(&mut thread_rng(), trace.key_count() << 1, sample.as_mut());
+        trace.sample_keys(
+            &mut thread_rng(),
+            trace.key_count_upper_bound() << 1,
+            sample.as_mut(),
+        );
         sample
     });
     assert_eq!(&sample, &all_keys);
@@ -1542,7 +1744,7 @@ pub fn test_trace_sampling<T: Trace<Time = ()>>(trace: &T) {
     // Sample size < trace size - return at most the number of keys requested,
     // no duplicates, all returned keys must belong to the trace.
     let (all_keys, sample) = retry_until_stable(trace, || {
-        let sample_size = trace.key_count() >> 1;
+        let sample_size = trace.key_count_upper_bound() >> 1;
         let mut sample = trace.factories().keys_factory().default_box();
         trace.sample_keys(&mut thread_rng(), sample_size, sample.as_mut());
         assert!(sample.len() <= sample_size);
@@ -1555,5 +1757,130 @@ pub fn test_trace_sampling<T: Trace<Time = ()>>(trace: &T) {
     let all_keys_set = all_keys.dyn_iter().map(clone_box).collect::<BTreeSet<_>>();
     for key in sample.dyn_iter() {
         assert!(all_keys_set.contains(key));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Extreme, filter, retain_n_unsatisfying};
+    use crate::dynamic::{DowncastTrait, DynData, Erase, WithFactory};
+    use crate::trace::{Filter, GroupFilter};
+    use crate::{DynZWeight, ZWeight};
+    use dyn_clone::clone_box;
+
+    type Tuples = Vec<((Box<DynData>, Box<DynData>, u32), Box<DynZWeight>)>;
+
+    /// `(key, value, time, weight)` rows, boxed the way the model takes them.
+    fn tuples(rows: &[(i32, i32, u32, ZWeight)]) -> Tuples {
+        rows.iter()
+            .map(|&(key, value, time, weight)| {
+                (
+                    (clone_box(key.erase()), clone_box(value.erase()), time),
+                    clone_box(weight.erase()),
+                )
+            })
+            .collect()
+    }
+
+    fn plain(tuples: &Tuples) -> Vec<(i32, i32, u32, ZWeight)> {
+        tuples
+            .iter()
+            .map(|((key, value, time), weight)| {
+                (
+                    *unsafe { key.as_ref().downcast::<i32>() },
+                    *unsafe { value.as_ref().downcast::<i32>() },
+                    *time,
+                    *unsafe { weight.as_ref().downcast::<ZWeight>() },
+                )
+            })
+            .collect()
+    }
+
+    fn keeps_at_least_8() -> Filter<DynData> {
+        Filter::new(Box::new(|v: &DynData| *unsafe { v.downcast::<i32>() } >= 8))
+    }
+
+    /// Each key keeps every value that satisfies the filter, plus the `n`
+    /// failing values nearest the chosen end of that key's own group.
+    #[test]
+    fn retains_the_n_failing_values_nearest_each_end() {
+        let rows = tuples(&[
+            (1, 1, 0, 1),
+            (1, 3, 0, 1),
+            (1, 5, 0, 1),
+            (1, 9, 0, 1),
+            (2, 2, 0, 1),
+            (2, 4, 0, 1),
+        ]);
+
+        let top = retain_n_unsatisfying(rows.clone(), &keeps_at_least_8(), 2, Extreme::Largest);
+        assert_eq!(
+            plain(&top),
+            vec![
+                (1, 3, 0, 1),
+                (1, 5, 0, 1),
+                (1, 9, 0, 1),
+                (2, 2, 0, 1),
+                (2, 4, 0, 1)
+            ],
+            "the two largest failing values of each key, plus everything >= 8"
+        );
+
+        let bottom = retain_n_unsatisfying(rows, &keeps_at_least_8(), 2, Extreme::Smallest);
+        assert_eq!(
+            plain(&bottom),
+            vec![
+                (1, 1, 0, 1),
+                (1, 3, 0, 1),
+                (1, 9, 0, 1),
+                (2, 2, 0, 1),
+                (2, 4, 0, 1)
+            ],
+            "the two smallest failing values of each key, plus everything >= 8"
+        );
+    }
+
+    /// A value occurring at several times still counts once against `n`.
+    #[test]
+    fn a_value_at_several_times_counts_once() {
+        // Value 5 occurs twice. Counting tuples would account for it twice and
+        // drop value 3.
+        let rows = tuples(&[(1, 3, 0, 1), (1, 5, 0, 1), (1, 5, 7, 1)]);
+
+        let top = retain_n_unsatisfying(rows, &keeps_at_least_8(), 2, Extreme::Largest);
+        assert_eq!(
+            plain(&top),
+            vec![(1, 3, 0, 1), (1, 5, 0, 1), (1, 5, 7, 1)],
+            "values 3 and 5 are the two largest failing values"
+        );
+    }
+
+    /// The same, through `filter`, which is what `TestBatch::retain_values` and
+    /// `assert_trace_eq` call.
+    #[test]
+    fn filter_dispatches_top_and_bottom_n() {
+        let rows = tuples(&[(1, 1, 0, 1), (1, 5, 0, 1), (1, 9, 0, 1)]);
+
+        let top = filter(
+            rows.clone(),
+            &None,
+            &Some(GroupFilter::TopN(
+                1,
+                keeps_at_least_8(),
+                <DynData as WithFactory<i32>>::FACTORY,
+            )),
+        );
+        assert_eq!(plain(&top), vec![(1, 5, 0, 1), (1, 9, 0, 1)]);
+
+        let bottom = filter(
+            rows,
+            &None,
+            &Some(GroupFilter::BottomN(
+                1,
+                keeps_at_least_8(),
+                <DynData as WithFactory<i32>>::FACTORY,
+            )),
+        );
+        assert_eq!(plain(&bottom), vec![(1, 1, 0, 1), (1, 9, 0, 1)]);
     }
 }

@@ -1,4 +1,5 @@
 // API to read from tables/views and write into tables using HTTP
+use crate::api::endpoints::metrics;
 use crate::api::error::ApiError;
 use crate::api::examples;
 use crate::api::main::ServerState;
@@ -9,16 +10,16 @@ use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
 use actix_http::StatusCode;
 use actix_web::{
-    get,
-    http::{header, Method},
+    HttpRequest, HttpResponse, get,
+    http::{Method, header},
     post,
     web::{self, Data as WebData, ReqData},
-    HttpRequest, HttpResponse,
 };
 #[allow(unused_imports)]
 use feldera_types::checkpoint::RemoteCheckpoint;
 use feldera_types::query_params::{
-    ApproveParameters, MetricsParameters, SamplyProfileGetParams, SamplyProfileParams,
+    ApproveParameters, MetricsFormat, MetricsParameters, SamplyProfileGetParams,
+    SamplyProfileParams,
 };
 use feldera_types::runtime_status::BootstrapConfig;
 use feldera_types::{program_schema::SqlIdentifier, query_params::ActivateParams};
@@ -51,9 +52,10 @@ pub mod support_bundle;
         ("table_name" = String, Path,
             description = "SQL table name. Unquoted SQL names have to be capitalized. Quoted SQL names have to exactly match the case from the SQL program."),
         ("force" = bool, Query, description = "When `true`, push data to the pipeline even if the pipeline is paused. The default value is `false`"),
-        ("format" = String, Query, description = "Input data format, either `csv' or 'json'."),
+        ("format" = String, Query, description = "Input data format: `csv`, `json`, `parquet`, `avro`, or `raw`. The default is `csv`."),
         ("array" = Option<bool>, Query, description = "Set to `true` if updates in this stream are packaged into JSON arrays (used in conjunction with `format=json`). The default values is `false`."),
         ("update_format" = Option<JsonUpdateFormat>, Query, description = "JSON data change event format (used in conjunction with `format=json`).  The default value is 'insert_delete'."),
+        ("connector_metadata" = Option<String>, Query, description = "Connector metadata for every record of this request, as a JSON object.  `CONNECTOR_METADATA()` returns the object for the records, so a column declared with `DEFAULT CAST(CONNECTOR_METADATA()['name'] AS type)` takes its value from the object's `name` attribute.  Works with every input format."),
     ),
     request_body(
         content = String,
@@ -477,6 +479,111 @@ pub(crate) async fn get_pipeline_output_connector_status(
     Ok(response)
 }
 
+/// Control Output Connector
+///
+/// Start (resume) or pause the output connector.
+///
+/// The following values of the `action` argument are accepted: `start` and `pause`.
+///
+/// Output connectors can be in either the `Running` or `Paused` state. By default,
+/// connectors are initialized in the `Running` state when a pipeline is deployed.
+/// In this state, the connector forwards the output of its view to the configured
+/// sink. A connector can be created in the `Paused` state by setting its
+/// [`paused`](https://docs.feldera.com/connectors/#generic-attributes) property
+/// to `true`.
+///
+/// A paused output connector discards the output it receives instead of sending
+/// it to its sink; output produced while the connector is paused is gone for
+/// good.  The `start` command resumes the connector with the output the
+/// pipeline produces from that point on.
+///
+/// The current connector state can be retrieved via the
+/// `GET /v0/pipelines/{pipeline_name}/stats` endpoint.
+#[utoipa::path(
+    context_path = "/v0",
+    security(("JSON web token (JWT) or API key" = [])),
+    params(
+        ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        ("view_name" = String, Path, description = "SQL view name"),
+        ("connector_name" = String, Path, description = "Output connector name"),
+    ),
+    responses(
+        (status = OK
+            , description = "Action has been processed"),
+        (status = NOT_FOUND
+            , body = ErrorResponse
+            , description = "Pipeline, view and/or output connector with that name does not exist"
+            , examples(
+                ("Pipeline with that name does not exist" = (value = json!(examples::error_unknown_pipeline_name()))),
+            )
+        ),
+        (status = SERVICE_UNAVAILABLE
+            , body = ErrorResponse
+            , examples(
+                ("Pipeline is not deployed" = (value = json!(examples::error_pipeline_interaction_not_deployed()))),
+                ("Pipeline is currently unavailable" = (value = json!(examples::error_pipeline_interaction_currently_unavailable()))),
+                ("Disconnected during response" = (value = json!(examples::error_pipeline_interaction_disconnected()))),
+                ("Response timeout" = (value = json!(examples::error_pipeline_interaction_timeout())))
+            )
+        ),
+        (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
+    ),
+    tag = "Output Connectors"
+)]
+#[post("/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/{action}")]
+pub(crate) async fn post_pipeline_output_connector_action(
+    state: WebData<ServerState>,
+    client: WebData<awc::Client>,
+    tenant_id: ReqData<TenantId>,
+    path: web::Path<(String, String, String, String)>,
+) -> Result<HttpResponse, ManagerError> {
+    // Parse the URL path parameters
+    let (pipeline_name, view_name, connector_name, action) = path.into_inner();
+
+    // Validate action
+    let verb = match action.as_str() {
+        "start" => "starting",
+        "pause" => "pausing",
+        _ => {
+            return Err(ApiError::InvalidConnectorAction { action }.into());
+        }
+    };
+
+    // The view name provided by the user is interpreted as
+    // a SQL identifier to account for case (in-)sensitivity
+    let actual_view_name = SqlIdentifier::from(&view_name).name();
+    let endpoint_name = format!("{actual_view_name}.{connector_name}");
+
+    // URL encode endpoint name to account for special characters
+    let encoded_endpoint_name = urlencoding::encode(&endpoint_name).to_string();
+
+    // Forward the action request to the pipeline
+    let response = state
+        .runner
+        .forward_http_request_to_pipeline_by_name(
+            client.as_ref(),
+            *tenant_id,
+            &pipeline_name,
+            Method::GET,
+            &format!("output_endpoints/{encoded_endpoint_name}/{action}"),
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+    // Log only if the response indicates success
+    if response.status() == StatusCode::OK {
+        info!(
+            pipeline = %pipeline_name,
+            pipeline_id = "N/A",
+            tenant = %tenant_id.0,
+            "Connector action: {verb} on view '{view_name}' on connector '{connector_name}'"
+        );
+    }
+    Ok(response)
+}
+
 /// Send command to an output connector.
 #[utoipa::path(
     context_path = "/v0",
@@ -488,7 +595,7 @@ pub(crate) async fn get_pipeline_output_connector_status(
     ),
     request_body(
         content = Object,
-        content_type = "text/json",
+        content_type = "application/json",
         description = "Command to send to the output connector"),
     responses(
         (status = OK
@@ -602,7 +709,7 @@ pub(crate) async fn get_pipeline_stats(
 
 /// Get Pipeline Metrics
 ///
-/// Retrieve the metrics of a running or paused pipeline.
+/// Retrieve the metrics of a pipeline.
 #[utoipa::path(
     context_path = "/v0",
     security(("JSON web token (JWT) or API key" = [])),
@@ -618,15 +725,6 @@ pub(crate) async fn get_pipeline_stats(
             , description = "Pipeline with that name does not exist"
             , body = ErrorResponse
             , example = json!(examples::error_unknown_pipeline_name())),
-        (status = SERVICE_UNAVAILABLE
-            , body = ErrorResponse
-            , examples(
-                ("Pipeline is not deployed" = (value = json!(examples::error_pipeline_interaction_not_deployed()))),
-                ("Pipeline is currently unavailable" = (value = json!(examples::error_pipeline_interaction_currently_unavailable()))),
-                ("Disconnected during response" = (value = json!(examples::error_pipeline_interaction_disconnected()))),
-                ("Response timeout" = (value = json!(examples::error_pipeline_interaction_timeout())))
-            )
-        ),
         (status = INTERNAL_SERVER_ERROR, body = ErrorResponse),
     ),
     tag = "Metrics & Debugging"
@@ -637,23 +735,45 @@ pub(crate) async fn get_pipeline_metrics(
     client: WebData<awc::Client>,
     tenant_id: ReqData<TenantId>,
     path: web::Path<String>,
-    _query: web::Query<MetricsParameters>,
+    query: web::Query<MetricsParameters>,
     request: HttpRequest,
 ) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
-    state
-        .runner
-        .forward_http_request_to_pipeline_by_name(
-            client.as_ref(),
-            *tenant_id,
-            &pipeline_name,
-            Method::GET,
-            "metrics",
-            request.query_string(),
-            None,
-            None,
-        )
+
+    let pipeline = state
+        .db
+        .lock()
         .await
+        .get_pipeline_for_monitoring(*tenant_id, &pipeline_name)
+        .await?;
+    let pipelines = std::slice::from_ref(&pipeline);
+
+    let from_pipeline =
+        metrics::fetch_pipeline_metrics(&state, client.as_ref(), &pipeline, request.query_string())
+            .await;
+
+    match query.format {
+        MetricsFormat::Prometheus => {
+            let mut body = metrics::status_metrics(pipelines).into_bytes();
+            if let Some(bytes) = from_pipeline {
+                body.extend(bytes);
+                body.push(b'\n');
+            }
+            Ok(HttpResponse::Ok().content_type("text/plain").body(body))
+        }
+        MetricsFormat::Json => {
+            let mut families = metrics::status_metrics_json(pipelines);
+            if let Some(bytes) = from_pipeline {
+                match serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+                    Ok(from_pipeline) => families.extend(from_pipeline),
+                    Err(error) => {
+                        debug!("Pipeline {pipeline_name} returned invalid JSON metrics: {error}")
+                    }
+                }
+            }
+            Ok(HttpResponse::Ok().json(families))
+        }
+    }
 }
 
 /// Get Time Series Stats
@@ -1204,12 +1324,19 @@ pub(crate) async fn checkpoint_pipeline(
     security(("JSON web token (JWT) or API key" = [])),
     params(
         ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        ("incarnation_uuid" = Option<Uuid>, Query, description = "Incarnation UUID returned by the `POST checkpoint` request this status check is for. If given and it does not match the pipeline's current incarnation, the pipeline process has restarted since the checkpoint was requested and the response is a 400 error rather than a status."),
     ),
     responses(
         (status = OK
          , description = "Checkpoint status retrieved successfully"
          , content_type = "application/json"
          , body = CheckpointStatus),
+        (status = BAD_REQUEST
+            , description = "The given `incarnation_uuid` does not match the pipeline's \
+                              current incarnation (error code `IncarnationUuidMismatch`): \
+                              the pipeline process has restarted since the checkpoint was \
+                              requested"
+            , body = ErrorResponse),
         (status = NOT_FOUND
             , description = "Pipeline with that name does not exist"
             , body = ErrorResponse
@@ -1266,12 +1393,18 @@ pub(crate) async fn get_checkpoint_status(
     security(("JSON web token (JWT) or API key" = [])),
     params(
         ("pipeline_name" = String, Path, description = "Unique pipeline name"),
+        ("incarnation_uuid" = Option<Uuid>, Query, description = "Incarnation UUID returned by the `POST checkpoint/sync` request this status check is for. If given and it does not match the pipeline's current incarnation, the pipeline process has restarted since the sync was requested and the response is a 400 error rather than a status."),
     ),
     responses(
         (status = OK
          , description = "Checkpoint sync status retrieved successfully"
          , content_type = "application/json"
          , body = CheckpointSyncStatus),
+        (status = BAD_REQUEST
+            , description = "The given `incarnation_uuid` does not match the pipeline's \
+                              current incarnation (error code `IncarnationUuidMismatch`): \
+                              the pipeline process has restarted since the sync was requested"
+            , body = ErrorResponse),
         (status = NOT_FOUND
             , description = "Pipeline with that name does not exist"
             , body = ErrorResponse
@@ -1600,19 +1733,20 @@ pub(crate) async fn get_pipeline_heap_profile(
     tenant_id: ReqData<TenantId>,
     path: web::Path<String>,
     request: HttpRequest,
+    body: web::Payload,
 ) -> Result<HttpResponse, ManagerError> {
     let pipeline_name = path.into_inner();
+    // Streamed, like the circuit profiles
     state
         .runner
-        .forward_http_request_to_pipeline_by_name(
+        .forward_streaming_http_request_to_pipeline_by_name(
             client.as_ref(),
             *tenant_id,
             &pipeline_name,
-            Method::GET,
             "heap_profile",
-            request.query_string(),
-            None,
-            None,
+            request,
+            body,
+            Some(Duration::from_secs(120)),
         )
         .await
 }

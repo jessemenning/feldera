@@ -1,6 +1,6 @@
 <script lang="ts">
+  import { ClipboardCopyButton } from 'common-ui'
   import { slide } from 'svelte/transition'
-  import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
 
   const {
     header,
@@ -72,14 +72,14 @@
     <div class=" flex w-full flex-col">
       <div class="flex justify-between pb-2 font-semibold">
         <span class={textClass}>{header}</span>
-        <div class="flex flex-nowrap gap-4">
+        <div class="flex flex-nowrap gap-2.5">
           {#if message}
             <ClipboardCopyButton value={message} class="-m-2"></ClipboardCopyButton>
           {/if}
           {#if onClose}
             <button
               onclick={onClose}
-              class="fd fd-x -m-2 btn-icon text-[24px]"
+              class="fd fd-x -m-2 btn-icon text-[20px]"
               aria-label="Dismiss pipeline deployment error"
             >
             </button>

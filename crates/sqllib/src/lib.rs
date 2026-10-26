@@ -23,6 +23,10 @@ pub use error::*;
 #[doc(hidden)]
 pub mod float;
 pub use float::*;
+pub(crate) mod hash_repr;
+#[doc(hidden)]
+pub use dbsp::dynamic::HashRepr as __HashRepr;
+
 #[doc(hidden)]
 pub mod geopoint;
 pub use geopoint::*;
@@ -51,9 +55,19 @@ pub use uuid::*;
 pub mod variant;
 pub use variant::*;
 pub mod flat_variant;
+
+/// VARIANT in the Parquet variant binary encoding.
+mod variant_binary;
+/// Conversions between `VariantValue` and the `VARIANT` representations of this crate.
+mod variant_value;
 pub use flat_variant::casts::*;
 pub use flat_variant::functions::*;
-pub use flat_variant::{FlatVariant, variant_to_fv, variant_to_fvN};
+pub use flat_variant::{FlatVariant, SqlVariant, variant_to_fv, variant_to_fvN};
+// Re-export the engine-neutral VARIANT value that connector metadata carries, so UDFs and
+// preprocessors can use it without importing the feldera-types crate.
+pub use feldera_types::variant::{
+    VariantDecimal4, VariantDecimal8, VariantDecimal16, VariantDecimalError, VariantValue,
+};
 #[doc(hidden)]
 pub mod rfc3339;
 #[doc(hidden)]
@@ -69,7 +83,7 @@ pub use string_interner::{build_string_interner, intern_string, unintern_string}
 // Perhaps they should be defined in sqllib in the first place?
 pub use dbsp::algebra::{F32, F64};
 use dbsp::{
-    DBData, MapHandle, OrdIndexedZSet, OrdZSet, OutputHandle, ZSetHandle, ZWeight,
+    DBData, LazyMapHandle, MapHandle, OrdIndexedZSet, OrdZSet, OutputHandle, ZSetHandle, ZWeight,
     algebra::{
         AddByRef, HasOne, HasZero, NegByRef, OrdIndexedZSetFactories, OrdZSetFactories, Semigroup,
         SemigroupValue, ZRingValue,
@@ -1051,29 +1065,6 @@ some_polymorphic_function2!(power, i32, i32, i32, i32, F64);
 
 ////////////////////////////////////////////////
 
-// Functions called by 'writelog'
-#[doc(hidden)]
-pub fn dump<T>(prefix: SqlString, data: &T) -> T
-where
-    T: Debug + Clone,
-{
-    println!("{}: {:?}", prefix.str(), data);
-    data.clone()
-}
-
-#[doc(hidden)]
-pub fn print(str: SqlString) {
-    print!("{}", str.str())
-}
-
-#[doc(hidden)]
-pub fn print_opt(str: Option<SqlString>) {
-    match str {
-        None => print!("NULL"),
-        Some(x) => print!("{}", x.str()),
-    }
-}
-
 #[doc(hidden)]
 pub fn zset_map<D, T, F>(data: &WSet<D>, mapper: F) -> WSet<T>
 where
@@ -1107,7 +1098,8 @@ where
 {
     let factories = OrdZSetFactories::new::<D, (), ZWeight>();
 
-    let mut builder = OrdWSetBuilder::with_capacity(&factories, data.len(), data.len());
+    let mut builder =
+        OrdWSetBuilder::with_capacity(&factories, data.len_upper_bound(), data.len_upper_bound());
 
     let mut cursor = data.cursor();
     while cursor.key_valid() {
@@ -1137,8 +1129,11 @@ where
     F: Fn((&K, &D), &T) -> bool,
 {
     let factories = OrdIndexedZSetFactories::new::<K, D, ZWeight>();
-    let mut builder =
-        OrdIndexedWSetBuilder::with_capacity(&factories, data.key_count(), data.len());
+    let mut builder = OrdIndexedWSetBuilder::with_capacity(
+        &factories,
+        data.key_count_upper_bound(),
+        data.len_upper_bound(),
+    );
 
     let mut cursor = data.cursor();
     while cursor.key_valid() {
@@ -1185,6 +1180,31 @@ pub fn append_to_map_handle<K, V, U>(
         } else {
             let key = unsafe { cursor.key().downcast::<V>() };
             handle.push(key_f(&key.clone()), Update::Insert(key.clone()));
+        }
+        cursor.step_key();
+    }
+}
+
+#[doc(hidden)]
+pub fn append_to_lazy_map_handle<K, V>(
+    data: &WSet<V>,
+    handle: &LazyMapHandle<K, V>,
+    key_f: fn(&V) -> K,
+) where
+    K: DBData,
+    V: DBData,
+{
+    let mut cursor = data.cursor();
+    while cursor.key_valid() {
+        let w = *cursor.weight().deref();
+        if !w.is_zero() {
+            // The lazy map takes whole records and deletes rather than
+            // upserts: a delete names its key alone, and a write carries the
+            // record that replaces whatever the key held.
+            // SAFETY: `data` is a `WSet<V>`, so every key is a `V`.
+            let record = unsafe { cursor.key().downcast::<V>() };
+            let value = if w.ge0() { Some(record.clone()) } else { None };
+            handle.push(key_f(record), value);
         }
         cursor.step_key();
     }
@@ -1330,6 +1350,32 @@ where
             TS::combine(&left.0, &right.0),
             RS::combine(&left.1, &right.1),
             VS::combine(&left.2, &right.2),
+        )
+    }
+}
+
+#[derive(Clone)]
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub struct QuadSemigroup<T, R, V, W, TS, RS, VS, WS>(PhantomData<(T, R, V, W, TS, RS, VS, WS)>);
+
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+impl<T, R, V, W, TS, RS, VS, WS> Semigroup<Tup4<T, R, V, W>>
+    for QuadSemigroup<T, R, V, W, TS, RS, VS, WS>
+where
+    TS: Semigroup<T>,
+    RS: Semigroup<R>,
+    VS: Semigroup<V>,
+    WS: Semigroup<W>,
+{
+    #[doc(hidden)]
+    fn combine(left: &Tup4<T, R, V, W>, right: &Tup4<T, R, V, W>) -> Tup4<T, R, V, W> {
+        Tup4::new(
+            TS::combine(&left.0, &right.0),
+            RS::combine(&left.1, &right.1),
+            VS::combine(&left.2, &right.2),
+            WS::combine(&left.3, &right.3),
         )
     }
 }

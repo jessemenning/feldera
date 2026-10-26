@@ -71,6 +71,10 @@ pub const STATE_RECORDS_COUNT: MetricId = MetricId(Cow::Borrowed("state_records_
 pub const INPUT_RECORDS_COUNT: MetricId = MetricId(Cow::Borrowed("input_records_count"));
 pub const INPUT_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("input_batches_stats"));
 pub const OUTPUT_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("output_batches_stats"));
+pub const OUTPUT_ADJUSTMENT_STATS: MetricId = MetricId(Cow::Borrowed("output_adjustment_stats"));
+pub const UNREAD_UPDATES_COUNT: MetricId = MetricId(Cow::Borrowed("unread_updates_count"));
+pub const CONFLICTING_UPDATES_COUNT: MetricId =
+    MetricId(Cow::Borrowed("conflicting_updates_count"));
 pub const EXCHANGE_WAIT_TIME_SECONDS: MetricId =
     MetricId(Cow::Borrowed("exchange_wait_time_seconds"));
 pub const EXCHANGE_SERIALIZATION_TIME_SECONDS: MetricId =
@@ -112,6 +116,12 @@ pub const CACHE_FOREGROUND_HITS: MetricId = MetricId(Cow::Borrowed("foreground_c
 pub const CACHE_FOREGROUND_MISSES: MetricId = MetricId(Cow::Borrowed("foreground_cache_misses"));
 pub const CACHE_BACKGROUND_HITS: MetricId = MetricId(Cow::Borrowed("background_cache_hits"));
 pub const CACHE_BACKGROUND_MISSES: MetricId = MetricId(Cow::Borrowed("background_cache_misses"));
+pub const CACHE_FOREGROUND_PREFETCHES: MetricId =
+    MetricId(Cow::Borrowed("foreground_cache_prefetches"));
+pub const CACHE_FOREGROUND_WAITS: MetricId = MetricId(Cow::Borrowed("foreground_cache_waits"));
+pub const CACHE_BACKGROUND_PREFETCHES: MetricId =
+    MetricId(Cow::Borrowed("background_cache_prefetches"));
+pub const CACHE_BACKGROUND_WAITS: MetricId = MetricId(Cow::Borrowed("background_cache_waits"));
 pub const CACHE_FOREGROUND_HIT_RATE_PERCENT: MetricId =
     MetricId(Cow::Borrowed("foreground_cache_hit_rate_percent"));
 pub const CACHE_BACKGROUND_HIT_RATE_PERCENT: MetricId =
@@ -164,10 +174,19 @@ pub const RUNTIME_SECONDS: MetricId = MetricId(Cow::Borrowed("runtime_seconds"))
 /// to blocking in the kernel (e.g. because it is waiting for I/O).
 pub const RUNTIME_NONBLOCKING_PERCENT: MetricId = MetricId(Cow::Borrowed("nonblocking_percent"));
 pub const RUNTIME_PERCENT: MetricId = MetricId(Cow::Borrowed("runtime_percent"));
+pub const CIRCUIT_WAIT_BY_REASON_SECONDS: MetricId =
+    MetricId(Cow::Borrowed("circuit_wait_by_reason_seconds"));
 pub const CIRCUIT_WAIT_TIME_SECONDS: MetricId =
     MetricId(Cow::Borrowed("circuit_wait_time_seconds"));
 pub const STEPS_COUNT: MetricId = MetricId(Cow::Borrowed("steps_count"));
 pub const CIRCUIT_RUNTIME_SECONDS: MetricId = MetricId(Cow::Borrowed("circuit_runtime_seconds"));
+
+/// CPU time the worker thread used while evaluating steps.
+pub const CIRCUIT_CPU_TIME_SECONDS: MetricId = MetricId(Cow::Borrowed("circuit_cpu_time_seconds"));
+
+/// Fraction of the circuit's step time spent on the CPU.
+pub const CIRCUIT_NONBLOCKING_PERCENT: MetricId =
+    MetricId(Cow::Borrowed("circuit_nonblocking_percent"));
 pub const CIRCUIT_IDLE_TIME_SECONDS: MetricId =
     MetricId(Cow::Borrowed("circuit_idle_time_seconds"));
 pub const CIRCUIT_RUNTIME_ELAPSED_SECONDS: MetricId =
@@ -180,12 +199,12 @@ pub const PREFIX_BATCHES_STATS: MetricId = MetricId(Cow::Borrowed("prefix_batche
 pub const INPUT_INTEGRAL_RECORDS_COUNT: MetricId =
     MetricId(Cow::Borrowed("input_integral_records_count"));
 
-pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
+pub const CIRCUIT_METRICS: [CircuitMetric; 86] = [
     // State
     CircuitMetric {
         name: USED_MEMORY_BYTES,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "Bytes used by the in-memory state of the operator. See also 'allocated_memory_bytes'.",
     },
     CircuitMetric {
@@ -245,7 +264,7 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
     CircuitMetric {
         name: MERGING_SIZE_BYTES,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "Approximate combined in-memory and on-disk size of currently merging batches.",
     },
     CircuitMetric {
@@ -293,13 +312,13 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
     CircuitMetric {
         name: BLOOM_FILTER_HITS_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of hits across all Bloom filters. The hits are summed across the Bloom filters for all batches in the spine.",
     },
     CircuitMetric {
         name: BLOOM_FILTER_MISSES_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of misses across all Bloom filters. The misses are summed across the Bloom filters for all batches in the spine.",
     },
     CircuitMetric {
@@ -317,13 +336,13 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
     CircuitMetric {
         name: ROARING_FILTER_HITS_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of hits across all bitmap filters. The hits are summed across the bitmap filters for all batches in the spine.",
     },
     CircuitMetric {
         name: ROARING_FILTER_MISSES_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of misses across all bitmap filters. The misses are summed across the bitmap filters for all batches in the spine.",
     },
     CircuitMetric {
@@ -341,13 +360,13 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
     CircuitMetric {
         name: RANGE_FILTER_HITS_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of hits across all range filters. The hits are summed across the range filters for all batches in the spine.",
     },
     CircuitMetric {
         name: RANGE_FILTER_MISSES_COUNT,
         category: CircuitMetricCategory::State,
-        advanced: false,
+        advanced: true,
         description: "The number of misses across all range filters. The misses are summed across the range filters for all batches in the spine.",
     },
     CircuitMetric {
@@ -437,6 +456,24 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
         description: "Distribution of output batch sizes produced by the operator.",
     },
     CircuitMetric {
+        name: OUTPUT_ADJUSTMENT_STATS,
+        category: CircuitMetricCategory::Outputs,
+        advanced: true,
+        description: "Distribution of the sizes of outputs produced by the lazy upsert operator.",
+    },
+    CircuitMetric {
+        name: UNREAD_UPDATES_COUNT,
+        category: CircuitMetricCategory::Inputs,
+        advanced: true,
+        description: "Keys a lazy input map resolved without reading the update it collected, because the key was written once and the transaction held no deletes. Against 'input_batches_stats' it says how often the shortcut applied.",
+    },
+    CircuitMetric {
+        name: CONFLICTING_UPDATES_COUNT,
+        category: CircuitMetricCategory::Multihost,
+        advanced: true,
+        description: "Number of updates that arrived at the same step as another update to their key, which happens when several hosts ingest that key in one transaction.",
+    },
+    CircuitMetric {
         name: COMPUTED_OUTPUT_RECORDS_COUNT,
         category: CircuitMetricCategory::Outputs,
         advanced: false,
@@ -452,7 +489,7 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
     CircuitMetric {
         name: INVOCATIONS_COUNT,
         category: CircuitMetricCategory::Time,
-        advanced: false,
+        advanced: true,
         description: "Number of times the operator has been invoked.",
     },
     CircuitMetric {
@@ -468,10 +505,16 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
         description: "Percentage of time spent evaluating the operator as a fraction of the total runtime of all operators in the circuit.",
     },
     CircuitMetric {
+        name: CIRCUIT_WAIT_BY_REASON_SECONDS,
+        category: CircuitMetricCategory::Time,
+        advanced: true,
+        description: "'circuit_wait_time_seconds' split by what the worker was waiting for.",
+    },
+    CircuitMetric {
         name: CIRCUIT_WAIT_TIME_SECONDS,
         category: CircuitMetricCategory::Time,
         advanced: false,
-        description: "Time the circuit scheduler spent waiting for an operator to become ready.",
+        description: "Time during a step when the worker was not running: its async runtime had nothing to run, for example while waiting for other workers at an exchange or for background work to finish, or its thread was blocked in a storage system call, reading a layer-file block, spilling blocks, fsyncing a layer file, or creating, renaming and unlinking one. 'circuit_wait_by_reason_seconds' says which. A system call counts only for the part its thread spends off the CPU: the rest of it runs in the kernel on the worker's own thread and is already in 'circuit_cpu_time_seconds'. Other blocking an operator does without yielding is not counted here and shows up instead as a low 'circuit_nonblocking_percent'.",
     },
     CircuitMetric {
         name: STEPS_COUNT,
@@ -483,13 +526,25 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
         name: CIRCUIT_RUNTIME_SECONDS,
         category: CircuitMetricCategory::Time,
         advanced: false,
-        description: "Total time spent evaluating the circuit, including operators runtime and circuit wait time ('circuit_wait_time_seconds').",
+        description: "Total time spent evaluating the circuit: operator runtime, circuit wait time ('circuit_wait_time_seconds'), and time blocked in the kernel or descheduled. See also 'circuit_cpu_time_seconds'.",
+    },
+    CircuitMetric {
+        name: CIRCUIT_CPU_TIME_SECONDS,
+        category: CircuitMetricCategory::Time,
+        advanced: false,
+        description: "CPU time the worker thread used while evaluating steps. Subtracting this and 'circuit_wait_time_seconds' from 'circuit_runtime_seconds' leaves the time the worker was blocked in the kernel or descheduled.",
+    },
+    CircuitMetric {
+        name: CIRCUIT_NONBLOCKING_PERCENT,
+        category: CircuitMetricCategory::Time,
+        advanced: true,
+        description: "Fraction of the circuit's step time spent on the CPU, as opposed to waiting for other workers, blocking in the kernel, or being descheduled.",
     },
     CircuitMetric {
         name: CIRCUIT_IDLE_TIME_SECONDS,
         category: CircuitMetricCategory::Time,
         advanced: false,
-        description: "Total time spent between circuit invocations, waiting for new data from input connectors or for output connector queues to clear out.",
+        description: "Time between one step ending and the next beginning. This time includes waiting for the other workers to finish their step and for the pipeline to initiate the next step.",
     },
     CircuitMetric {
         name: CIRCUIT_RUNTIME_ELAPSED_SECONDS,
@@ -594,6 +649,30 @@ pub const CIRCUIT_METRICS: [CircuitMetric; 76] = [
         category: CircuitMetricCategory::Cache,
         advanced: false,
         description: "Statistics about cache misses in the background thread.",
+    },
+    CircuitMetric {
+        name: CACHE_FOREGROUND_PREFETCHES,
+        category: CircuitMetricCategory::Cache,
+        advanced: true,
+        description: "Blocks the foreground thread asked storage for ahead of need, so that a cursor walking forward finds them in the cache. Bytes are the blocks' sizes; the time is zero, since the reads run in the background.",
+    },
+    CircuitMetric {
+        name: CACHE_FOREGROUND_WAITS,
+        category: CircuitMetricCategory::Cache,
+        advanced: true,
+        description: "Blocks the foreground thread wanted while a read issued ahead of need was still in flight. The time is how long it waited; each is a round trip the read-ahead did not fully hide.",
+    },
+    CircuitMetric {
+        name: CACHE_BACKGROUND_PREFETCHES,
+        category: CircuitMetricCategory::Cache,
+        advanced: true,
+        description: "Blocks a background thread asked storage for ahead of need.",
+    },
+    CircuitMetric {
+        name: CACHE_BACKGROUND_WAITS,
+        category: CircuitMetricCategory::Cache,
+        advanced: true,
+        description: "Blocks a background thread wanted while a read issued ahead of need was still in flight, and the time it waited for them.",
     },
     CircuitMetric {
         name: CACHE_FOREGROUND_HIT_RATE_PERCENT,
@@ -706,11 +785,7 @@ impl BatchSizeStats {
             ),
             (
                 Cow::Borrowed("avg_records_count"),
-                MetaItem::Count(if self.cnt == 0 {
-                    0
-                } else {
-                    self.total / self.cnt
-                }),
+                MetaItem::Count(self.total.checked_div(self.cnt).unwrap_or(0)),
             ),
             (
                 Cow::Borrowed("total_records_count"),
@@ -762,6 +837,21 @@ impl OperatorMeta {
 
     pub fn get(&self, metric_id: MetricId) -> Option<MetaItem> {
         self.entries.get(&(metric_id, Vec::new())).cloned()
+    }
+
+    /// Every reading of `metric_id`, with the labels that tell them apart.
+    ///
+    /// [`Self::get`] answers for the one reading that carries no labels; a
+    /// metric that reports a value per label, such as one wait time per reason,
+    /// is read here.
+    pub fn readings(
+        &self,
+        metric_id: &MetricId,
+    ) -> impl Iterator<Item = (&MetricLabels, &MetaItem)> {
+        self.entries
+            .iter()
+            .filter(move |((id, _), _)| id == metric_id)
+            .map(|((_, labels), value)| (labels, value))
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -839,9 +929,9 @@ pub enum MetaItem {
     Count(usize),
 
     /// A percentage in terms of a numerator and denominator. Separating these
-    /// makes it possible to aggregate them.
+    /// makes it possible to aggregate them. The numerator can be negative.
     Percent {
-        numerator: u64,
+        numerator: i64,
         denominator: u64,
     },
 
@@ -857,7 +947,7 @@ pub enum MetaItem {
 
 #[derive(Serialize)]
 struct PercentValue {
-    numerator: u64,
+    numerator: i64,
     denominator: u64,
 }
 

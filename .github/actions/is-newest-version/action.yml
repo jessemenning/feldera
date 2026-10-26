@@ -1,0 +1,44 @@
+name: Is newest version
+description: >
+  Decide whether the version being released is the newest of the repository's
+  v* tags, so release workflows can keep floating pointers (the GitHub
+  "latest" marker, :latest image tags, live docs and sandboxes) on the newest
+  version when shipping a backport from an old release line. Requires a
+  checkout with tags fetched; the new release's own tag must not exist yet.
+
+inputs:
+  version:
+    description: The version being released, without the leading v.
+    required: true
+
+outputs:
+  is_newest:
+    description: '"true" when the version is >= every existing v* tag, else "false".'
+    value: ${{ steps.compare.outputs.is_newest }}
+
+runs:
+  using: composite
+  steps:
+    - id: compare
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        # Strict X.Y.Z filter: a stray non-numeric tag (vnext) or a
+        # pre-release tag (v1.2.3-rc1) would otherwise outrank real versions
+        # under sort -V and silently flip a normal release to a backport.
+        highest=$(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1 || true)
+        # Fail closed: an empty tag list on a release repo means the checkout
+        # did not fetch tags. Guessing "newest" here would move every
+        # floating pointer onto whatever is being released.
+        if [ -z "$highest" ]; then
+          echo "::error::no vX.Y.Z tags visible; was the checkout made with fetch-tags?"
+          exit 1
+        fi
+        if [ "$(printf '%s\n%s\n' "$highest" "$VERSION" | sort -V | tail -1)" = "$VERSION" ]; then
+          echo "is_newest=true" >> "$GITHUB_OUTPUT"
+          echo "v$VERSION is the newest version (highest existing tag: v$highest)"
+        else
+          echo "is_newest=false" >> "$GITHUB_OUTPUT"
+          echo "v$VERSION is a backport (highest existing tag: v$highest); floating pointers stay put"
+        fi

@@ -70,9 +70,6 @@ public abstract class CalciteRelNode extends CalciteObject implements IHasId {
         }
     }
 
-    @Override
-    public String getMessage() { return ""; }
-
     public abstract IIndentStream asJson(IIndentStream stream, Map<RelNode, Integer> idRemap);
 
     public abstract CalciteRelNode remove(RelNode node);
@@ -84,4 +81,7 @@ public abstract class CalciteRelNode extends CalciteObject implements IHasId {
 
     /** Return a version of this node where all final nodes are marked partial */
     public abstract CalciteRelNode intermediate();
+
+    /** The Calcite relational operators that this node stands for, in execution order */
+    public abstract List<RelNode> getRelNodes();
 }

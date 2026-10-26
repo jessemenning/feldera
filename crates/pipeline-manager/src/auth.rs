@@ -33,9 +33,11 @@
 //! OpenAPI spec (or look at the endpoints in `api/api_keys`).
 //! These API keys can then be used in the REST API similar to how JWT tokens
 //! are used above, but with the bearer token being "apikey:1234..." to
-//! authorize access. For now, we simply have two permission types: Read and
-//! Write. Later, we will expand to have fine-grained access to specific API
-//! resources.
+//! authorize access. Every principal (login JWT, API key, or OIDC trust)
+//! resolves to a single RBAC [`Role`] (`read < write < admin < owner`); the
+//! RBAC middleware (`crate::api::rbac`) enforces the minimum role per route.
+//! API keys carry only `read` or `write`; `admin` and `owner` come solely from
+//! signature-verified principals.
 //!
 //! API keys are randomly generated 128 character sequences that are never
 //! stored in the pipeline manager or in the database. It is the responsibility
@@ -44,27 +46,26 @@
 //! pipeline manager side, we store a hash of the API key in the database along
 //! with the permissions.
 
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, sync::Arc};
 
+use actix_web::HttpMessage;
 use actix_web::body::MessageBody;
 use actix_web::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use actix_web::middleware::Next;
-use actix_web::HttpMessage;
 use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
-    error::ErrorUnauthorized,
+    error::{ErrorBadRequest, ErrorUnauthorized},
     web::Data,
 };
 use actix_web_httpauth::extractors::{
-    bearer::{BearerAuth, Config},
     AuthenticationError,
+    bearer::{BearerAuth, Config},
 };
-use awc::error::JsonPayloadError;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cached::{Cached, TimedCache};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation, decode, decode_header};
 use rand::rngs::ThreadRng;
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use static_assertions::assert_impl_any;
@@ -74,19 +75,118 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::api::main::ServerState;
-use crate::config::ApiServerConfig;
+use crate::config::{ApiServerConfig, BasePath};
 use crate::db::error::DBError;
 use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
-use crate::db::types::api_key::ApiPermission;
+use crate::db::types::role::Role;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::{MembershipOrigin, UserMembership};
+use crate::oidc::fetch::{
+    OidcClients, OidcDestination, fetch_issuer_jwks, fetch_jwks_uri_from_discovery,
+};
+use crate::oidc::userinfo::{
+    PROFILE_REFRESH_TTL_SECONDS, deserialize_bool_or_string, fetch_user_profile,
+    resolve_userinfo_endpoint,
+};
+use reqwest::Certificate;
 
-// Used when no auth is configured, so we tag the request with the default user
-// and passthrough
+/// The authenticated principal behind a request, resolved by `auth_validator`
+/// and stored in request extensions. The RBAC middleware reads `role`; handlers
+/// read the acting tenant (also stored as a bare `TenantId` for compatibility
+/// with existing `ReqData<TenantId>` extractors).
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedPrincipal {
+    /// The tenant the request operates in: the one the principal's claims
+    /// resolve to, or the one a `Feldera-Tenant` header selected among those it
+    /// is authorized for.
+    pub acting_tenant: TenantId,
+    /// The principal's effective role in the acting tenant.
+    pub role: Role,
+    /// Human-readable identity for audit logging (email, sub, or "apikey:<name>").
+    pub label: String,
+}
+
+impl AuthenticatedPrincipal {
+    /// Insert the principal and the acting tenant into request extensions.
+    fn install(self, req: &ServiceRequest) {
+        req.extensions_mut().insert(self.acting_tenant);
+        req.extensions_mut().insert(self);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(role: Role) -> Self {
+        Self {
+            acting_tenant: DEFAULT_TENANT_ID,
+            role,
+            label: "test".to_string(),
+        }
+    }
+}
+
+/// Identity of a human login, installed by `bearer_auth` as a request
+/// extension so the session endpoint can look up the user's memberships.
+/// Absent for API keys, federated workloads, and no-auth mode.
+#[derive(Clone, Debug)]
+pub(crate) struct LoginIdentity {
+    pub provider: String,
+    pub subject: String,
+}
+
+/// Marker extension: the login carried no resolvable acting tenant. Only the
+/// session endpoint sees such a request; every other route was refused. The
+/// session handler answers with the caller's memberships and no acting-tenant
+/// fields, so a client can pick a tenant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnresolvedActingTenant;
+
+/// Whether this request may be answered without a resolved acting tenant.
+///
+/// The path is compared root-relative, so the exemption holds for a deployment
+/// mounted on a subpath: `/feldera/v0/config/session` matches. Comparing the
+/// raw path would strand such a login, since the picker's own endpoint would be
+/// the one request it could not make.
+fn is_session_request(req: &ServiceRequest) -> bool {
+    if req.method() != actix_web::http::Method::GET {
+        return false;
+    }
+    BasePath::root_relative(req) == "/v0/config/session"
+}
+
+/// Returns true if the given OIDC identity is configured as a platform owner.
+/// Matches an `owners` entry against the email, the bare subject, or the
+/// provider-qualified `"<issuer> <subject>"` form. Callers must pass `email`
+/// only when the provider verified it (`email_verified == true`), so an
+/// unverified, user-settable email cannot confer `owner`.
+fn is_configured_owner(
+    owners: &[String],
+    provider: &str,
+    subject: &str,
+    email: Option<&str>,
+) -> bool {
+    if owners.is_empty() {
+        return false;
+    }
+    let qualified = format!("{provider} {subject}");
+    owners
+        .iter()
+        .map(|o| o.trim())
+        // Skip empty entries: a trailing/double comma in FELDERA_OWNERS yields
+        // "", which must not match a token with an empty/absent email or subject.
+        .filter(|o| !o.is_empty())
+        .any(|o| o == qualified || o == subject || email.map(|e| e == o).unwrap_or(false))
+}
+
+// Used when no auth is configured, so we tag the request with the default
+// principal and passthrough. A single local node has one tenant, so the dev
+// principal is `admin` of it; cross-tenant `owner` is meaningless here.
 pub(crate) fn tag_with_default_tenant_id(req: ServiceRequest) -> ServiceRequest {
-    req.extensions_mut().insert(DEFAULT_TENANT_ID);
-    req.extensions_mut()
-        .insert(vec![ApiPermission::Read, ApiPermission::Write]);
+    AuthenticatedPrincipal {
+        acting_tenant: DEFAULT_TENANT_ID,
+        role: Role::Admin,
+        label: "default".to_string(),
+    }
+    .install(&req);
     req
 }
 
@@ -125,20 +225,17 @@ pub(crate) async fn promote_websocket_subprotocol_auth(
     mut req: ServiceRequest,
     next: Next<impl MessageBody>,
 ) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    if !req.headers().contains_key(header::AUTHORIZATION) {
-        if let Some(token) = decode_ws_subprotocol(req.headers(), WS_BEARER_PROTOCOL_PREFIX) {
-            if let Ok(authorization) = HeaderValue::from_str(&format!("Bearer {token}")) {
-                req.headers_mut()
-                    .insert(header::AUTHORIZATION, authorization);
-                if let Some(tenant) =
-                    decode_ws_subprotocol(req.headers(), WS_TENANT_PROTOCOL_PREFIX)
-                {
-                    if let Ok(tenant) = HeaderValue::from_str(&tenant) {
-                        req.headers_mut()
-                            .insert(HeaderName::from_static(TENANT_HEADER), tenant);
-                    }
-                }
-            }
+    if !req.headers().contains_key(header::AUTHORIZATION)
+        && let Some(token) = decode_ws_subprotocol(req.headers(), WS_BEARER_PROTOCOL_PREFIX)
+        && let Ok(authorization) = HeaderValue::from_str(&format!("Bearer {token}"))
+    {
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, authorization);
+        if let Some(tenant) = decode_ws_subprotocol(req.headers(), WS_TENANT_PROTOCOL_PREFIX)
+            && let Ok(tenant) = HeaderValue::from_str(&tenant)
+        {
+            req.headers_mut()
+                .insert(HeaderName::from_static(TENANT_HEADER), tenant);
         }
     }
     next.call(req).await
@@ -156,16 +253,535 @@ fn create_authz_json_error(message: &str) -> actix_web::Error {
 /// Authorization using a bearer token. Expects to find either a typical
 /// OAuth2/OIDC JWT token or an API key. JWT tokens are expected to be available
 /// as is, whereas API keys are prefix with the string "apikey:".
+///
+/// A JWT may come from either:
+///   1. The configured OIDC login provider (existing browser-driven flow).
+///   2. A foreign issuer authorized by an OIDC trust relationship — the
+///      workload-identity-federation path.
+///
+/// We dispatch on the `iss` claim, peeked unverified, then sign-verify in
+/// the corresponding handler.
 pub(crate) async fn auth_validator(
     req: ServiceRequest,
     credentials: BearerAuth,
 ) -> Result<ServiceRequest, (actix_web::error::Error, ServiceRequest)> {
+    // Reject ambiguous or malformed selectors before any auth path can treat
+    // one as an absent header and silently choose a different tenant.
+    if let Err(error) = tenant_selector(req.headers()) {
+        return Err((error, req));
+    }
     let token = credentials.token();
-    // Check if we are using an API key first.
     if token.starts_with(API_KEY_PREFIX) {
         return api_key_auth(req, token).await;
     }
-    bearer_auth(req, token).await
+    let configuration = req.app_data::<AuthConfiguration>().unwrap();
+    match peek_unverified_iss(token) {
+        Some(iss) if iss == configuration.provider.issuer() => bearer_auth(req, token).await,
+        Some(_) => oidc_trust_auth(req, token).await,
+        None => {
+            let config = req.app_data::<Config>().cloned().unwrap_or_default();
+            Err((
+                AuthenticationError::from(config)
+                    .with_error_description("Malformed JWT: missing iss claim")
+                    .into(),
+                req,
+            ))
+        }
+    }
+}
+
+/// A tenant selector is one non-empty header value. All credential types use
+/// this parser, including credentials promoted from WebSocket subprotocols.
+fn tenant_selector(headers: &HeaderMap) -> Result<Option<&str>, actix_web::Error> {
+    let invalid = || {
+        ErrorBadRequest(
+            "Invalid Feldera-Tenant header: send exactly one non-empty tenant name or UUID, or omit the header",
+        )
+    };
+    let mut values = headers.get_all(TENANT_HEADER);
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    let selector = value.to_str().map_err(|_| invalid())?;
+    if selector.trim().is_empty() {
+        return Err(invalid());
+    }
+    Ok(Some(selector))
+}
+
+/// Decode the JWT payload without verifying the signature and return the
+/// `iss` claim, if present. Used only to route the token to the right
+/// verification path; the chosen handler performs full signature checks.
+fn peek_unverified_iss(token: &str) -> Option<String> {
+    use base64::Engine;
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64.as_bytes())
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    v.get("iss")?.as_str().map(String::from)
+}
+
+/// Extract audiences from an `aud` claim that may be a string or an array.
+fn audiences_from_claim(aud: Option<&serde_json::Value>) -> Vec<String> {
+    match aud {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Verify a JWT against the issuer named in its `iss` claim, then resolve
+/// the request to a tenant via a registered trust relationship.
+async fn oidc_trust_auth(
+    req: ServiceRequest,
+    token: &str,
+) -> Result<ServiceRequest, (actix_web::error::Error, ServiceRequest)> {
+    let unauthorized = |msg: String, req: ServiceRequest| {
+        let config = req.app_data::<Config>().cloned().unwrap_or_default();
+        Err((
+            AuthenticationError::from(config)
+                .with_error_description(msg)
+                .into(),
+            req,
+        ))
+    };
+
+    // A database that cannot answer says nothing about the caller's
+    // credentials. Reporting it as 401 sends users to re-authenticate during an
+    // outage, and hides the outage from whoever is looking at status codes, so
+    // the error keeps the status it already carries.
+    let unavailable = |e: DBError, req: ServiceRequest| Err((e.into(), req));
+
+    let header = match decode_header(token) {
+        Ok(h) => h,
+        Err(e) => {
+            debug!("Federated token: bad header: {:?}", e);
+            return unauthorized("Malformed JWT header".to_string(), req);
+        }
+    };
+    if header.alg != Algorithm::RS256 {
+        return unauthorized(format!("Unsupported JWT algorithm {:?}", header.alg), req);
+    }
+    let Some(kid) = header.kid else {
+        return unauthorized("JWT header missing kid".to_string(), req);
+    };
+    let Some(iss) = peek_unverified_iss(token) else {
+        return unauthorized("JWT missing iss".to_string(), req);
+    };
+
+    let state = req.app_data::<Data<ServerState>>().unwrap().clone();
+
+    // SSRF/DoS gate: only fetch discovery/JWKS for an issuer that at least one
+    // trust names, whether configured at launch or registered in a tenant. The
+    // two sources earn different destination policies, because the operator
+    // picked one and a tenant administrator picked the other.
+    let destination = if state.config.owner_trusts.names_issuer(&iss) {
+        Some(OidcDestination::OperatorConfigured)
+    } else {
+        match state.db.lock().await.is_trusted_issuer(&iss).await {
+            Ok(true) => Some(OidcDestination::TenantRegistered(
+                state.config.tenant_issuer_policy(),
+            )),
+            Ok(false) => None,
+            Err(e) => {
+                error!("Trusted-issuer check failed for '{iss}': {e}");
+                return unavailable(e, req);
+            }
+        }
+    };
+    let Some(destination) = destination else {
+        debug!("Federated token from unregistered issuer '{iss}' rejected");
+        return unauthorized(
+            "No OIDC trust relationship matches this token".to_string(),
+            req,
+        );
+    };
+
+    let jwk = match resolve_issuer_jwk(&state, &iss, &kid, destination).await {
+        Ok(k) => k,
+        Err(e) => {
+            // The detail stays in the log. The caller chose this fetch's
+            // destination, so echoing the outcome would report whether an
+            // internal address answered.
+            error!("Federated JWKS fetch for issuer '{iss}' failed: {e}");
+            return unauthorized("Could not verify the token's signing key".to_string(), req);
+        }
+    };
+
+    // Verify signature + exp + nbf. Issuer/audience are checked against the
+    // trust relationship below, not by the JWT validator itself.
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.validate_aud = false;
+    validation.set_required_spec_claims(&["exp"]);
+    let token_data = match decode::<OidcClaim>(token, &jwk, &validation) {
+        Ok(td) => td,
+        Err(e) => {
+            debug!("Federated token verification failed: {:?}", e.kind());
+            return unauthorized(format!("JWT verification failed: {}", e), req);
+        }
+    };
+    if token_data.claims.iss != iss {
+        return unauthorized("iss mismatch between header peek and body".to_string(), req);
+    }
+
+    let audiences = audiences_from_claim(token_data.claims.aud.as_ref());
+    let owner_trust = state
+        .config
+        .owner_trusts
+        .admits(&iss, &token_data.claims.sub, &audiences);
+    let matches = {
+        let db = state.db.lock().await;
+        db.match_oidc_trust(&iss, &token_data.claims.sub, &audiences)
+            .await
+    };
+    let matches = match matches {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Federated trust lookup failed: {e}");
+            return unavailable(e, req);
+        }
+    };
+    if matches.is_empty() && !owner_trust {
+        let ip = req
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "<unknown IP>".to_string());
+        error!(
+            "Federated JWT rejected: no trust relationship matches iss='{iss}' sub='{}' from {ip}",
+            token_data.claims.sub
+        );
+        return unauthorized(
+            "No OIDC trust relationship matches this token".to_string(),
+            req,
+        );
+    }
+
+    let label = format!("oidc:{}", token_data.claims.sub);
+    let db_err =
+        |e: DBError, req: ServiceRequest| Err((crate::error::ManagerError::from(e).into(), req));
+
+    // An owner belongs to no tenant of its own, so it acts wherever the
+    // Feldera-Tenant header points, and in the default tenant without one, as a
+    // configured owner does. That is what lets an owner call the platform-wide
+    // tenant routes on a deployment that has no tenants yet. Owner wins over any
+    // tenant-scoped match.
+    if owner_trust {
+        let acting = {
+            let db = state.db.lock().await;
+            resolve_owner_acting_tenant(&db, req.headers(), DEFAULT_TENANT_ID).await
+        };
+        let acting = match acting {
+            Ok(t) => t,
+            Err(e) => return Err((e, req)),
+        };
+        AuthenticatedPrincipal {
+            acting_tenant: acting,
+            role: Role::Owner,
+            label,
+        }
+        .install(&req);
+        return Ok(req);
+    }
+
+    // Tenant-scoped matches. A `Feldera-Tenant` header is always honoured or
+    // refused, never ignored: a caller that names a tenant its token is not
+    // trusted in has to be told so. Serving it another tenant's data because
+    // that happened to be its only match would let it act on a tenant it never
+    // asked for, believing it acted on the one it did.
+    let tenant_matches: Vec<(TenantId, Role)> = matches;
+    let selector = match tenant_selector(req.headers()) {
+        Ok(selector) => selector.map(str::to_string),
+        Err(e) => return Err((e, req)),
+    };
+    let (acting_tenant, role) = match selector {
+        Some(selector) => {
+            let selected = {
+                let db = state.db.lock().await;
+                db.resolve_tenant_selector(&selector).await
+            };
+            // Unknown tenant name/UUID surfaces as 404; a known tenant the token
+            // is not trusted in is 403.
+            let selected = match selected {
+                Ok(t) => t,
+                Err(e) => return db_err(e, req),
+            };
+            match tenant_matches.iter().find(|(t, _)| *t == selected).copied() {
+                Some(pair) => pair,
+                None => return db_err(DBError::OidcTenantNotTrusted { tenant: selector }, req),
+            }
+        }
+        // Without a selector a single match is unambiguous; several are not.
+        None if tenant_matches.len() == 1 => tenant_matches[0],
+        None => return db_err(DBError::AmbiguousOidcTenant, req),
+    };
+    AuthenticatedPrincipal {
+        acting_tenant,
+        role,
+        label,
+    }
+    .install(&req);
+    Ok(req)
+}
+
+/// Resolve the tenant an `owner` acts in. Every principal type selects its
+/// acting tenant with the `Feldera-Tenant` header, but each validates the
+/// selection against its own authorization set: a human login against the
+/// `tenants` claim, a federated token against the trusts that matched it. An
+/// owner's set is every tenant, so this path resolves the selector without such
+/// a filter, which is why it is gated on `role == Owner` by the callers.
+///
+/// The selector is looked up strictly by UUID or name and never creates a
+/// tenant; a miss is a 404, so a typo cannot cross into the wrong tenant.
+/// Without the header the owner acts in the tenant its own claims resolved to.
+async fn resolve_owner_acting_tenant(
+    db: &StoragePostgres,
+    headers: &actix_web::http::header::HeaderMap,
+    home: TenantId,
+) -> Result<TenantId, actix_web::Error> {
+    match tenant_selector(headers)? {
+        Some(selector) => db
+            .resolve_tenant_selector(selector)
+            .await
+            // DBError::UnknownTenantName maps to HTTP 404 through ResponseError.
+            .map_err(|e| crate::error::ManagerError::from(e).into()),
+        None => Ok(home),
+    }
+}
+
+/// The owner's home tenant: named by its claims, the default tenant when they
+/// name none or, with provisioning off, when the named tenant does not exist.
+/// A login with provisioning off must not create tenants, an owner's included.
+async fn owner_home_tenant(
+    state: &ServerState,
+    token_data: &TokenData<OidcClaim>,
+    provider: &str,
+) -> Result<TenantId, DBError> {
+    // The Feldera-Tenant header selects the acting tenant for an owner, so
+    // the home resolution deliberately reads the claims with no headers.
+    let empty = actix_web::http::header::HeaderMap::new();
+    let Ok(name) = token_data.tenant_name(&state.config, &empty) else {
+        return Ok(DEFAULT_TENANT_ID);
+    };
+    let db = state.db.lock().await;
+    if state.config.provision_on_login {
+        db.get_or_create_tenant_id(Uuid::now_v7(), name, provider.to_string())
+            .await
+    } else {
+        // By name alone: the name came from the claims, and one that parses
+        // as a UUID must not be reinterpreted as a tenant id.
+        Ok(db
+            .find_tenant_id_by_name(&name)
+            .await?
+            .unwrap_or(DEFAULT_TENANT_ID))
+    }
+}
+
+/// Provision what the tenancy strategy implies for this login, when
+/// `provision_on_login` allows it. The deliberately selected claim entry is
+/// fully provisioned (get-or-create, enroll, `first_user_role` on creation);
+/// every other listed entry enrolls into an existing tenant only, so a
+/// mangled claim entry cannot mint a tenant with the logger-in as its admin.
+/// With provisioning off, only the user's identity row is refreshed (email),
+/// so member lists stay readable; tenant creation and enrollment stop.
+async fn provision_login(
+    state: &ServerState,
+    token_data: &TokenData<OidcClaim>,
+    selector: Option<&str>,
+    provider: &str,
+    subject: &str,
+    email: Option<&str>,
+) -> Result<(), DBError> {
+    if !state.config.provision_on_login {
+        let db = state.db.lock().await;
+        db.get_or_create_user(Uuid::now_v7(), provider, subject, email)
+            .await?;
+        return Ok(());
+    }
+    let Some(listed) = token_data.authorized_tenants() else {
+        // The token names no tenant: derive one or, with both derivations
+        // off, provision nothing. That is no error: the user may hold
+        // API-granted memberships, and a user without any is denied by the
+        // acting-tenant selection, not here.
+        let Some(name) = derived_tenant_name(&state.config, provider, subject) else {
+            return Ok(());
+        };
+        let db = state.db.lock().await;
+        db.resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            name,
+            provider.to_string(),
+            subject.to_string(),
+            email.map(str::to_string),
+            state.config.default_role,
+            state.config.first_user_role,
+            MembershipOrigin::Derived,
+        )
+        .await?;
+        return Ok(());
+    };
+    let candidate = match selector {
+        Some(sel) => listed.iter().find(|n| n.as_str() == sel).cloned(),
+        None if listed.len() == 1 => Some(listed[0].clone()),
+        None => None,
+    };
+    let db = state.db.lock().await;
+    if let Some(name) = &candidate {
+        db.resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            name.clone(),
+            provider.to_string(),
+            subject.to_string(),
+            email.map(str::to_string),
+            state.config.default_role,
+            state.config.first_user_role,
+            MembershipOrigin::Claim,
+        )
+        .await?;
+    }
+    let others: Vec<String> = listed
+        .iter()
+        .filter(|n| Some(*n) != candidate.as_ref())
+        .cloned()
+        .collect();
+    if !others.is_empty() {
+        db.enroll_in_existing_tenants(
+            Uuid::now_v7(),
+            provider,
+            subject,
+            email,
+            &others,
+            state.config.default_role,
+            MembershipOrigin::Claim,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Ask the identity provider what it holds for this login, when that is due:
+/// after one of `auth_time` or [`PROFILE_REFRESH_TTL_SECONDS`] expires. See
+/// [`crate::oidc::userinfo`] for the reasoning.
+///
+/// Display data only, so fetch detached.
+async fn refresh_profile_if_due(
+    state: &Data<ServerState>,
+    token_data: &TokenData<OidcClaim>,
+    provider: &str,
+    subject: &str,
+    token: &str,
+) {
+    let auth_time = token_data.claims.auth_time;
+    let due = state
+        .user_profiles
+        .lock()
+        .await
+        .claim_refresh(provider, subject, auth_time);
+    if !due {
+        return;
+    }
+    let state = state.clone();
+    let issuer = token_data.claims.iss.clone();
+    let provider = provider.to_string();
+    let subject = subject.to_string();
+    let token = token.to_string();
+    tokio::spawn(async move {
+        if let Err(e) =
+            refresh_user_profile(&state, &issuer, &provider, &subject, &token, auth_time).await
+        {
+            // The recorded attempt holds off the next try, so a provider
+            // without a UserInfo endpoint says this once a day, not per login.
+            debug!("Profile refresh for '{subject}' at '{issuer}' did not complete: {e}");
+        }
+    });
+}
+
+/// Read this identity's profile from the provider and store it. The issuer is
+/// the configured login provider, which the operator named, so its fetches are
+/// [`OidcDestination::OperatorConfigured`] like its JWKS fetches.
+async fn refresh_user_profile(
+    state: &ServerState,
+    issuer: &str,
+    provider: &str,
+    subject: &str,
+    token: &str,
+    auth_time: Option<i64>,
+) -> anyhow::Result<()> {
+    let claimed = state
+        .db
+        .lock()
+        .await
+        .claim_profile_refresh(
+            Uuid::now_v7(),
+            provider,
+            subject,
+            auth_time,
+            PROFILE_REFRESH_TTL_SECONDS as i64,
+        )
+        .await?;
+    if !claimed {
+        return Ok(());
+    }
+    let destination = OidcDestination::OperatorConfigured;
+    let endpoint = resolve_userinfo_endpoint(
+        &state.user_profiles,
+        issuer,
+        destination,
+        &state.oidc_clients,
+    )
+    .await?;
+    let profile =
+        fetch_user_profile(&endpoint, subject, token, destination, &state.oidc_clients).await?;
+    state
+        .db
+        .lock()
+        .await
+        .store_user_profile(provider, subject, &profile)
+        .await?;
+    Ok(())
+}
+
+/// Pick the acting tenant from the user's memberships: a selector must name a
+/// tenant the user is a member of, and without one a sole membership is
+/// unambiguous. One neutral answer covers an unknown tenant and a tenant the
+/// user is no member of, because distinguishing them would let any
+/// authenticated user probe which tenants exist. Only the miss folds in; an
+/// infrastructure error must surface as one, not as an authorization denial.
+async fn select_acting_tenant(
+    state: &ServerState,
+    selector: Option<&str>,
+    memberships: &[UserMembership],
+) -> Result<(TenantId, Role), DBError> {
+    let Some(sel) = selector else {
+        return match memberships {
+            [only] => Ok((only.tenant_id, only.role)),
+            [] => Err(DBError::NoTenantMemberships),
+            _ => Err(DBError::AmbiguousTenantMembership),
+        };
+    };
+    let tenant = match state.db.lock().await.get_tenant(sel).await {
+        Ok(tenant) => Some(tenant),
+        Err(DBError::UnknownTenantName { .. }) => None,
+        Err(e) => return Err(e),
+    };
+    tenant
+        .and_then(|tenant| memberships.iter().find(|m| m.tenant_id == tenant.id))
+        .map(|m| (m.tenant_id, m.role))
+        .ok_or(DBError::NotATenantMember {
+            tenant: sel.to_string(),
+        })
 }
 
 async fn bearer_auth(
@@ -181,8 +797,9 @@ async fn bearer_auth(
     let token_data = decode_token_with_validation(token, &req, configuration).await;
     match token_data {
         Ok(token_data) => {
-            // Validate groups authorization (for providers that support groups)
-            let state = req.app_data::<Data<ServerState>>().unwrap();
+            // Validate groups authorization (for providers that support groups).
+            // Clone the (Arc-backed) handle so `req` can be moved on error paths.
+            let state = req.app_data::<Data<ServerState>>().unwrap().clone();
             if let Err(AuthError::InsufficientGroups) =
                 validate_groups_authorization(&token_data, &state.config)
             {
@@ -192,64 +809,133 @@ async fn bearer_auth(
                 ));
             }
 
-            // Get tenant name using resolution logic with headers
-            let tenant_name = match token_data.tenant_name(&state.config, req.headers()) {
-                Ok(name) => name,
-                Err(AuthError::NoTenantFound) => {
-                    return Err((
-                        create_authz_json_error("You are not authorized to access any Feldera tenant. Contact your administrator if you need access to Feldera."),
-                        req,
-                    ));
-                }
-                Err(AuthError::MissingTenantHeader) => {
-                    return Err((
-                        create_authz_json_error("Feldera-Tenant header is required when your access token contains multiple tenants."),
-                        req,
-                    ));
-                }
-                Err(AuthError::UnauthorizedTenant(tenant)) => {
-                    return Err((
-                        create_authz_json_error(&format!("You are not authorized to access tenant '{}'. Check your access token's tenants claim.", tenant)),
-                        req,
-                    ));
-                }
-                Err(e) => {
-                    error!("Tenant resolution error: {}", e);
-                    return Err((
-                        create_authz_json_error(&format!("Tenant resolution failed: {}", e)),
-                        req,
-                    ));
-                }
+            let provider = token_data.provider();
+            let subject = token_data.claims.sub.clone();
+            let email = token_data.claims.email.clone();
+            let label = email.clone().unwrap_or_else(|| subject.clone());
+            // Human logins carry their identity to the session endpoint,
+            // which reports the user's memberships to drive tenant selection.
+            req.extensions_mut().insert(LoginIdentity {
+                provider: provider.clone(),
+                subject: subject.clone(),
+            });
+            // Owners take an early return below, and a token need not carry an
+            // email claim at all, so this sits ahead of both. It deliberately
+            // does not feed owner matching: that must not turn on whether a
+            // background fetch has landed yet.
+            refresh_profile_if_due(&state, &token_data, &provider, &subject, token).await;
+            // Only a provider-verified email may match an owner entry; an
+            // unverified, user-settable email must never confer `owner`.
+            let verified_email = if token_data.claims.email_verified {
+                email.as_deref()
+            } else {
+                None
             };
-
-            // TODO: Handle tenant deletions at some point
-            let tenant = {
-                let db = &state.db.lock().await;
-                db.get_or_create_tenant_id(Uuid::now_v7(), tenant_name, token_data.provider())
-                    .await
-            };
-
-            match tenant {
-                Ok(tenant_id) => {
-                    req.extensions_mut().insert(tenant_id);
-                    req.extensions_mut()
-                        .insert(vec![ApiPermission::Read, ApiPermission::Write]);
-                    Ok(req)
-                }
-                Err(e) => {
-                    error!(
-                        "Could not fetch tenant ID for token_data {:?}, with error {}",
-                        token_data, e
+            // Either configured way of being an owner counts here. A trust is
+            // usually written for a foreign issuer, but one naming the login
+            // provider is a reasonable thing to write, and silently ignoring it
+            // would be a trap.
+            let is_owner =
+                is_configured_owner(&state.config.owners, &provider, &subject, verified_email)
+                    || state.config.owner_trusts.admits(
+                        &provider,
+                        &subject,
+                        &audiences_from_claim(token_data.claims.aud.as_ref()),
                     );
-                    Err((
-                        create_authz_json_error(&format!(
-                            "Database error while fetching tenant: {}",
-                            e
-                        )),
-                        req,
-                    ))
+
+            if is_owner {
+                let home = match owner_home_tenant(&state, &token_data, &provider).await {
+                    Ok(home) => home,
+                    Err(e) => {
+                        return Err((
+                            create_authz_json_error(&format!(
+                                "Database error while fetching tenant: {e}"
+                            )),
+                            req,
+                        ));
+                    }
+                };
+                let acting = {
+                    let db = state.db.lock().await;
+                    resolve_owner_acting_tenant(&db, req.headers(), home).await
+                };
+                let acting_tenant = match acting {
+                    Ok(t) => t,
+                    Err(e) => return Err((e, req)),
+                };
+                AuthenticatedPrincipal {
+                    acting_tenant,
+                    role: Role::Owner,
+                    label,
                 }
+                .install(&req);
+                return Ok(req);
             }
+
+            // Non-owner: the membership table is the authorization authority;
+            // the tenancy strategy only provisions (see `provision_login`).
+            let selector = match tenant_selector(req.headers()) {
+                Ok(selector) => selector.map(str::to_string),
+                Err(e) => return Err((e, req)),
+            };
+
+            if let Err(e) = provision_login(
+                &state,
+                &token_data,
+                selector.as_deref(),
+                &provider,
+                &subject,
+                email.as_deref(),
+            )
+            .await
+            {
+                error!("Could not resolve login, with error {e}");
+                return Err((
+                    create_authz_json_error(&format!("Database error while resolving login: {e}")),
+                    req,
+                ));
+            }
+
+            let memberships = {
+                let db = state.db.lock().await;
+                match db.list_user_memberships(&provider, &subject).await {
+                    Ok((memberships, _)) => memberships,
+                    Err(e) => {
+                        return Err((crate::error::ManagerError::from(e).into(), req));
+                    }
+                }
+            };
+
+            let (acting_tenant, role) =
+                match select_acting_tenant(&state, selector.as_deref(), &memberships).await {
+                    Ok(pair) => pair,
+                    Err(DBError::AmbiguousTenantMembership | DBError::NoTenantMemberships)
+                        if is_session_request(&req) =>
+                    {
+                        // The session endpoint answers a login with no
+                        // resolvable acting tenant (none, or several without a
+                        // selector), so the console can drive its tenant
+                        // picker. The sentinel principal reaches only this
+                        // endpoint, which never reads its acting tenant when
+                        // the marker is present.
+                        req.extensions_mut().insert(UnresolvedActingTenant);
+                        AuthenticatedPrincipal {
+                            acting_tenant: DEFAULT_TENANT_ID,
+                            role: Role::Read,
+                            label,
+                        }
+                        .install(&req);
+                        return Ok(req);
+                    }
+                    Err(e) => return Err((crate::error::ManagerError::from(e).into(), req)),
+                };
+            AuthenticatedPrincipal {
+                acting_tenant,
+                role,
+                label,
+            }
+            .install(&req);
+            Ok(req)
         }
         Err(error) => {
             let descr = match error {
@@ -282,12 +968,39 @@ async fn api_key_auth(
     let ad = req.app_data::<Data<ServerState>>();
     let validate = {
         let db = &ad.unwrap().db.lock().await;
-        validate_api_keys(db, api_key_str).await
+        db.validate_api_key(api_key_str).await
     };
     match validate {
-        Ok((tenant_id, permissions)) => {
-            req.extensions_mut().insert(tenant_id);
-            req.extensions_mut().insert(permissions);
+        Ok((tenant_id, role)) => {
+            let selector = match tenant_selector(req.headers()) {
+                Ok(selector) => selector,
+                Err(e) => return Err((e, req)),
+            };
+            if let Some(selector) = selector {
+                let selected = ad
+                    .unwrap()
+                    .db
+                    .lock()
+                    .await
+                    .resolve_tenant_selector(selector)
+                    .await;
+                match selected {
+                    Ok(selected) if selected == tenant_id => {}
+                    Ok(_) | Err(DBError::UnknownTenantName { .. }) => {
+                        let error = DBError::NotATenantMember {
+                            tenant: selector.to_string(),
+                        };
+                        return Err((crate::error::ManagerError::from(error).into(), req));
+                    }
+                    Err(e) => return Err((crate::error::ManagerError::from(e).into(), req)),
+                }
+            }
+            AuthenticatedPrincipal {
+                acting_tenant: tenant_id,
+                role,
+                label: "apikey".to_string(),
+            }
+            .install(&req);
             Ok(req)
         }
         Err(error) => {
@@ -323,8 +1036,8 @@ pub(crate) struct TenantRecord {
     /// Corresponds to the sub or subscriber from a claim
     pub tenant: String,
 
-    /// Corresponds to the identity provider from a claim
-    pub provider: String,
+    /// The OIDC issuer this tenant was first provisioned under.
+    pub initial_provider: String,
 }
 
 const DEFAULT_TENANT_ID: TenantId = TenantId(Uuid::nil());
@@ -334,7 +1047,7 @@ impl TenantRecord {
         Self {
             id: DEFAULT_TENANT_ID,
             tenant: "default".to_string(),
-            provider: "default".to_string(),
+            initial_provider: "default".to_string(),
         }
     }
 }
@@ -361,12 +1074,23 @@ trait OidcClaimExt {
 
 impl OidcClaimExt for TokenData<OidcClaim> {
     fn authorized_tenants(&self) -> Option<Vec<String>> {
-        // Priority: tenants array > single tenant claim
-        if let Some(ref tenants) = self.claims.tenants {
-            Some(tenants.clone())
+        // Priority: tenants array > single tenant claim.
+        //
+        // Empty and whitespace-only entries are dropped: IdP claim templates
+        // emit "" when a group mapping evaluates empty, and that must mean
+        // "no claim" (fall through to derivation), not a shared tenant
+        // literally named the empty string.
+        let listed = if let Some(ref tenants) = self.claims.tenants {
+            tenants.clone()
         } else {
-            self.claims.tenant.as_ref().map(|t| vec![t.clone()])
-        }
+            self.claims.tenant.iter().cloned().collect()
+        };
+        let non_empty: Vec<String> = listed
+            .into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        (!non_empty.is_empty()).then_some(non_empty)
     }
 
     fn tenant_name(
@@ -377,44 +1101,46 @@ impl OidcClaimExt for TokenData<OidcClaim> {
         let issuer = &self.claims.iss;
         let sub = &self.claims.sub;
 
-        // Check if we have explicit tenant authorization in the claim
+        // Check if we have explicit tenant authorization in the claim.
+        // `authorized_tenants` never returns an empty list: a claim with no
+        // usable entries is `None` and falls through to derivation.
         if let Some(authorized) = self.authorized_tenants() {
-            if authorized.len() > 1 {
-                // Multi-tenant: require header selection
-                let selected = headers
-                    .get(TENANT_HEADER)
-                    .and_then(|h| h.to_str().ok())
-                    .ok_or(AuthError::MissingTenantHeader)?;
-
-                // Validate selected tenant is authorized
-                if authorized.contains(&selected.to_string()) {
-                    return Ok(selected.to_string());
-                } else {
-                    return Err(AuthError::UnauthorizedTenant(selected.to_string()));
+            let selected = headers
+                .get(TENANT_HEADER)
+                .and_then(|h| h.to_str().ok())
+                .filter(|s| !s.is_empty());
+            // A selector is always checked against the claim, never ignored.
+            // Honouring it only when the claim lists several tenants would
+            // silently place a caller in its one authorized tenant while it
+            // believes it named another.
+            return match selected {
+                Some(selected) if authorized.iter().any(|t| t == selected) => {
+                    Ok(selected.to_string())
                 }
-            } else if authorized.len() == 1 {
-                // Single tenant in array or single tenant claim
-                return Ok(authorized[0].clone());
-            }
-            // Empty array falls through to fallback logic
+                Some(selected) => Err(AuthError::UnauthorizedTenant(selected.to_string())),
+                None if authorized.len() == 1 => Ok(authorized[0].clone()),
+                None => Err(AuthError::MissingTenantHeader),
+            };
         }
 
-        // Fallback logic when no explicit tenant/tenants claims
-        // Priority: issuer-domain > sub (if enabled)
+        // Fallback when the token claims no tenant at all: derive one.
+        let Some(derived) = derived_tenant_name(config, issuer, sub) else {
+            return Err(AuthError::NoTenantFound);
+        };
 
-        if config.issuer_tenant {
-            if let Some(issuer_tenant) = extract_tenant_from_issuer(issuer) {
-                return Ok(issuer_tenant);
-            }
+        // A derived tenant is the single tenant this token is authorized for, so
+        // a selector naming a different one is refused. Ignoring it here would
+        // reintroduce, for tokens that claim no tenant, exactly the silent
+        // substitution the claimed-tenant path above rejects.
+        match headers
+            .get(TENANT_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .filter(|s| !s.is_empty())
+        {
+            Some(selected) if selected == derived => Ok(derived),
+            Some(selected) => Err(AuthError::UnauthorizedTenant(selected.to_string())),
+            None => Ok(derived),
         }
-
-        if config.individual_tenant {
-            debug!("Using sub claim for tenant resolution: {}", sub);
-            return Ok(sub.clone());
-        }
-
-        // No valid tenant found
-        Err(AuthError::NoTenantFound)
     }
 
     fn provider(&self) -> String {
@@ -422,16 +1148,28 @@ impl OidcClaimExt for TokenData<OidcClaim> {
     }
 }
 
-/// Extract tenant identifier from OIDC issuer domain.
-///
-/// Extracts the full hostname from issuer URLs for tenant identification.
-/// This approach avoids tenant name collisions by using the complete domain.
-/// Examples:
-/// - "<https://acme-corp.okta.com/oauth2/default>" → Some("acme-corp.okta.com")
-/// - "<https://company.auth.us-west-2.amazoncognito.com/oauth2>" → Some("company.auth.us-west-2.amazoncognito.com")
-/// - "<https://accounts.google.com>" → Some("accounts.google.com")
-///
-/// Validates that the user belongs to at least one required group (for providers that support groups).
+/// The tenant name the strategy derives for a token that claims none.
+/// Priority: issuer domain (if enabled) over the `sub` claim (if enabled);
+/// `None` when both derivations are off.
+fn derived_tenant_name(
+    config: &crate::config::ApiServerConfig,
+    issuer: &str,
+    sub: &str,
+) -> Option<String> {
+    config
+        .issuer_tenant
+        .then(|| extract_tenant_from_issuer(issuer))
+        .flatten()
+        .or_else(|| {
+            config.individual_tenant.then(|| {
+                debug!("Using sub claim for tenant resolution: {}", sub);
+                sub.to_string()
+            })
+        })
+}
+
+/// Validates that the user belongs to at least one required group (for
+/// providers that support groups). Passes when no groups are configured.
 fn validate_groups_authorization(
     token: &TokenData<OidcClaim>,
     config: &ApiServerConfig,
@@ -458,8 +1196,10 @@ fn validate_groups_authorization(
     }
 }
 
-/// Extract tenant identifier from issuer claim in OIDC Access token.
-/// The full issuer hostname is used to avoid collisions.
+/// Extract a tenant identifier from an OIDC issuer URL: the full hostname, used
+/// to avoid tenant-name collisions across providers. Examples:
+/// - `https://acme-corp.okta.com/oauth2/default` → `Some("acme-corp.okta.com")`
+/// - `https://accounts.google.com` → `Some("accounts.google.com")`
 fn extract_tenant_from_issuer(issuer: &str) -> Option<String> {
     Url::parse(issuer)
         .ok()
@@ -485,20 +1225,50 @@ pub(crate) struct ProviderGenericOidc {
     pub(crate) jwk_uri: String,
 }
 
-#[derive(Deserialize)]
-struct OidcDiscoveryDocument {
-    jwks_uri: String,
-}
+/// Resolve the RSA decoding key for `(issuer, kid)` from the federated JWKS
+/// cache, fetching on a miss. The network fetch runs without holding the cache
+/// lock, so a slow issuer endpoint cannot serialize all federated auth.
+///
+/// An unverified token chooses the `kid`, so a miss must not cost a fetch per
+/// request. Refreshes for one issuer serialize on a gate, and a refresh that
+/// did not produce the requested `kid` blocks further fetches for
+/// [`ISSUER_REFRESH_COOLDOWN_SECONDS`]. A genuine key rollover still resolves on
+/// its first miss, because the cooldown only starts once a refresh has run.
+async fn resolve_issuer_jwk(
+    state: &ServerState,
+    issuer: &str,
+    kid: &str,
+    destination: OidcDestination,
+) -> Result<DecodingKey, AuthError> {
+    if let Some(key) = state.issuer_jwk_cache.lock().await.cached(issuer, kid) {
+        return Ok(key);
+    }
 
-/// Fetch OIDC discovery document and extract jwks_uri
-async fn fetch_jwks_uri_from_discovery(issuer: &str) -> Result<String, reqwest::Error> {
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    let response = reqwest::get(&discovery_url).await?;
-    let discovery: OidcDiscoveryDocument = response.json().await?;
-    Ok(discovery.jwks_uri)
+    let gate = state.issuer_jwk_cache.lock().await.refresh_gate(issuer);
+    let _refreshing = gate.lock().await;
+
+    {
+        let mut cache = state.issuer_jwk_cache.lock().await;
+        // A refresh may have completed while this request waited on the gate.
+        if let Some(key) = cache.cached(issuer, kid) {
+            return Ok(key);
+        }
+        if cache.refreshed_recently(issuer) {
+            return Err(AuthError::JwkShape(
+                "kid not present in issuer JWKS".to_string(),
+            ));
+        }
+        // Marked before the fetch, so that a failing issuer is retried on the
+        // cooldown rather than on every request.
+        cache.mark_refreshed(issuer);
+    }
+
+    let keys = fetch_issuer_jwks(issuer, destination, &state.oidc_clients).await?;
+    let mut cache = state.issuer_jwk_cache.lock().await;
+    cache.insert(issuer, keys);
+    cache
+        .cached(issuer, kid)
+        .ok_or_else(|| AuthError::JwkShape("kid not present in issuer JWKS".to_string()))
 }
 
 #[derive(Clone, Serialize, ToSchema)]
@@ -507,8 +1277,33 @@ pub(crate) enum AuthProvider {
     GenericOidc(ProviderGenericOidc),
 }
 
-pub(crate) fn aws_auth_config() -> AuthConfiguration {
+impl AuthProvider {
+    /// The configured login provider's issuer URL.
+    /// Used to distinguish login JWTs from workload-federation JWTs.
+    pub fn issuer(&self) -> &str {
+        match self {
+            AuthProvider::AwsCognito(p) => &p.issuer,
+            AuthProvider::GenericOidc(p) => &p.issuer,
+        }
+    }
+}
+
+/// Shared login JWT checks. Generic OIDC requires an audience; Cognito access
+/// tokens bind to the client through `client_id`, checked after decoding.
+fn login_validation(issuer: &str, audience: Option<&str>) -> Validation {
     let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer]);
+    validation.set_required_spec_claims(&["exp", "iss", "sub"]);
+    validation.validate_nbf = true;
+    if let Some(audience) = audience {
+        validation.set_audience(&[audience]);
+        // set_audience checks a present claim but does not require one.
+        validation.required_spec_claims.insert("aud".to_string());
+    }
+    validation
+}
+
+pub(crate) fn aws_auth_config() -> AuthConfiguration {
     let client_id = env::var("FELDERA_AUTH_CLIENT_ID")
         .expect("Missing environment variable FELDERA_AUTH_CLIENT_ID");
     let iss =
@@ -517,10 +1312,10 @@ pub(crate) fn aws_auth_config() -> AuthConfiguration {
     // We do not validate with set_audience because it is optional,
     // and AWS Cognito doesn't consistently claim it in JWT (e.g. via Hosted UI
     // auth)
-    validation.set_issuer(&[&iss]);
+    let validation = login_validation(&iss, None);
     AuthConfiguration {
         provider: AuthProvider::AwsCognito(ProviderAwsCognito {
-            issuer: iss.clone(),
+            issuer: iss,
             login_url: env::var("AWS_COGNITO_LOGIN_URL")
                 .expect("Missing environment variable AWS_COGNITO_LOGIN_URL"),
             logout_url: env::var("AWS_COGNITO_LOGOUT_URL")
@@ -534,19 +1329,23 @@ pub(crate) fn aws_auth_config() -> AuthConfiguration {
 
 pub(crate) async fn generic_oidc_auth_config(
     api_config: &crate::config::ApiServerConfig,
+    extra_roots: &[Certificate],
 ) -> Result<AuthConfiguration, Box<dyn std::error::Error>> {
-    let mut validation = Validation::new(Algorithm::RS256);
     let client_id = env::var("FELDERA_AUTH_CLIENT_ID")
         .expect("Missing environment variable FELDERA_AUTH_CLIENT_ID");
     let iss =
         env::var("FELDERA_AUTH_ISSUER").expect("Missing environment variable FELDERA_AUTH_ISSUER");
 
-    // Use OIDC discovery to fetch jwks_uri
-    let jwk_uri = fetch_jwks_uri_from_discovery(&iss).await?;
+    // Use OIDC discovery to fetch jwks_uri. The operator set this issuer, so it
+    // may name a provider on the deployment's own network.
+    let jwk_uri = fetch_jwks_uri_from_discovery(
+        &iss,
+        OidcDestination::OperatorConfigured,
+        &OidcClients::new(extra_roots)?,
+    )
+    .await?;
 
-    validation.set_issuer(&[&iss]);
-    // Use configurable audience claim from API server configuration
-    validation.set_audience(&[&api_config.auth_audience]);
+    let validation = login_validation(&iss, Some(&api_config.auth_audience));
 
     // Add 'groups' scope if authorized_groups is configured
     let extra_oidc_scopes = if !api_config.authorized_groups.is_empty() {
@@ -615,6 +1414,18 @@ struct OidcClaim {
     /// Email address (if available)
     email: Option<String>,
 
+    /// Whether the identity provider verified the email address. Owner matching
+    /// on `email` requires this to be `true`: an unverified, user-settable email
+    /// must never confer the platform-wide `owner` role.
+    #[serde(default, deserialize_with = "deserialize_bool_or_string")]
+    email_verified: bool,
+
+    /// When the user last authenticated, in Unix time. Standard OIDC (Core 1.0
+    /// §2), and unchanged by token refresh, so a newer value marks a genuine
+    /// new login rather than a renewed token. Drives how often Feldera asks the
+    /// provider for the user's profile (see [`crate::oidc::userinfo`]).
+    auth_time: Option<i64>,
+
     /// Tenant identifier for single-tenant deployments
     /// TODO: Deprecated, remove when no one no longer uses it
     tenant: Option<String>,
@@ -657,11 +1468,9 @@ where
 }
 
 #[derive(Debug)]
-enum AuthError {
+pub(crate) enum AuthError {
     JwtDecoding(jsonwebtoken::errors::Error),
-    JwkFetch(awc::error::SendRequestError),
-    JwkPayload(awc::error::PayloadError),
-    JwkContentType,
+    JwkFetch(reqwest::Error),
     JwkShape(String),
     NoTenantFound,
     InsufficientGroups,
@@ -674,9 +1483,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::JwtDecoding(err) => err.fmt(f),
             AuthError::JwkFetch(err) => err.fmt(f),
-            AuthError::JwkPayload(err) => err.fmt(f),
             AuthError::JwkShape(err) => err.fmt(f),
-            AuthError::JwkContentType => f.write_str("Content type error"),
             AuthError::NoTenantFound => f.write_str("You are not authorized to access any Feldera tenant. Contact your administrator if you need access to Feldera."),
             AuthError::InsufficientGroups => f.write_str("User does not belong to required groups for access."),
             AuthError::MissingTenantHeader => f.write_str("Feldera-Tenant header is required when access token contains multiple tenants."),
@@ -685,8 +1492,8 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-impl From<awc::error::SendRequestError> for AuthError {
-    fn from(value: awc::error::SendRequestError) -> Self {
+impl From<reqwest::Error> for AuthError {
+    fn from(value: reqwest::Error) -> Self {
         Self::JwkFetch(value)
     }
 }
@@ -726,7 +1533,9 @@ async fn decode_oidc_token(
 
                     let state = req.app_data::<Data<ServerState>>().unwrap();
                     let cache = &mut state.jwk_cache.lock().await;
-                    let jwk = cache.get(&kid, &configuration.provider).await?;
+                    let jwk = cache
+                        .get(&kid, &configuration.provider, &state.oidc_clients)
+                        .await?;
 
                     let token_data = decode::<OidcClaim>(token, &jwk, &configuration.validation);
                     match token_data {
@@ -758,20 +1567,24 @@ async fn decode_token_with_validation(
 ) -> Result<TokenData<OidcClaim>, AuthError> {
     let token_data = decode_oidc_token(token, req, configuration).await?;
 
-    // Provider-specific validations based on optional fields
-
-    // Validate client_id if present (AWS Cognito puts it in a separate field)
-    if let Some(ref client_id) = token_data.claims.client_id {
-        if configuration.client_id != *client_id {
-            return Err(jsonwebtoken::errors::ErrorKind::InvalidAudience.into());
-        }
+    // Cognito requires both claims; other providers may omit them.
+    let is_cognito = matches!(configuration.provider, AuthProvider::AwsCognito(_));
+    if token_data
+        .claims
+        .client_id
+        .as_deref()
+        .map_or(is_cognito, |client_id| client_id != configuration.client_id)
+    {
+        return Err(jsonwebtoken::errors::ErrorKind::InvalidAudience.into());
     }
 
-    // Validate token_use if present (AWS Cognito requires "access" for access tokens)
-    if let Some(ref token_use) = token_data.claims.token_use {
-        if token_use != "access" {
-            return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
-        }
+    if token_data
+        .claims
+        .token_use
+        .as_deref()
+        .map_or(is_cognito, |token_use| token_use != "access")
+    {
+        return Err(jsonwebtoken::errors::ErrorKind::InvalidToken.into());
     }
 
     Ok(token_data)
@@ -781,8 +1594,88 @@ pub struct JwkCache {
     cache: TimedCache<String, DecodingKey>,
 }
 
+/// JWKS cache keyed by (issuer, kid) for federated tokens whose issuer is
+/// dynamically discovered from a registered trust relationship.
+///
+/// Lock order is always gate before cache. Take an issuer's gate first, then
+/// the lock around this struct, and release that lock before awaiting anything.
+/// Holding this struct's lock while awaiting a gate is the reverse order and
+/// deadlocks against any request already in [`resolve_issuer_jwk`], which is
+/// why that function reads the gate out of a temporary rather than holding the
+/// cache across the two.
+pub struct IssuerJwkCache {
+    cache: TimedCache<(String, String), DecodingKey>,
+    /// Issuers refreshed within the cooldown. Membership is the whole value:
+    /// entries expire after [`ISSUER_REFRESH_COOLDOWN_SECONDS`].
+    recent_refresh: TimedCache<String, ()>,
+    /// One gate per issuer, so concurrent misses cost a single fetch.
+    refresh_gates: TimedCache<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
 const DEFAULT_JWK_CACHE_LIFETIME_SECONDS: u64 = 120;
 const DEFAULT_JWK_CACHE_CAPACITY: usize = 10;
+const ISSUER_JWK_CACHE_CAPACITY: usize = 64;
+
+/// Minimum gap between JWKS refreshes for one issuer. An unverified token
+/// chooses the `kid`, so without this gap every unknown `kid` would cost a
+/// discovery fetch and a JWKS fetch.
+const ISSUER_REFRESH_COOLDOWN_SECONDS: u64 = 30;
+
+impl IssuerJwkCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            cache: TimedCache::with_lifespan_and_capacity(
+                DEFAULT_JWK_CACHE_LIFETIME_SECONDS,
+                ISSUER_JWK_CACHE_CAPACITY,
+            ),
+            recent_refresh: TimedCache::with_lifespan_and_capacity(
+                ISSUER_REFRESH_COOLDOWN_SECONDS,
+                ISSUER_JWK_CACHE_CAPACITY,
+            ),
+            refresh_gates: TimedCache::with_lifespan_and_capacity(
+                DEFAULT_JWK_CACHE_LIFETIME_SECONDS,
+                ISSUER_JWK_CACHE_CAPACITY,
+            ),
+        }
+    }
+
+    /// Return the cached decoding key for `(issuer, kid)`, if present. No I/O,
+    /// so the caller holds the lock only briefly (see [`resolve_issuer_jwk`]).
+    fn cached(&mut self, issuer: &str, kid: &str) -> Option<DecodingKey> {
+        self.cache
+            .cache_get(&(issuer.to_string(), kid.to_string()))
+            .cloned()
+    }
+
+    /// Insert freshly fetched keys for `issuer`, keyed by `kid`.
+    fn insert(&mut self, issuer: &str, keys: HashMap<String, DecodingKey>) {
+        for (kid, decoding_key) in keys {
+            self.cache
+                .cache_set((issuer.to_string(), kid), decoding_key);
+        }
+    }
+
+    /// Whether `issuer` was refreshed within the cooldown.
+    fn refreshed_recently(&mut self, issuer: &str) -> bool {
+        self.recent_refresh.cache_get(&issuer.to_string()).is_some()
+    }
+
+    /// Start `issuer`'s cooldown.
+    fn mark_refreshed(&mut self, issuer: &str) {
+        self.recent_refresh.cache_set(issuer.to_string(), ());
+    }
+
+    /// The gate that serializes refreshes for `issuer`.
+    fn refresh_gate(&mut self, issuer: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = issuer.to_string();
+        if let Some(gate) = self.refresh_gates.cache_get(&key) {
+            return gate.clone();
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        self.refresh_gates.cache_set(key, gate.clone());
+        gate
+    }
+}
 
 impl JwkCache {
     pub(crate) fn new() -> JwkCache {
@@ -798,6 +1691,7 @@ impl JwkCache {
         &mut self,
         key: &String,
         provider: &AuthProvider,
+        clients: &OidcClients,
     ) -> Result<DecodingKey, AuthError> {
         let cache = &mut self.cache;
         let val = &cache.cache_get(key);
@@ -805,7 +1699,7 @@ impl JwkCache {
             Some(dk) => Ok((*dk).clone()),
             None => {
                 // TODO: Introduce a minimum delay between refreshes
-                let fetched = fetch_jwk_keys(provider).await;
+                let fetched = fetch_jwk_keys(provider, clients).await;
                 match fetched {
                     Ok(map) => {
                         for (key_id, decoding_key) in map {
@@ -826,86 +1720,91 @@ impl JwkCache {
 
 async fn fetch_jwk_keys(
     provider: &AuthProvider,
+    clients: &OidcClients,
 ) -> Result<HashMap<String, DecodingKey>, AuthError> {
     match &provider {
-        AuthProvider::AwsCognito(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri).await,
-        AuthProvider::GenericOidc(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri).await,
+        AuthProvider::AwsCognito(provider) => fetch_jwk_oidc_keys(&provider.jwk_uri, clients).await,
+        AuthProvider::GenericOidc(provider) => {
+            fetch_jwk_oidc_keys(&provider.jwk_uri, clients).await
+        }
     }
 }
 
 // We don't want to fetch keys on every authentication attempt, so cache the
 // results. TODO: implement periodic refresh
-async fn fetch_jwk_oidc_keys(url: &String) -> Result<HashMap<String, DecodingKey>, AuthError> {
-    let client = awc::Client::new();
+//
+// This shares the federated path's client so both reach an issuer the same way.
+// A default `awc` client cannot: it picks one root source at compile time, and
+// `rustls-0_23-webpki-roots` wins over `rustls-0_23-native-roots` whenever both
+// are enabled, which happens as soon as the manager is built alongside a crate
+// that asks for the former. The login provider then silently loses every root
+// outside the public web PKI, including this deployment's own CA.
+async fn fetch_jwk_oidc_keys(
+    url: &str,
+    clients: &OidcClients,
+) -> Result<HashMap<String, DecodingKey>, AuthError> {
+    let client = clients.for_destination(OidcDestination::OperatorConfigured);
 
-    let res = client.get(url).send().await;
-    if let Err(e) = &res {
+    let response = client.get(url).send().await.map_err(|e| {
         debug!("JWK fetch request failed: {:?}", e);
+        AuthError::JwkFetch(e)
+    })?;
+
+    let keys_as_json = response.json::<Value>().await.map_err(|e| {
+        debug!("Failed to read JWK response: {}", e);
+        AuthError::JwkShape(e.to_string())
+    })?;
+
+    parse_rsa_jwks(&keys_as_json)
+}
+
+/// Parse a JWK set into RSA decoding keys, keyed by `kid`. Keeps only keys
+/// declared for RS256 signature verification (`alg=RS256`, `use=sig`). Shared by
+/// the login-provider (awc) and federated (reqwest) fetch paths.
+pub(crate) fn parse_rsa_jwks(value: &Value) -> Result<HashMap<String, DecodingKey>, AuthError> {
+    let filtered = value
+        .get("keys")
+        .ok_or_else(|| {
+            debug!("JWK response missing 'keys' field");
+            AuthError::JwkShape("Missing keys field".to_owned())
+        })?
+        .as_array()
+        .ok_or_else(|| {
+            debug!("JWK 'keys' field is not an array");
+            AuthError::JwkShape("keys field was not an array".to_owned())
+        })?
+        .iter()
+        .filter_map(|val| check_key_as_str("alg", "RS256", val))
+        .filter_map(|val| check_key_as_str("use", "sig", val));
+
+    let mut ret = HashMap::new();
+    for json_value in filtered {
+        let kid = validate_field_is_str("kid", json_value).ok_or_else(|| {
+            debug!("JWK entry missing 'kid' field");
+            AuthError::JwkShape("Could not extract 'kid' field".to_owned())
+        })?;
+        let n = validate_field_is_str("n", json_value).ok_or_else(|| {
+            debug!("JWK entry missing 'n' field");
+            AuthError::JwkShape("Could not extract 'n' field".to_owned())
+        })?;
+        let e = validate_field_is_str("e", json_value).ok_or_else(|| {
+            debug!("JWK entry missing 'e' field");
+            AuthError::JwkShape("Could not extract 'e' field".to_owned())
+        })?;
+        let decoding_key = DecodingKey::from_rsa_components(n, e).map_err(|e| {
+            debug!("Failed to create decoding key: {}", e);
+            AuthError::JwkShape(format!("Invalid JWK decoding key: {}", e))
+        })?;
+        ret.insert(kid.to_owned(), decoding_key);
     }
-
-    let keys_as_json = res?.json::<Value>().await;
-
-    match keys_as_json {
-        Ok(value) => {
-            let filtered = value
-                .get("keys")
-                .ok_or_else(|| {
-                    debug!("JWK response missing 'keys' field");
-                    AuthError::JwkShape("Missing keys field".to_owned())
-                })?
-                .as_array()
-                .ok_or_else(|| {
-                    debug!("JWK 'keys' field is not an array");
-                    AuthError::JwkShape("keys field was not an array".to_owned())
-                })?
-                .iter()
-                // Standard OIDC JWK endpoints should return keys for RS256 signature verification.
-                // This filter ensures we only use appropriate keys for our validation
-                .filter_map(|val| check_key_as_str("alg", "RS256", val))
-                .filter_map(|val| check_key_as_str("use", "sig", val));
-
-            let mut ret = HashMap::new();
-            for json_value in filtered {
-                let kid = validate_field_is_str("kid", json_value).ok_or_else(|| {
-                    debug!("JWK entry missing 'kid' field");
-                    AuthError::JwkShape("Could not extract 'kid' field".to_owned())
-                })?;
-                let n = validate_field_is_str("n", json_value).ok_or_else(|| {
-                    debug!("JWK entry missing 'n' field");
-                    AuthError::JwkShape("Could not extract 'n' field".to_owned())
-                })?;
-                let e = validate_field_is_str("e", json_value).ok_or_else(|| {
-                    debug!("JWK entry missing 'e' field");
-                    AuthError::JwkShape("Could not extract 'e' field".to_owned())
-                })?;
-                let decoding_key = DecodingKey::from_rsa_components(n, e).map_err(|e| {
-                    debug!("Failed to create decoding key: {}", e);
-                    AuthError::JwkShape(format!("Invalid JWK decoding key: {}", e))
-                })?;
-                ret.insert(kid.to_owned(), decoding_key);
-            }
-            Ok(ret)
-        }
-        Err(JsonPayloadError::Deserialize(json_error)) => {
-            debug!("Failed to deserialize JWK response: {}", json_error);
-            Err(AuthError::JwkShape(json_error.to_string()))
-        }
-        Err(JsonPayloadError::Payload(payload)) => {
-            debug!("JWK payload error: {:?}", payload);
-            Err(AuthError::JwkPayload(payload))
-        }
-        Err(JsonPayloadError::ContentType) => {
-            debug!("JWK response has invalid content type");
-            Err(AuthError::JwkContentType)
-        }
-    }
+    Ok(ret)
 }
 
 fn check_key_as_str<'a>(key: &str, check: &str, json: &'a Value) -> Option<&'a Value> {
-    if let Some(value) = validate_field_is_str(key, json) {
-        if value == check {
-            return Some(json);
-        }
+    if let Some(value) = validate_field_is_str(key, json)
+        && value == check
+    {
+        return Some(json);
     }
     debug!(
         "Skipping JWK key because it did not match the required shape {} {}",
@@ -916,21 +1815,12 @@ fn check_key_as_str<'a>(key: &str, check: &str, json: &'a Value) -> Option<&'a V
 
 fn validate_field_is_str<'a>(key: &str, json: &'a Value) -> Option<&'a str> {
     let value = json.get(key);
-    if let Some(value) = value {
-        if let Some(value) = value.as_str() {
-            return Some(value);
-        }
+    if let Some(value) = value
+        && let Some(value) = value.as_str()
+    {
+        return Some(value);
     }
     None
-}
-
-// Fetch keys on every authentication attempt, so cache the
-// results.
-async fn validate_api_keys(
-    db: &StoragePostgres,
-    api_key: &str,
-) -> Result<(TenantId, Vec<ApiPermission>), DBError> {
-    db.validate_api_key(api_key).await
 }
 
 const API_KEY_LENGTH: usize = 128;
@@ -956,51 +1846,122 @@ mod test {
 
     use actix_http::{HttpMessage, StatusCode};
     use actix_web::{
+        App, HttpRequest, HttpResponse,
         body::{BoxBody, EitherBody},
         dev::ServiceResponse,
         http::{self},
-        test, web, App, HttpRequest, HttpResponse,
+        test, web,
     };
     use actix_web_httpauth::middleware::HttpAuthentication;
     use base64::Engine;
     use cached::Cached;
     use chrono::Utc;
-    use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, encode};
     use tokio::sync::{Mutex, RwLock};
     use uuid::Uuid;
 
-    use super::AuthError;
-    use crate::db::types::api_key::ApiPermission;
+    use super::{AuthError, AuthenticatedPrincipal};
+    use crate::db::types::role::{MintableKeyRole, Role};
+    use crate::oidc::fetch::OidcClients;
     use crate::{
         api::main::ServerState,
         auth::{self, AuthConfiguration, AuthProvider, OidcClaim},
-        config::ApiServerConfig,
+        config::{ApiServerConfig, BasePath},
         db::storage::Storage,
         ensure_default_crypto_provider,
     };
     use crate::{auth::fetch_jwk_oidc_keys, config::CommonConfig};
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+    use rsa::pkcs8::EncodePublicKey;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    /// The session endpoint is the one route a login with no resolvable acting
+    /// tenant may reach, so the console can drive its tenant picker. The
+    /// exemption compares the path root-relative and therefore survives a
+    /// subpath deployment; comparing `req.path()` raw would strand such a login
+    /// at the very endpoint meant to unstick it. Removing the `BasePath` strip
+    /// in `is_session_request` flips the `/feldera` case to false.
+    // `#[actix_web::test]` (not `#[test]`) because `use actix_web::test`
+    // shadows the built-in test attribute in this module; the body is pure.
+    #[actix_web::test]
+    async fn session_request_is_recognized_under_a_base_path() {
+        let session_request = |base_path: &str, uri: &str| {
+            auth::is_session_request(
+                &test::TestRequest::get()
+                    .uri(uri)
+                    .app_data(BasePath(base_path.to_string()))
+                    .to_srv_request(),
+            )
+        };
+
+        assert!(session_request("", "/v0/config/session"));
+        assert!(session_request("/feldera", "/feldera/v0/config/session"));
+        // No other endpoint is exempt, prefixed or not, and neither is a write
+        // to the session path.
+        assert!(!session_request("", "/v0/pipelines"));
+        assert!(!session_request("/feldera", "/feldera/v0/pipelines"));
+        assert!(!auth::is_session_request(
+            &test::TestRequest::post()
+                .uri("/feldera/v0/config/session")
+                .app_data(BasePath("/feldera".to_string()))
+                .to_srv_request()
+        ));
+    }
 
     async fn setup(claim: OidcClaim) -> (String, DecodingKey) {
-        let rsa = openssl::rsa::Rsa::generate(2048).unwrap();
+        let rsa = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("rsa01".to_owned());
 
         let token_encoded = encode(
             &header,
             &claim,
-            &EncodingKey::from_rsa_pem(&rsa.private_key_to_pem().unwrap()).unwrap(),
+            &EncodingKey::from_rsa_pem(rsa.to_pkcs1_pem(LineEnding::LF).unwrap().as_bytes())
+                .unwrap(),
         )
         .unwrap();
-        let decoding_key = DecodingKey::from_rsa_pem(&rsa.public_key_to_pem().unwrap()).unwrap();
+        let decoding_key = DecodingKey::from_rsa_pem(
+            RsaPublicKey::from(&rsa)
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
         let token = token_encoded.as_str();
         (token.to_owned(), decoding_key)
     }
 
     fn validation(aud: &str, iss: &str) -> Validation {
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = super::login_validation(iss, None);
         validation.set_audience(&[aud]);
-        validation.set_issuer(&[iss]);
         validation
+    }
+
+    fn default_manager_test_config() -> ApiServerConfig {
+        ApiServerConfig {
+            auth_provider: crate::config::AuthProviderType::AwsCognito,
+            dev_mode: false,
+            dump_openapi: false,
+            allowed_origins: None,
+            demos_dir: vec![],
+            telemetry: "".to_owned(),
+            conceptualhq: "".to_owned(),
+            product_fruits: "".to_owned(),
+            support_data_collection_frequency: 15,
+            support_data_retention: 3,
+            authorized_groups: vec![],
+            individual_tenant: true,
+            issuer_tenant: false,
+            auth_audience: "feldera-api".to_string(),
+            owners: vec![],
+            owner_trusts: crate::config::OwnerTrusts::default(),
+            allow_internal_tenant_trust_issuers: false,
+            default_role: Role::Read,
+            first_user_role: Role::Admin,
+            provision_on_login: true,
+            http_base_path: String::new(),
+            enable_pipeline_resize: false,
+        }
     }
 
     fn default_claim() -> OidcClaim {
@@ -1016,11 +1977,44 @@ mod test {
             token_use: Some("access".to_owned()),
             username: Some("some-user".to_owned()),
             email: None,
+            email_verified: false,
+            auth_time: None,
             tenant: None,
             tenants: None,
             groups: None,
             additional_claims: serde_json::Map::new(),
         }
+    }
+
+    /// Empty and whitespace claim entries mean "no claim": they fall through
+    /// to derivation instead of naming a tenant literally called "".
+    #[tokio::test]
+    async fn empty_claim_entries_are_ignored() {
+        use super::OidcClaimExt;
+        use jsonwebtoken::TokenData;
+
+        let config = default_manager_test_config();
+        let headers = actix_web::http::header::HeaderMap::new();
+        let name_for = |tenant: Option<&str>, tenants: Option<Vec<&str>>| {
+            let mut claim = default_claim();
+            claim.tenant = tenant.map(str::to_string);
+            claim.tenants = tenants.map(|ts| ts.into_iter().map(str::to_string).collect());
+            TokenData {
+                header: Header::new(Algorithm::RS256),
+                claims: claim,
+            }
+            .tenant_name(&config, &headers)
+        };
+
+        // individual_tenant is on, so a token with no usable claim derives
+        // its personal tenant from the sub.
+        assert_eq!(name_for(None, None).unwrap(), "some-sub");
+        assert_eq!(name_for(Some(""), None).unwrap(), "some-sub");
+        assert_eq!(name_for(None, Some(vec![""])).unwrap(), "some-sub");
+        assert_eq!(name_for(None, Some(vec!["  ", ""])).unwrap(), "some-sub");
+        // Usable entries survive, trimmed, with empties dropped around them.
+        assert_eq!(name_for(None, Some(vec![" acme "])).unwrap(), "acme");
+        assert_eq!(name_for(None, Some(vec!["", "acme"])).unwrap(), "acme");
     }
 
     async fn run_test(
@@ -1070,22 +2064,7 @@ mod test {
             disable_cluster_monitor_resources: false,
         };
 
-        let manager_config = ApiServerConfig {
-            auth_provider: crate::config::AuthProviderType::AwsCognito,
-            dev_mode: false,
-            dump_openapi: false,
-            allowed_origins: None,
-            demos_dir: vec![],
-            telemetry: "".to_owned(),
-            conceptualhq: "".to_owned(),
-            product_fruits: "".to_owned(),
-            support_data_collection_frequency: 15,
-            support_data_retention: 3,
-            authorized_groups: vec![],
-            individual_tenant: true,
-            issuer_tenant: false,
-            auth_audience: "feldera-api".to_string(),
-        };
+        let manager_config = default_manager_test_config();
 
         let (conn, _temp) = crate::db::test::setup_pg().await;
         if let Some(api_key) = api_key {
@@ -1102,7 +2081,7 @@ mod test {
                 Uuid::now_v7(),
                 "foo",
                 &api_key,
-                vec![ApiPermission::Read, ApiPermission::Write],
+                MintableKeyRole::Write,
             )
             .await
             .unwrap();
@@ -1134,12 +2113,12 @@ mod test {
                 "/",
                 web::get().to(|req: HttpRequest| async move {
                     {
+                        // After auth, a principal must be installed with at least
+                        // the read role (login creates the tenant => admin; the
+                        // test API key carries write).
                         let ext = req.extensions();
-                        let permissions = ext.get::<Vec<ApiPermission>>().unwrap();
-                        assert_eq!(
-                            *permissions,
-                            vec![ApiPermission::Read, ApiPermission::Write]
-                        );
+                        let principal = ext.get::<AuthenticatedPrincipal>().unwrap();
+                        assert!(principal.role.satisfies(Role::Read));
                     }
                     HttpResponse::build(StatusCode::OK).await
                 }),
@@ -1152,9 +2131,59 @@ mod test {
     #[actix_web::test]
     async fn invalid_url() {
         ensure_default_crypto_provider();
-        let url = "http://localhost/doesnotexist".to_owned();
-        let res = fetch_jwk_oidc_keys(&url).await;
+        // Fail URL parsing without depending on whether localhost serves HTTP.
+        let url = "http://[invalid".to_owned();
+        let res = fetch_jwk_oidc_keys(&url, &OidcClients::new(&[]).unwrap()).await;
         assert!(matches!(res.err().unwrap(), AuthError::JwkFetch(_)));
+    }
+
+    #[tokio::test]
+    async fn owner_matching_ignores_empty_entries() {
+        use super::is_configured_owner;
+        let owners = vec!["owner@example.com".to_string(), "iss sub2".to_string()];
+        // Matches by email and by provider-qualified "<issuer> <subject>".
+        assert!(is_configured_owner(
+            &owners,
+            "iss",
+            "x",
+            Some("owner@example.com")
+        ));
+        assert!(is_configured_owner(&owners, "iss", "sub2", None));
+        assert!(!is_configured_owner(
+            &owners,
+            "iss",
+            "nobody",
+            Some("no@x.com")
+        ));
+        // A blank entry (trailing/double comma in FELDERA_OWNERS) must never
+        // match a token with an empty/absent email or subject.
+        let with_blank = vec!["a".to_string(), "".to_string(), "b".to_string()];
+        assert!(!is_configured_owner(&with_blank, "iss", "", Some("")));
+        assert!(!is_configured_owner(&with_blank, "iss", "", None));
+    }
+
+    /// A provider that spells `email_verified` as a string still confers owner
+    /// on an `owners` entry naming that email, and `auth_time` reaches the
+    /// profile refresh.
+    #[tokio::test]
+    async fn a_string_email_verified_still_counts_as_verified() {
+        let parse = |json: &str| serde_json::from_str::<OidcClaim>(json).unwrap();
+        let base = r#""exp":1,"iat":1,"iss":"i","sub":"s""#;
+
+        let cognito = parse(&format!(r#"{{{base},"email_verified":"true"}}"#));
+        assert!(cognito.email_verified);
+        assert!(parse(&format!(r#"{{{base},"email_verified":true}}"#)).email_verified);
+        assert!(!parse(&format!(r#"{{{base},"email_verified":"false"}}"#)).email_verified);
+        // Absent, or a shape neither spelling covers, reads as unverified
+        // rather than failing the whole token.
+        assert!(!parse(&format!("{{{base}}}")).email_verified);
+        assert!(!parse(&format!(r#"{{{base},"email_verified":"maybe"}}"#)).email_verified);
+
+        assert_eq!(
+            parse(&format!(r#"{{{base},"auth_time":1737000000}}"#)).auth_time,
+            Some(1737000000)
+        );
+        assert_eq!(parse(&format!("{{{base}}}")).auth_time, None);
     }
 
     #[tokio::test]
@@ -1168,6 +2197,72 @@ mod test {
             .to_request();
         let res = run_test(req, Some(decoding_key), None, validation).await;
         assert_eq!(200, res.status());
+    }
+
+    #[tokio::test]
+    async fn cognito_requires_client_and_access_token_use() {
+        for missing in ["client_id", "token_use"] {
+            let mut claim = default_claim();
+            match missing {
+                "client_id" => claim.client_id = None,
+                "token_use" => claim.token_use = None,
+                _ => unreachable!(),
+            }
+            let (token, decoding_key) = setup(claim).await;
+            let req = test::TestRequest::get()
+                .uri("/")
+                .insert_header((http::header::AUTHORIZATION, format!("Bearer {token}")))
+                .to_request();
+            let res = run_test(
+                req,
+                Some(decoding_key),
+                None,
+                validation("some-client", "some-iss"),
+            )
+            .await;
+            assert_eq!(res.status(), 401, "accepted token without {missing}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_validation_requires_audience_and_enforces_nbf() {
+        for audience in [None, Some("some-client")] {
+            for nbf in [None, Some(serde_json::json!(Utc::now().timestamp() + 3600))] {
+                let mut claim = default_claim();
+                claim.aud = audience.map(|aud| serde_json::json!(aud));
+                if let Some(nbf) = &nbf {
+                    claim
+                        .additional_claims
+                        .insert("nbf".to_string(), nbf.clone());
+                }
+                let (token, key) = setup(claim).await;
+                let result = jsonwebtoken::decode::<OidcClaim>(
+                    &token,
+                    &key,
+                    &super::login_validation("some-iss", Some("some-client")),
+                );
+                assert_eq!(result.is_ok(), audience.is_some() && nbf.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_selector_rejects_ambiguous_or_malformed_headers() {
+        use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
+        let name = HeaderName::from_static("feldera-tenant");
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::tenant_selector(&headers).unwrap(), None);
+        for valid in ["tenant-x", "00000000-0000-0000-0000-000000000000"] {
+            headers.insert(name.clone(), HeaderValue::from_str(valid).unwrap());
+            assert_eq!(super::tenant_selector(&headers).unwrap(), Some(valid));
+        }
+        for invalid in [b"".as_slice(), b"   ", b"\xff"] {
+            headers.insert(name.clone(), HeaderValue::from_bytes(invalid).unwrap());
+            assert!(super::tenant_selector(&headers).is_err());
+        }
+        headers.insert(name.clone(), HeaderValue::from_static("tenant-x"));
+        headers.append(name, HeaderValue::from_static("tenant-y"));
+        assert!(super::tenant_selector(&headers).is_err());
     }
 
     #[tokio::test]
@@ -1394,5 +2489,57 @@ mod test {
                 input
             );
         }
+    }
+
+    /// A tenant-registered issuer may not reach an internal service, even when
+    /// its hostname resolves to one.
+    #[tokio::test]
+    async fn public_only_resolver_refuses_a_loopback_hostname() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        let refused = crate::oidc::fetch::PublicAddrsOnly
+            .resolve(reqwest::dns::Name::from_str("localhost").unwrap())
+            .await;
+        assert!(
+            refused.is_err(),
+            "'localhost' resolves to loopback and must be refused"
+        );
+
+        let permitted = crate::oidc::fetch::PublicAddrsOnly
+            .resolve(reqwest::dns::Name::from_str("one.one.one.one").unwrap())
+            .await;
+        // Skipped rather than failed when the test host has no DNS.
+        if let Ok(addrs) = permitted {
+            assert!(
+                addrs.count() > 0,
+                "a public hostname must keep at least one address"
+            );
+        }
+    }
+
+    /// An unverified token picks the `kid`, so a refresh that did not produce it
+    /// must not let the next request fetch again.
+    #[tokio::test]
+    async fn an_issuer_refresh_starts_a_cooldown() {
+        let mut cache = super::IssuerJwkCache::new();
+        assert!(!cache.refreshed_recently("https://idp.example.com"));
+
+        cache.mark_refreshed("https://idp.example.com");
+        assert!(cache.refreshed_recently("https://idp.example.com"));
+        // The cooldown is per issuer, so one slow provider cannot block others.
+        assert!(!cache.refreshed_recently("https://other.example.com"));
+    }
+
+    /// Concurrent misses for one issuer share a gate, so they cost one fetch.
+    #[tokio::test]
+    async fn a_refresh_gate_is_shared_per_issuer() {
+        let mut cache = super::IssuerJwkCache::new();
+        let first = cache.refresh_gate("https://idp.example.com");
+        let second = cache.refresh_gate("https://idp.example.com");
+        let other = cache.refresh_gate("https://other.example.com");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 }

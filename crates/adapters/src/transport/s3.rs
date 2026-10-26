@@ -639,7 +639,7 @@ impl S3InputReader {
                                                     false,
                                                     anyhow!(
                                                         "could not fetch object '{}': {e:?}",
-                                                        &partially_processed_key.key
+                                                        partially_processed_key.key
                                                     ),
                                                     Some("s3-obj-fetch"),
                                                 );
@@ -672,7 +672,7 @@ impl S3InputReader {
                                                     false,
                                                     anyhow!(
                                                         "error reading object '{}' at offset '{error_offset}': {e:?}; max retries '{max_retries}' exceeded, this object is partially processed",
-                                                        &partially_processed_key.key,
+                                                        partially_processed_key.key,
                                                     ),
                                                     Some("s3-obj-read"),
                                                 );
@@ -706,7 +706,7 @@ impl S3InputReader {
                                                             false,
                                                             anyhow!(
                                                                 "error when reading object after prior failure; object '{}': bytes at offset `{latest_start_offset}..{}` do not match after reconnection; did the object change?",
-                                                                &partially_processed_key.key,
+                                                                partially_processed_key.key,
                                                                 latest_start_offset + min as u64
                                                             ),
                                                             Some("s3-obj-read"),
@@ -762,7 +762,7 @@ impl S3InputReader {
                                             e.map_description(|desc| {
                                                 format!(
                                                     "error parsing object '{}': {desc}",
-                                                    &partially_processed_key.key
+                                                    partially_processed_key.key
                                                 )
                                             })
                                         })
@@ -965,7 +965,11 @@ fn to_s3_config(config: &Arc<S3InputConfig>) -> aws_sdk_s3::Config {
 #[cfg(test)]
 mod test {
     use crate::{
-        test::{MockDeZSet, MockInputConsumer, MockInputParser, mock_parser_pipeline, wait},
+        preprocess::PassthroughPreprocessorFactory,
+        test::{
+            ErrorCallback, MockDeZSet, MockInputConsumer, MockInputParser, mock_parser_pipeline,
+            wait,
+        },
         transport::s3::{S3InputConfig, S3InputReader},
     };
     use aws_sdk_s3::{
@@ -976,6 +980,9 @@ mod test {
         primitives::{ByteStream, SdkBody},
         types::error::builders::{NoSuchBucketBuilder, NoSuchKeyBuilder},
     };
+    use feldera_adapterlib::format::{MessageOrientedPreprocessedParser, Parser};
+    use feldera_adapterlib::preprocess::{PreprocessorFactory, PreprocessorWatchdog};
+    use feldera_types::preprocess::PreprocessorConfig;
     use feldera_types::{
         config::{InputEndpointConfig, TransportConfig},
         deserialize_without_context,
@@ -984,6 +991,12 @@ mod test {
     use mockall::predicate::eq;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// How long a test waits for an error the connector is expected to report.
+    /// Generous: it only bounds the wait so a regression fails instead of
+    /// hanging the whole test binary.
+    const ERROR_TIMEOUT: Duration = Duration::from_secs(60);
 
     #[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, PartialOrd, Ord)]
     struct TestStruct {
@@ -1027,9 +1040,63 @@ mod test {
   }
 }"#;
 
+    /// Newline-delimited JSON: `lines: single` picks the greedy line splitter.
+    const NDJSON_SINGLE_KEY_CONFIG_STR: &str = r#"
+{
+  "stream": "test_input",
+  "transport": {
+    "name": "s3_input",
+    "config": {
+      "aws_access_key_id": "FAKE_ACCESS_KEY",
+      "aws_secret_access_key": "FAKE_SECRET",
+      "bucket_name": "test-bucket",
+      "region": "us-west-1",
+      "key": "obj1"
+    }
+  },
+  "format": {
+    "name": "json",
+    "config": {
+      "update_format": "raw",
+      "array": false,
+      "lines": "single"
+    }
+  }
+}"#;
+
+    /// Builds a reader over `mock`, with `on_error` already installed.
+    ///
+    /// The callback has to be passed in rather than registered afterwards:
+    /// [`S3InputReader::new_inner`] starts listing objects as soon as it is
+    /// called, so a caller that registers later can miss an error the listing
+    /// already reported.
     fn test_setup(
         config_str: &str,
         mock: super::MockS3Client,
+        on_error: ErrorCallback,
+    ) -> (
+        Box<dyn crate::InputReader>,
+        MockInputConsumer,
+        MockInputParser,
+        MockDeZSet<TestStruct, TestStruct>,
+    ) {
+        test_setup_with(config_str, mock, on_error, Preprocess::No)
+    }
+
+    /// Whether to wrap the endpoint's parser the way a connector configured with
+    /// a message-oriented preprocessor does, which makes `parse` return a nested
+    /// buffer instead of a flat one.
+    #[derive(Copy, Clone, PartialEq)]
+    enum Preprocess {
+        No,
+        Passthrough,
+    }
+
+    fn test_setup_with(
+        config_str: &str,
+        mock: super::MockS3Client,
+        on_error: ErrorCallback,
+        preprocess: Preprocess,
     ) -> (
         Box<dyn crate::InputReader>,
         MockInputConsumer,
@@ -1049,11 +1116,29 @@ mod test {
             &config.connector_config.format.unwrap(),
         )
         .unwrap();
-        consumer.on_error(Some(Box::new(|_, _| ())));
+        consumer.on_error(Some(on_error));
+        let endpoint_parser: Box<dyn Parser> = if preprocess == Preprocess::Passthrough {
+            let preprocessor_config = PreprocessorConfig {
+                name: "passthrough".to_string(),
+                message_oriented: true,
+                config: serde_json::Value::Null,
+                max_allowed_call_duration: None,
+            };
+            let preprocessor = PassthroughPreprocessorFactory
+                .create(&preprocessor_config)
+                .unwrap();
+            Box::new(MessageOrientedPreprocessedParser::new(
+                preprocessor,
+                Box::new(parser.clone()),
+                PreprocessorWatchdog::new(&preprocessor_config),
+            ))
+        } else {
+            Box::new(parser.clone())
+        };
         let reader = Box::new(S3InputReader::new_inner(
             &transport_config,
             Box::new(consumer.clone()),
-            Box::new(parser.clone()),
+            endpoint_parser,
             Arc::new(mock),
             None,
         )) as Box<dyn crate::InputReader>;
@@ -1061,7 +1146,8 @@ mod test {
     }
 
     fn run_test(config_str: &str, mock: super::MockS3Client, mut test_data: Vec<TestStruct>) {
-        let (reader, consumer, parser, input_handle) = test_setup(config_str, mock);
+        let (reader, consumer, parser, input_handle) =
+            test_setup(config_str, mock, Box::new(|_, _| ()));
         // No outputs should be produced at this point.
         assert!(parser.state().data.is_empty());
         assert!(!consumer.state().eoi);
@@ -1114,6 +1200,74 @@ mod test {
             });
         let test_data: Vec<TestStruct> = (1..4).map(|i| TestStruct { i }).collect();
         run_test(SINGLE_KEY_CONFIG_STR, mock, test_data);
+    }
+
+    /// A preprocessor makes `parse` return a nested buffer, and the endpoint
+    /// hands the circuit at most `max_batch_size` records per step, so a single
+    /// parsed buffer has to survive being split across steps. Dropping the
+    /// remainder loses records the endpoint already reported as received, which
+    /// pins `total_input_records` above `total_processed_records` and stops the
+    /// pipeline from ever reporting completion.
+    ///
+    /// The format matters: newline-delimited JSON splits with `LineSplitter`,
+    /// which takes as many records as it can per chunk, so one nested element
+    /// holds many records and a batch boundary lands inside it. A CSV splitter
+    /// yields one record per element and never exercises the split.
+    #[test]
+    fn preprocessed_read_split_across_batches() {
+        const RECORDS: i64 = 100;
+        // Not a divisor of RECORDS, so the last batch is short too.
+        const MAX_BATCH_SIZE: usize = 7;
+
+        let body = (1..=RECORDS)
+            .map(|i| format!("{{\"i\":{i}}}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+
+        let mut mock = super::MockS3Client::default();
+        mock.expect_get_object_keys()
+            .with(eq("test-bucket"), eq(""), eq(&None), eq(&None))
+            .return_once(|_, _, _, _| Ok((vec!["obj1".to_string()], None)));
+        mock.expect_get_object()
+            .with(eq("test-bucket"), eq("obj1"), eq(0), eq(&None))
+            .return_once(move |_, _, _, _| {
+                Ok(GetObjectOutput::builder()
+                    .body(ByteStream::from(SdkBody::from(body.as_str())))
+                    .build())
+            });
+
+        let (reader, consumer, _parser, input_handle) = test_setup_with(
+            NDJSON_SINGLE_KEY_CONFIG_STR,
+            mock,
+            Box::new(|_, _| ()),
+            Preprocess::Passthrough,
+        );
+        consumer.set_max_batch_size(MAX_BATCH_SIZE);
+
+        reader.extend();
+        wait(
+            || {
+                reader.queue(false);
+                input_handle.state().flushed.len() == RECORDS as usize
+            },
+            10000,
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "only {} of {RECORDS} records reached the circuit",
+                input_handle.state().flushed.len()
+            )
+        });
+
+        let mut outputs = input_handle
+            .state()
+            .flushed
+            .iter()
+            .map(|upd| upd.unwrap_insert().clone())
+            .collect::<Vec<_>>();
+        outputs.sort();
+        let expected: Vec<TestStruct> = (1..=RECORDS).map(|i| TestStruct { i }).collect();
+        assert_eq!(outputs, expected);
     }
 
     #[test]
@@ -1185,7 +1339,8 @@ mod test {
             .with(eq("test-bucket"), eq(""), eq(&None), eq(&None))
             .return_once(|_, _, _, _| Ok((objs, None)));
         let test_data: Vec<TestStruct> = (0..1000).map(|i| TestStruct { i }).collect();
-        let (reader, _consumer, _parser, input_handle) = test_setup(MULTI_KEY_CONFIG_STR, mock);
+        let (reader, _consumer, _parser, input_handle) =
+            test_setup(MULTI_KEY_CONFIG_STR, mock, Box::new(|_, _| ()));
         reader.extend();
         wait(
             || {
@@ -1220,13 +1375,22 @@ mod test {
             .return_once(|_, _, _, _| {
                 Err(ListObjectsV2Error::NoSuchBucket(NoSuchBucketBuilder::default().build()).into())
             });
-        let (reader, consumer, _parser, _) = test_setup(MULTI_KEY_CONFIG_STR, mock);
         let (tx, rx) = std::sync::mpsc::channel();
-        consumer.on_error(Some(Box::new(move |fatal, err| {
-            tx.send((fatal, format!("{err}"))).unwrap()
-        })));
+        let (reader, _consumer, _parser, _) = test_setup(
+            MULTI_KEY_CONFIG_STR,
+            mock,
+            // Ignore a send failure: the receiver is gone once the assertion
+            // below has run, and the reader can still report during teardown.
+            Box::new(move |fatal, err| {
+                let _ = tx.send((fatal, format!("{err}")));
+            }),
+        );
         reader.extend();
-        assert_eq!((true, "NoSuchBucket".to_string()), rx.recv().unwrap());
+        assert_eq!(
+            (true, "NoSuchBucket".to_string()),
+            rx.recv_timeout(ERROR_TIMEOUT)
+                .expect("connector reported no error for a missing bucket"),
+        );
     }
 
     #[test]

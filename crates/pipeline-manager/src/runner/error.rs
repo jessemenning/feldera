@@ -1,8 +1,6 @@
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::utils::ValidationError;
-use actix_web::{
-    body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
-};
+use actix_web::{HttpResponse, ResponseError, body::BoxBody, http::StatusCode};
 use feldera_types::error::{DetailedError, ErrorResponse};
 use indoc::writedoc;
 use serde::Serialize;
@@ -56,6 +54,9 @@ pub enum RunnerError {
         current_status: ResourcesStatus,
         desired_status: ResourcesDesiredStatus,
     },
+    AutomatonGen2MultihostUnsupported {
+        hosts: usize,
+    },
 
     // The pipeline runner implementation encounters an error
     RunnerProvisionError {
@@ -73,6 +74,13 @@ pub enum RunnerError {
     RunnerConfigError {
         error: String,
     },
+    Gen2BinaryNotConfigured,
+    Gen2BinaryNotFound {
+        path: String,
+    },
+    Gen2EngineBuildNotSelectable {
+        runtime_version: String,
+    },
 
     // Interaction with the pipeline runner
     RunnerInteractionUnreachable {
@@ -80,6 +88,7 @@ pub enum RunnerError {
     },
     RunnerInteractionLogFollowRequestChannelFull,
     RunnerInteractionLogFollowRequestChannelClosed,
+    RunnerInteractionLogPositionTimeout,
 
     // Interaction with the pipeline
     PipelineInteractionNotDeployed {
@@ -162,11 +171,19 @@ impl DetailedError for RunnerError {
             RunnerError::AutomatonImpossibleDesiredStatus { .. } => {
                 Cow::from("AutomatonImpossibleDesiredStatus")
             }
+            RunnerError::AutomatonGen2MultihostUnsupported { .. } => {
+                Cow::from("AutomatonGen2MultihostUnsupported")
+            }
             RunnerError::RunnerProvisionError { .. } => Cow::from("RunnerProvisionError"),
             RunnerError::RunnerCheckError { .. } => Cow::from("RunnerCheckError"),
             RunnerError::RunnerStopError { .. } => Cow::from("RunnerStopError"),
             RunnerError::RunnerClearError { .. } => Cow::from("RunnerClearError"),
             RunnerError::RunnerConfigError { .. } => Cow::from("RunnerConfigError"),
+            RunnerError::Gen2BinaryNotConfigured => Cow::from("Gen2BinaryNotConfigured"),
+            RunnerError::Gen2BinaryNotFound { .. } => Cow::from("Gen2BinaryNotFound"),
+            RunnerError::Gen2EngineBuildNotSelectable { .. } => {
+                Cow::from("Gen2EngineBuildNotSelectable")
+            }
             RunnerError::RunnerInteractionUnreachable { .. } => {
                 Cow::from("RunnerInteractionUnreachable")
             }
@@ -175,6 +192,9 @@ impl DetailedError for RunnerError {
             }
             RunnerError::RunnerInteractionLogFollowRequestChannelClosed => {
                 Cow::from("RunnerInteractionLogFollowRequestChannelClosed")
+            }
+            RunnerError::RunnerInteractionLogPositionTimeout => {
+                Cow::from("RunnerInteractionLogPositionTimeout")
             }
             RunnerError::PipelineInteractionNotDeployed { .. } => {
                 Cow::from("PipelineInteractionNotDeployed")
@@ -280,7 +300,7 @@ impl Display for RunnerError {
                     Pipeline could not be provisioned within the timeout of {}s. Possible reasons:
 
                     1) It takes too long to bring up the pipeline (e.g., cloud resources) compared to the timeout.
-                       If so, try increasing `provisioning_timeout_secs` in the Pipeline settings.
+                       If so, try increasing `provisioning_timeout` (for example `20m`) in the Pipeline settings.
 
                     2) Your cloud environment could not provision some required resources like volumes or containers.
                        The pipeline logs might provide more insight if this is the case.
@@ -308,18 +328,29 @@ impl Display for RunnerError {
                 current_status,
                 desired_status,
             } => {
-                write! {
+                write!(
                     f,
                     "
                     Current deployment status {current_status} cannot reach desired status {desired_status}
                     "
-                }
+                )
+            }
+            Self::AutomatonGen2MultihostUnsupported { hosts } => {
+                write!(
+                    f,
+                    "The Gen-2 engine does not support multihost pipelines yet. \
+                    Set 'runtime_config.hosts' to 1 or select a different runtime version \
+                    to start this pipeline (requested {hosts} hosts)."
+                )
             }
             Self::RunnerProvisionError { error } => {
                 write!(f, "Pipeline provision failed: {error}")
             }
             Self::RunnerCheckError { error } => {
-                write!(f, "Pipeline check failed: compute and/or storage resources encountered a fatal error.\n\n{error}")
+                write!(
+                    f,
+                    "Pipeline check failed: compute and/or storage resources encountered a fatal error.\n\n{error}"
+                )
             }
             Self::RunnerStopError { error } => {
                 write!(f, "Pipeline stop failed (will retry): {error}")
@@ -330,6 +361,28 @@ impl Display for RunnerError {
             Self::RunnerConfigError { error } => {
                 write!(f, "Pipeline runner configuration error: {error}")
             }
+            Self::Gen2BinaryNotConfigured => {
+                write!(
+                    f,
+                    "The Gen-2 engine executable is not configured. Set the GEN2_BINARY \
+                    environment variable to the executable's location to start a Gen-2 pipeline."
+                )
+            }
+            Self::Gen2BinaryNotFound { path } => {
+                write!(
+                    f,
+                    "Gen-2 engine executable '{path}' not found. Point the GEN2_BINARY \
+                    environment variable at the executable, or place it on PATH under that name."
+                )
+            }
+            Self::Gen2EngineBuildNotSelectable { runtime_version } => {
+                write!(
+                    f,
+                    "The runtime version '{runtime_version}' pins a Gen2 engine build, which this \
+                    runner cannot select: it runs the engine at GEN2_BINARY. Set \
+                    'program_config.runtime_version' to 'gen2' to start this pipeline."
+                )
+            }
             Self::RunnerInteractionUnreachable { error } => {
                 write!(
                     f,
@@ -337,10 +390,22 @@ impl Display for RunnerError {
                 )
             }
             Self::RunnerInteractionLogFollowRequestChannelFull => {
-                write!(f, "Log follow request channel is full -- this indicates that the runner logging is overwhelmed")
+                write!(
+                    f,
+                    "Log follow request channel is full -- this indicates that the runner logging is overwhelmed"
+                )
             }
             Self::RunnerInteractionLogFollowRequestChannelClosed => {
-                write!(f, "Log follow request channel is closed -- this indicates that the runner crashed unexpectedly")
+                write!(
+                    f,
+                    "Log follow request channel is closed -- this indicates that the runner crashed unexpectedly"
+                )
+            }
+            Self::RunnerInteractionLogPositionTimeout => {
+                write!(
+                    f,
+                    "Logs thread did not report the position to resume from in time -- retry the request"
+                )
             }
             Self::PipelineInteractionNotDeployed {
                 pipeline_name,
@@ -438,11 +503,15 @@ impl ResponseError for RunnerError {
             Self::AutomatonSuspendingComputeTimeout { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonAfterInitializationBecameRunning => StatusCode::INTERNAL_SERVER_ERROR,
             Self::AutomatonImpossibleDesiredStatus { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::AutomatonGen2MultihostUnsupported { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerProvisionError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerCheckError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerStopError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerClearError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::RunnerConfigError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Gen2BinaryNotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Gen2BinaryNotFound { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Gen2EngineBuildNotSelectable { .. } => StatusCode::BAD_REQUEST,
             Self::RunnerInteractionUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RunnerInteractionLogFollowRequestChannelFull { .. } => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -450,6 +519,7 @@ impl ResponseError for RunnerError {
             Self::RunnerInteractionLogFollowRequestChannelClosed { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::RunnerInteractionLogPositionTimeout => StatusCode::SERVICE_UNAVAILABLE,
             Self::PipelineInteractionNotDeployed { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::PipelineUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::PipelineMissingDeploymentLocation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -460,6 +530,76 @@ impl ResponseError for RunnerError {
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
-        HttpResponseBuilder::new(self.status_code()).json(ErrorResponse::from_error(self))
+        crate::error::json_error_response(self)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::RunnerError;
+
+    /// The Gen-2 multihost refusal is customer-facing; pin its wording.
+    #[test]
+    fn gen2_multihost_error_wording() {
+        let message = RunnerError::AutomatonGen2MultihostUnsupported { hosts: 3 }.to_string();
+        assert!(
+            message.contains("Gen-2 engine does not support multihost pipelines"),
+            "unexpected wording: {message}"
+        );
+        assert!(
+            message.contains("runtime_config.hosts"),
+            "should name the field to change: {message}"
+        );
+        assert!(
+            message.contains('3'),
+            "should report the requested host count: {message}"
+        );
+    }
+
+    /// The missing-executable error is customer-facing; pin its wording.
+    #[test]
+    fn gen2_binary_not_found_wording() {
+        let message = RunnerError::Gen2BinaryNotFound {
+            path: "gen2-engine".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("Gen-2 engine executable"), "{message}");
+        assert!(message.contains("not found"), "{message}");
+        assert!(
+            message.contains("gen2-engine"),
+            "names the value that failed: {message}"
+        );
+        assert!(
+            message.contains("GEN2_BINARY"),
+            "should point at the env var that names it: {message}"
+        );
+    }
+
+    /// The pinned-build refusal is customer-facing; pin its wording and the setting it names.
+    #[test]
+    fn gen2_engine_build_not_selectable_wording() {
+        let message = RunnerError::Gen2EngineBuildNotSelectable {
+            runtime_version: "gen2:d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b".to_string(),
+        }
+        .to_string();
+        for named in [
+            "'gen2:d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b'",
+            "GEN2_BINARY",
+            "'program_config.runtime_version'",
+        ] {
+            assert!(message.contains(named), "names {named}: {message}");
+        }
+    }
+
+    /// The unconfigured-engine error is customer-facing; pin its wording. It must name
+    /// `GEN2_BINARY`, since that variable is the only way to reach the engine.
+    #[test]
+    fn gen2_binary_not_configured_wording() {
+        let message = RunnerError::Gen2BinaryNotConfigured.to_string();
+        assert!(message.contains("not configured"), "{message}");
+        assert!(
+            message.contains("GEN2_BINARY"),
+            "should name the variable to set: {message}"
+        );
     }
 }

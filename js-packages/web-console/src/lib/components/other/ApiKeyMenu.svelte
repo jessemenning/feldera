@@ -42,7 +42,7 @@
         <div class=" w-full">
           <div>
             {key.name}
-            [{key.scopes}]
+            <span class="text-sm text-surface-800-200">[{key.role}]</span>
           </div>
 
           <div class="text-sm">{key.id}</div>

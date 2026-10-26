@@ -16,6 +16,7 @@ import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.util.List;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /**
  * The DBSPWindow operator corresponds to a DBSP window() call.
@@ -24,23 +25,43 @@ import java.util.List;
  * elements in the left input are compared with the two scalars
  * in the pair; when they fall between the two limits,
  * they are emitted to the output ZSet. */
-public final class DBSPWindowOperator extends DBSPBinaryOperator implements IContainsIntegrator, IIncremental {
+public final class DBSPWindowOperator extends DBSPBinaryOperator implements IHasInputIntegrator, IIncremental {
     public final boolean lowerInclusive;
     public final boolean upperInclusive;
+    /** True if the window's lower bound is -infinity.
+     * This property is not used for code generation, but it is difficult to infer later.
+     * The validity relies on the fact that no optimizations change window bounds once created. */
+    public final boolean lowerUnbounded;
 
     public DBSPWindowOperator(CalciteRelNode node, boolean lowerInclusive, boolean upperInclusive,
-            OutputPort data, OutputPort control) {
+            boolean lowerUnbounded, OutputPort data, OutputPort control) {
         super(node, "window", null, data.outputType(), data.isMultiset(), data, control);
         // Check that the left input and output are indexed ZSets.
         DBSPTypeIndexedZSet indexedType = this.getOutputIndexedZSetType();
         DBSPType expectedControlType = new DBSPTypeRawTuple(
                 new DBSPTypeTypedBox(indexedType.keyType, false),
                 new DBSPTypeTypedBox(indexedType.keyType, false));
-        Utilities.enforce(control.outputType().sameType(expectedControlType),
+        // Under --gen2, RemoveTypedBox unboxes the bounds
+        DBSPType unboxedControlType = new DBSPTypeRawTuple(indexedType.keyType, indexedType.keyType);
+        Utilities.enforce(control.outputType().sameType(expectedControlType) ||
+                        control.outputType().sameType(unboxedControlType),
                 () -> "Window bounds must have type " + expectedControlType +
                         ", but have type " + control.outputType());
         this.lowerInclusive = lowerInclusive;
         this.upperInclusive = upperInclusive;
+        this.lowerUnbounded = lowerUnbounded;
+    }
+
+    @Override
+    public boolean equivalent(DBSPOperator other) {
+        if (!super.equivalent(other))
+            return false;
+        DBSPWindowOperator otherOperator = other.as(DBSPWindowOperator.class);
+        if (otherOperator == null)
+            return false;
+        return this.lowerInclusive == otherOperator.lowerInclusive &&
+                this.upperInclusive == otherOperator.upperInclusive &&
+                this.lowerUnbounded == otherOperator.lowerUnbounded;
     }
 
     @Override
@@ -52,9 +73,23 @@ public final class DBSPWindowOperator extends DBSPBinaryOperator implements ICon
             if (force || this.inputsDiffer(newInputs))
                 return new DBSPWindowOperator(
                         this.getRelNode(), this.lowerInclusive, this.upperInclusive,
+                        this.lowerUnbounded,
                         newInputs.get(0), newInputs.get(1)).copyAnnotations(this);
         }
         return this;
+    }
+
+    @Override
+    public boolean hasInputIntegrator(int inputIndex) {
+        // Input 1 carries the window bounds
+        return inputIndex == 0;
+    }
+
+    @Override
+    public boolean garbageCollectsInput(int inputIndex) {
+        // The runtime truncates the trace of input 0 below the lower window bound; a window
+        // without a lower bound truncates nothing
+        return inputIndex == 0 && !this.lowerUnbounded;
     }
 
     @Override
@@ -71,8 +106,16 @@ public final class DBSPWindowOperator extends DBSPBinaryOperator implements ICon
         DBSPSimpleOperator.CommonInfo info = commonInfoFromJson(node, decoder);
         boolean lowerInclusive = Utilities.getBooleanProperty(node, "lowerInclusive");
         boolean upperInclusive = Utilities.getBooleanProperty(node, "upperInclusive");
+        boolean lowerUnbounded = Utilities.getBooleanProperty(node, "lowerUnbounded");
         return new DBSPWindowOperator(CalciteEmptyRel.INSTANCE,
-                lowerInclusive, upperInclusive, info.getInput(0), info.getInput(1))
+                lowerInclusive, upperInclusive, lowerUnbounded, info.getInput(0), info.getInput(1))
                 .addAnnotations(info.annotations(), DBSPWindowOperator.class);
+    }
+
+    @Override
+    protected StreamKind computeOutputKind() {
+        this.requireInputAmong(0, StreamKind.DELTA);
+        this.requireInputAmong(1, StreamKind.WATERLINE);
+        return StreamKind.DELTA;
     }
 }

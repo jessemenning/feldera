@@ -20,6 +20,19 @@ public class ConnectorTests extends BaseSQLTests {
             TestUtil.assertMessagesContain(compiler.messages, msg);
     }
 
+    /** Compiles SQL and asserts that it produces neither errors nor warnings. */
+    private void runCleanConnectorTest(String sql) {
+        this.runCleanConnectorTest(this.chattyCompiler(), sql);
+    }
+
+    /** Like {@link #runCleanConnectorTest(String)}, using a caller-configured compiler. */
+    private void runCleanConnectorTest(DBSPCompiler compiler, String sql) {
+        compiler.submitStatementsForCompilation(sql);
+        compiler.getFinalCircuit(true);
+        Assert.assertEquals(0, compiler.messages.exitCode);
+        Assert.assertEquals(compiler.messages.toString(), 0, compiler.messages.warningCount());
+    }
+
     /** Adds four spaces of indentation to every line of {@code body}. */
     private static String indent4(String body) {
         return body.lines()
@@ -53,6 +66,17 @@ public class ConnectorTests extends BaseSQLTests {
                 "  }]'\n" +
                 ");",
                 expectedMessages);
+    }
+
+    /** Like {@link #tableConnectorTest}, but asserts that the config draws no warning. */
+    private void cleanTableConnectorTest(String connectorBody) {
+        runCleanConnectorTest(
+                "CREATE TABLE T (x INT) WITH (\n" +
+                "  'connectors' = '[{\n" +
+                "    \"name\": \"c\",\n" +
+                indent4(connectorBody) + "\n" +
+                "  }]'\n" +
+                ");");
     }
 
     /**
@@ -302,6 +326,54 @@ public class ConnectorTests extends BaseSQLTests {
                     4|   "postprocessor": [{
                                            ^
                     5|      "config": {}""");
+    }
+
+    @Test
+    public void testSoftDeleteValidation() {
+        // A table without a primary key accepts soft deletes.
+        runConnectorTest("""
+                CREATE TABLE T(x INT) WITH ('connectors' = '[{
+                   "name": "0",
+                   "soft_delete": true,
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   }
+                }]');""");
+
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT NOT NULL PRIMARY KEY, y INT) WITH ('connectors' = '[{
+                   "name": "0",
+                   "soft_delete": true,
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   }
+                }]');""", """
+                Compilation error: "soft_delete" property cannot be used for table 't', which has a primary key (x); soft deletes are only supported for tables without a primary key
+                    3|   "soft_delete": true,
+                                        ^""");
+
+        // Soft deletes describe what a connector ingests, so they are meaningless on a view.
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x INT);
+                CREATE VIEW V WITH ('connectors' = '[{
+                   "name": "0",
+                   "soft_delete": true
+                }]') AS SELECT * FROM T;""", """
+                Compilation error: "soft_delete" property for view 'v' must be attached to a table: soft deletes apply to the records a connector ingests
+                    4|   "soft_delete": true""");
+
+        // `soft_delete: false` is the default and imposes no restriction.
+        runConnectorTest("""
+                CREATE TABLE T(x INT NOT NULL PRIMARY KEY) WITH ('connectors' = '[{
+                   "name": "0",
+                   "soft_delete": false,
+                   "transport": {
+                     "name": "datagen",
+                     "config": {}
+                   }
+                }]');""");
     }
 
     // ---- CSV format config ----
@@ -635,6 +707,108 @@ public class ConnectorTests extends BaseSQLTests {
                 "\"threads\" must be greater than 0");
     }
 
+    @Test
+    public void sendSnapshotRequiresMaterializedView() {
+        String sql = """
+                CREATE TABLE T (x INT);
+                CREATE VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "send_snapshot": true,
+                    "transport": {
+                      "name": "delta_table_output",
+                      "config": { "uri": "s3://bucket/table", "mode": "truncate" }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;""";
+        this.statementsFailingInCompilation(sql,
+                "\"send_snapshot\" property for view 'v' requires a materialized view");
+    }
+
+    @Test
+    public void connectorOnLocalView() {
+        String sql = """
+                CREATE TABLE T (x INT);
+                CREATE LOCAL VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "transport": {
+                      "name": "delta_table_output",
+                      "config": { "uri": "s3://bucket/table", "mode": "truncate" }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;
+                CREATE VIEW W AS SELECT * FROM V;""";
+        this.statementsFailingInCompilation(sql,
+                "error: Connector on LOCAL VIEW: LOCAL VIEW (view 'v') is not an output of the " +
+                "pipeline, so it cannot have connectors.");
+    }
+
+    @Test
+    public void emptyConnectorListOnLocalView() {
+        runCleanConnectorTest("""
+                CREATE TABLE T (x INT);
+                CREATE LOCAL VIEW V WITH ('connectors' = '[]') AS SELECT * FROM T;
+                CREATE VIEW W AS SELECT * FROM V;""");
+    }
+
+    @Test
+    public void connectorOnViewWithCte() {
+        // CteToLocalViews rewrites each CTE into a LOCAL VIEW; the connectors stay on the outer view
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.options.languageOptions.cteViews = true;
+        runCleanConnectorTest(compiler, """
+                CREATE TABLE T (x INT);
+                CREATE VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "transport": {
+                      "name": "delta_table_output",
+                      "config": { "uri": "s3://bucket/table", "mode": "truncate" }
+                    }
+                  }]'
+                ) AS WITH cte AS (SELECT * FROM T) SELECT * FROM cte;""");
+    }
+
+    @Test
+    public void sendSnapshotThroughIndexRequiresMaterializedView() {
+        // The index of a non-materialized view stores no data, so it cannot serve a snapshot
+        String sql = """
+                CREATE TABLE T (x INT);
+                CREATE VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "index": "ix",
+                    "send_snapshot": true,
+                    "transport": {
+                      "name": "delta_table_output",
+                      "config": { "uri": "s3://bucket/table", "mode": "truncate" }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;
+                CREATE INDEX IX ON V(x);""";
+        this.statementsFailingInCompilation(sql,
+                "\"send_snapshot\" property for view 'v' requires a materialized view");
+    }
+
+    @Test
+    public void sendSnapshotThroughIndexOfMaterializedView() {
+        runCleanConnectorTest("""
+                CREATE TABLE T (x INT);
+                CREATE MATERIALIZED VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "index": "ix",
+                    "send_snapshot": true,
+                    "transport": {
+                      "name": "delta_table_output",
+                      "config": { "uri": "s3://bucket/table", "mode": "truncate" }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;
+                CREATE INDEX IX ON V(x);""");
+    }
+
     // ---- HTTP transport config ----
 
     @Test
@@ -738,6 +912,270 @@ public class ConnectorTests extends BaseSQLTests {
     }
 
     @Test
+    public void postgresCdcReaderRunSourceMigrations() {
+        for (String option : new String[]{"", ", \"run_source_migrations\": true",
+                ", \"run_source_migrations\": false"}) {
+            cleanTableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders"%s
+                  }
+                }""".formatted(option));
+        }
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "run_source_migrations": "no"
+                  }
+                }""",
+                "Cannot deserialize value of type `java.lang.Boolean` from String \"no\"");
+    }
+
+    @Test
+    public void postgresCdcReaderValidBatchAndMemoryBackpressure() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_fill_ms": 5000,
+                      "memory_budget_ratio": 0.3,
+                      "max_bytes": 4194304
+                    },
+                    "memory_backpressure": {
+                      "activate_threshold": 0.9,
+                      "resume_threshold": 0.6
+                    }
+                  }
+                }""");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsZeroBatchMemoryBudgetRatio() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "memory_budget_ratio": 0.0
+                    }
+                  }
+                }""",
+                "\"batch.memory_budget_ratio\" must be in the (0.0, 1.0] interval");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsOutOfRangeBatchMemoryBudgetRatio() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "memory_budget_ratio": 1.5
+                    }
+                  }
+                }""",
+                "\"batch.memory_budget_ratio\" must be in the (0.0, 1.0] interval, got 1.5");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsZeroBatchMaxBytes() {
+        // The deprecated spelling, a number of bytes, is still checked, and the
+        // error names the key the user wrote.
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_bytes": 0
+                    }
+                  }
+                }""",
+                "\"batch.max_bytes\" is '0'; it must be greater than 0");
+    }
+
+    @Test
+    public void postgresCdcReaderBatchMaxSize() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_size": "4Mi"
+                    }
+                  }
+                }""");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsZeroBatchMaxSize() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_size": "0"
+                    }
+                  }
+                }""",
+                "\"batch.max_size\" is '0'; it must be greater than 0, for example \"32Mi\"");
+    }
+
+    /** The runtime refuses null for a size that has a default but cannot be unset. */
+    @Test
+    public void requiredSizesRejectNull() {
+        for (String key: new String[] { "max_size", "max_bytes" })
+            tableConnectorTest("""
+                    "transport": {
+                      "name": "postgres_cdc_input",
+                      "config": {
+                        "uri": "postgres://localhost/db",
+                        "publication": "my_pub",
+                        "source_table": "public.orders",
+                        "batch": {
+                          "%s": null
+                        }
+                      }
+                    }""".formatted(key),
+                    "\"batch." + key + "\" cannot be null; remove it to use the default");
+        for (String key: new String[] { "max_buffer_size", "max_buffer_size_bytes" }) {
+            viewConnectorTest("""
+                    "transport": {
+                      "name": "postgres_output",
+                      "config": {
+                        "uri": "postgres://localhost/db",
+                        "table": "t",
+                        "%s": null
+                      }
+                    }""".formatted(key),
+                    "\"" + key + "\" cannot be null; remove it to use the default");
+            viewConnectorTest("""
+                    "transport": {
+                      "name": "dynamodb_output",
+                      "config": {
+                        "table": "my-table",
+                        "region": "us-east-1",
+                        "%s": null
+                      }
+                    }""".formatted(key),
+                    "\"" + key + "\" cannot be null; remove it to use the default");
+        }
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsMalformedBatchMaxSize() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_size": "4m"
+                    }
+                  }
+                }""",
+                "\"batch.max_size\": unknown unit 'm' in size '4m'");
+    }
+
+    /** Both spellings of the batch size reach one setting, so writing both is rejected. */
+    @Test
+    public void postgresCdcReaderRejectsBothBatchSizeSpellings() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "batch": {
+                      "max_size": "4Mi",
+                      "max_bytes": 4194304
+                    }
+                  }
+                }""",
+                "\"batch.max_bytes\" is another spelling of \"batch.max_size\"");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsZeroActivateThreshold() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "memory_backpressure": {
+                      "activate_threshold": 0.0
+                    }
+                  }
+                }""",
+                "\"memory_backpressure.activate_threshold\" must be in the (0.0, 1.0] interval");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsResumeThresholdOfOne() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "memory_backpressure": {
+                      "resume_threshold": 1.0
+                    }
+                  }
+                }""",
+                "\"memory_backpressure.resume_threshold\" must be in the [0.0, 1.0) interval");
+    }
+
+    @Test
+    public void postgresCdcReaderRejectsResumeGteActivateThreshold() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "postgres_cdc_input",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "publication": "my_pub",
+                    "source_table": "public.orders",
+                    "memory_backpressure": {
+                      "activate_threshold": 0.5,
+                      "resume_threshold": 0.5
+                    }
+                  }
+                }""",
+                "must be lower than");
+    }
+
+    @Test
     public void postgresWriterCdcMissingOpColumn() {
         viewConnectorTest("""
                 "transport": {
@@ -750,6 +1188,29 @@ public class ConnectorTests extends BaseSQLTests {
                   }
                 }""",
                 "\"cdc_op_column\" cannot be empty in CDC mode");
+    }
+
+    @Test
+    public void postgresWriterBufferSize() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "postgres_output",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "table": "t",
+                    "max_buffer_size": "512Ki"
+                  }
+                }""");
+        viewConnectorTest("""
+                "transport": {
+                  "name": "postgres_output",
+                  "config": {
+                    "uri": "postgres://localhost/db",
+                    "table": "t",
+                    "max_buffer_size": "0"
+                  }
+                }""",
+                "\"max_buffer_size\" is '0'; it must be greater than 0, for example \"1Mi\"");
     }
 
     @Test
@@ -821,6 +1282,54 @@ public class ConnectorTests extends BaseSQLTests {
                   }
                 }""",
                 "required field \"topic\" is missing or empty");
+    }
+
+    @Test
+    public void kafkaInputLegacyTopics() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topics": ["my-topic"]
+                  }
+                }""");
+    }
+
+    @Test
+    public void kafkaInputEmptyTopics() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topics": []
+                  }
+                }""",
+                "required field \"topic\" is missing or empty");
+    }
+
+    @Test
+    public void kafkaInputTopicAndTopics() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topic": "my-topic",
+                    "topics": ["my-topic"]
+                  }
+                }""",
+                "\"topic\" and the legacy \"topics\" are mutually exclusive");
+    }
+
+    @Test
+    public void kafkaInputMultipleTopics() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topics": ["a", "b"]
+                  }
+                }""",
+                "the legacy \"topics\" accepts exactly one topic, not 2");
     }
 
     @Test
@@ -1015,6 +1524,39 @@ public class ConnectorTests extends BaseSQLTests {
     }
 
     @Test
+    public void fileInputBufferSize() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "file_input",
+                  "config": {
+                    "path": "/data/input.csv",
+                    "buffer_size": "64Ki"
+                  }
+                }""");
+        tableConnectorTest("""
+                "transport": {
+                  "name": "file_input",
+                  "config": {
+                    "path": "/data/input.csv",
+                    "buffer_size_bytes": 65536
+                  }
+                }""");
+    }
+
+    @Test
+    public void fileInputMalformedBufferSize() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "file_input",
+                  "config": {
+                    "path": "/data/input.csv",
+                    "buffer_size": "64KB "
+                  }
+                }""",
+                "\"buffer_size\": unknown unit 'KB ' in size '64KB '");
+    }
+
+    @Test
     public void fileOutputUnknownField() {
         viewConnectorTest("""
                 "transport": {
@@ -1107,6 +1649,53 @@ public class ConnectorTests extends BaseSQLTests {
                     "region": "us-east-1"
                   }
                 }""");
+    }
+
+    @Test
+    public void dynamodbOutputBufferSize() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "dynamodb_output",
+                  "config": {
+                    "table": "my-table",
+                    "region": "us-east-1",
+                    "max_buffer_size": "2Mi"
+                  }
+                }""");
+        // The deprecated spelling counts bytes.
+        viewConnectorTest("""
+                "transport": {
+                  "name": "dynamodb_output",
+                  "config": {
+                    "table": "my-table",
+                    "region": "us-east-1",
+                    "max_buffer_size_bytes": 2097152
+                  }
+                }""");
+    }
+
+    @Test
+    public void dynamodbOutputRejectsZeroBufferSize() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "dynamodb_output",
+                  "config": {
+                    "table": "my-table",
+                    "region": "us-east-1",
+                    "max_buffer_size": "0"
+                  }
+                }""",
+                "\"max_buffer_size\" is '0'; it must be greater than 0, for example \"1Mi\"");
+        viewConnectorTest("""
+                "transport": {
+                  "name": "dynamodb_output",
+                  "config": {
+                    "table": "my-table",
+                    "region": "us-east-1",
+                    "max_buffer_size_bytes": 0
+                  }
+                }""",
+                "\"max_buffer_size_bytes\" is '0'; it must be greater than 0");
     }
 
     @Test
@@ -1242,7 +1831,7 @@ public class ConnectorTests extends BaseSQLTests {
                     "clock_resolution_usecs": 0
                   }
                 }""",
-                "\"clock_resolution_usecs\" must be greater than 0");
+                "\"clock_resolution_usecs\" is '0'; it must be greater than 0");
     }
 
     @Test
@@ -1268,6 +1857,78 @@ public class ConnectorTests extends BaseSQLTests {
                     "http_driven": true
                   }
                 }""");
+    }
+
+    // ---- S2 transport config ----
+
+    @Test
+    public void s2InputValidConfig() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "s2_input",
+                  "config": {
+                    "basin": "events",
+                    "stream": "orders",
+                    "auth_token": "${env:S2_AUTH_TOKEN}",
+                    "start_from": {"SeqNum": 42}
+                  }
+                }""");
+    }
+
+    @Test
+    public void s2InputInvalidStartFrom() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "s2_input",
+                  "config": {
+                    "basin": "events",
+                    "stream": "orders",
+                    "auth_token": "token",
+                    "start_from": {"SeqNum": -1}
+                  }
+                }""",
+                "\"start_from\" must be \"Beginning\", \"Tail\"");
+    }
+
+    @Test
+    public void s2InputMissingStream() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "s2_input",
+                  "config": {
+                    "basin": "events",
+                    "auth_token": "token"
+                  }
+                }""",
+                "required field \"stream\" is missing or empty");
+    }
+
+    @Test
+    public void s2OutputValidConfig() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "s2_output",
+                  "config": {
+                    "basin": "events",
+                    "stream": "results",
+                    "auth_token": "${env:S2_AUTH_TOKEN}"
+                  }
+                }""");
+    }
+
+    @Test
+    public void s2OutputUnknownField() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "s2_output",
+                  "config": {
+                    "basin": "events",
+                    "stream": "results",
+                    "auth_token": "token",
+                    "batch_size": 100
+                  }
+                }""",
+                "unknown field \"batch_size\"");
     }
 
     // ---- NATS transport config ----
@@ -1451,6 +2112,583 @@ public class ConnectorTests extends BaseSQLTests {
                     }
                   }
                 }""",
-                "\"inactivity_timeout_secs\" must be at least 1");
+                "\"inactivity_timeout_secs\" is '0'; it must be at least 1 second");
+    }
+
+    // ---- Human-readable duration fields ----
+
+    @Test
+    public void urlInputDurationField() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "url_input",
+                  "config": {
+                    "path": "https://example.com/data.csv",
+                    "pause_linger": "1h30m"
+                  }
+                }""");
+    }
+
+    @Test
+    public void urlInputMalformedDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "url_input",
+                  "config": {
+                    "path": "https://example.com/data.csv",
+                    "pause_linger": "30"
+                  }
+                }""",
+                "\"pause_linger\": '30' has no unit");
+    }
+
+    @Test
+    public void kafkaInputDurationField() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topic": "my-topic",
+                    "group_join_timeout": "10s"
+                  }
+                }""");
+    }
+
+    @Test
+    public void kafkaInputLegacyTimeout() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topic": "my-topic",
+                    "group_join_timeout_secs": 10
+                  }
+                }""");
+    }
+
+    @Test
+    public void kafkaInputMalformedDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topic": "my-topic",
+                    "group_join_timeout": "10sec"
+                  }
+                }""",
+                "unknown unit 'sec' in duration '10sec'");
+    }
+
+    @Test
+    public void kafkaOutputDurationField() {
+        runCleanConnectorTest("""
+                CREATE TABLE T (x INT);
+                CREATE VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "transport": {
+                      "name": "kafka_output",
+                      "config": {
+                        "topic": "my-topic",
+                        "initialization_timeout": "90s"
+                      }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;""");
+    }
+
+    @Test
+    public void kafkaOutputMalformedDuration() {
+        viewConnectorTest("""
+                "transport": {
+                  "name": "kafka_output",
+                  "config": {
+                    "topic": "my-topic",
+                    "initialization_timeout": ""
+                  }
+                }""",
+                "\"initialization_timeout\": duration is empty");
+    }
+
+    @Test
+    public void pubSubInputDurationFields() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "pub_sub_input",
+                  "config": {
+                    "subscription": "my-sub",
+                    "timeout": "30s",
+                    "connect_timeout": "10s"
+                  }
+                }""");
+    }
+
+    @Test
+    public void pubSubInputLegacyTimeouts() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "pub_sub_input",
+                  "config": {
+                    "subscription": "my-sub",
+                    "timeout_seconds": 30,
+                    "connect_timeout_seconds": 10
+                  }
+                }""");
+    }
+
+    @Test
+    public void pubSubInputMalformedDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "pub_sub_input",
+                  "config": {
+                    "subscription": "my-sub",
+                    "connect_timeout": "-10s"
+                  }
+                }""",
+                "\"connect_timeout\": duration '-10s' cannot be negative");
+    }
+
+    @Test
+    public void avroParserDurationField() {
+        cleanTableConnectorTest("""
+                "format": {
+                  "name": "avro",
+                  "config": {
+                    "registry_urls": ["http://localhost:8081"],
+                    "registry_timeout": "10s"
+                  }
+                }""");
+    }
+
+    @Test
+    public void avroParserLegacyTimeout() {
+        cleanTableConnectorTest("""
+                "format": {
+                  "name": "avro",
+                  "config": {
+                    "registry_urls": ["http://localhost:8081"],
+                    "registry_timeout_secs": 10
+                  }
+                }""");
+    }
+
+    @Test
+    public void avroParserMalformedDuration() {
+        tableConnectorTest("""
+                "format": {
+                  "name": "avro",
+                  "config": {
+                    "registry_urls": ["http://localhost:8081"],
+                    "registry_timeout": "ten seconds"
+                  }
+                }""",
+                "unknown unit 'ten seconds';");
+    }
+
+    @Test
+    public void avroEncoderDurationField() {
+        runCleanConnectorTest("""
+                CREATE TABLE T (x INT);
+                CREATE VIEW V WITH (
+                  'connectors' = '[{
+                    "name": "c",
+                    "format": {
+                      "name": "avro",
+                      "config": {
+                        "registry_urls": ["http://localhost:8081"],
+                        "registry_timeout": "500ms"
+                      }
+                    }
+                  }]'
+                ) AS SELECT * FROM T;""");
+    }
+
+    @Test
+    public void avroEncoderMalformedDuration() {
+        viewConnectorTest("""
+                "format": {
+                  "name": "avro",
+                  "config": {
+                    "registry_timeout": "10y"
+                  }
+                }""",
+                "unknown unit 'y' in duration '10y'");
+    }
+
+    @Test
+    public void clockInputDurationField() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "clock",
+                  "config": {
+                    "clock_resolution": "1s"
+                  }
+                }""");
+    }
+
+    @Test
+    public void clockInputNoResolution() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "clock",
+                  "config": {
+                    "http_driven": true
+                  }
+                }""");
+    }
+
+    @Test
+    public void clockInputZeroDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "clock",
+                  "config": {
+                    "clock_resolution": "0"
+                  }
+                }""",
+                "\"clock_resolution\" is '0'; it must be greater than 0");
+    }
+
+    @Test
+    public void clockInputMalformedDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "clock",
+                  "config": {
+                    "clock_resolution": "1000"
+                  }
+                }""",
+                "\"clock_resolution\": '1000' has no unit");
+    }
+
+    @Test
+    public void natsInputDurationFields() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222",
+                      "connection_timeout": "30s",
+                      "request_timeout": "10s"
+                    },
+                    "stream_name": "orders",
+                    "inactivity_timeout": "2m",
+                    "retry_interval": "5s",
+                    "consumer_config": {
+                      "deliver_policy": "All",
+                      "max_expiry": "30s"
+                    }
+                  }
+                }""");
+    }
+
+    @Test
+    public void natsInputMalformedConnectionDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222",
+                      "connection_timeout": "30 s"
+                    },
+                    "stream_name": "orders",
+                    "consumer_config": {
+                      "deliver_policy": "All"
+                    }
+                  }
+                }""",
+                "\"connection_config.connection_timeout\": unknown unit ' s'");
+    }
+
+    @Test
+    public void natsInputMalformedConsumerDuration() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "orders",
+                    "consumer_config": {
+                      "deliver_policy": "All",
+                      "max_expiry": "forever"
+                    }
+                  }
+                }""",
+                "unknown unit 'forever';");
+    }
+
+    @Test
+    public void natsInputInactivityTimeoutBelowMinimum() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "inactivity_timeout": "500ms",
+                    "consumer_config": {
+                      "deliver_policy": "All"
+                    }
+                  }
+                }""",
+                "\"inactivity_timeout\" is '500ms'; it must be at least 1 second");
+    }
+
+    @Test
+    public void natsInputRetryIntervalBelowMinimum() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "retry_interval": "0",
+                    "consumer_config": {
+                      "deliver_policy": "All"
+                    }
+                  }
+                }""",
+                "\"retry_interval\" is '0'; it must be at least 1 second");
+    }
+
+    @Test
+    public void natsInputLegacyRetryIntervalBelowMinimum() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "retry_interval_secs": 0,
+                    "consumer_config": {
+                      "deliver_policy": "All"
+                    }
+                  }
+                }""",
+                "\"retry_interval_secs\" is '0'; it must be at least 1 second");
+    }
+
+    /**
+     * A deprecated spelling takes any whole number up to {@code u64::MAX}, however JSON
+     * writes it.
+     */
+    @Test
+    public void legacyWholeNumbersAccepted() {
+        for (String value : new String[] { "60", "60.0", "6e1", "18446744073709551615" })
+            cleanTableConnectorTest("""
+                    "transport": {
+                      "name": "url_input",
+                      "config": {
+                        "path": "https://example.com/data.csv",
+                        "pause_timeout": %s
+                      }
+                    }""".formatted(value));
+    }
+
+    /** A deprecated spelling rejects a fraction, a negative, and a number past {@code u64::MAX}. */
+    @Test
+    public void legacyNonWholeNumbersRejected() {
+        for (String value : new String[] { "60.5", "-1", "20000000000000000000" })
+            tableConnectorTest("""
+                    "transport": {
+                      "name": "url_input",
+                      "config": {
+                        "path": "https://example.com/data.csv",
+                        "pause_timeout": %s
+                      }
+                    }""".formatted(value),
+                    "expected a duration such as \"30s\"");
+    }
+
+    /**
+     * Writing both spellings of a setting is rejected even when one of them is
+     * {@code null}, because the runtime rejects the pair as a duplicate field.
+     */
+    @Test
+    public void bothSpellingsRejectedEvenWithANull() {
+        for (String pair : new String[] {
+                "\"clock_resolution\": null, \"clock_resolution_usecs\": 5",
+                "\"clock_resolution\": \"1s\", \"clock_resolution_usecs\": null" })
+            tableConnectorTest("""
+                    "transport": {
+                      "name": "clock",
+                      "config": { %s }
+                    }""".formatted(pair),
+                    "\"clock_resolution_usecs\" is another spelling of \"clock_resolution\"");
+    }
+
+    /** Writing both spellings of a setting is rejected, even for one with no minimum. */
+    @Test
+    public void kafkaInputRejectsBothSpellingsOfOneSetting() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "kafka_input",
+                  "config": {
+                    "topic": "my-topic",
+                    "group_join_timeout": "10s",
+                    "group_join_timeout_secs": 25
+                  }
+                }""",
+                "\"group_join_timeout_secs\" is another spelling of "
+                + "\"group_join_timeout\"; write one of the two");
+    }
+
+    /**
+     * The superseded `max_expires` was a `std::time::Duration`, which serde writes
+     * as a `{secs, nanos}` object. The runtime still reads that, so a connector
+     * stored before the rename must still compile clean.
+     */
+    @Test
+    public void natsConsumerAcceptsTheLegacyExpiryObject() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "consumer_config": {
+                      "deliver_policy": "All",
+                      "max_expires": { "secs": 45, "nanos": 0 }
+                    }
+                  }
+                }""");
+    }
+
+    /** A NATS consumer whose consumer config carries {@code expiry} as given. */
+    private static String natsConsumerWithExpiry(String expiry) {
+        return """
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "consumer_config": {
+                      "deliver_policy": "All",
+                      %s
+                    }
+                  }
+                }""".formatted(expiry);
+    }
+
+    /**
+     * The legacy {secs, nanos} object takes exactly what the runtime reads: {@code secs}
+     * as a u64, {@code nanos} as a u32, either one alone, and the old key may also carry
+     * a duration string.
+     */
+    @Test
+    public void natsConsumerExpiryObjectsTheRuntimeReads() {
+        for (String expiry : new String[] {
+                "\"max_expires\": { \"secs\": 18446744073709551615 }",
+                "\"max_expires\": { \"nanos\": 4294967295 }",
+                "\"max_expires\": \"45s\"" })
+            cleanTableConnectorTest(natsConsumerWithExpiry(expiry));
+    }
+
+    /**
+     * A legacy {secs, nanos} object the runtime rejects is rejected here too: an unknown
+     * key, an empty object, a negative or oversized field, a fractional number.
+     */
+    @Test
+    public void natsConsumerExpiryObjectsTheRuntimeRejects() {
+        for (String expiry : new String[] {
+                "\"max_expires\": { \"secs\": 45, \"millis\": 0 }",
+                "\"max_expires\": { }",
+                "\"max_expires\": { \"secs\": -1 }",
+                "\"max_expires\": { \"secs\": 18446744073709551616 }",
+                "\"max_expires\": { \"nanos\": 4294967296 }",
+                "\"max_expires\": { \"secs\": 1.5 }" })
+            tableConnectorTest(natsConsumerWithExpiry(expiry),
+                    "expected a duration such as \"30s\", or a {secs, nanos} object");
+    }
+
+    /**
+     * Jackson reads a number literal past the range of a double as infinity. Such a
+     * number is reported like any other value that is not a duration, rather than
+     * crashing the compiler on its conversion.
+     */
+    @Test
+    public void legacyKeyRejectsAnInfiniteNumber() {
+        for (String number : new String[] { "1e400", "-1e400" })
+            tableConnectorTest("""
+                    "transport": {
+                      "name": "url_input",
+                      "config": {
+                        "path": "https://example.com/data.csv",
+                        "pause_timeout": %s
+                      }
+                    }""".formatted(number),
+                    "expected a duration such as \"30s\"");
+    }
+
+    /** A deprecated spelling also takes a duration string, which means what it says. */
+    @Test
+    public void legacyKeyAcceptsADurationString() {
+        cleanTableConnectorTest("""
+                "transport": {
+                  "name": "url_input",
+                  "config": {
+                    "path": "https://example.com/data.csv",
+                    "pause_timeout": "90s"
+                  }
+                }""");
+    }
+
+    /**
+     * The NATS consumer expiry takes a duration string, or the {secs, nanos} object its
+     * deprecated spelling took, but not a bare number.
+     */
+    @Test
+    public void natsConsumerRejectsABareNumberForTheExpiry() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "consumer_config": {
+                      "deliver_policy": "All",
+                      "max_expiry": 30
+                    }
+                  }
+                }""",
+                "expected a duration such as \"30s\", or a {secs, nanos} object");
+    }
+
+    @Test
+    public void natsInputRejectsBothSpellingsOfOneSetting() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "nats_input",
+                  "config": {
+                    "connection_config": {
+                      "server_url": "nats://localhost:4222"
+                    },
+                    "stream_name": "my-stream",
+                    "inactivity_timeout": "0s",
+                    "inactivity_timeout_secs": 60,
+                    "consumer_config": {
+                      "deliver_policy": "All"
+                    }
+                  }
+                }""",
+                "\"inactivity_timeout_secs\" is another spelling of \"inactivity_timeout\"; "
+                + "write one of the two");
     }
 }

@@ -47,8 +47,8 @@
   import { untrack } from 'svelte'
   import { DecoupledStateProxy } from '$lib/compositions/decoupledState.svelte'
   import { useDarkMode } from '$lib/compositions/useDarkMode.svelte'
-  import { isMonacoEditorDisabled } from '$lib/functions/common/monacoEditor'
-  import { MonacoEditor, setSelections as setEditorSelections } from 'common-ui'
+  import { isMonacoEditorDisabled } from '$lib/functions/monacoEditor'
+  import { getThemeColor, MonacoEditor, setSelections as setEditorSelections } from 'common-ui'
   import * as MonacoImports from 'monaco-editor'
   import { editor, KeyCode, KeyMod } from 'monaco-editor'
   import type { EditorLanguage } from 'monaco-editor/esm/metadata.js'
@@ -56,7 +56,6 @@
   import { effectMonacoContentPlaceholder } from '$lib/components/monacoEditor/effectMonacoContentPlaceholder.svelte'
   import { GenericOverlayWidget } from '$lib/components/monacoEditor/GenericOverlayWidget'
   import { useCodeEditorSettings } from '$lib/compositions/pipelines/useCodeEditorSettings.svelte'
-  import { getThemeColor } from '$lib/functions/common/color'
   import { felderaCompilerMarkerSource } from '$lib/functions/pipelines/monaco'
   import type { Snippet } from '$lib/types/svelte'
 
@@ -67,6 +66,7 @@
     files,
     currentFileName = $bindable(),
     editDisabled,
+    readOnlyMessage,
     codeEditor,
     statusBarCenter,
     statusBarEnd,
@@ -88,6 +88,9 @@
     }[]
     currentFileName: string
     editDisabled?: boolean
+    // Overrides the generic read-only hint for a writable file, e.g. to explain
+    // a permission-driven read-only state. Ignored for compiler-generated files.
+    readOnlyMessage?: string
     codeEditor: Snippet<[textEditor: Snippet, statusBar: Snippet, isReadOnly: boolean]>
     statusBarCenter?: Snippet
     statusBarEnd?: Snippet<[downstreamChanged: boolean]>
@@ -336,7 +339,7 @@
 {@render codeEditor(textEditor, statusBar, isReadOnly)}
 {#snippet textEditor()}
   <div class="flex h-full flex-col">
-    <div class="flex flex-row-reverse flex-wrap items-end">
+    <div class="flex flex-row-reverse flex-wrap items-center border-b border-surface-200-800">
       {@render toolBarEnd?.({ saveFile: _saveFile })}
       <div class="mr-auto flex flex-nowrap items-center justify-end">
         {#each files as file}
@@ -383,7 +386,8 @@
             readOnlyMessage: {
               value: isReadOnlyFile
                 ? 'Cannot edit a compiler-generated file'
-                : 'Cannot edit code while the pipeline is running or its storage is in use'
+                : (readOnlyMessage ??
+                  'Cannot edit code while the pipeline is running or its storage is in use')
             },
             fontFamily: theme.config.monospaceFontFamily,
             fontSize: editorFontSize.value,
@@ -412,7 +416,7 @@
 {/snippet}
 
 {#snippet statusBar()}
-  <div class="flex h-9 flex-nowrap gap-3">
+  <div class="flex h-6 flex-nowrap gap-3">
     {@render statusBarCenter?.()}
   </div>
   <div class="ml-auto flex flex-nowrap gap-x-2">

@@ -50,8 +50,16 @@ as follows:
 
 2. Associate the index with an output connector by setting the connector’s `index` property to the name of the index. This allows the connector to merge insert and delete events for the same key into a single update event.
 
+An index stores data only when its view is materialized.  A connector attached to an index
+of a view that is not materialized receives the changes to the view, but cannot use
+`send_snapshot`; declare the view with `CREATE MATERIALIZED VIEW` to send a snapshot
+through an index (see [Materialized Tables and Views](/sql/materialized)).
+
 The specific behavior of this transformation depends on the data format and transport protocol used. Currently, the `index` property is supported only for:
-- Kafka output connectors configured with the [Avro format](/formats/avro/)
+- Kafka output connectors configured with the [Avro
+  format](/formats/avro/), except in a pipeline configured for exactly
+  once fault tolerance (because Kafka connectors use the key to
+  deduplicate output in exactly once fault tolerance).
 - [Postgres output connector](/connectors/sinks/postgresql)
 - [Delta Lake output connector](/connectors/sinks/delta)
 
@@ -71,9 +79,9 @@ See the [Postgres Output Connector documentation](/connectors/sinks/postgresql)
 for more examples.
 
 ```sql
-create table t0 (id int, s varchar);
+CREATE TABLE t0 (id INT, s VARCHAR);
 
-create materialized view v1 with (
+CREATE MATERIALIZED VIEW v1 WITH (
     'connectors' = '[{
         "index": "v1_idx",
         "transport": {
@@ -84,8 +92,8 @@ create materialized view v1 with (
             }
         }
     }]'
-) as select * from t0;
-create index v1_idx on v1(id);
+) AS SELECT * FROM t0;
+CREATE INDEX v1_idx ON v1(id);
 ```
 
 #### Avro Format
@@ -94,13 +102,13 @@ See the [Avro format documentation](/formats/avro#examples-1) for more examples.
 
 
 ```sql
-create table my_table (
-   id bigint,
-   name string
+CREATE TABLE my_table (
+   id BIGINT,
+   name STRING
 );
 
-create view my_view
-with (
+CREATE VIEW my_view
+WITH (
   -- Associate `my_index` (see below) with an output connector via the connector’s `index` property.
   'connectors' = '[{
     "index": "my_index",
@@ -121,11 +129,11 @@ with (
     }
   }]'
 )
-as
-   select * from my_view;
+AS
+   SELECT * FROM my_view;
 
 -- Create an index over `my_view`.
-create index my_index on my_view(id);
+CREATE INDEX my_index ON my_view(id);
 ```
 
 :::warning

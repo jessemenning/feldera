@@ -176,11 +176,11 @@ public class UnusedFields extends Passes {
 
             TableMetadata metadata = new TableMetadata(
                     source.metadata.tableName,
-                    remainingColumns, source.metadata.getForeignKeys(),
+                    remainingColumns, source.metadata.getForeignKeys(), source.metadata.expectedSize,
                     source.metadata.materialized, source.metadata.isStreaming(), source.metadata.skipUnusedColumns);
             DBSPSourceMultisetOperator replacement = new DBSPSourceMultisetOperator(
                     source.getRelNode(), source.sourceName, new DBSPTypeZSet(newType.toTuple()), newType,
-                    metadata, source.tableName, source.comment);
+                    metadata, source.tableName, source.kind, source.comment);
             this.addOperator(replacement);
             Utilities.putNew(this.replacement, source, replacement);
         }

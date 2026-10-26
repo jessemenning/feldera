@@ -48,6 +48,11 @@ impl Checkpointer {
     /// We keep at least this many checkpoints around.
     pub(super) const MIN_CHECKPOINT_THRESHOLD: usize = 2;
 
+    /// Returns the storage backend this checkpointer writes to.
+    pub(super) fn backend(&self) -> &Arc<dyn StorageBackend> {
+        &self.backend
+    }
+
     /// Creates a new checkpointer for directory `storage_path`.  Deletes any
     /// unreferenced files in the directory.
     pub fn new(backend: Arc<dyn StorageBackend>) -> Result<Self, Error> {
@@ -295,7 +300,7 @@ impl Checkpointer {
         cp_dir: &StoragePath,
     ) -> Result<(), StorageError> {
         let deps: CheckpointDependencies =
-            match backend.read_json(&cp_dir.child(CHECKPOINT_DEPENDENCIES)) {
+            match backend.read_json(&cp_dir.clone().join(CHECKPOINT_DEPENDENCIES)) {
                 Ok(d) => d,
                 Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
@@ -345,6 +350,12 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// First phase of committing a checkpoint: writes everything that the
+    /// checkpoint owns into its directory and returns its metadata.
+    ///
+    /// The checkpoint is not visible yet.  [Self::publish] adds it to the
+    /// catalog, which is what makes it visible to `/checkpoints`, to a restart,
+    /// and to garbage collection.
     pub(super) fn commit(
         &mut self,
         uuid: Uuid,
@@ -357,7 +368,7 @@ impl Checkpointer {
         // checkpoint. Explicitly commit it so the durability guarantee
         // does not depend on the implicit fsync inside `complete()`.
         self.backend
-            .write(&Self::checkpoint_dir(uuid).child("CHECKPOINT"), FBuf::new())
+            .write(&Self::checkpoint_dir(uuid).join("CHECKPOINT"), FBuf::new())
             .and_then(|reader| reader.commit())?;
 
         let mut md = CheckpointMetadata {
@@ -397,7 +408,7 @@ impl Checkpointer {
 
         self.backend
             .write_json(
-                &cp_dir.child(CHECKPOINT_DEPENDENCIES),
+                &cp_dir.clone().join(CHECKPOINT_DEPENDENCIES),
                 &CheckpointDependenciesWrite {
                     batches: &batches_vec,
                     state_files: &state_files,
@@ -411,6 +422,16 @@ impl Checkpointer {
 
         md.size = Some(self.measure_checkpoint_storage_use(uuid)?);
 
+        Ok(md)
+    }
+
+    /// Second phase of committing a checkpoint: adds `md` to the catalog, which
+    /// publishes the checkpoint.
+    ///
+    /// The caller must have written every file the checkpoint needs, including
+    /// the pipeline state that [Self::commit] does not write, because a
+    /// checkpoint in the catalog is one that a restart may use.
+    pub(super) fn publish(&mut self, md: &CheckpointMetadata) -> Result<(), Error> {
         // Persist the catalog first, then add to the in-memory list only on
         // success. Otherwise a failed write leaves callers with a phantom
         // checkpoint that no future restart will recognize. The same rollback
@@ -424,6 +445,22 @@ impl Checkpointer {
             self.checkpoint_list.pop_back();
             return Err(e);
         }
+        Ok(())
+    }
+
+    /// Commits and publishes a checkpoint in one call, for tests that have no
+    /// reason to act between the two phases.
+    #[cfg(test)]
+    fn commit_and_publish(
+        &mut self,
+        uuid: Uuid,
+        fingerprint: u64,
+        identifier: Option<String>,
+        steps: Option<u64>,
+        processed_records: Option<u64>,
+    ) -> Result<CheckpointMetadata, Error> {
+        let md = self.commit(uuid, fingerprint, identifier, steps, processed_records)?;
+        self.publish(&md)?;
         Ok(md)
     }
 
@@ -490,16 +527,18 @@ impl Checkpointer {
             .and_then(|reader| reader.commit())?)
     }
 
-    /// Removes `file` and logs any error.
-    fn remove_batch_file(&self, file: &StoragePath) {
+    /// Removes `file` and logs any error.  Returns true if `file` is gone.
+    fn remove_batch_file(&self, file: &StoragePath) -> bool {
         match self.backend.delete_if_exists(file) {
             Ok(_) => {
                 debug!("Removed file {file}");
+                true
             }
             Err(e) => {
                 warn!(
                     "Unable to remove old-checkpoint file {file}: {e} (the pipeline will try to delete the file again on a restart)"
                 );
+                false
             }
         }
     }
@@ -559,32 +598,33 @@ impl Checkpointer {
         // to remove the checkpoint files again (see also [`Self::gc_startup`]).
         self.update_checkpoint_file()?;
 
-        // Also keep batches of the newest retained checkpoint not in `except`
-        // (its merger may still depend on them). Errors must propagate so we
-        // never delete a batch we couldn't prove safe.
-        if let Some(retained) = self
-            .checkpoint_list
-            .iter()
-            .find(|c| !except.contains(&c.uuid))
-        {
+        // Also keep the batches of every retained checkpoint.  Retained
+        // checkpoints need not descend from one another: a pipeline that
+        // resumed from an older checkpoint than the newest one in the catalog
+        // took its next checkpoint as a child of the older one.  Errors must
+        // propagate so we never delete a batch we couldn't prove safe.
+        for retained in &self.checkpoint_list {
             let batches = self.backend.gather_batches_for_checkpoint(retained)?;
             batch_files_to_keep.extend(batches);
         }
 
+        let mut removed_batch_files = 0;
         for cpm in &to_remove {
             for batch_file in self
                 .backend
                 .gather_batches_for_checkpoint_uuid(*cpm)?
                 .difference(&batch_files_to_keep)
             {
-                self.remove_batch_file(batch_file);
+                if self.remove_batch_file(batch_file) {
+                    removed_batch_files += 1;
+                }
             }
 
             self.remove_checkpoint_dir(*cpm)?;
         }
 
         info!(
-            "cleaned up {} checkpoints; exception list: {except:?}, retaining checkpoints: {:?}",
+            "cleaned up {} checkpoints and {removed_batch_files} batch files; exception list: {except:?}, retaining checkpoints: {:?}",
             to_remove.len(),
             self.checkpoint_list
                 .iter()
@@ -837,7 +877,7 @@ mod test {
         std::fs::write(&state_file, b"spine state").unwrap();
 
         checkpointer
-            .commit(uuid, 0, None, Some(0), Some(0))
+            .commit_and_publish(uuid, 0, None, Some(0), Some(0))
             .unwrap();
         drop(checkpointer);
 
@@ -922,7 +962,7 @@ mod test {
         .unwrap();
 
         checkpointer
-            .commit(uuid, 0, None, Some(0), Some(0))
+            .commit_and_publish(uuid, 0, None, Some(0), Some(0))
             .unwrap();
         drop(checkpointer);
 
@@ -931,7 +971,8 @@ mod test {
         assert!(cp_dir.join("dependencies.json").exists());
         assert!(batch_path.exists());
 
-        let log = LogCapture::new(|| drop(Checkpointer::new(make_backend()).unwrap())).log;
+        let backend = make_backend();
+        let log = LogCapture::new(|| drop(Checkpointer::new(backend).unwrap())).log;
         assert_eq!(
             log,
             " INFO dbsp::circuit::checkpointer: GC kept 2/1/0 expected files/directories/other, kept 0/0/0 unexpected, and deleted 0/0/0 unused; 0 error(s) reading directory entries\n"
@@ -944,8 +985,9 @@ mod test {
 
         // Now delete the batch and ensure that startup reports that it's missing.
         std::fs::remove_file(&batch_path).unwrap();
+        let backend = make_backend();
         assert_eq!(
-            LogCapture::new(|| drop(Checkpointer::new(make_backend()).unwrap())).log,
+            LogCapture::new(|| drop(Checkpointer::new(backend).unwrap())).log,
             r#" INFO dbsp::circuit::checkpointer: GC kept 1/1/0 expected files/directories/other, kept 0/0/0 unexpected, and deleted 0/0/0 unused; 0 error(s) reading directory entries
 ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) with the following UUID(s) have 1 missing file(s) in storage: 019e4708-bac8-7c10-b2f7-5cb248871905
 ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaaa.feldera
@@ -985,7 +1027,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         .unwrap();
 
         checkpointer
-            .commit(uuid, 0, None, Some(0), Some(0))
+            .commit_and_publish(uuid, 0, None, Some(0), Some(0))
             .unwrap();
         drop(checkpointer);
 
@@ -1023,7 +1065,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
             .map(|i| {
                 let uuid = uuid::Uuid::now_v7();
                 checkpointer
-                    .commit(uuid, 0, None, Some(i as u64), Some(0))
+                    .commit_and_publish(uuid, 0, None, Some(i as u64), Some(0))
                     .unwrap();
                 uuid
             })
@@ -1033,8 +1075,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         std::fs::remove_file(tempdir.path().join(CHECKPOINT_FILE_NAME)).unwrap();
 
         let err = Checkpointer::new(make_backend())
-            .err()
-            .expect("missing catalog with orphan UUID dirs must error");
+            .expect_err("missing catalog with orphan UUID dirs must error");
         assert!(
             format!("{err}").contains("checkpoint catalog (checkpoints.feldera) missing"),
             "expected catalog-missing error, got: {err}",
@@ -1067,7 +1108,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         for i in 0..Checkpointer::MIN_CHECKPOINT_THRESHOLD + 1 {
             let uuid = uuid::Uuid::now_v7();
             checkpointer
-                .commit(uuid, 0, None, Some(i as u64), Some(0))
+                .commit_and_publish(uuid, 0, None, Some(i as u64), Some(0))
                 .unwrap();
             uuids.push(uuid);
         }
@@ -1088,6 +1129,56 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         );
     }
 
+    /// When a restart resumes from an older checkpoint than the newest one in
+    /// the catalog, GC must keep the batches of every retained checkpoint.
+    #[test]
+    fn gc_checkpoint_keeps_batches_of_forked_checkpoints() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let make_backend = || -> Arc<dyn StorageBackend> {
+            Arc::new(PosixBackend::new(
+                tempdir.path(),
+                StorageCacheConfig::default(),
+                &FileBackendConfig::default(),
+            ))
+        };
+        let commit = |checkpointer: &mut Checkpointer, steps: u64, batches: &[&str]| {
+            let uuid = uuid::Uuid::now_v7();
+            let cp_dir = tempdir.path().join(uuid.to_string());
+            std::fs::create_dir_all(&cp_dir).unwrap();
+            for batch in batches {
+                std::fs::write(tempdir.path().join(batch), b"batch payload").unwrap();
+            }
+            std::fs::write(
+                cp_dir.join("pspine-batches-trace.dat"),
+                serde_json::to_vec(&serde_json::json!({ "files": batches })).unwrap(),
+            )
+            .unwrap();
+            checkpointer
+                .commit_and_publish(uuid, 0, None, Some(steps), Some(0))
+                .unwrap();
+            uuid
+        };
+
+        // B no longer references A's batch: its process merged it away.
+        let mut checkpointer = Checkpointer::new(make_backend()).unwrap();
+        commit(&mut checkpointer, 330, &["w0-a.feldera"]);
+        commit(&mut checkpointer, 335, &["w0-b.feldera"]);
+        drop(checkpointer);
+
+        // The process that wrote B died before the root state file pointed at
+        // it, so its successor resumes from A and checkpoints C from A's batches.
+        let mut checkpointer = Checkpointer::new(make_backend()).unwrap();
+        let c = commit(&mut checkpointer, 335, &["w0-a.feldera", "w0-c.feldera"]);
+        checkpointer.gc_checkpoint(HashSet::new()).unwrap();
+        drop(checkpointer);
+
+        let log = LogCapture::new(|| drop(Checkpointer::new(make_backend()).unwrap())).log;
+        assert!(
+            tempdir.path().join("w0-a.feldera").exists(),
+            "GC deleted w0-a.feldera, which retained checkpoint {c} references:\n{log}",
+        );
+    }
+
     /// Startup must not panic when a checkpoint dir contains malformed
     /// dependency metadata. The corrupt metadata should surface as an
     /// `Err` from `Checkpointer::new` so the caller can decide what to do.
@@ -1105,7 +1196,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         let mut checkpointer = Checkpointer::new(make_backend()).unwrap();
         let uuid = uuid::Uuid::now_v7();
         checkpointer
-            .commit(uuid, 0, None, Some(0), Some(0))
+            .commit_and_publish(uuid, 0, None, Some(0), Some(0))
             .unwrap();
         drop(checkpointer);
 
@@ -1128,7 +1219,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
     /// A failed `commit` must not leave the new checkpoint in the in-memory
     /// list. Otherwise callers see a checkpoint that no restart will find.
     #[test]
-    fn failed_commit_rolls_back_in_memory_list() {
+    fn failed_publish_rolls_back_in_memory_list() {
         use feldera_types::constants::CHECKPOINT_FILE_NAME;
         let tempdir = tempfile::tempdir().unwrap();
         let posix: Arc<dyn StorageBackend> = Arc::new(PosixBackend::new(
@@ -1143,10 +1234,10 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
         let mut checkpointer = Checkpointer::new(backend).unwrap();
 
         let uuid = uuid::Uuid::now_v7();
-        let result = checkpointer.commit(uuid, 0, None, Some(0), Some(0));
+        let result = checkpointer.commit_and_publish(uuid, 0, None, Some(0), Some(0));
         assert!(
             result.is_err(),
-            "commit should fail when catalog write fails"
+            "publishing should fail when the catalog write fails"
         );
 
         assert!(
@@ -1154,7 +1245,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
                 .checkpoint_list
                 .iter()
                 .any(|cpm| cpm.uuid == uuid),
-            "failed commit left UUID {uuid} in the in-memory checkpoint list",
+            "failed publication left UUID {uuid} in the in-memory checkpoint list",
         );
     }
 
@@ -1218,7 +1309,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
 
             for i in 0..Checkpointer::MIN_CHECKPOINT_THRESHOLD {
                 self.checkpointer
-                    .commit(uuid::Uuid::now_v7(), 0, None, Some(i as u64), Some(0))
+                    .commit_and_publish(uuid::Uuid::now_v7(), 0, None, Some(i as u64), Some(0))
                     .unwrap();
             }
 
@@ -1245,7 +1336,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
 
             let uuid = uuid::Uuid::now_v7();
             self.checkpointer
-                .commit(uuid, 0, None, Some(2), Some(0))
+                .commit_and_publish(uuid, 0, None, Some(2), Some(0))
                 .unwrap();
 
             TestState::<ExtraCheckpoints> {
@@ -1269,7 +1360,7 @@ ERROR dbsp::circuit::checkpointer: 1 checkpoint(s) need missing file: w0-aaaaaaa
             self.precondition();
 
             self.checkpointer
-                .commit(uuid::Uuid::now_v7(), 0, None, Some(3), Some(0))
+                .commit_and_publish(uuid::Uuid::now_v7(), 0, None, Some(3), Some(0))
                 .unwrap();
 
             TestState::<ExtraCheckpoints> {

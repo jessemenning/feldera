@@ -72,6 +72,11 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Parameter(names = "--unaryPlusNoop",
                 description = "Compile unary plus into a no-operation; similar to sqlite")
         public boolean unaryPlusNoop = false;
+        /** Rewrite CTE queries to use local views instead.
+         * Hidden: intended for testing and debugging. */
+        @Parameter(names = "--cteViews", hidden = true,
+                description = "Convert each top-level common table expression (WITH) in a view into a LOCAL VIEW")
+        public boolean cteViews = false;
 
         public boolean same(Language language) {
             // Only compare fields that matter.
@@ -84,7 +89,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Override
         public String toString() {
             return "Language{" +
-                    "\n\tgenerateInputForEveryTable=" + this.generateInputForEveryTable +
+                    "\n\tcteViews=" + this.cteViews +
+                    ",\n\tgenerateInputForEveryTable=" + this.generateInputForEveryTable +
                     ",\n\tignoreOrderBy=" + this.ignoreOrderBy +
                     ",\n\tincrementalize=" + this.incrementalize +
                     ",\n\tlenient=" + this.lenient +
@@ -181,6 +187,8 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         public boolean emitSvg = false;
         @Parameter(names="--jit", description = "Emit a JSON representation suitable for an interpreter")
         public boolean interpreterJson = false;
+        @Parameter(names="--gen2", description = "Compile for the Gen-2 engine: emit the circuit IR (as --jit does) and drop the primary-key columns from the value of an indexed source")
+        public boolean gen2 = false;
         @Nullable @Parameter(names = "--plan", description = "Emit the Calcite plan of the program in the specified JSON file")
         public String emitPlan = null;
         @Nullable @Parameter(names = "--dataflow", description = "Emit the Dataflow graph of the program in the specified JSON file")
@@ -229,6 +237,9 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
         @Parameter(hidden = true, names = "--testing",
                 description = "Signals that compiler is invoked from a testing path: disables some warnings")
         public boolean testing = false;
+        /** Testing only: serialize the circuit to JSON and decode it back after every
+         * optimization pass.  SerializationTests sets this; the other tests do not. */
+        public boolean checkSerialization = false;
 
         // Used only for internal testing
         public boolean nowStream = true;
@@ -243,6 +254,13 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
 
         public boolean multiCrates() {
             return !this.crates.isEmpty();
+        }
+
+        /** Whether to emit the circuit IR instead of Rust.  {@code --jit} asks for the IR
+         * alone; {@code --gen2} implies it, and additionally changes how the IR is built
+         * (see {@link #gen2}). */
+        public boolean emitCircuitIr() {
+            return this.interpreterJson || this.gen2;
         }
 
         @Override
@@ -272,6 +290,7 @@ public class CompilerOptions implements IDiff<CompilerOptions>, IValidate {
                     ",\n\temitJpeg=" + this.emitJpeg +
                     ",\n\temitSvg=" + this.emitSvg +
                     ",\n\tinterpreterJson=" + this.interpreterJson +
+                    ",\n\tgen2=" + this.gen2 +
                     ",\n\temitJsonErrors=" + this.emitJsonErrors +
                     ",\n\temitJsonSchema=" + Utilities.singleQuote(this.emitJsonSchema) +
                     ",\n\temitPlan=" + this.emitPlan +

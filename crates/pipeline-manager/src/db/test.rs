@@ -1,49 +1,68 @@
 use crate::api::support_data_collector::SupportBundleData;
-use crate::auth::{generate_api_key, TenantRecord};
+use crate::auth::{TenantRecord, generate_api_key};
 use crate::db::error::DBError;
 use crate::db::error::DBError::InvalidResourcesStatusNotRemain;
 use crate::db::operations::pipeline::get_pipeline_by_id_for_monitoring;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
-use crate::db::storage_postgres::{is_pipeline_assigned_to_worker, StoragePostgres};
-use crate::db::types::api_key::{ApiKeyDescr, ApiKeyId, ApiPermission};
+use crate::db::storage_postgres::{StoragePostgres, is_pipeline_assigned_to_worker};
+use crate::db::transaction;
+use crate::db::transaction::LOCK_TIMEOUT;
+use crate::db::types::api_key::{ApiKeyDescr, ApiKeyId};
+use crate::db::types::deployment::{
+    DeploymentResources, PipelineDeploymentConfig, merge_deployment_config_on_edit,
+    parse_deployment_config_patch, patch_deployment_config, running_deployment_config,
+};
 use crate::db::types::monitor::{
     ClusterMonitorEvent, ClusterMonitorEventId, ExtendedClusterMonitorEvent,
     ExtendedPipelineMonitorEvent, MonitorStatus, NewClusterMonitorEvent, PipelineMonitorEvent,
     PipelineMonitorEventId,
 };
+use crate::db::types::oidc_trust::{OidcTrustDescr, OidcTrustId, claim_matches};
 use crate::db::types::pipeline::{
     ClientMetadata, ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PatchClientMetadata,
     PipelineDescr, PipelineId,
 };
 use crate::db::types::program::{
-    generate_pipeline_config, validate_program_status_transition, CompilationProfile,
-    ProgramConfig, ProgramError, ProgramInfo, ProgramStatus, RustCompilationInfo,
-    SqlCompilationInfo,
+    CompilationProfile, PipelineProgramArtifacts, ProgramConfig, ProgramError, ProgramInfo,
+    ProgramStatus, RuntimeSelector, RustCompilationInfo, SqlCompilationInfo,
+    generate_pipeline_config, validate_program_status_transition,
 };
 use crate::db::types::resources_status::{
-    validate_resources_desired_status_transition, validate_resources_status_transition,
-    ResourcesDesiredStatus, ResourcesStatus,
+    ResourcesDesiredStatus, ResourcesStatus, validate_resources_desired_status_transition,
+    validate_resources_status_transition,
 };
-use crate::db::types::storage::{validate_storage_status_transition, StorageStatus};
+use crate::db::types::role::{MemberRole, MintableKeyRole, Role};
+use crate::db::types::storage::{StorageStatus, validate_storage_status_transition};
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::{
+    MembershipOrigin, TenantInfo, TenantMember, UserId, UserMembership, UserProfile,
+};
 use crate::db::types::utils::{
-    validate_api_key_name, validate_deployment_config, validate_pipeline_name,
+    MAXIMUM_TAG_LENGTH, validate_api_key_name, validate_deployment_config, validate_pipeline_name,
     validate_program_config, validate_program_info, validate_runtime_config,
-    validate_storage_status_details, MAXIMUM_TAG_LENGTH,
+    validate_storage_status_details,
 };
 use crate::db::types::version::Version;
+use crate::oidc::destination::{TenantIssuerPolicy, validate_tenant_oidc_url};
+use crate::oidc::trust_name::validate_oidc_trust_name;
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use aws_lc_rs::digest;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::{DateTime, TimeZone, Utc};
+use deadpool_postgres::GenericClient;
 use feldera_types::checkpoint::CheckpointMetadata;
 use feldera_types::config::{
-    DevTweaks, FtConfig, PipelineConfig, ProgramIr, ResourceConfig, RuntimeConfig,
+    AutoscalingConfig, DevTweaks, FtConfig, PipelineConfig, ProgramIr, ResourceConfig,
+    RuntimeConfig, StorageAutoscalingConfig,
 };
+use feldera_types::duration::ConfigDuration;
 use feldera_types::error::ErrorResponse;
 use feldera_types::program_schema::ProgramSchema;
 use feldera_types::runtime_status::{
     BootstrapConfig, BootstrapPolicy, RuntimeDesiredStatus, RuntimeStatus, StorageStatusDetails,
 };
-use openssl::sha;
+use feldera_types::size::ConfigSize;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use proptest_derive::Arbitrary;
@@ -56,7 +75,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::vec;
 use tokio::spawn;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::sleep;
 use tracing::info;
 use uuid::Uuid;
@@ -85,8 +104,8 @@ impl Drop for DbHandle {
 
     #[cfg(not(feature = "postgresql_embedded"))]
     fn drop(&mut self) {
-        use postgres_openssl::TlsStream;
-        use tokio_postgres::{tls::NoTlsStream, Connection, Socket};
+        use tokio_postgres::{Connection, Socket, tls::NoTlsStream};
+        use tokio_postgres_rustls::RustlsStream as TlsStream;
         enum ConnWrapper {
             Tls(Connection<Socket, TlsStream<Socket>>),
             NoTls(Connection<Socket, NoTlsStream>),
@@ -147,6 +166,13 @@ pub(crate) async fn setup_pg() -> (StoragePostgres, tempfile::TempDir) {
     use crate::config::DatabaseConfig;
     use std::net::TcpListener;
 
+    // Connecting to the database goes through `rustls`, which panics when no process-wide
+    // crypto provider is installed. Install it here rather than in each test: without it a
+    // test panics *after* its embedded server has started, and the panic leaks that server.
+    // Enough leaked servers exhaust the host's shared memory and every later `pg_ctl` fails
+    // with "could not start server", which reads as an unrelated problem.
+    crate::ensure_default_crypto_provider();
+
     // Install the test database in a temporary directory and bound to a free port
     let mut attempt = 1;
     let (_temp_dir, pg) = loop {
@@ -168,7 +194,10 @@ pub(crate) async fn setup_pg() -> (StoragePostgres, tempfile::TempDir) {
         match crate::db::pg_setup::install(temp_path.into(), false, Some(port)).await {
             Ok(pg) => break (_temp_dir, pg),
             Err(e) => {
-                info!("Unable to install test database on port {port} ({} attempts left) -- port might have become occupied in the meanwhile. Original error: {e}", 10 - attempt);
+                info!(
+                    "Unable to install test database on port {port} ({} attempts left) -- port might have become occupied in the meanwhile. Original error: {e}",
+                    10 - attempt
+                );
                 sleep(Duration::from_millis(100)).await;
             }
         }
@@ -283,8 +312,11 @@ struct RuntimeConfigPropVal {
     val19: Option<u64>,
     val20: usize,
     val21: Option<u64>,
+    val22: Option<u64>,
+    val23: bool,
+    val24: Option<String>,
 }
-type ProgramConfigPropVal = (u8, bool, bool, bool);
+type ProgramConfigPropVal = (u8, bool, bool, bool, u8);
 type ProgramInfoPropVal = (u8, u8, u8);
 
 /// Generates a limited pipeline name.
@@ -297,6 +329,106 @@ fn map_val_to_limited_pipeline_name(val: PipelineNamePropVal) -> String {
     }
 }
 
+/// Generates `trust-1`, `trust-2`, `trust-3`, or the empty string, which no
+/// trust may be named, so a quarter of the generated names are rejected.
+fn limited_oidc_trust_name() -> impl Strategy<Value = String> {
+    any::<u8>().prop_map(|val| match val % 4 {
+        0 => "".to_string(),
+        n => format!("trust-{n}"),
+    })
+}
+
+/// Generates one of a few tenant names, so that renames collide often enough
+/// to exercise the unique-name conflict.
+fn limited_tenant_name() -> impl Strategy<Value = String> {
+    any::<u8>().prop_map(|val| format!("tenant-{}", val % 3))
+}
+
+/// Generates one of a few issuers, so that trusts collide on issuer often
+/// enough to exercise matching and the trusted-issuer gate.
+fn limited_issuer() -> impl Strategy<Value = String> {
+    any::<u8>().prop_map(|val| match val % 3 {
+        0 => "".to_string(), // An invalid (empty) issuer
+        n => format!("https://idp{n}.example"),
+    })
+}
+
+/// Generates a claim pattern, mixing concrete values with `*` wildcards so that
+/// matching is exercised in both directions.
+fn limited_claim_pattern() -> impl Strategy<Value = String> {
+    any::<u8>().prop_map(|val| {
+        match val % 6 {
+            0 => "".to_string(), // An invalid (empty) subject pattern
+            1 => "*".to_string(),
+            2 => "repo:acme/*".to_string(),
+            3 => "repo:acme/api".to_string(),
+            4 => "*:prod".to_string(),
+            _ => "system:sa:*:default".to_string(),
+        }
+    })
+}
+
+/// Generates a concrete claim value to match patterns against.
+fn limited_claim_value() -> impl Strategy<Value = String> {
+    any::<u8>().prop_map(|val| match val % 5 {
+        0 => "".to_string(),
+        1 => "repo:acme/api".to_string(),
+        2 => "repo:acme/api:prod".to_string(),
+        3 => "system:sa:kube:default".to_string(),
+        _ => "other".to_string(),
+    })
+}
+
+/// Generates a limited OIDC identity `(provider, subject)`, small enough that
+/// the same identity recurs and exercises the get-or-create path.
+fn limited_identity() -> impl Strategy<Value = (String, String)> {
+    (any::<u8>(), any::<u8>()).prop_map(|(p, s)| {
+        (
+            format!("https://idp{}.example", p % 2),
+            format!("user-{}", s % 3),
+        )
+    })
+}
+
+/// The user id a caller would mint for an identity. Callers pass a fresh
+/// `Uuid::now_v7()`, so two identities never share one; deriving the id from the
+/// identity keeps that true here, where `limited_uuid` would collide and hit a
+/// primary-key violation instead of the get-or-create path under test.
+fn user_id_for_identity(provider: &str, subject: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider.hash(&mut hasher);
+    subject.hash(&mut hasher);
+    let half = hasher.finish().to_be_bytes();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&half);
+    bytes[8..].copy_from_slice(&half);
+    Uuid::from_bytes(bytes)
+}
+
+/// The id a caller would mint for a trust. Distinct trusts get distinct ids, as
+/// `Uuid::now_v7()` would give them, so that several can coexist; re-creating
+/// the same trust reuses the id and collides on the name, as intended.
+fn trust_id_for(name: &str) -> Uuid {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    let half = hasher.finish().to_be_bytes();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&half);
+    bytes[8..].copy_from_slice(&half);
+    Uuid::from_bytes(bytes)
+}
+
+/// Generates an optional email, including the absent case that exercises the
+/// COALESCE on update and the NULL ordering in the member listing.
+fn limited_email() -> impl Strategy<Value = Option<String>> {
+    any::<u8>().prop_map(|val| match val % 3 {
+        0 => None,
+        n => Some(format!("user{n}@example.com")),
+    })
+}
+
 /// Generates a limited runtime configuration (1/8 is invalid).
 fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::Value {
     if val.invalid0.is_multiple_of(8) {
@@ -304,12 +436,12 @@ fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::V
     } else {
         serde_json::to_value(RuntimeConfig {
             workers: val.val0,
-            max_rss_mb: val.val21,
-            datafusion_memory_mb: None,
+            max_rss: val.val21.map(ConfigSize::from_mb),
+            datafusion_memory: None,
             hosts: val.val20,
             cpu_profiler: val.val1,
             min_batch_size_records: val.val2,
-            max_buffering_delay_usecs: val.val3,
+            max_buffering_delay: Some(ConfigDuration::from_micros(val.val3)),
             storage: val.val4.then(Default::default),
             fault_tolerance: FtConfig::default(),
             tracing: val.val5,
@@ -317,14 +449,23 @@ fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::V
             resources: ResourceConfig {
                 cpu_cores_min: val.val7,
                 cpu_cores_max: val.val8,
-                memory_mb_min: val.val9,
-                memory_mb_max: val.val10,
-                storage_mb_max: val.val11,
+                memory_min: val.val9.map(ConfigSize::from_mb),
+                memory_max: val.val10.map(ConfigSize::from_mb),
+                storage_min: val.val22.map(ConfigSize::from_mb),
+                storage_max: val.val11.map(ConfigSize::from_mb),
+                autoscaling: val.val23.then_some(AutoscalingConfig {
+                    storage: Some(StorageAutoscalingConfig {
+                        scale_threshold: Some(0.8),
+                        scale_threshold_available: Some(ConfigSize::from_mb(10000)),
+                        scale_factor: Some(2.0),
+                    }),
+                }),
                 storage_class: val.val12,
+                volume_attributes_class: val.val24,
                 service_account_name: val.val13,
                 namespace: val.val14,
             },
-            clock_resolution_usecs: val.val15,
+            clock_resolution: val.val15.map(ConfigDuration::from_micros),
             // Varies so the proptest exercises the "cannot edit unless
             // storage is cleared" restriction on this field.
             clock_timezone_offset: match val.val0 % 3 {
@@ -333,7 +474,7 @@ fn map_val_to_limited_runtime_config(val: RuntimeConfigPropVal) -> serde_json::V
                 _ => Some("-08:00".parse().unwrap()),
             },
             pin_cpus: Vec::new(),
-            provisioning_timeout_secs: val.val16,
+            provisioning_timeout: val.val16.map(ConfigDuration::from_secs),
             max_parallel_connector_init: None,
             init_containers: None,
             checkpoint_during_suspend: val.val17,
@@ -362,11 +503,31 @@ fn map_val_to_limited_program_config(val: ProgramConfigPropVal) -> serde_json::V
                 Some(CompilationProfile::Optimized)
             },
             cache: val.3,
-            runtime_version: None,
+            // Exercise setting and unsetting the Gen-2 engine across create and
+            // update transitions; a third of valid configs select it.
+            runtime_version: if val.4.is_multiple_of(3) {
+                Some(RuntimeSelector::Gen2(None))
+            } else {
+                None
+            },
             use_platform_compiler: false,
         })
         .unwrap()
     }
+}
+
+#[test]
+fn limited_program_config_exercises_gen2() {
+    // Guard against a silent no-op: the generator must actually emit a Gen-2
+    // runtime. A serialization slip would store null instead, and the harness
+    // would never exercise setting or unsetting Gen-2.
+    assert_eq!(
+        map_val_to_limited_program_config((1, true, false, true, 0))["runtime_version"],
+        json!("gen2")
+    );
+    assert!(
+        map_val_to_limited_program_config((1, true, false, true, 1))["runtime_version"].is_null()
+    );
 }
 
 /// Generates a limited program information (1/8 is invalid).
@@ -384,6 +545,7 @@ fn map_val_to_limited_program_info(val: ProgramInfoPropVal) -> serde_json::Value
             udf_stubs: format!("udf-stubs-{}", val.2),
             input_connectors: BTreeMap::new(),
             output_connectors: BTreeMap::new(),
+            circuit_ir: None,
             dataflow: None,
         })
         .unwrap()
@@ -502,6 +664,22 @@ fn limited_option_program_config() -> impl Strategy<Value = Option<serde_json::V
     any::<Option<ProgramConfigPropVal>>().prop_map(|val| val.map(map_val_to_limited_program_config))
 }
 
+/// Generates different deployment patches, valid and invalid.
+fn limited_patch_pipeline_deployment() -> impl Strategy<Value = PipelineDeploymentConfig> {
+    let cpu = proptest::option::of(prop_oneof![Just(-1.0), Just(0.5), Just(1.0), Just(2.0)]);
+    let memory = proptest::option::of(prop_oneof![Just(0u64), Just(1000), Just(2000)]);
+    (cpu.clone(), cpu, memory.clone(), memory).prop_map(
+        |(cpu_cores_min, cpu_cores_max, memory_mb_min, memory_mb_max)| PipelineDeploymentConfig {
+            resources: DeploymentResources {
+                cpu_cores_min,
+                cpu_cores_max,
+                memory_min: memory_mb_min.map(ConfigSize::from_mb),
+                memory_max: memory_mb_max.map(ConfigSize::from_mb),
+            },
+        },
+    )
+}
+
 /// Generates different SQL compilation information.
 fn limited_sql_compilation_info() -> impl Strategy<Value = SqlCompilationInfo> {
     any::<u8>().prop_map(|v| SqlCompilationInfo {
@@ -512,10 +690,12 @@ fn limited_sql_compilation_info() -> impl Strategy<Value = SqlCompilationInfo> {
 
 /// Generates different Rust compilation information.
 fn limited_rust_compilation_info() -> impl Strategy<Value = RustCompilationInfo> {
-    any::<(u8, u8, u8)>().prop_map(|v| RustCompilationInfo {
-        exit_code: (v.0 % 4) as i32,
-        stdout: format!("stdout-{}", v.1),
-        stderr: format!("stderr-{}", v.1),
+    any::<(u8, u8, u8)>().prop_map(|v| {
+        RustCompilationInfo::from_process_output_streams(
+            (v.0 % 4) as i32,
+            format!("stdout-{}", v.1),
+            format!("stderr-{}", v.1),
+        )
     })
 }
 
@@ -532,7 +712,7 @@ fn limited_pipeline_config() -> impl Strategy<Value = serde_json::Value> {
         } else {
             val.2.invalid0 = 1; // Prevent it from being invalid
             let runtime_config = map_val_to_limited_runtime_config(val.2);
-            val.3 .0 = 1; // Prevent it from being invalid
+            val.3.0 = 1; // Prevent it from being invalid
             let program_info: ProgramInfo =
                 serde_json::from_value(map_val_to_limited_program_info(val.3)).unwrap();
             serde_json::to_value(PipelineConfig {
@@ -551,6 +731,8 @@ fn limited_pipeline_config() -> impl Strategy<Value = serde_json::Value> {
                         .map(|dataflow| dataflow.mir.clone())
                         .unwrap_or_default(),
                     program_schema: program_info.schema.clone(),
+                    circuit_ir: None,
+                    udf_library: None,
                 }),
             })
             .unwrap()
@@ -624,15 +806,14 @@ fn limited_optional_storage_status_details() -> impl Strategy<Value = Option<ser
         if v.0 {
             None
         } else {
-            let mut checkpoints = Vec::new();
-            checkpoints.push(CheckpointMetadata {
+            let checkpoints = vec![CheckpointMetadata {
                 uuid: Default::default(),
                 identifier: None,
                 fingerprint: 0,
                 size: None,
                 steps: Some(v.1),
                 processed_records: None,
-            });
+            }];
             Some(serde_json::to_value(&StorageStatusDetails { checkpoints }).unwrap())
         }
     })
@@ -690,7 +871,8 @@ fn limited_retention_num() -> impl Strategy<Value = u32> {
 //////////////////////////////////////////////////////////////////////////////
 /////                          MANUAL TESTS                              /////
 
-/// Creation and retrieval of tenants.
+/// Creation and retrieval of tenants: the name identifies the tenant, and the
+/// provider recorded alongside it does not.
 #[tokio::test]
 async fn tenant_creation() {
     let handle = test_setup().await;
@@ -719,11 +901,213 @@ async fn tenant_creation() {
         .get_or_create_tenant_id(Uuid::now_v7(), "x".to_string(), "z".to_string())
         .await
         .unwrap();
+    // Repeating a name resolves to the same tenant.
     assert_eq!(tenant_id_1, tenant_id_2);
     assert_eq!(tenant_id_2, tenant_id_3);
+    // A different name is a different tenant.
     assert_ne!(tenant_id_3, tenant_id_4);
     assert_ne!(tenant_id_4, tenant_id_5);
-    assert_ne!(tenant_id_3, tenant_id_5);
+    // The same name under another provider is still that tenant, so changing
+    // the configured issuer does not fork it.
+    assert_eq!(tenant_id_3, tenant_id_5);
+}
+
+/// Explicit tenant creation is idempotent: repeating a name returns the
+/// existing tenant, unchanged, with `created = false`.
+#[tokio::test]
+async fn explicit_tenant_creation_is_idempotent() {
+    let handle = test_setup().await;
+    let new_id = Uuid::now_v7();
+    let (first, created) = handle
+        .db
+        .get_or_create_tenant(new_id, "acme", "issuer-a")
+        .await
+        .unwrap();
+    assert!(created);
+    assert_eq!(first.id, TenantId(new_id));
+    assert_eq!(first.name, "acme");
+    assert_eq!(first.initial_provider, "issuer-a");
+
+    // A repeat, even under another provider, returns the tenant unchanged.
+    let (second, created) = handle
+        .db
+        .get_or_create_tenant(Uuid::now_v7(), "acme", "issuer-b")
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(second, first);
+}
+
+/// Single-tenant retrieval resolves a name or a UUID, and a miss is an error.
+#[tokio::test]
+async fn tenant_retrieval_by_name_or_id() {
+    let handle = test_setup().await;
+    let (tenant, _) = handle
+        .db
+        .get_or_create_tenant(Uuid::now_v7(), "acme", "issuer-a")
+        .await
+        .unwrap();
+    assert_eq!(handle.db.get_tenant("acme").await.unwrap(), tenant);
+    assert_eq!(
+        handle.db.get_tenant(&tenant.id.to_string()).await.unwrap(),
+        tenant
+    );
+    assert!(matches!(
+        handle.db.get_tenant("absent").await.unwrap_err(),
+        DBError::UnknownTenantName { .. }
+    ));
+    // A UUID selector is looked up by id only, never as a name: a tenant whose
+    // name is a UUID string is not resolvable through that name, only its id.
+    let uuid_name = Uuid::now_v7().to_string();
+    let (uuid_named, _) = handle
+        .db
+        .get_or_create_tenant(Uuid::now_v7(), &uuid_name, "issuer-a")
+        .await
+        .unwrap();
+    assert!(matches!(
+        handle.db.get_tenant(&uuid_name).await.unwrap_err(),
+        DBError::UnknownTenantName { .. }
+    ));
+    assert_eq!(
+        handle
+            .db
+            .get_tenant(&uuid_named.id.to_string())
+            .await
+            .unwrap(),
+        uuid_named
+    );
+}
+
+/// Membership rows record how they came into existence, a role change keeps
+/// the recorded origin, and a user's memberships are listable by identity.
+#[tokio::test]
+async fn membership_origin_is_recorded() {
+    let handle = test_setup().await;
+    let provider = "https://idp.test".to_string();
+    let (tenant, _alice, _) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            provider.clone(),
+            "alice".to_string(),
+            None,
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    assert_eq!(members[0].origin, Some(MembershipOrigin::Claim));
+
+    let bob = handle
+        .db
+        .preprovision_member(Uuid::now_v7(), tenant, &provider, "bob", None, Role::Read)
+        .await
+        .unwrap();
+    handle
+        .db
+        .upsert_member_role(tenant, bob, Role::Admin, MembershipOrigin::Derived)
+        .await
+        .unwrap();
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    let bob_row = members.iter().find(|m| m.user_id == bob).unwrap();
+    assert_eq!(bob_row.role, Role::Admin);
+    assert_eq!(bob_row.origin, Some(MembershipOrigin::Api));
+
+    let (memberships, _) = handle
+        .db
+        .list_user_memberships(&provider, "alice")
+        .await
+        .unwrap();
+    assert_eq!(memberships.len(), 1);
+    assert_eq!(memberships[0].tenant_id, tenant);
+    assert_eq!(memberships[0].name, "acme");
+    // Alice's login created the tenant, so she holds `first_user_role`.
+    assert_eq!(memberships[0].role, Role::Admin);
+    assert!(
+        handle
+            .db
+            .list_user_memberships(&provider, "nobody")
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
+/// The creation time of a user is the time of the first tenant membership. A
+/// user without memberships, and a user with a membership from before V36
+/// (NULL), have none.
+#[tokio::test]
+async fn user_created_at_is_recorded() {
+    let handle = test_setup().await;
+    let provider = "https://idp.test";
+    let created_at = async |subject: &str| {
+        handle
+            .db
+            .list_user_memberships(provider, subject)
+            .await
+            .unwrap()
+            .1
+    };
+    let login = async |tenant: &str| {
+        handle
+            .db
+            .resolve_login(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                tenant.to_string(),
+                provider.to_string(),
+                "alice".to_string(),
+                None,
+                Role::Read,
+                Role::Admin,
+                MembershipOrigin::Derived,
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(created_at("alice").await, None);
+
+    // A user record without a membership has no creation time.
+    handle
+        .db
+        .get_or_create_user(Uuid::now_v7(), provider, "alice", None)
+        .await
+        .unwrap();
+    assert_eq!(created_at("alice").await, None);
+
+    let before = Utc::now();
+    login("acme").await;
+    let first = created_at("alice")
+        .await
+        .expect("the first membership records the creation time");
+    assert!(first >= before - chrono::Duration::seconds(5));
+
+    // A later login and a later membership do not move the creation time.
+    login("acme").await;
+    let (beta, alice, _) = login("beta").await;
+    assert_eq!(created_at("alice").await, Some(first));
+
+    // Make the `acme` membership older than V36. The `beta` membership has a
+    // time, but it is not the signup time.
+    handle
+        .db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE tenant_membership SET created_at = NULL \
+             WHERE user_id = $1 AND tenant_id <> $2",
+            &[&alice.0, &beta.0],
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_at("alice").await, None);
 }
 
 /// Creation, deletion and validation of API keys.
@@ -743,14 +1127,13 @@ async fn api_key_store_and_validation() {
                 Uuid::now_v7(),
                 api_key_name,
                 &api_key,
-                vec![ApiPermission::Read, ApiPermission::Write],
+                MintableKeyRole::Write,
             )
             .await
             .unwrap();
-        let scopes = handle.db.validate_api_key(&api_key).await.unwrap();
-        assert_eq!(tenant_id, scopes.0);
-        assert_eq!(&ApiPermission::Read, scopes.1.first().unwrap());
-        assert_eq!(&ApiPermission::Write, scopes.1.get(1).unwrap());
+        let validated = handle.db.validate_api_key(&api_key).await.unwrap();
+        assert_eq!(tenant_id, validated.0);
+        assert_eq!(Role::Write, validated.1);
 
         // Delete API key
         handle
@@ -775,6 +1158,973 @@ async fn api_key_store_and_validation() {
         let err = handle.db.validate_api_key(&api_key_2).await.unwrap_err();
         assert!(matches!(err, DBError::InvalidApiKey));
     }
+}
+
+/// `V37` copies the CPU and memory of the runtime config into the stored deployment config of
+/// stopped pipelines only, leaving every other field alone.
+#[tokio::test]
+async fn stopped_deployment_resources_are_synced_once() {
+    let handle = test_setup().await;
+    let client = handle.db.pool.get().await.unwrap();
+    // Temp tables shadow the real one, so the migration runs unmodified.
+    client
+        .batch_execute(
+            r#"CREATE TEMP TABLE pipeline (id int PRIMARY KEY, deployment_resources_status varchar,
+                 runtime_config varchar, deployment_config varchar);
+               INSERT INTO pipeline VALUES
+                 (1, 'stopped', '{"resources": {"cpu_cores_min": 8, "memory_mb_max": 2000}}',
+                  '{"workers": 4, "resources": {"cpu_cores_min": 4.0, "cpu_cores_max": 6.0, "memory_mb_max": 1000, "storage_mb_max": 50}}'),
+                 (2, 'provisioned', '{"resources": {"cpu_cores_min": 8}}', '{"resources": {"cpu_cores_min": 2.0}}'),
+                 (3, 'stopped', '{}', NULL);"#,
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../../migrations/V37__sync_stopped_deployment_resources.sql"
+        ))
+        .await
+        .unwrap();
+    let deployment_config = |id: i32| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "SELECT deployment_config FROM pipeline WHERE id = $1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get::<_, Option<String>>(0)
+                .map(|config| serde_json::from_str::<serde_json::Value>(&config).unwrap())
+        }
+    };
+    assert_eq!(
+        deployment_config(1).await,
+        Some(json!({"workers": 4, "resources": {
+            "cpu_cores_min": 8, "cpu_cores_max": null, "memory_mb_min": null,
+            "memory_mb_max": 2000, "storage_mb_max": 50
+        }}))
+    );
+    assert_eq!(
+        deployment_config(2).await,
+        Some(json!({"resources": {"cpu_cores_min": 2.0}}))
+    );
+    assert_eq!(deployment_config(3).await, None);
+    client
+        .batch_execute("DROP TABLE pg_temp.pipeline;")
+        .await
+        .unwrap();
+}
+
+/// The tenant-identity section of `V35__rbac.sql`, delimited in the file by
+/// `BEGIN tenant identity` / `END tenant identity`.
+fn tenant_identity_migration() -> &'static str {
+    let migration = include_str!("../../migrations/V35__rbac.sql");
+    let (_, after_begin) = migration
+        .split_once("-- BEGIN tenant identity")
+        .expect("V35__rbac.sql lost its `BEGIN tenant identity` marker");
+    let (section, _) = after_begin
+        .split_once("-- END tenant identity")
+        .expect("V35__rbac.sql lost its `END tenant identity` marker");
+    section
+}
+
+/// Upgrading a deployment that already has two tenants of one name renames
+/// rather than fails, and the name stays with the tenant users already reach.
+#[tokio::test]
+async fn duplicate_tenant_names_are_renamed_not_rejected() {
+    let handle = test_setup().await;
+    let client = handle.db.pool.get().await.unwrap();
+
+    let live = Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").unwrap();
+    let orphan = Uuid::parse_str("00000000-0000-0000-0000-0000000000a2").unwrap();
+    let untouched = Uuid::parse_str("00000000-0000-0000-0000-0000000000a3").unwrap();
+    let name_of = |id: Uuid| {
+        let client = &client;
+        async move {
+            client
+                .query_one("SELECT tenant FROM tenant WHERE id = $1", &[&id])
+                .await
+                .unwrap()
+                .get::<_, String>(0)
+        }
+    };
+    // Reproduce the shape from before this migration: a `tenant` table whose
+    // name is not unique, and enough of `pipeline` to count. Temp tables shadow
+    // the real ones, so the migration below can run against them unmodified.
+    // `live` is registered under the currently configured issuer but holds
+    // nothing, while the `orphan` left behind by an earlier issuer holds the
+    // pipelines, so the two ranking criteria disagree.
+    let build = "CREATE TEMP TABLE tenant (id uuid PRIMARY KEY, tenant varchar NOT NULL, provider varchar NOT NULL);
+         CREATE TEMP TABLE pipeline (id uuid PRIMARY KEY, tenant_id uuid NOT NULL);
+         INSERT INTO tenant VALUES
+           ('00000000-0000-0000-0000-0000000000a1', 'acme', 'https://new-idp.example'),
+           ('00000000-0000-0000-0000-0000000000a2', 'acme', 'https://old-idp.example'),
+           ('00000000-0000-0000-0000-0000000000a3', 'beta', 'https://new-idp.example');
+         INSERT INTO pipeline VALUES
+           ('00000000-0000-0000-0000-0000000000b1', '00000000-0000-0000-0000-0000000000a2'),
+           ('00000000-0000-0000-0000-0000000000b2', '00000000-0000-0000-0000-0000000000a2');";
+    // Run the migration itself, not a copy, so the two cannot drift. Only the
+    // tenant-identity section applies to these tables; the rest of V35 creates
+    // the RBAC tables, which the test database already has. The ADD CONSTRAINT
+    // that closes the section is part of the assertion: it only succeeds if the
+    // rename left the names unique.
+    let migration = tenant_identity_migration();
+    // Qualified with pg_temp so a reset can never reach the real tables.
+    let reset = "DROP TABLE pg_temp.tenant; DROP TABLE pg_temp.pipeline;";
+
+    client.batch_execute(build).await.unwrap();
+    client
+        .execute(
+            "SELECT set_config('feldera.auth_issuer', $1, false)",
+            &[&"https://new-idp.example"],
+        )
+        .await
+        .unwrap();
+    client.batch_execute(migration).await.unwrap();
+
+    // The tenant on the configured issuer keeps the name even though the other
+    // holds the pipelines, so the upgrade does not move anyone.
+    assert_eq!(name_of(live).await, "acme");
+    // The orphan keeps its own pipelines under a name an owner can still reach.
+    assert_eq!(name_of(orphan).await, format!("acme ({orphan})"));
+    // A name that was never shared is untouched.
+    assert_eq!(name_of(untouched).await, "beta");
+
+    // With no issuer configured, as when authentication is off, the name falls
+    // back to following the pipelines.
+    client.batch_execute(reset).await.unwrap();
+    client.batch_execute(build).await.unwrap();
+    client
+        .execute(
+            "SELECT set_config('feldera.auth_issuer', $1, false)",
+            &[&""],
+        )
+        .await
+        .unwrap();
+    client.batch_execute(migration).await.unwrap();
+    assert_eq!(name_of(orphan).await, "acme");
+    assert_eq!(name_of(live).await, format!("acme ({live})"));
+}
+
+/// A tenant is identified by its name alone, so changing the configured issuer
+/// reuses the existing tenant instead of creating a second one of the same name.
+#[tokio::test]
+async fn tenant_survives_a_changed_issuer() {
+    let handle = test_setup().await;
+
+    let before = handle
+        .db
+        .get_or_create_tenant_id(
+            Uuid::now_v7(),
+            "acme".to_string(),
+            "https://old-idp.example".to_string(),
+        )
+        .await
+        .unwrap();
+
+    // The same tenant name under a new issuer resolves to the same tenant, so
+    // an IdP migration does not strand the pipelines on an unreachable one.
+    let after = handle
+        .db
+        .get_or_create_tenant_id(
+            Uuid::now_v7(),
+            "acme".to_string(),
+            "https://new-idp.example".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+
+    let named = handle.db.resolve_tenant_selector("acme").await.unwrap();
+    assert_eq!(named, before);
+    let tenants = handle.db.list_tenants().await.unwrap();
+    assert_eq!(
+        tenants.iter().filter(|t| t.name == "acme").count(),
+        1,
+        "the issuer change must not have created a second 'acme'"
+    );
+
+    // The old composite constraint is dropped, not just shadowed by the new one.
+    let leftover = handle
+        .db
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query(
+            "SELECT conname FROM pg_constraint \
+             WHERE conrelid = 'tenant'::regclass AND contype = 'u' \
+               AND pg_get_constraintdef(oid) LIKE 'UNIQUE (tenant, provider)%'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        leftover.is_empty(),
+        "the (tenant, provider) constraint should have been dropped"
+    );
+}
+
+/// A tenant that no login resolves to is recovered by giving it the name that
+/// logins do resolve, even though every request re-creates that name.
+#[tokio::test]
+async fn renaming_takes_a_name_that_logins_keep_recreating() {
+    let handle = test_setup().await;
+    let provider = "https://acme.idp.example".to_string();
+    let asserted = "acme.idp.example".to_string();
+
+    // Authentication goes on: the first login creates a tenant of its own, and
+    // everything from before is left behind in `default`.
+    let stranded = TenantRecord::default().id;
+    let fresh = handle
+        .db
+        .get_or_create_tenant_id(Uuid::now_v7(), asserted.clone(), provider.clone())
+        .await
+        .unwrap();
+    assert_ne!(stranded, fresh);
+
+    // Freeing the name first cannot work: the next request re-creates it. So
+    // the plain rename conflicts, and only taking the name succeeds.
+    assert!(matches!(
+        handle
+            .db
+            .rename_tenant(stranded, &asserted, false)
+            .await
+            .unwrap_err(),
+        DBError::DuplicateName
+    ));
+    let displaced = handle
+        .db
+        .rename_tenant(stranded, &asserted, true)
+        .await
+        .unwrap()
+        .expect("the tenant holding the name should have been displaced");
+    assert_eq!(displaced.id, fresh);
+    assert_eq!(displaced.name, format!("{asserted} ({fresh})"));
+
+    // The next login lands on the recovered tenant, with its pipelines.
+    let after = handle
+        .db
+        .get_or_create_tenant_id(Uuid::now_v7(), asserted.clone(), provider)
+        .await
+        .unwrap();
+    assert_eq!(after, stranded);
+}
+
+/// A tenant is deleted only once it holds nothing, so a mistyped identifier
+/// cannot cascade away a live tenant's resources.
+#[tokio::test]
+async fn deleting_a_tenant_requires_it_to_be_empty() {
+    let handle = test_setup().await;
+    let tenant = handle
+        .db
+        .get_or_create_tenant_id(
+            Uuid::now_v7(),
+            "leftover".to_string(),
+            "https://idp.example".to_string(),
+        )
+        .await
+        .unwrap();
+
+    // A member alone does not block: a login re-creates its own membership.
+    let user = handle
+        .db
+        .get_or_create_user(
+            Uuid::now_v7(),
+            "https://idp.example",
+            "someone",
+            Some("someone@idp.example"),
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .upsert_member_role(tenant, user, Role::Write, MembershipOrigin::Api)
+        .await
+        .unwrap();
+
+    // An API key does.
+    handle
+        .db
+        .store_api_key_hash(
+            tenant,
+            Uuid::now_v7(),
+            "key",
+            &generate_api_key(),
+            MintableKeyRole::Write,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        handle.db.delete_tenant(tenant).await.unwrap_err(),
+        DBError::TenantNotEmpty { api_keys: 1, .. }
+    ));
+
+    handle.db.delete_api_key(tenant, "key").await.unwrap();
+    handle.db.delete_tenant(tenant).await.unwrap();
+    assert!(
+        !handle
+            .db
+            .list_tenants()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.id == tenant)
+    );
+
+    // Deleting it again reports the tenant as unknown.
+    assert!(matches!(
+        handle.db.delete_tenant(tenant).await.unwrap_err(),
+        DBError::UnknownTenant { .. }
+    ));
+}
+
+/// A profile refresh is claimed once per span, and again once the token says
+/// the user authenticated anew.
+#[tokio::test]
+async fn profile_refresh_is_claimed_once_per_authentication() {
+    let handle = test_setup().await;
+    let day = 24 * 60 * 60;
+    let claim = async |auth_time| {
+        handle
+            .db
+            .claim_profile_refresh(Uuid::now_v7(), "https://idp.example", "ada", auth_time, day)
+            .await
+            .unwrap()
+    };
+
+    // The first claim also creates the identity, which is how a platform owner
+    // (whose role comes from configuration, not a membership) gets a record.
+    assert!(claim(Some(1000)).await);
+    assert!(!claim(Some(1000)).await);
+    // A token issued from the same authentication adds nothing, however often
+    // it is refreshed.
+    assert!(!claim(Some(1000)).await);
+    assert!(claim(Some(2000)).await);
+    assert!(!claim(Some(2000)).await);
+
+    // A second identity is tracked on its own.
+    assert!(
+        handle
+            .db
+            .claim_profile_refresh(Uuid::now_v7(), "https://idp.example", "bob", Some(1), day)
+            .await
+            .unwrap()
+    );
+
+    // A zero-length span stands for one that has elapsed: the provider is asked
+    // again even though nobody re-authenticated.
+    assert!(
+        handle
+            .db
+            .claim_profile_refresh(Uuid::now_v7(), "https://idp.example", "ada", None, 0)
+            .await
+            .unwrap()
+    );
+}
+
+/// A stored profile keeps an email and the provider's verdict on it together,
+/// and an unverified address never displaces a verified one.
+#[tokio::test]
+async fn a_verified_email_outranks_a_claimed_one() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example";
+    let tenant = handle
+        .db
+        .get_or_create_tenant_id(Uuid::now_v7(), "acme".to_string(), provider.to_string())
+        .await
+        .unwrap();
+    let member_email = async || {
+        let members = handle.db.list_tenant_members(tenant).await.unwrap();
+        let member = members.first().cloned().expect("one member");
+        (member.email, member.email_verified, member.display_name)
+    };
+
+    // An administrator pre-provisions the membership with the address they
+    // believe belongs to this subject. Nobody has verified it.
+    let user = handle
+        .db
+        .preprovision_member(
+            Uuid::now_v7(),
+            tenant,
+            provider,
+            "ada",
+            Some("typo@example.com"),
+            Role::Write,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        member_email().await,
+        (Some("typo@example.com".to_string()), false, None)
+    );
+
+    // The provider then answers with the real address and vouches for it.
+    handle
+        .db
+        .store_user_profile(
+            provider,
+            "ada",
+            &UserProfile {
+                email: Some("ada@example.com".to_string()),
+                email_verified: true,
+                display_name: Some("Ada Lovelace".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        member_email().await,
+        (
+            Some("ada@example.com".to_string()),
+            true,
+            Some("Ada Lovelace".to_string())
+        )
+    );
+
+    // Neither a later login's claim nor another pre-provisioning call may
+    // displace it, which would leave the verified mark beside a different
+    // address.
+    handle
+        .db
+        .get_or_create_user(Uuid::now_v7(), provider, "ada", Some("spoof@example.com"))
+        .await
+        .unwrap();
+    handle
+        .db
+        .preprovision_member(
+            Uuid::now_v7(),
+            tenant,
+            provider,
+            "ada",
+            Some("other@example.com"),
+            Role::Read,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        member_email().await,
+        (
+            Some("ada@example.com".to_string()),
+            true,
+            Some("Ada Lovelace".to_string())
+        )
+    );
+
+    // A later answer that says nothing about the email leaves both it and the
+    // verdict alone, and still records the name it does carry.
+    handle
+        .db
+        .store_user_profile(
+            provider,
+            "ada",
+            &UserProfile {
+                email: None,
+                email_verified: false,
+                display_name: Some("A. Lovelace".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        member_email().await,
+        (
+            Some("ada@example.com".to_string()),
+            true,
+            Some("A. Lovelace".to_string())
+        )
+    );
+
+    // An answer the provider will not vouch for replaces both together.
+    handle
+        .db
+        .store_user_profile(
+            provider,
+            "ada",
+            &UserProfile {
+                email: Some("ada@newdomain.test".to_string()),
+                email_verified: false,
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        member_email().await,
+        (
+            Some("ada@newdomain.test".to_string()),
+            false,
+            Some("A. Lovelace".to_string())
+        )
+    );
+    assert_eq!(
+        user,
+        handle.db.list_tenant_members(tenant).await.unwrap()[0].user_id
+    );
+}
+
+/// `first_user_role` sets the role of the login that creates a tenant: with
+/// `write`, the creator is not made admin (e.g. a shared sandbox).
+#[tokio::test]
+async fn rbac_first_user_role_configurable() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+
+    // Creator of a fresh tenant, with first_user_role = write, is admitted at
+    // write rather than admin.
+    let (tenant, _founder, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "sandbox".to_string(),
+            provider.clone(),
+            "founder".to_string(),
+            Some("founder@sandbox.test".to_string()),
+            Role::Read,
+            Role::Write,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(role, Role::Write);
+
+    // The freshly created tenant therefore has no admin member; only a platform
+    // owner could administer it.
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    assert!(members.iter().all(|m| m.role != Role::Admin));
+}
+
+/// RBAC login resolution and membership: the first principal of a fresh tenant
+/// becomes its admin, later principals default to read, roles are editable and
+/// removable, and strict tenant lookup works.
+#[tokio::test]
+async fn rbac_login_resolution_and_membership() {
+    let handle = test_setup().await;
+    let provider = "https://idp.example".to_string();
+
+    // First login into a fresh tenant: the creator becomes admin.
+    let (tenant, alice, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            provider.clone(),
+            "alice".to_string(),
+            Some("alice@acme.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(role, Role::Admin);
+
+    // Second login into the existing tenant defaults to read.
+    let (tenant2, bob, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            provider.clone(),
+            "bob".to_string(),
+            Some("bob@acme.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant2, tenant);
+    assert_eq!(role, Role::Read);
+
+    // A repeat login keeps the stored role (idempotent, not re-defaulted).
+    let (_, alice_again, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            provider.clone(),
+            "alice".to_string(),
+            None,
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(alice_again, alice);
+    assert_eq!(role, Role::Admin);
+
+    // Membership listing reflects both users and their roles.
+    let role_of = |members: &[crate::db::types::user::TenantMember], uid: UserId| {
+        members.iter().find(|m| m.user_id == uid).map(|m| m.role)
+    };
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(role_of(&members, alice), Some(Role::Admin));
+    assert_eq!(role_of(&members, bob), Some(Role::Read));
+
+    // An admin can change bob's role to write.
+    handle
+        .db
+        .upsert_member_role(tenant, bob, Role::Write, MembershipOrigin::Api)
+        .await
+        .unwrap();
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    assert_eq!(role_of(&members, bob), Some(Role::Write));
+
+    // Strict tenant selector resolves by name and by UUID, and rejects misses.
+    assert_eq!(
+        handle.db.resolve_tenant_selector("acme").await.unwrap(),
+        tenant
+    );
+    assert_eq!(
+        handle
+            .db
+            .resolve_tenant_selector(&tenant.0.to_string())
+            .await
+            .unwrap(),
+        tenant
+    );
+    assert!(matches!(
+        handle.db.resolve_tenant_selector("nope").await.unwrap_err(),
+        DBError::UnknownTenantName { .. }
+    ));
+
+    // Removal drops the membership.
+    handle.db.remove_member(tenant, bob).await.unwrap();
+    assert_eq!(
+        handle.db.list_tenant_members(tenant).await.unwrap().len(),
+        1
+    );
+}
+
+/// Federated-token resolution: the issuer gate rejects unregistered issuers
+/// before any fetch, an optional audience narrows candidates, and a token
+/// trusted by several tenants returns all of them (the caller disambiguates via
+/// the Feldera-Tenant header, verified at the auth layer).
+/// Every start recreates the default tenant if it is missing, and the default
+/// tenant can be renamed, so that bootstrap must not insert a second row for it.
+#[tokio::test]
+async fn default_tenant_bootstrap_survives_a_rename() {
+    let handle = test_setup().await;
+    let default_id = TenantRecord::default().id;
+
+    handle
+        .db
+        .rename_tenant(default_id, "renamed-away", false)
+        .await
+        .unwrap();
+
+    // What the next start does.
+    handle.db.ensure_default_tenant().await.unwrap();
+
+    // Still one tenant, still under the name the rename gave it.
+    let tenants = handle.db.list_tenants().await.unwrap();
+    assert_eq!(tenants.len(), 1, "the bootstrap must not add a second row");
+    assert_eq!(tenants[0].name, "renamed-away");
+}
+
+/// A registered issuer becomes a fetch destination before any signature is
+/// verified, so registration refuses one that names an internal service unless
+/// the operator permits it.
+#[tokio::test]
+async fn oidc_trust_rejects_an_unreachable_issuer() {
+    let handle = test_setup().await;
+    let tenant_id = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            "prov".to_string(),
+            "admin".to_string(),
+            None,
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let register = |name: &'static str, issuer: &'static str, policy: TenantIssuerPolicy| {
+        let db = &handle.db;
+        async move {
+            db.create_oidc_trust(
+                tenant_id,
+                Uuid::now_v7(),
+                name,
+                None,
+                issuer,
+                "sub",
+                None,
+                Role::Read,
+                policy,
+            )
+            .await
+        }
+    };
+
+    for issuer in [
+        "http://idp.example",             // not https
+        "https://169.254.169.254/latest", // cloud metadata service
+        "https://127.0.0.1:9876",         // loopback
+        "https://10.0.0.5",               // private network
+        "https://user:pw@idp.example",    // embedded credentials
+        "idp.example",                    // not a URL
+    ] {
+        let created = register("refused", issuer, TenantIssuerPolicy::PublicHttpsOnly).await;
+        assert!(
+            matches!(created, Err(DBError::InvalidOidcIssuerUrl { .. })),
+            "issuer '{issuer}' must be refused, got {created:?}"
+        );
+    }
+
+    // The escape hatch admits an internal address and nothing else: the same
+    // registration over http still fails.
+    register(
+        "internal",
+        "https://10.0.0.5",
+        TenantIssuerPolicy::AllowInternal,
+    )
+    .await
+    .unwrap();
+    let plaintext = register(
+        "plaintext",
+        "http://idp.example",
+        TenantIssuerPolicy::AllowInternal,
+    )
+    .await;
+    assert!(matches!(
+        plaintext,
+        Err(DBError::InvalidOidcIssuerUrl { .. })
+    ));
+
+    // A public https issuer is accepted either way.
+    register(
+        "public",
+        "https://token.actions.githubusercontent.com",
+        TenantIssuerPolicy::PublicHttpsOnly,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn oidc_trust_matching_and_issuer_gate() {
+    let handle = test_setup().await;
+    let iss = "https://oidc.example";
+
+    let mk_tenant = |name: &'static str| {
+        let db = &handle.db;
+        async move {
+            db.resolve_login(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                name.to_string(),
+                "prov".to_string(),
+                format!("admin-{name}"),
+                None,
+                Role::Read,
+                Role::Admin,
+                MembershipOrigin::Claim,
+            )
+            .await
+            .unwrap()
+            .0
+        }
+    };
+    let tenant_a = mk_tenant("a").await;
+    let tenant_b = mk_tenant("b").await;
+
+    // Unregistered issuer: gate is closed and no trust matches.
+    assert!(!handle.db.is_trusted_issuer(iss).await.unwrap());
+    assert!(
+        handle
+            .db
+            .match_oidc_trust(iss, "system:sa:app", &["a".to_string()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Two tenants trust the same issuer+subject, disambiguated by audience.
+    let sub = "system:sa:app";
+    handle
+        .db
+        .create_oidc_trust(
+            tenant_a,
+            Uuid::now_v7(),
+            "ta",
+            None,
+            iss,
+            sub,
+            Some("a"),
+            Role::Write,
+            TenantIssuerPolicy::PublicHttpsOnly,
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .create_oidc_trust(
+            tenant_b,
+            Uuid::now_v7(),
+            "tb",
+            None,
+            iss,
+            sub,
+            Some("b"),
+            Role::Write,
+            TenantIssuerPolicy::PublicHttpsOnly,
+        )
+        .await
+        .unwrap();
+
+    assert!(handle.db.is_trusted_issuer(iss).await.unwrap());
+    assert_eq!(
+        handle
+            .db
+            .match_oidc_trust(iss, sub, &["a".to_string()])
+            .await
+            .unwrap(),
+        vec![(tenant_a, Role::Write)]
+    );
+    assert_eq!(
+        handle
+            .db
+            .match_oidc_trust(iss, sub, &["b".to_string()])
+            .await
+            .unwrap(),
+        vec![(tenant_b, Role::Write)]
+    );
+    // A token whose audience matches neither trust does not resolve.
+    assert!(
+        handle
+            .db
+            .match_oidc_trust(iss, sub, &["c".to_string()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A third tenant trusts the same issuer+subject with NO audience, so it
+    // matches any token. A token with audience "a" now resolves to two tenants
+    // (a via its audience, c via the wildcard); both are returned so the auth
+    // layer can pick one from the Feldera-Tenant header.
+    let tenant_c = mk_tenant("c").await;
+    handle
+        .db
+        .create_oidc_trust(
+            tenant_c,
+            Uuid::now_v7(),
+            "tc",
+            None,
+            iss,
+            sub,
+            None,
+            Role::Read,
+            TenantIssuerPolicy::PublicHttpsOnly,
+        )
+        .await
+        .unwrap();
+    let mut got = handle
+        .db
+        .match_oidc_trust(iss, sub, &["a".to_string()])
+        .await
+        .unwrap();
+    got.sort_by_key(|(t, _)| t.0);
+    let mut want = vec![(tenant_a, Role::Write), (tenant_c, Role::Read)];
+    want.sort_by_key(|(t, _)| t.0);
+    assert_eq!(got, want);
+
+    // `owner` is configuration only, so the schema refuses a row carrying it.
+    assert!(
+        handle
+            .db
+            .create_oidc_trust(
+                tenant_a,
+                Uuid::now_v7(),
+                "bad-owner",
+                None,
+                "https://owner.example",
+                "root",
+                None,
+                Role::Owner,
+                TenantIssuerPolicy::PublicHttpsOnly,
+            )
+            .await
+            .is_err()
+    );
+}
+
+/// Pre-provisioning: an admin grants a role by identity before first login; the
+/// grant appears in the member list and survives the user's first login instead
+/// of being overwritten by the default role.
+#[tokio::test]
+async fn preprovision_member_survives_first_login() {
+    let handle = test_setup().await;
+    let (tenant, _admin, _) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            "prov".to_string(),
+            "admin".to_string(),
+            None,
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+
+    // Grant write to carol before she has ever logged in.
+    let carol = handle
+        .db
+        .preprovision_member(
+            Uuid::now_v7(),
+            tenant,
+            "prov",
+            "carol",
+            Some("carol@acme.test"),
+            Role::Write,
+        )
+        .await
+        .unwrap();
+    let members = handle.db.list_tenant_members(tenant).await.unwrap();
+    assert_eq!(
+        members.iter().find(|m| m.user_id == carol).map(|m| m.role),
+        Some(Role::Write)
+    );
+
+    // Carol's first login keeps the pre-provisioned write role (not defaulted).
+    let (login_tenant, login_user, role) = handle
+        .db
+        .resolve_login(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "acme".to_string(),
+            "prov".to_string(),
+            "carol".to_string(),
+            Some("carol@acme.test".to_string()),
+            Role::Read,
+            Role::Admin,
+            MembershipOrigin::Claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_tenant, tenant);
+    assert_eq!(login_user, carol);
+    assert_eq!(role, Role::Write);
 }
 
 /// Creation of pipelines.
@@ -1271,8 +2621,8 @@ async fn pipeline_versioning() {
     // Edit runtime configuration -> increment version and refresh_version
     let new_runtime_config = serde_json::to_value(RuntimeConfig {
         workers: 100,
-        max_rss_mb: None,
-        datafusion_memory_mb: None,
+        max_rss: None,
+        datafusion_memory: None,
         hosts: 1,
         storage: None,
         fault_tolerance: FtConfig::default(),
@@ -1280,21 +2630,24 @@ async fn pipeline_versioning() {
         tracing: false,
         tracing_endpoint_jaeger: "".to_string(),
         min_batch_size_records: 0,
-        max_buffering_delay_usecs: 0,
+        max_buffering_delay: None,
         resources: ResourceConfig {
             cpu_cores_min: None,
             cpu_cores_max: None,
-            memory_mb_min: None,
-            memory_mb_max: None,
-            storage_mb_max: None,
+            memory_min: None,
+            memory_max: None,
+            storage_min: None,
+            storage_max: None,
+            autoscaling: None,
             storage_class: None,
+            volume_attributes_class: None,
             service_account_name: None,
             namespace: None,
         },
-        clock_resolution_usecs: None,
+        clock_resolution: None,
         clock_timezone_offset: None,
         pin_cpus: Vec::new(),
-        provisioning_timeout_secs: None,
+        provisioning_timeout: None,
         max_parallel_connector_init: None,
         init_containers: None,
         checkpoint_during_suspend: true,
@@ -1328,6 +2681,214 @@ async fn pipeline_versioning() {
     assert_eq!(current.version, Version(7));
     assert_eq!(current.program_version, Version(5));
     assert_eq!(current.refresh_version, Version(7));
+}
+
+/// `storage_min` sizes the volume and cannot change while storage is in
+/// use, like `storage_max`. The autoscaling policy can.
+#[tokio::test]
+async fn storage_mb_min_edit_restricted_to_cleared_storage() {
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+    let pipeline = handle
+        .db
+        .new_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "v0",
+            PipelineDescr {
+                name: "autoscaled".to_string(),
+                description: "".to_string(),
+                tags: vec![],
+                runtime_config: json!({
+                    "resources": { "storage_mb_min": 1000, "storage_mb_max": 8000 }
+                }),
+                program_code: "".to_string(),
+                udf_rust: "".to_string(),
+                udf_toml: "".to_string(),
+                program_config: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Compile and provision, which marks storage as in use.
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_sql_compiled(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &SqlCompilationInfo {
+                exit_code: 0,
+                messages: vec![],
+            },
+            &serde_json::to_value(ProgramInfo {
+                schema: serde_json::to_value(ProgramSchema {
+                    inputs: vec![],
+                    outputs: vec![],
+                })
+                .unwrap(),
+                main_rust: "".to_string(),
+                udf_stubs: "".to_string(),
+                input_connectors: BTreeMap::new(),
+                output_connectors: BTreeMap::new(),
+                circuit_ir: None,
+                dataflow: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_rust(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_success(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
+            "def",
+            "123",
+            "456",
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .set_deployment_resources_desired_status_provisioned(
+            tenant_id,
+            "autoscaled",
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_deployment_resources_status_to_provisioning(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            Uuid::nil(),
+            serde_json::to_value(generate_pipeline_config(
+                pipeline.id,
+                &pipeline.name,
+                &serde_json::from_value(pipeline.runtime_config.clone()).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Stop it: edits need a stopped pipeline, and storage stays in use.
+    handle
+        .db
+        .set_deployment_resources_desired_status_stopped(tenant_id, "autoscaled")
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_deployment_resources_status_to_stopping(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_deployment_resources_status_to_stopped(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle
+            .db
+            .get_pipeline(tenant_id, "autoscaled")
+            .await
+            .unwrap()
+            .storage_status,
+        StorageStatus::InUse
+    );
+
+    let update = |runtime_config: serde_json::Value| {
+        let db = &handle.db;
+        async move {
+            db.update_pipeline(
+                tenant_id,
+                "autoscaled",
+                &None,
+                &PatchClientMetadata::default(),
+                "v0",
+                false,
+                &Some(runtime_config),
+                &None,
+                &None,
+                &None,
+                &None,
+            )
+            .await
+        }
+    };
+
+    // Changing the initial volume size is refused while storage is in use.
+    let err = update(json!({
+        "resources": { "storage_mb_min": 2000, "storage_mb_max": 8000 }
+    }))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DBError::EditRestrictedToClearedStorage { not_allowed }
+                if not_allowed == &["`runtime_config.resources.storage_min`".to_string()]
+        ),
+        "{err:?}"
+    );
+
+    // Changing the autoscaling policy is allowed. The policy goes in under the
+    // older spelling and comes back stored under the current one.
+    update(json!({
+        "resources": {
+            "storage_mb_min": 1000,
+            "storage_mb_max": 8000,
+            "autoscaling": {
+                "storage": {
+                    "scale_threshold": 0.9,
+                    "scale_threshold_available_mb": 20000,
+                    "scale_factor": 3.0
+                }
+            }
+        }
+    }))
+    .await
+    .unwrap();
+    let stored = handle
+        .db
+        .get_pipeline(tenant_id, "autoscaled")
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.runtime_config["resources"]["autoscaling"],
+        json!({
+            "storage": {
+                "scale_threshold": 0.9,
+                "scale_threshold_available": "20G",
+                "scale_factor": 3.0
+            }
+        })
+    );
 }
 
 /// If the name of a pipeline already exists, it should return an error.
@@ -1481,6 +3042,7 @@ async fn pipeline_program_compilation() {
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
                 output_connectors: BTreeMap::new(),
+                circuit_ir: None,
                 dataflow: None,
             })
             .unwrap(),
@@ -1509,11 +3071,7 @@ async fn pipeline_program_compilation() {
             tenant_id,
             pipeline1.id,
             Version(1),
-            &RustCompilationInfo {
-                exit_code: 0,
-                stdout: "".to_string(),
-                stderr: "".to_string(),
-            },
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
             "abc",
             "123",
             "456",
@@ -1569,6 +3127,243 @@ async fn pipeline_program_compilation() {
             .unwrap(),
         None
     );
+}
+
+/// Checks that `count_pipelines_needing_compilation` counts exactly the stopped
+/// pipelines whose program status is pending, compiling_sql, sql_compiled or
+/// compiling_rust.
+#[tokio::test]
+async fn count_pipelines_needing_compilation() {
+    async fn new_test_pipeline(
+        db: &StoragePostgres,
+        tenant_id: TenantId,
+        name: &str,
+    ) -> ExtendedPipelineDescr {
+        db.new_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "v0",
+            PipelineDescr {
+                name: name.to_string(),
+                description: "".to_string(),
+                tags: vec![],
+                runtime_config: json!({}),
+                program_code: "".to_string(),
+                udf_rust: "".to_string(),
+                udf_toml: "".to_string(),
+                program_config: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn advance_program_status(
+        db: &StoragePostgres,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        statuses: &[ProgramStatus],
+        program_info: &serde_json::Value,
+    ) {
+        let sql_compilation = SqlCompilationInfo {
+            exit_code: 0,
+            messages: vec![],
+        };
+        let rust_compilation =
+            RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string());
+        for status in statuses {
+            match status {
+                ProgramStatus::Pending => db
+                    .transit_program_status_to_pending(tenant_id, pipeline_id, Version(1))
+                    .await
+                    .unwrap(),
+                ProgramStatus::CompilingSql => db
+                    .transit_program_status_to_compiling_sql(tenant_id, pipeline_id, Version(1))
+                    .await
+                    .unwrap(),
+                ProgramStatus::SqlCompiled => db
+                    .transit_program_status_to_sql_compiled(
+                        tenant_id,
+                        pipeline_id,
+                        Version(1),
+                        &sql_compilation,
+                        program_info,
+                    )
+                    .await
+                    .unwrap(),
+                ProgramStatus::CompilingRust => db
+                    .transit_program_status_to_compiling_rust(tenant_id, pipeline_id, Version(1))
+                    .await
+                    .unwrap(),
+                ProgramStatus::Success => db
+                    .transit_program_status_to_success(
+                        tenant_id,
+                        pipeline_id,
+                        Version(1),
+                        &rust_compilation,
+                        "abc",
+                        "123",
+                        "456",
+                    )
+                    .await
+                    .unwrap(),
+                ProgramStatus::SqlError => db
+                    .transit_program_status_to_sql_error(
+                        tenant_id,
+                        pipeline_id,
+                        Version(1),
+                        &sql_compilation,
+                    )
+                    .await
+                    .unwrap(),
+                ProgramStatus::RustError => db
+                    .transit_program_status_to_rust_error(
+                        tenant_id,
+                        pipeline_id,
+                        Version(1),
+                        &rust_compilation,
+                    )
+                    .await
+                    .unwrap(),
+                ProgramStatus::SystemError => db
+                    .transit_program_status_to_system_error(
+                        tenant_id,
+                        pipeline_id,
+                        Version(1),
+                        "system error",
+                    )
+                    .await
+                    .unwrap(),
+            }
+        }
+    }
+
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+    let program_info = serde_json::to_value(ProgramInfo {
+        schema: serde_json::to_value(ProgramSchema {
+            inputs: vec![],
+            outputs: vec![],
+        })
+        .unwrap(),
+        main_rust: "".to_string(),
+        udf_stubs: "".to_string(),
+        input_connectors: BTreeMap::new(),
+        output_connectors: BTreeMap::new(),
+        circuit_ir: None,
+        dataflow: None,
+    })
+    .unwrap();
+
+    assert_eq!(
+        handle
+            .db
+            .count_pipelines_needing_compilation()
+            .await
+            .unwrap(),
+        0
+    );
+
+    // One counted pipeline per status with outstanding compilation work
+    let p_pending = new_test_pipeline(&handle.db, tenant_id, "counted-pending").await;
+    for (name, statuses) in [
+        ("counted-compiling-sql", vec![ProgramStatus::CompilingSql]),
+        (
+            "counted-sql-compiled",
+            vec![ProgramStatus::CompilingSql, ProgramStatus::SqlCompiled],
+        ),
+        (
+            "counted-compiling-rust",
+            vec![
+                ProgramStatus::CompilingSql,
+                ProgramStatus::SqlCompiled,
+                ProgramStatus::CompilingRust,
+            ],
+        ),
+    ] {
+        let pipeline = new_test_pipeline(&handle.db, tenant_id, name).await;
+        advance_program_status(&handle.db, tenant_id, pipeline.id, &statuses, &program_info).await;
+    }
+    assert_eq!(
+        handle
+            .db
+            .count_pipelines_needing_compilation()
+            .await
+            .unwrap(),
+        4
+    );
+
+    // Terminal statuses are counted while in flight, no longer once reached
+    for (name, statuses) in [
+        (
+            "done-success",
+            vec![
+                ProgramStatus::CompilingSql,
+                ProgramStatus::SqlCompiled,
+                ProgramStatus::CompilingRust,
+                ProgramStatus::Success,
+            ],
+        ),
+        (
+            "done-sql-error",
+            vec![ProgramStatus::CompilingSql, ProgramStatus::SqlError],
+        ),
+        (
+            "done-rust-error",
+            vec![
+                ProgramStatus::CompilingSql,
+                ProgramStatus::SqlCompiled,
+                ProgramStatus::CompilingRust,
+                ProgramStatus::RustError,
+            ],
+        ),
+        ("done-system-error", vec![ProgramStatus::SystemError]),
+    ] {
+        let pipeline = new_test_pipeline(&handle.db, tenant_id, name).await;
+        assert_eq!(
+            handle
+                .db
+                .count_pipelines_needing_compilation()
+                .await
+                .unwrap(),
+            5
+        );
+        advance_program_status(&handle.db, tenant_id, pipeline.id, &statuses, &program_info).await;
+        assert_eq!(
+            handle
+                .db
+                .count_pipelines_needing_compilation()
+                .await
+                .unwrap(),
+            4
+        );
+    }
+
+    // A non-stopped deployment is not counted. Non-stopped resources with an
+    // unfinished program is unreachable through the Storage API (provisioning
+    // requires a compiled program), so force the state to pin the predicate.
+    for (resources_status, expected_count) in [("provisioning", 3), ("stopped", 4)] {
+        handle
+            .db
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE pipeline SET deployment_resources_status = $1 WHERE id = $2",
+                &[&resources_status, &p_pending.id.0],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .db
+                .count_pipelines_needing_compilation()
+                .await
+                .unwrap(),
+            expected_count
+        );
+    }
 }
 
 /// Tests the following sequence of events:
@@ -1646,6 +3441,7 @@ async fn pipeline_transition_after_quick_stop() {
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
                 output_connectors: BTreeMap::new(),
+                circuit_ir: None,
                 dataflow: None,
             })
             .unwrap(),
@@ -1681,11 +3477,7 @@ async fn pipeline_transition_after_quick_stop() {
             tenant_id,
             pipeline1.id,
             Version(1),
-            &RustCompilationInfo {
-                exit_code: 0,
-                stdout: "".to_string(),
-                stderr: "".to_string(),
-            },
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
             "def",
             "123",
             "456",
@@ -1799,7 +3591,270 @@ async fn pipeline_transition_after_quick_stop() {
     );
 }
 
-/// Deployment of a pipeline by starting it and progressing through various deployment statuses.
+/// Deployment patch of a running pipeline.
+#[tokio::test]
+async fn pipeline_deployment_patch() {
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+    let pipeline = handle
+        .db
+        .new_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "v0",
+            PipelineDescr {
+                name: "resized".to_string(),
+                description: "".to_string(),
+                tags: vec![],
+                runtime_config: json!({
+                    "workers": 4,
+                    "resources": {"cpu_cores_min": 2, "cpu_cores_max": 3, "memory_mb_min": 4000, "memory_mb_max": 4000}
+                }),
+                program_code: "".to_string(),
+                udf_rust: "".to_string(),
+                udf_toml: "".to_string(),
+                program_config: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    let patch = parse_deployment_config_patch(
+        &json!({"resources": {"cpu_cores_min": 1.0, "memory_mb_min": 3000, "memory_mb_max": 3000}}),
+    )
+    .unwrap();
+
+    // Stopped
+    assert!(matches!(
+        handle
+            .db
+            .patch_pipeline_deployment(tenant_id, "resized", &patch)
+            .await
+            .unwrap_err(),
+        DBError::DeploymentRestrictedToRunning
+    ));
+
+    // Compile
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_sql_compiled(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &SqlCompilationInfo {
+                exit_code: 0,
+                messages: vec![],
+            },
+            &serde_json::to_value(ProgramInfo {
+                schema: serde_json::to_value(ProgramSchema {
+                    inputs: vec![],
+                    outputs: vec![],
+                })
+                .unwrap(),
+                main_rust: "".to_string(),
+                udf_stubs: "".to_string(),
+                input_connectors: BTreeMap::new(),
+                output_connectors: BTreeMap::new(),
+                circuit_ir: None,
+                dataflow: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_rust(tenant_id, pipeline.id, Version(1))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_success(
+            tenant_id,
+            pipeline.id,
+            Version(1),
+            &RustCompilationInfo {
+                exit_code: 0,
+                stdout: "".to_string(),
+                stderr: "".to_string(),
+                messages: vec![],
+            },
+            "def",
+            "123",
+            "456",
+        )
+        .await
+        .unwrap();
+    async fn start(db: &StoragePostgres, tenant_id: TenantId, version: Version) {
+        let pipeline = db.get_pipeline(tenant_id, "resized").await.unwrap();
+        db.set_deployment_resources_desired_status_provisioned(
+            tenant_id,
+            "resized",
+            RuntimeDesiredStatus::Paused,
+            BootstrapConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        db.transit_deployment_resources_status_to_provisioning(
+            tenant_id,
+            pipeline.id,
+            version,
+            Uuid::nil(),
+            serde_json::to_value(generate_pipeline_config(
+                pipeline.id,
+                &pipeline.name,
+                &serde_json::from_value(pipeline.runtime_config.clone()).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.transit_deployment_resources_status_to_provisioned(
+            tenant_id,
+            pipeline.id,
+            version,
+            "location",
+            json!({}),
+            RuntimeStatus::Initializing,
+            json!(""),
+            RuntimeDesiredStatus::Paused,
+        )
+        .await
+        .unwrap();
+    }
+    async fn stop(db: &StoragePostgres, tenant_id: TenantId, version: Version) {
+        let pipeline = db.get_pipeline(tenant_id, "resized").await.unwrap();
+        db.set_deployment_resources_desired_status_stopped(tenant_id, "resized")
+            .await
+            .unwrap();
+        db.transit_deployment_resources_status_to_stopping(
+            tenant_id,
+            pipeline.id,
+            version,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.transit_deployment_resources_status_to_stopped(tenant_id, pipeline.id, version)
+            .await
+            .unwrap();
+    }
+
+    // Running: the patch writes the deployment configuration only
+    start(&handle.db, tenant_id, Version(1)).await;
+    let before = handle.db.get_pipeline(tenant_id, "resized").await.unwrap();
+    let returned = handle
+        .db
+        .patch_pipeline_deployment(tenant_id, "resized", &patch)
+        .await
+        .unwrap();
+    let after = handle.db.get_pipeline(tenant_id, "resized").await.unwrap();
+    assert_eq!(returned, after);
+    let resized = after.deployment_config.clone().unwrap();
+    assert_eq!(resized["resources"]["cpu_cores_min"], json!(1.0));
+    assert_eq!(resized["resources"]["memory_min"], json!("3G"));
+    assert_eq!(after.runtime_config, before.runtime_config);
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.refresh_version, Version(before.refresh_version.0 + 1));
+
+    // Running: an invalid patch changes nothing
+    let invalid =
+        parse_deployment_config_patch(&json!({"resources": {"cpu_cores_min": 9.0}})).unwrap();
+    assert!(matches!(
+        handle
+            .db
+            .patch_pipeline_deployment(tenant_id, "resized", &invalid)
+            .await
+            .unwrap_err(),
+        DBError::InvalidDeploymentPatch { .. }
+    ));
+    let unchanged = handle.db.get_pipeline(tenant_id, "resized").await.unwrap();
+    assert_eq!(unchanged.deployment_config, after.deployment_config);
+    assert_eq!(unchanged.refresh_version, after.refresh_version);
+
+    // Stopping requested: refused although still provisioned
+    handle
+        .db
+        .set_deployment_resources_desired_status_stopped(tenant_id, "resized")
+        .await
+        .unwrap();
+    assert!(matches!(
+        handle
+            .db
+            .patch_pipeline_deployment(tenant_id, "resized", &patch)
+            .await
+            .unwrap_err(),
+        DBError::DeploymentRestrictedToRunning
+    ));
+
+    // Stopped: the resized deployment configuration is kept
+    stop(&handle.db, tenant_id, Version(1)).await;
+    let stopped = handle.db.get_pipeline(tenant_id, "resized").await.unwrap();
+    assert_eq!(stopped.deployment_config, Some(resized.clone()));
+
+    // Stopped: a full update (PUT) with the same runtime config keeps the resize
+    let (is_new, put) = handle
+        .db
+        .new_or_update_pipeline(
+            tenant_id,
+            Uuid::now_v7(),
+            "resized",
+            "v0",
+            true,
+            PipelineDescr {
+                name: "resized".to_string(),
+                description: "after a PUT".to_string(),
+                tags: vec![],
+                runtime_config: stopped.runtime_config.clone(),
+                program_code: "".to_string(),
+                udf_rust: "".to_string(),
+                udf_toml: "".to_string(),
+                program_config: stopped.program_config.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!is_new);
+    assert_eq!(put.deployment_config, Some(resized.clone()));
+
+    // Stopped: an edit of other fields keeps the resize, a CPU or memory edit replaces it
+    let edit = |runtime_config: serde_json::Value| {
+        let db = &handle.db;
+        async move {
+            db.update_pipeline(
+                tenant_id,
+                "resized",
+                &None,
+                &PatchClientMetadata::default(),
+                "v0",
+                false,
+                &Some(runtime_config),
+                &None,
+                &None,
+                &None,
+                &None,
+            )
+            .await
+            .unwrap()
+            .deployment_config
+            .unwrap()
+        }
+    };
+    let mut runtime_config = stopped.runtime_config.clone();
+    runtime_config["min_batch_size_records"] = json!(7);
+    assert_eq!(edit(runtime_config.clone()).await, resized);
+    runtime_config["resources"]["cpu_cores_min"] = json!(2.5);
+    let edited = edit(runtime_config).await;
+    assert_eq!(edited["resources"]["cpu_cores_min"], json!(2.5));
+    assert_eq!(edited["resources"]["memory_min"], json!("4G"));
+}
+
 #[tokio::test]
 async fn pipeline_deployment() {
     let handle = test_setup().await;
@@ -1868,6 +3923,7 @@ async fn pipeline_deployment() {
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
                 output_connectors: BTreeMap::new(),
+                circuit_ir: None,
                 dataflow: None,
             })
             .unwrap(),
@@ -1903,11 +3959,7 @@ async fn pipeline_deployment() {
             tenant_id,
             pipeline1.id,
             Version(1),
-            &RustCompilationInfo {
-                exit_code: 0,
-                stdout: "".to_string(),
-                stderr: "".to_string(),
-            },
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
             "def",
             "123",
             "456",
@@ -2125,11 +4177,24 @@ async fn pipeline_deployment() {
             .refresh_version,
         Version(10)
     );
+    let before_stop = handle
+        .db
+        .get_pipeline_by_id(tenant_id, pipeline1.id)
+        .await
+        .unwrap();
+    assert!(before_stop.deployment_config.is_some());
     handle
         .db
         .transit_deployment_resources_status_to_stopped(tenant_id, pipeline1.id, Version(1))
         .await
         .unwrap();
+    let stopped = handle
+        .db
+        .get_pipeline_by_id(tenant_id, pipeline1.id)
+        .await
+        .unwrap();
+    assert_eq!(stopped.deployment_config, before_stop.deployment_config);
+    assert_eq!(stopped.deployment_location, None);
     handle
         .db
         .set_deployment_resources_desired_status_provisioned(
@@ -2270,6 +4335,15 @@ async fn pipeline_deployment() {
         .transit_storage_status_to_cleared(tenant_id, pipeline1.id)
         .await
         .unwrap();
+    assert!(
+        handle
+            .db
+            .get_pipeline_by_id(tenant_id, pipeline1.id)
+            .await
+            .unwrap()
+            .deployment_config
+            .is_some()
+    );
     handle
         .db
         .set_deployment_resources_desired_status_provisioned(
@@ -2533,6 +4607,280 @@ async fn pipeline_start_fails() {
 /// Pipeline can only transition from `Stopped` to `Provisioning` if the version guard
 /// presented matches.
 #[tokio::test]
+async fn sql_compilation_clear_recovers_every_stranded_program() {
+    // A worker clears, before taking its next job, the rows in its shard that nothing else
+    // will advance. `get_next_sql_compilation` claims only `Stopped` + `Pending` + this
+    // platform version, so a row is stranded either because this worker died holding it, or
+    // because it names a platform version no running worker matches.
+    //
+    // Behavioural, not a model-versus-implementation comparison: the predicate is written
+    // twice, once in SQL and once in the model, and dropping a case from both at once would
+    // leave those two agreeing with each other and wrong.
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+
+    let descr = |name: &'static str| PipelineDescr {
+        name: name.to_string(),
+        description: "".to_string(),
+        tags: vec![],
+        runtime_config: json!({}),
+        program_code: "".to_string(),
+        udf_rust: "".to_string(),
+        udf_toml: "".to_string(),
+        program_config: json!({}),
+    };
+
+    // Interrupted by this worker's previous incarnation: same platform version.
+    let ours = handle
+        .db
+        .new_pipeline(tenant_id, Uuid::now_v7(), "v0", descr("ours"))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, ours.id, Version(1))
+        .await
+        .unwrap();
+
+    // Claimed by a worker of a platform version that no longer runs.
+    let stale_platform = handle
+        .db
+        .new_pipeline(tenant_id, Uuid::now_v7(), "v_old", descr("stale_platform"))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, stale_platform.id, Version(1))
+        .await
+        .unwrap();
+
+    // Waiting to be compiled, but on a platform version the claim query will not match.
+    let stale_pending = handle
+        .db
+        .new_pipeline(tenant_id, Uuid::now_v7(), "v_old", descr("stale_pending"))
+        .await
+        .unwrap();
+
+    handle
+        .db
+        .clear_ongoing_sql_compilation_for_worker("v0", 0, 1)
+        .await
+        .unwrap();
+
+    for (pipeline, name) in [
+        (&ours, "ours"),
+        (&stale_platform, "stale_platform"),
+        (&stale_pending, "stale_pending"),
+    ] {
+        let after = handle.db.get_pipeline(tenant_id, name).await.unwrap();
+        assert_eq!(
+            after.program_status,
+            ProgramStatus::Pending,
+            "{name}: must be claimable again"
+        );
+        assert_eq!(
+            after.platform_version, "v0",
+            "{name}: must name the platform version the claim query matches"
+        );
+        let _ = pipeline;
+    }
+}
+
+#[tokio::test]
+async fn artifact_retention_covers_both_compiling_statuses() {
+    // `runtime_version` is an unstable feature; without it `program_config`'s selector is
+    // ignored and every program looks like a platform one.
+    crate::enable_test_unstable_features();
+
+    // Artifact cleanup keeps what this list names and removes the rest, so a program whose
+    // artifacts are on disk must appear here even before its checksums are recorded. Both
+    // compiling statuses cover such a window: `CompilingRust` for the binary and program
+    // info a legacy program delivers, `CompilingSql` for the program info a Gen-2 program
+    // delivers, which is its only artifact.
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+
+    let make = |name: &'static str| PipelineDescr {
+        name: name.to_string(),
+        description: "".to_string(),
+        tags: vec![],
+        runtime_config: json!({}),
+        program_code: "".to_string(),
+        udf_rust: "".to_string(),
+        udf_toml: "".to_string(),
+        program_config: json!({ "runtime_version": "gen2" }),
+    };
+
+    // Left in `Pending`: nothing has been delivered, so nothing must be retained.
+    let pending = handle
+        .db
+        .new_pipeline(tenant_id, Uuid::now_v7(), "v0", make("pending"))
+        .await
+        .unwrap();
+    // Moved to `CompilingSql`, the status a Gen-2 program is in when it delivers.
+    let compiling = handle
+        .db
+        .new_pipeline(tenant_id, Uuid::now_v7(), "v0", make("compiling"))
+        .await
+        .unwrap();
+    handle
+        .db
+        .transit_program_status_to_compiling_sql(tenant_id, compiling.id, Version(1))
+        .await
+        .unwrap();
+
+    let listed = handle
+        .db
+        .list_pipeline_programs_across_all_tenants()
+        .await
+        .unwrap();
+    let ids: Vec<PipelineId> = listed.iter().map(|p| p.pipeline_id).collect();
+    assert!(
+        ids.contains(&compiling.id),
+        "a CompilingSql program must be retained: its program info is already on disk"
+    );
+    assert!(
+        !ids.contains(&pending.id),
+        "a Pending program has delivered nothing and must not hold artifacts"
+    );
+
+    let entry = listed
+        .iter()
+        .find(|p| p.pipeline_id == compiling.id)
+        .unwrap();
+    assert!(
+        entry.is_gen2,
+        "the runtime selector is read from program_config"
+    );
+    assert_eq!(
+        entry.program_info_integrity_checksum, None,
+        "the checksum is not recorded until the row reaches Success, which is why the \
+         relaxed prefix has to cover this window"
+    );
+}
+
+#[tokio::test]
+async fn runner_descriptor_uses_runtime_compatibility_not_string_equality() {
+    // A pipeline compiled for one platform version, asked for by a runner naming another.
+    // Readiness is decided by `is_supported_runtime`, not by comparing the two strings, so
+    // the runner gets the complete descriptor it needs to provision.
+    //
+    // Drives the model and the implementation through the same steps and compares them, the
+    // way `db_impl_behaves_like_model` does, because the divergence was in the model alone:
+    // asserting on the implementation would pass either way. Deterministic, where the
+    // property test reaches this only when its generator happens to name a different
+    // platform version.
+    let handle = test_setup().await;
+    let tenant_id = TenantRecord::default().id;
+    let model = Mutex::new(DbModel {
+        tenants: BTreeMap::from([(tenant_id, TenantRecord::default())]),
+        api_keys: BTreeMap::new(),
+        pipelines: BTreeMap::new(),
+        pipeline_events: BTreeMap::new(),
+        cluster_events: BTreeMap::new(),
+        oidc_trusts: BTreeMap::new(),
+        users: BTreeMap::new(),
+        memberships: BTreeMap::new(),
+    });
+
+    let pipeline_id = Uuid::now_v7();
+    let descr = PipelineDescr {
+        name: "example1".to_string(),
+        description: "".to_string(),
+        tags: vec![],
+        runtime_config: json!({}),
+        program_code: "".to_string(),
+        udf_rust: "".to_string(),
+        udf_toml: "".to_string(),
+        program_config: json!({}),
+    };
+    let program_info = serde_json::to_value(ProgramInfo {
+        schema: serde_json::to_value(ProgramSchema {
+            inputs: vec![],
+            outputs: vec![],
+        })
+        .unwrap(),
+        main_rust: "".to_string(),
+        udf_stubs: "".to_string(),
+        input_connectors: BTreeMap::new(),
+        output_connectors: BTreeMap::new(),
+        circuit_ir: None,
+        dataflow: None,
+    })
+    .unwrap();
+    let sql_info = SqlCompilationInfo {
+        exit_code: 0,
+        messages: vec![],
+    };
+    let rust_info =
+        RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string());
+
+    // Compile the pipeline to Success on platform version "v0", on both sides.
+    for db in [&model as &dyn Storage, &handle.db as &dyn Storage] {
+        db.new_pipeline(tenant_id, pipeline_id, "v0", descr.clone())
+            .await
+            .unwrap();
+        let id = PipelineId(pipeline_id);
+        db.transit_program_status_to_compiling_sql(tenant_id, id, Version(1))
+            .await
+            .unwrap();
+        db.transit_program_status_to_sql_compiled(
+            tenant_id,
+            id,
+            Version(1),
+            &sql_info,
+            &program_info,
+        )
+        .await
+        .unwrap();
+        db.transit_program_status_to_compiling_rust(tenant_id, id, Version(1))
+            .await
+            .unwrap();
+        db.transit_program_status_to_success(
+            tenant_id,
+            id,
+            Version(1),
+            &rust_info,
+            "def",
+            "123",
+            "456",
+        )
+        .await
+        .unwrap();
+        db.set_deployment_resources_desired_status_provisioned(
+            tenant_id,
+            &descr.name,
+            RuntimeDesiredStatus::Running,
+            BootstrapConfig::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Ask as a runner on "v1" for a pipeline compiled on "v0".
+    let id = PipelineId(pipeline_id);
+    let from_model = model
+        .get_pipeline_by_id_for_runner(tenant_id, id, "v1", false)
+        .await
+        .unwrap();
+    let from_impl = handle
+        .db
+        .get_pipeline_by_id_for_runner(tenant_id, id, "v1", false)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(from_impl, ExtendedPipelineDescrRunner::Complete(_)),
+        "a differing platform version must not by itself withhold the complete descriptor"
+    );
+    assert_eq!(
+        std::mem::discriminant(&from_model),
+        std::mem::discriminant(&from_impl),
+        "the model must decide runner readiness the way the implementation does"
+    );
+}
+#[tokio::test]
 async fn pipeline_provision_version_guard() {
     let handle = test_setup().await;
     let tenant_id = TenantRecord::default().id;
@@ -2584,6 +4932,7 @@ async fn pipeline_provision_version_guard() {
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
                 output_connectors: BTreeMap::new(),
+                circuit_ir: None,
                 dataflow: None,
             })
             .unwrap(),
@@ -2601,11 +4950,7 @@ async fn pipeline_provision_version_guard() {
             tenant_id,
             pipeline.id,
             Version(1),
-            &RustCompilationInfo {
-                exit_code: 0,
-                stdout: "".to_string(),
-                stderr: "".to_string(),
-            },
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
             "def",
             "123",
             "456",
@@ -2643,11 +4988,11 @@ async fn pipeline_provision_version_guard() {
             &PatchClientMetadata::default(),
             "v0",
             false,
-            &Some(
-                serde_json::to_value(RuntimeConfig {
+            &Some({
+                let config = RuntimeConfig {
                     workers: 10,
-                    max_rss_mb: None,
-                    datafusion_memory_mb: None,
+                    max_rss: None,
+                    datafusion_memory: None,
                     hosts: 1,
                     storage: None,
                     fault_tolerance: FtConfig::default(),
@@ -2655,12 +5000,12 @@ async fn pipeline_provision_version_guard() {
                     tracing: false,
                     tracing_endpoint_jaeger: "".to_string(),
                     min_batch_size_records: 0,
-                    max_buffering_delay_usecs: 0,
+                    max_buffering_delay: None,
                     resources: Default::default(),
-                    clock_resolution_usecs: None,
+                    clock_resolution: None,
                     clock_timezone_offset: None,
                     pin_cpus: Vec::new(),
-                    provisioning_timeout_secs: None,
+                    provisioning_timeout: None,
                     max_parallel_connector_init: None,
                     init_containers: None,
                     checkpoint_during_suspend: false,
@@ -2670,9 +5015,9 @@ async fn pipeline_provision_version_guard() {
                     env: BTreeMap::new(),
                     logging: None,
                     pipeline_template_configmap: None,
-                })
-                .unwrap(),
-            ),
+                };
+                serde_json::to_value(config).unwrap()
+            }),
             &None,
             &None,
             &None,
@@ -2839,6 +5184,7 @@ async fn pipeline_client_metadata_update_while_running() {
                 udf_stubs: "".to_string(),
                 input_connectors: BTreeMap::new(),
                 output_connectors: BTreeMap::new(),
+                circuit_ir: None,
                 dataflow: None,
             })
             .unwrap(),
@@ -2856,11 +5202,7 @@ async fn pipeline_client_metadata_update_while_running() {
             tenant_id,
             pipeline.id,
             Version(1),
-            &RustCompilationInfo {
-                exit_code: 0,
-                stdout: "".to_string(),
-                stderr: "".to_string(),
-            },
+            &RustCompilationInfo::from_process_output_streams(0, "".to_string(), "".to_string()),
             "def",
             "123",
             "456",
@@ -2978,6 +5320,73 @@ async fn pipeline_client_metadata_update_while_running() {
     assert_eq!(unchanged.refresh_version, before.refresh_version);
 }
 
+/// Reads the lock timeout that applies to `client`, in milliseconds. Zero is
+/// the Postgres default and means a statement waits for a lock indefinitely.
+async fn lock_timeout_ms(client: &impl GenericClient) -> i64 {
+    client
+        .query_one(
+            "SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// A failed statement has to report what the server said. `tokio_postgres`
+/// displays the category the failure falls into and leaves the message itself to
+/// the error it wraps, so a report of the outermost error alone is useless for
+/// diagnosis.
+#[tokio::test]
+async fn postgres_error_reports_what_the_server_said() {
+    let handle = test_setup().await;
+    let mut client = handle.db.pool.get().await.unwrap();
+    let txn = transaction::begin(&mut client).await.unwrap();
+
+    let error: DBError = txn.batch_execute("SELECT 1/0").await.unwrap_err().into();
+    let reported = error.to_string();
+    assert!(
+        reported.contains("division by zero"),
+        "the server's message is missing from {reported:?}"
+    );
+}
+
+/// The lock timeout has to be carried by each transaction rather than by the
+/// connection: a pooler in between rejects the connection option that would
+/// carry it, and a session-level setting does not follow the client to the
+/// server connection its next transaction lands on.
+#[tokio::test]
+async fn transaction_lock_timeout_is_transaction_local() {
+    let handle = test_setup().await;
+    let mut client = handle.db.pool.get().await.unwrap();
+    let expected_ms = LOCK_TIMEOUT.as_millis() as i64;
+
+    // The session holds no timeout of its own: the test server leaves the
+    // parameter at the Postgres default of waiting indefinitely.
+    assert_eq!(
+        lock_timeout_ms(&client).await,
+        0,
+        "the connection carries the lock timeout instead of leaving it to each transaction"
+    );
+
+    let txn = transaction::begin(&mut client).await.unwrap();
+    assert_eq!(lock_timeout_ms(&txn).await, expected_ms);
+    txn.commit().await.unwrap();
+
+    assert_eq!(
+        lock_timeout_ms(&client).await,
+        0,
+        "the lock timeout outlived its transaction, so it can leak to whichever \
+         client uses this connection next"
+    );
+
+    // Read-only transactions are bounded as well: reading a row still waits for
+    // any conflicting lock a schema change holds.
+    let txn = transaction::begin_read_only(&mut client).await.unwrap();
+    assert_eq!(lock_timeout_ms(&txn).await, expected_ms);
+    txn.commit().await.unwrap();
+}
+
 #[tokio::test]
 async fn pipeline_concurrent_access_stall() {
     let handle = test_setup().await;
@@ -3010,8 +5419,8 @@ async fn pipeline_concurrent_access_stall() {
 
     // Non-conflicting
     for (row_lock1, row_lock2) in [(false, false), (true, false), (false, true)] {
-        let txn1 = client1.transaction().await.unwrap();
-        let txn2 = client2.transaction().await.unwrap();
+        let txn1 = transaction::begin(&mut client1).await.unwrap();
+        let txn2 = transaction::begin(&mut client2).await.unwrap();
         get_pipeline_by_id_for_monitoring(&txn1, tenant_id, pipeline.id, row_lock1)
             .await
             .unwrap();
@@ -3022,17 +5431,15 @@ async fn pipeline_concurrent_access_stall() {
         txn2.commit().await.unwrap();
     }
 
-    // Conflicting
-    let txn1 = client1.transaction().await.unwrap();
-    let txn2 = client2.transaction().await.unwrap();
+    // Conflicting. Both transactions are started the way the manager starts
+    // them, which is what bounds the wait for the row lock: the test would hang
+    // here if that bound were lost. It consequently runs for the duration of
+    // the timeout.
+    let txn1 = transaction::begin(&mut client1).await.unwrap();
+    let txn2 = transaction::begin(&mut client2).await.unwrap();
     get_pipeline_by_id_for_monitoring(&txn1, tenant_id, pipeline.id, true)
         .await
         .unwrap();
-    // The lock timeout has been set globally via an option. As such, the below is not needed.
-    // This test does take some time as a consequence (the actual timeout used: 10 seconds).
-    // However, this is an important check to make sure that when the system is deployed,
-    // the lock timeout is enforced.
-    // txn2.execute("SET LOCAL lock_timeout = 10000", &[]).await.unwrap();
     let ts_start = Instant::now();
     let error = get_pipeline_by_id_for_monitoring(&txn2, tenant_id, pipeline.id, true)
         .await
@@ -3043,7 +5450,10 @@ async fn pipeline_concurrent_access_stall() {
         DBError::LockTookTooLong
     );
     let elapsed = ts_start.elapsed();
-    assert!(elapsed >= Duration::from_millis(8000) && elapsed <= Duration::from_millis(30000));
+    assert!(
+        elapsed >= LOCK_TIMEOUT.mul_f64(0.8) && elapsed <= LOCK_TIMEOUT * 3,
+        "waited {elapsed:?} for the row lock, which is not around the {LOCK_TIMEOUT:?} timeout"
+    );
     txn1.commit().await.unwrap();
     txn2.commit().await.unwrap();
 }
@@ -3102,13 +5512,13 @@ async fn pipeline_concurrent_access_deadlock() {
     // - T2 tries to lock pipeline 1 -> waits or deadlock
     let mut client1 = handle.db.pool.get().await.unwrap();
     let mut client2 = handle.db.pool.get().await.unwrap();
-    let txn2 = client2.transaction().await.unwrap();
+    let txn2 = transaction::begin(&mut client2).await.unwrap();
     get_pipeline_by_id_for_monitoring(&txn2, tenant_id, pipeline2.id, true)
         .await
         .unwrap();
     let (tx, rx) = oneshot::channel::<()>();
     let join_handle = spawn(async move {
-        let txn1 = client1.transaction().await.unwrap();
+        let txn1 = transaction::begin(&mut client1).await.unwrap();
         get_pipeline_by_id_for_monitoring(&txn1, tenant_id, pipeline1.id, true)
             .await
             .unwrap();
@@ -3119,16 +5529,12 @@ async fn pipeline_concurrent_access_deadlock() {
             return Some(e);
         }
         txn1.commit().await.unwrap();
-        return None;
+        None
     });
     rx.await.unwrap();
-    let t2_error = if let Err(e) =
-        get_pipeline_by_id_for_monitoring(&txn2, tenant_id, pipeline1.id, true).await
-    {
-        Some(e)
-    } else {
-        None
-    };
+    let t2_error = get_pipeline_by_id_for_monitoring(&txn2, tenant_id, pipeline1.id, true)
+        .await
+        .err();
     let t1_error = join_handle.await.unwrap();
     assert!(!(t1_error.is_some() && t2_error.is_some()));
     let error = t1_error.unwrap_or_else(|| {
@@ -3144,6 +5550,344 @@ async fn pipeline_concurrent_access_deadlock() {
 //////////////////////////////////////////////////////////////////////////////
 /////                           PROP TESTS                               /////
 
+/// Compare the model and the implementation for one OIDC trust or membership
+/// action. Kept out of the main dispatch loop so its locals do not add to that
+/// already very large future.
+async fn check_rbac_action(
+    i: usize,
+    model: &Mutex<DbModel>,
+    handle: &DbHandle,
+    action: RbacAction,
+) {
+    match action {
+        RbacAction::ListOidcTrust(tenant_id) => {
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let mut model_response = model.list_oidc_trust(tenant_id).await.unwrap();
+            let mut impl_response = handle.db.list_oidc_trust(tenant_id).await.unwrap();
+            model_response.sort_by(|a, b| a.name.cmp(&b.name));
+            impl_response.sort_by(|a, b| a.name.cmp(&b.name));
+            assert_eq!(model_response, impl_response);
+        }
+        RbacAction::GetOidcTrust(tenant_id, name) => {
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model.get_oidc_trust(tenant_id, &name).await;
+            let impl_response = handle.db.get_oidc_trust(tenant_id, &name).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::DeleteOidcTrust(tenant_id, name) => {
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model.delete_oidc_trust(tenant_id, &name).await;
+            let impl_response = handle.db.delete_oidc_trust(tenant_id, &name).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::CreateOidcTrust(
+            tenant_id,
+            name,
+            description,
+            issuer,
+            subject,
+            audience,
+            role,
+        ) => {
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let id = trust_id_for(&name);
+            let role = role.role();
+            let model_response = model
+                .create_oidc_trust(
+                    tenant_id,
+                    id,
+                    &name,
+                    description.as_deref(),
+                    &issuer,
+                    &subject,
+                    audience.as_deref(),
+                    role,
+                    TenantIssuerPolicy::PublicHttpsOnly,
+                )
+                .await;
+            let impl_response = handle
+                .db
+                .create_oidc_trust(
+                    tenant_id,
+                    id,
+                    &name,
+                    description.as_deref(),
+                    &issuer,
+                    &subject,
+                    audience.as_deref(),
+                    role,
+                    TenantIssuerPolicy::PublicHttpsOnly,
+                )
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::IsTrustedIssuer(issuer) => {
+            let model_response = model.is_trusted_issuer(&issuer).await;
+            let impl_response = handle.db.is_trusted_issuer(&issuer).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::MatchOidcTrust(issuer, subject, audiences) => {
+            let model_response = model.match_oidc_trust(&issuer, &subject, &audiences).await;
+            let impl_response = handle
+                .db
+                .match_oidc_trust(&issuer, &subject, &audiences)
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::RenameTenant(tenant_id, new_name, displace_existing) => {
+            let model_response = model
+                .rename_tenant(tenant_id, &new_name, displace_existing)
+                .await;
+            let impl_response = handle
+                .db
+                .rename_tenant(tenant_id, &new_name, displace_existing)
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::DeleteTenant(tenant_id) => {
+            let model_response = model.delete_tenant(tenant_id).await;
+            let impl_response = handle.db.delete_tenant(tenant_id).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::ListTenants => {
+            let mut model_response = model.list_tenants().await.unwrap();
+            let mut impl_response = handle.db.list_tenants().await.unwrap();
+            model_response.sort_by_key(|a| a.id);
+            impl_response.sort_by_key(|a| a.id);
+            assert_eq!(model_response, impl_response);
+        }
+        RbacAction::GetTenantById(tenant_id) => {
+            // Not seeded first, so the id-selector miss path is exercised too.
+            let selector = tenant_id.0.to_string();
+            let model_response = model.get_tenant(&selector).await;
+            let impl_response = handle.db.get_tenant(&selector).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::GetTenantByName(name) => {
+            let model_response = model.get_tenant(&name).await;
+            let impl_response = handle.db.get_tenant(&name).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::CreateTenant(name, provider) => {
+            // Both sides get the same fresh id; only a creation uses it. The
+            // provider varies so that the exists path returning the stored
+            // rather than the passed provider is observable.
+            let new_id = Uuid::now_v7();
+            let model_response = model.get_or_create_tenant(new_id, &name, &provider).await;
+            let impl_response = handle
+                .db
+                .get_or_create_tenant(new_id, &name, &provider)
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::GetOrCreateUser((provider, subject), email) => {
+            let id = user_id_for_identity(&provider, &subject);
+            let model_response = model
+                .get_or_create_user(id, &provider, &subject, email.as_deref())
+                .await;
+            let impl_response = handle
+                .db
+                .get_or_create_user(id, &provider, &subject, email.as_deref())
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::ListTenantMembers(tenant_id) => {
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model.list_tenant_members(tenant_id).await;
+            let impl_response = handle.db.list_tenant_members(tenant_id).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::EnrollInExistingTenants((provider, subject), names, role) => {
+            let new_user_id = user_id_for_identity(&provider, &subject);
+            let model_response = model
+                .enroll_in_existing_tenants(
+                    new_user_id,
+                    &provider,
+                    &subject,
+                    None,
+                    &names,
+                    role.role(),
+                    MembershipOrigin::Api,
+                )
+                .await;
+            let impl_response = handle
+                .db
+                .enroll_in_existing_tenants(
+                    new_user_id,
+                    &provider,
+                    &subject,
+                    None,
+                    &names,
+                    role.role(),
+                    MembershipOrigin::Api,
+                )
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::ListUserMemberships((provider, subject)) => {
+            // Sorted by id on both sides: Postgres collates names by locale,
+            // Rust by bytes, and the order is not what this action checks.
+            // The clocks differ, so only the presence of a creation time is
+            // compared.
+            let (mut model_memberships, model_created_at) = model
+                .list_user_memberships(&provider, &subject)
+                .await
+                .unwrap();
+            let (mut impl_memberships, impl_created_at) = handle
+                .db
+                .list_user_memberships(&provider, &subject)
+                .await
+                .unwrap();
+            model_memberships.sort_by_key(|m| m.tenant_id);
+            impl_memberships.sort_by_key(|m| m.tenant_id);
+            assert_eq!(model_memberships, impl_memberships);
+            assert_eq!(model_created_at.is_some(), impl_created_at.is_some());
+        }
+        RbacAction::UpsertMemberRole(tenant_id, (provider, subject), role) => {
+            let user_id = user_id_for_identity(&provider, &subject);
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model
+                .upsert_member_role(
+                    tenant_id,
+                    UserId(user_id),
+                    role.role(),
+                    MembershipOrigin::Api,
+                )
+                .await;
+            let impl_response = handle
+                .db
+                .upsert_member_role(
+                    tenant_id,
+                    UserId(user_id),
+                    role.role(),
+                    MembershipOrigin::Api,
+                )
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::RemoveMember(tenant_id, (provider, subject)) => {
+            let user_id = user_id_for_identity(&provider, &subject);
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model.remove_member(tenant_id, UserId(user_id)).await;
+            let impl_response = handle.db.remove_member(tenant_id, UserId(user_id)).await;
+            check_responses(i, model_response, impl_response);
+        }
+        RbacAction::PreprovisionMember(tenant_id, (provider, subject), email, role) => {
+            let new_user_id = user_id_for_identity(&provider, &subject);
+            create_tenants_if_not_exists(model, handle, tenant_id)
+                .await
+                .unwrap();
+            let model_response = model
+                .preprovision_member(
+                    new_user_id,
+                    tenant_id,
+                    &provider,
+                    &subject,
+                    email.as_deref(),
+                    role.role(),
+                )
+                .await;
+            let impl_response = handle
+                .db
+                .preprovision_member(
+                    new_user_id,
+                    tenant_id,
+                    &provider,
+                    &subject,
+                    email.as_deref(),
+                    role.role(),
+                )
+                .await;
+            check_responses(i, model_response, impl_response);
+        }
+    }
+}
+
+/// Actions covering OIDC trust relationships and tenant membership.
+#[derive(Debug, Clone, Arbitrary)]
+enum RbacAction {
+    // OIDC trust relationships, which always belong to one tenant and carry an
+    // assignable role: `owner` comes from configuration, never from a row.
+    ListOidcTrust(TenantId),
+    GetOidcTrust(
+        TenantId,
+        #[proptest(strategy = "limited_oidc_trust_name()")] String,
+    ),
+    DeleteOidcTrust(
+        TenantId,
+        #[proptest(strategy = "limited_oidc_trust_name()")] String,
+    ),
+    CreateOidcTrust(
+        TenantId,
+        #[proptest(strategy = "limited_oidc_trust_name()")] String,
+        Option<String>,
+        #[proptest(strategy = "limited_issuer()")] String,
+        #[proptest(strategy = "limited_claim_pattern()")] String,
+        #[proptest(strategy = "proptest::option::of(limited_claim_pattern())")] Option<String>,
+        MemberRole,
+    ),
+    IsTrustedIssuer(#[proptest(strategy = "limited_issuer()")] String),
+    MatchOidcTrust(
+        #[proptest(strategy = "limited_issuer()")] String,
+        #[proptest(strategy = "limited_claim_value()")] String,
+        #[proptest(strategy = "prop::collection::vec(limited_claim_value(), 0..3)")] Vec<String>,
+    ),
+    RenameTenant(
+        TenantId,
+        #[proptest(strategy = "limited_tenant_name()")] String,
+        bool,
+    ),
+    DeleteTenant(TenantId),
+    // Users and tenant memberships
+    ListTenants,
+    GetTenantById(TenantId),
+    GetTenantByName(#[proptest(strategy = "limited_tenant_name()")] String),
+    CreateTenant(
+        #[proptest(strategy = "limited_tenant_name()")] String,
+        #[proptest(strategy = "limited_issuer()")] String,
+    ),
+    GetOrCreateUser(
+        #[proptest(strategy = "limited_identity()")] (String, String),
+        #[proptest(strategy = "limited_email()")] Option<String>,
+    ),
+    ListTenantMembers(TenantId),
+    ListUserMemberships(#[proptest(strategy = "limited_identity()")] (String, String)),
+    EnrollInExistingTenants(
+        #[proptest(strategy = "limited_identity()")] (String, String),
+        #[proptest(strategy = "prop::collection::vec(limited_tenant_name(), 0..3)")] Vec<String>,
+        MemberRole,
+    ),
+    UpsertMemberRole(
+        TenantId,
+        #[proptest(strategy = "limited_identity()")] (String, String),
+        MemberRole,
+    ),
+    RemoveMember(
+        TenantId,
+        #[proptest(strategy = "limited_identity()")] (String, String),
+    ),
+    PreprovisionMember(
+        TenantId,
+        #[proptest(strategy = "limited_identity()")] (String, String),
+        #[proptest(strategy = "limited_email()")] Option<String>,
+        MemberRole,
+    ),
+}
+
 /// Actions we can do on the Storage trait.
 #[derive(Debug, Clone, Arbitrary)]
 enum StorageAction {
@@ -3156,7 +5900,7 @@ enum StorageAction {
         #[proptest(strategy = "limited_uuid()")] Uuid,
         String,
         String,
-        Vec<ApiPermission>,
+        MintableKeyRole,
     ),
     ValidateApiKey(TenantId, String),
     // Pipelines
@@ -3222,6 +5966,14 @@ enum StorageAction {
         #[proptest(strategy = "limited_program_binary_integrity_checksum()")] String,
         #[proptest(strategy = "limited_program_info_integrity_checksum()")] String,
     ),
+    TransitProgramStatusToSuccessNoBinary(
+        TenantId,
+        PipelineId,
+        Version,
+        #[proptest(strategy = "limited_sql_compilation_info()")] SqlCompilationInfo,
+        #[proptest(strategy = "limited_program_info()")] serde_json::Value,
+        #[proptest(strategy = "limited_program_info_integrity_checksum()")] String,
+    ),
     TransitProgramStatusToSqlError(
         TenantId,
         PipelineId,
@@ -3257,6 +6009,11 @@ enum StorageAction {
         PipelineId,
         Version,
         #[proptest(strategy = "limited_resources_details()")] serde_json::Value,
+    ),
+    PatchPipelineDeployment(
+        TenantId,
+        #[proptest(strategy = "limited_pipeline_name()")] String,
+        #[proptest(strategy = "limited_patch_pipeline_deployment()")] PipelineDeploymentConfig,
     ),
     TransitDeploymentResourcesStatusToProvisioned(
         TenantId,
@@ -3315,6 +6072,7 @@ enum StorageAction {
     GetNextSqlCompilation(#[proptest(strategy = "limited_platform_version()")] String),
     ClearOngoingRustCompilation(#[proptest(strategy = "limited_platform_version()")] String),
     GetNextRustCompilation(#[proptest(strategy = "limited_platform_version()")] String),
+    CountPipelinesNeedingCompilation,
     ListPipelineProgramsAcrossAllTenants,
     ListClusterMonitorEvents,
     GetClusterMonitorEventShort(ClusterMonitorEventId),
@@ -3468,10 +6226,14 @@ fn check_responses<T: Debug + PartialEq>(
             "mismatch detected with model (left) and impl (right)"
         ),
         (Err(err_model), Ok(val_impl)) => {
-            panic!("step({step}): model returned error: {err_model:?}, but impl returned result: {val_impl:?}");
+            panic!(
+                "step({step}): model returned error: {err_model:?}, but impl returned result: {val_impl:?}"
+            );
         }
         (Ok(val_model), Err(err_impl)) => {
-            panic!("step({step}): model returned result: {val_model:?}, but impl returned error: {err_impl:?}");
+            panic!(
+                "step({step}): model returned result: {val_model:?}, but impl returned error: {err_impl:?}"
+            );
         }
         (Err(err_model), Err(err_impl)) => {
             assert_eq!(
@@ -3567,13 +6329,13 @@ fn check_response_pipelines(
     mut result_impl: DBResult<Vec<ExtendedPipelineDescr>>,
 ) {
     result_model = result_model.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_pipeline_with_constant_timestamps)
             .collect()
     });
     result_impl = result_impl.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_pipeline_with_constant_timestamps)
             .collect()
@@ -3589,13 +6351,13 @@ fn check_response_pipelines_for_monitoring(
     mut result_impl: DBResult<Vec<ExtendedPipelineDescrMonitoring>>,
 ) {
     result_model = result_model.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_pipeline_for_monitoring_with_constant_timestamps)
             .collect()
     });
     result_impl = result_impl.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_pipeline_for_monitoring_with_constant_timestamps)
             .collect()
@@ -3661,13 +6423,13 @@ fn check_responses_cluster_monitor_events(
     mut result_impl: DBResult<Vec<ClusterMonitorEvent>>,
 ) {
     result_model = result_model.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_cluster_monitor_event_short_with_constant_timestamps)
             .collect()
     });
     result_impl = result_impl.map(|mut v| {
-        v.sort_by(|p1, p2| p1.id.cmp(&p2.id));
+        v.sort_by_key(|p1| p1.id);
         v.into_iter()
             .map(convert_cluster_monitor_event_short_with_constant_timestamps)
             .collect()
@@ -3708,13 +6470,13 @@ fn check_responses_pipeline_monitor_events_short(
     mut result_impl: DBResult<Vec<PipelineMonitorEvent>>,
 ) {
     result_model = result_model.map(|mut v| {
-        v.sort_by(|p1, p2| p1.event_id.cmp(&p2.event_id));
+        v.sort_by_key(|p1| p1.event_id);
         v.into_iter()
             .map(convert_pipeline_monitor_event_short_with_constant_timestamps)
             .collect()
     });
     result_impl = result_impl.map(|mut v| {
-        v.sort_by(|p1, p2| p1.event_id.cmp(&p2.event_id));
+        v.sort_by_key(|p1| p1.event_id);
         v.into_iter()
             .map(convert_pipeline_monitor_event_short_with_constant_timestamps)
             .collect()
@@ -3730,13 +6492,13 @@ fn check_responses_pipeline_monitor_events_extended(
     mut result_impl: DBResult<Vec<ExtendedPipelineMonitorEvent>>,
 ) {
     result_model = result_model.map(|mut v| {
-        v.sort_by(|p1, p2| p1.event_id.cmp(&p2.event_id));
+        v.sort_by_key(|p1| p1.event_id);
         v.into_iter()
             .map(convert_pipeline_monitor_event_extended_with_constant_timestamps)
             .collect()
     });
     result_impl = result_impl.map(|mut v| {
-        v.sort_by(|p1, p2| p1.event_id.cmp(&p2.event_id));
+        v.sort_by_key(|p1| p1.event_id);
         v.into_iter()
             .map(convert_pipeline_monitor_event_extended_with_constant_timestamps)
             .collect()
@@ -3779,7 +6541,7 @@ async fn create_tenants_if_not_exists(
         let rec = TenantRecord {
             id: tenant_id,
             tenant: Uuid::now_v7().to_string(),
-            provider: Uuid::now_v7().to_string(),
+            initial_provider: Uuid::now_v7().to_string(),
         };
         e.insert(rec.clone());
         handle
@@ -3790,7 +6552,7 @@ async fn create_tenants_if_not_exists(
             .unwrap()
             .execute(
                 "INSERT INTO tenant VALUES ($1, $2, $3)",
-                &[&rec.id.0, &rec.tenant, &rec.provider],
+                &[&rec.id.0, &rec.tenant, &rec.initial_provider],
             )
             .await?;
     }
@@ -3828,6 +6590,9 @@ fn db_impl_behaves_like_model() {
                     pipelines: BTreeMap::new(),
                     pipeline_events: BTreeMap::new(),
                     cluster_events: BTreeMap::new(),
+                    oidc_trusts: BTreeMap::new(),
+                    users: BTreeMap::new(),
+                    memberships: BTreeMap::new(),
                 });
                 runtime.block_on(async {
                     // We empty all tables in the database before each test
@@ -3873,8 +6638,8 @@ fn db_impl_behaves_like_model() {
                             },
                             StorageAction::StoreApiKeyHash(tenant_id, id, name, key, permissions) => {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
-                                let model_response = model.store_api_key_hash(tenant_id, id, &name, &key, permissions.clone()).await;
-                                let impl_response = handle.db.store_api_key_hash(tenant_id, id, &name, &key, permissions.clone()).await;
+                                let model_response = model.store_api_key_hash(tenant_id, id, &name, &key, permissions).await;
+                                let impl_response = handle.db.store_api_key_hash(tenant_id, id, &name, &key, permissions).await;
                                 check_responses(i, model_response, impl_response);
                             },
                             StorageAction::ValidateApiKey(tenant_id,key) => {
@@ -3980,6 +6745,12 @@ fn db_impl_behaves_like_model() {
                                 let impl_response = handle.db.transit_program_status_to_success(tenant_id, pipeline_id, program_version_guard, &rust_compilation, &program_binary_source_checksum, &program_binary_integrity_checksum, &program_info_integrity_checksum).await;
                                 check_responses(i, model_response, impl_response);
                             }
+                            StorageAction::TransitProgramStatusToSuccessNoBinary(tenant_id, pipeline_id, program_version_guard, sql_compilation, program_info, program_info_integrity_checksum) => {
+                                create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
+                                let model_response = model.transit_program_status_to_success_no_binary(tenant_id, pipeline_id, program_version_guard, &sql_compilation, &program_info, &program_info_integrity_checksum).await;
+                                let impl_response = handle.db.transit_program_status_to_success_no_binary(tenant_id, pipeline_id, program_version_guard, &sql_compilation, &program_info, &program_info_integrity_checksum).await;
+                                check_responses(i, model_response, impl_response);
+                            }
                             StorageAction::TransitProgramStatusToSqlError(tenant_id, pipeline_id, program_version_guard, sql_compilation) => {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
                                 let model_response = model.transit_program_status_to_sql_error(tenant_id, pipeline_id, program_version_guard, &sql_compilation).await;
@@ -4020,6 +6791,12 @@ fn db_impl_behaves_like_model() {
                                 create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
                                 let model_response = model.remain_deployment_resources_status_provisioning(tenant_id, pipeline_id, version_guard, deployment_resources_status_details.clone()).await;
                                 let impl_response = handle.db.remain_deployment_resources_status_provisioning(tenant_id, pipeline_id, version_guard, deployment_resources_status_details.clone()).await;
+                                check_responses(i, model_response, impl_response);
+                            }
+                            StorageAction::PatchPipelineDeployment(tenant_id, pipeline_name, patch) => {
+                                create_tenants_if_not_exists(&model, &handle, tenant_id).await.unwrap();
+                                let model_response = model.patch_pipeline_deployment(tenant_id, &pipeline_name, &patch).await;
+                                let impl_response = handle.db.patch_pipeline_deployment(tenant_id, &pipeline_name, &patch).await;
                                 check_responses(i, model_response, impl_response);
                             }
                             StorageAction::TransitDeploymentResourcesStatusToProvisioned(tenant_id, pipeline_id, version_guard, deployment_location, deployment_resources_status_details, runtime_status, runtime_status_details, runtime_desired_status) => {
@@ -4105,6 +6882,11 @@ fn db_impl_behaves_like_model() {
                                 let model_response = model.get_next_rust_compilation(&platform_version, 0, 1).await;
                                 let impl_response = handle.db.get_next_rust_compilation(&platform_version, 0, 1).await;
                                 check_response_optional_pipeline_with_tenant_id(i, model_response, impl_response);
+                            }
+                            StorageAction::CountPipelinesNeedingCompilation => {
+                                let model_response = model.count_pipelines_needing_compilation().await;
+                                let impl_response = handle.db.count_pipelines_needing_compilation().await;
+                                check_responses(i, model_response, impl_response);
                             }
                             StorageAction::ListPipelineProgramsAcrossAllTenants => {
                                 let model_response = model.list_pipeline_programs_across_all_tenants().await;
@@ -4204,14 +6986,90 @@ fn db_impl_behaves_like_model() {
     }
 }
 
+/// Compares the OIDC trust and tenant-membership operations against the model.
+///
+/// Kept separate from `db_impl_behaves_like_model` rather than folded into
+/// `StorageAction`. Adding these actions to that enum overflows the test
+/// thread's stack: its dispatch builds one future holding every arm, which is
+/// already close to the limit, and boxing the arms did not bring it back down.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn rbac_db_impl_behaves_like_model() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let handle = runtime.block_on(async { test_setup().await });
+
+    let mut config = Config::default();
+    config.max_shrink_iters = u32::MAX;
+    config.source_file = Some("src/db/test.rs");
+    let mut runner = TestRunner::new(config);
+    let res = runner.run(
+        &prop::collection::vec(any::<RbacAction>(), 0..64),
+        |actions: Vec<RbacAction>| {
+            let model = Mutex::new(DbModel {
+                tenants: BTreeMap::new(),
+                api_keys: BTreeMap::new(),
+                pipelines: BTreeMap::new(),
+                pipeline_events: BTreeMap::new(),
+                cluster_events: BTreeMap::new(),
+                oidc_trusts: BTreeMap::new(),
+                users: BTreeMap::new(),
+                memberships: BTreeMap::new(),
+            });
+            runtime.block_on(async {
+                handle
+                    .db
+                    .pool
+                    .get()
+                    .await
+                    .unwrap()
+                    .execute(
+                        "DO $$ DECLARE r RECORD;
+                            BEGIN
+                                FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = current_schema()) LOOP
+                                EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' RESTART IDENTITY CASCADE';
+                                END LOOP;
+                            END $$;",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                for (i, action) in actions.into_iter().enumerate() {
+                    check_rbac_action(i, &model, &handle, action).await;
+                }
+            });
+            Ok(())
+        },
+    );
+    if let Err(e) = res {
+        panic!("{e:#}");
+    }
+}
+
+/// A user in the model: the identity's id, what the provider says about the
+/// person, and what the last profile refresh covered.
+#[derive(Clone, Debug)]
+struct UserRecord {
+    id: UserId,
+    profile: UserProfile,
+    refreshed_at: Option<DateTime<Utc>>,
+    refreshed_auth_time: Option<i64>,
+}
+
 /// Model of the database to which its operations are compared.
 #[derive(Debug)]
 struct DbModel {
     pub tenants: BTreeMap<TenantId, TenantRecord>,
-    pub api_keys: BTreeMap<(TenantId, String), (ApiKeyId, String, Vec<ApiPermission>)>,
+    pub api_keys: BTreeMap<(TenantId, String), (ApiKeyId, String, Role)>,
     pub pipelines: BTreeMap<(TenantId, PipelineId), ExtendedPipelineDescr>,
     pub pipeline_events: BTreeMap<(TenantId, PipelineId), Vec<ExtendedPipelineMonitorEvent>>,
     pub cluster_events: BTreeMap<ClusterMonitorEventId, ExtendedClusterMonitorEvent>,
+    /// Keyed by tenant and name, mirroring the table's uniqueness.
+    pub oidc_trusts: BTreeMap<(TenantId, String), OidcTrustDescr>,
+    /// Keyed by the `(provider, subject)` identity.
+    pub users: BTreeMap<(String, String), UserRecord>,
+    /// The role, the origin and the creation time of each membership.
+    pub memberships: BTreeMap<(TenantId, UserId), (Role, MembershipOrigin, DateTime<Utc>)>,
 }
 
 #[async_trait]
@@ -4399,15 +7257,20 @@ impl ModelHelpers for Mutex<DbModel> {
                 {
                     not_allowed.push("`runtime_config.fault_tolerance`");
                 }
-                if runtime_config
-                    .get("resources")
-                    .map(|v| v.get("storage_mb_max"))
-                    != pipeline
-                        .runtime_config
+                let storage_size = |config: &serde_json::Value, key: &str, legacy: &str| {
+                    config
                         .get("resources")
-                        .map(|v| v.get("storage_mb_max"))
+                        .map(|v| v.get(key).or(v.get(legacy)).cloned())
+                };
+                if storage_size(runtime_config, "storage_max", "storage_mb_max")
+                    != storage_size(&pipeline.runtime_config, "storage_max", "storage_mb_max")
                 {
-                    not_allowed.push("`runtime_config.resources.storage_mb_max`");
+                    not_allowed.push("`runtime_config.resources.storage_max`");
+                }
+                if storage_size(runtime_config, "storage_min", "storage_mb_min")
+                    != storage_size(&pipeline.runtime_config, "storage_min", "storage_mb_min")
+                {
+                    not_allowed.push("`runtime_config.resources.storage_min`");
                 }
                 if runtime_config.get("resources").map(|v| v.get("namespace"))
                     != pipeline
@@ -4481,6 +7344,15 @@ impl ModelHelpers for Mutex<DbModel> {
             if *runtime_config != pipeline.runtime_config {
                 version_increment = true;
             }
+            if let Some(deployment_config) = &pipeline.deployment_config
+                && let Some(edited) = merge_deployment_config_on_edit(
+                    deployment_config,
+                    &pipeline.runtime_config,
+                    runtime_config,
+                )
+            {
+                pipeline.deployment_config = Some(edited);
+            }
             pipeline.runtime_config = runtime_config.clone();
         }
         if let Some(program_code) = program_code {
@@ -4534,6 +7406,7 @@ impl ModelHelpers for Mutex<DbModel> {
             pipeline.program_info = None;
             pipeline.program_binary_source_checksum = None;
             pipeline.program_binary_integrity_checksum = None;
+            pipeline.program_info_integrity_checksum = None;
             pipeline.platform_version = platform_version.to_string();
         }
 
@@ -4570,6 +7443,7 @@ fn convert_descriptor_to_monitoring(
         program_status: pipeline.program_status,
         program_status_since: pipeline.program_status_since,
         deployment_error: pipeline.deployment_error.clone(),
+        deployment_config: pipeline.deployment_config.clone(),
         deployment_location: pipeline.deployment_location.clone(),
         refresh_version: pipeline.refresh_version,
         storage_status: pipeline.storage_status,
@@ -4678,7 +7552,77 @@ impl Storage for Mutex<DbModel> {
         _tenant_name: String,
         _provider: String,
     ) -> DBResult<TenantId> {
-        panic!("For model-based tests, we generate the TenantID using proptest, as opposed to generating a claim that we then get or create an ID for");
+        panic!(
+            "For model-based tests, we generate the TenantID using proptest, as opposed to generating a claim that we then get or create an ID for"
+        );
+    }
+
+    async fn find_tenant_id_by_name(&self, name: &str) -> DBResult<Option<TenantId>> {
+        let s = self.lock().await;
+        Ok(s.tenants
+            .iter()
+            .find(|(_, t)| t.tenant == name)
+            .map(|(id, _)| *id))
+    }
+
+    async fn get_tenant(&self, selector: &str) -> DBResult<TenantInfo> {
+        let s = self.lock().await;
+        let matched = if let Ok(uuid) = Uuid::parse_str(selector) {
+            s.tenants.get_key_value(&TenantId(uuid))
+        } else {
+            s.tenants.iter().find(|(_, t)| t.tenant == selector)
+        };
+        matched
+            .map(|(id, t)| TenantInfo {
+                id: *id,
+                name: t.tenant.clone(),
+                initial_provider: t.initial_provider.clone(),
+            })
+            .ok_or(DBError::UnknownTenantName {
+                name: selector.to_string(),
+            })
+    }
+
+    async fn get_or_create_tenant(
+        &self,
+        new_id: Uuid,
+        name: &str,
+        provider: &str,
+    ) -> DBResult<(TenantInfo, bool)> {
+        let mut s = self.lock().await;
+        if let Some((id, t)) = s.tenants.iter().find(|(_, t)| t.tenant == name) {
+            return Ok((
+                TenantInfo {
+                    id: *id,
+                    name: t.tenant.clone(),
+                    initial_provider: t.initial_provider.clone(),
+                },
+                false,
+            ));
+        }
+        let id = TenantId(new_id);
+        // Postgres would raise a primary-key violation here; callers mint a
+        // fresh v7 id, so crash rather than diverge from it silently.
+        assert!(
+            !s.tenants.contains_key(&id),
+            "get_or_create_tenant: id {id} already exists under another name"
+        );
+        s.tenants.insert(
+            id,
+            TenantRecord {
+                id,
+                tenant: name.to_string(),
+                initial_provider: provider.to_string(),
+            },
+        );
+        Ok((
+            TenantInfo {
+                id,
+                name: name.to_string(),
+                initial_provider: provider.to_string(),
+            },
+            true,
+        ))
     }
 
     async fn get_tenant_name(&self, tenant_id: TenantId) -> Result<String, DBError> {
@@ -4693,11 +7637,11 @@ impl Storage for Mutex<DbModel> {
         let s = self.lock().await;
         Ok(s.api_keys
             .iter()
-            .filter(|k| k.0 .0 == tenant_id)
+            .filter(|k| k.0.0 == tenant_id)
             .map(|k| ApiKeyDescr {
-                id: k.1 .0,
-                name: k.0 .1.clone(),
-                scopes: k.1 .2.clone(),
+                id: k.1.0,
+                name: k.0.1.clone(),
+                role: k.1.2,
             })
             .collect())
     }
@@ -4712,7 +7656,7 @@ impl Storage for Mutex<DbModel> {
                 Ok(ApiKeyDescr {
                     id: k.0,
                     name: name.to_string(),
-                    scopes: k.2.clone(),
+                    role: k.2,
                 })
             },
         )
@@ -4734,46 +7678,518 @@ impl Storage for Mutex<DbModel> {
         id: Uuid,
         name: &str,
         key: &str,
-        permissions: Vec<ApiPermission>,
+        role: MintableKeyRole,
     ) -> DBResult<()> {
         let mut s = self.lock().await;
         validate_api_key_name(name)?;
-        let mut hasher = sha::Sha256::new();
-        hasher.update(key.as_bytes());
-        let hash = openssl::base64::encode_block(&hasher.finish());
-        if s.api_keys.iter().any(|k| k.1 .0 == ApiKeyId(id)) {
+        let hash = BASE64_STANDARD.encode(digest::digest(&digest::SHA256, key.as_bytes()).as_ref());
+        if s.api_keys.iter().any(|k| k.1.0 == ApiKeyId(id)) {
             return Err(DBError::unique_key_violation("api_key_pkey"));
         }
         if s.api_keys.contains_key(&(tenant_id, name.to_string())) {
             return Err(DBError::DuplicateName);
         }
-        if s.api_keys.iter().any(|k| k.1 .1 == hash) {
+        if s.api_keys.iter().any(|k| k.1.1 == hash) {
             return Err(DBError::duplicate_key());
         }
         s.api_keys.insert(
             (tenant_id, name.to_string()),
-            (ApiKeyId(id), hash, permissions),
+            (ApiKeyId(id), hash, role.role()),
         );
         Ok(())
     }
 
-    async fn validate_api_key(&self, key: &str) -> DBResult<(TenantId, Vec<ApiPermission>)> {
+    async fn validate_api_key(&self, key: &str) -> DBResult<(TenantId, Role)> {
         let s = self.lock().await;
-        let mut hasher = sha::Sha256::new();
-        hasher.update(key.as_bytes());
-        let hash = openssl::base64::encode_block(&hasher.finish());
-        let record: Vec<(TenantId, Vec<ApiPermission>)> = s
+        let hash = BASE64_STANDARD.encode(digest::digest(&digest::SHA256, key.as_bytes()).as_ref());
+        let record: Vec<(TenantId, Role)> = s
             .api_keys
             .iter()
-            .filter(|k| k.1 .1 == hash)
-            .map(|k| (k.0 .0, k.1 .2.clone()))
+            .filter(|k| k.1.1 == hash)
+            .map(|k| (k.0.0, k.1.2))
             .collect();
         assert!(record.len() <= 1);
-        let record = record.first();
-        match record {
-            Some(record) => Ok((record.0, record.1.clone())),
+        match record.first() {
+            Some(record) => Ok((record.0, record.1)),
             None => Err(DBError::InvalidApiKey),
         }
+    }
+
+    async fn list_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+    ) -> DBResult<Vec<crate::db::types::oidc_trust::OidcTrustDescr>> {
+        let s = self.lock().await;
+        Ok(s.oidc_trusts
+            .iter()
+            .filter(|((scope, _), _)| *scope == tenant_id)
+            .map(|(_, descr)| descr.clone())
+            .collect())
+    }
+
+    async fn get_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        name: &str,
+    ) -> DBResult<crate::db::types::oidc_trust::OidcTrustDescr> {
+        let s = self.lock().await;
+        s.oidc_trusts
+            .get(&(tenant_id, name.to_string()))
+            .cloned()
+            .ok_or(DBError::UnknownOidcTrust {
+                name: name.to_string(),
+            })
+    }
+
+    async fn delete_oidc_trust(&self, tenant_id: TenantId, name: &str) -> DBResult<()> {
+        let mut s = self.lock().await;
+        s.oidc_trusts
+            .remove(&(tenant_id, name.to_string()))
+            .map(|_| ())
+            .ok_or(DBError::UnknownOidcTrust {
+                name: name.to_string(),
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        issuer: &str,
+        subject: &str,
+        audience: Option<&str>,
+        role: Role,
+        issuer_policy: TenantIssuerPolicy,
+    ) -> DBResult<()> {
+        validate_oidc_trust_name(name)?;
+        if issuer.is_empty() {
+            return Err(DBError::EmptyOidcTrustField {
+                field: "issuer".to_string(),
+            });
+        }
+        validate_tenant_oidc_url(issuer, issuer_policy).map_err(|e| {
+            DBError::InvalidOidcIssuerUrl {
+                issuer: issuer.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        if subject.is_empty() {
+            return Err(DBError::EmptyOidcTrustField {
+                field: "subject".to_string(),
+            });
+        }
+        let mut s = self.lock().await;
+        // Postgres checks the unique indexes (primary key and the name indexes)
+        // during the insert and the foreign key only at the end of the
+        // statement, so uniqueness is reported first. Both index violations map
+        // to the same error, so their relative order does not matter.
+        let duplicate_id = s.oidc_trusts.values().any(|d| d.id.0 == id);
+        if duplicate_id || s.oidc_trusts.contains_key(&(tenant_id, name.to_string())) {
+            return Err(DBError::DuplicateName);
+        }
+        if !s.tenants.contains_key(&tenant_id) {
+            return Err(DBError::UnknownTenant { tenant_id });
+        }
+        s.oidc_trusts.insert(
+            (tenant_id, name.to_string()),
+            OidcTrustDescr {
+                id: OidcTrustId(id),
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                issuer: issuer.to_string(),
+                subject: subject.to_string(),
+                audience: audience.map(str::to_string),
+                role,
+            },
+        );
+        Ok(())
+    }
+
+    async fn is_trusted_issuer(&self, issuer: &str) -> DBResult<bool> {
+        let s = self.lock().await;
+        Ok(s.oidc_trusts.values().any(|d| d.issuer == issuer))
+    }
+
+    async fn match_oidc_trust(
+        &self,
+        issuer: &str,
+        subject: &str,
+        audiences: &[String],
+    ) -> DBResult<Vec<(TenantId, Role)>> {
+        let s = self.lock().await;
+        let mut matched: Vec<(TenantId, Role)> = Vec::new();
+        for ((scope, _), descr) in s.oidc_trusts.iter() {
+            if descr.issuer != issuer || !claim_matches(&descr.subject, subject) {
+                continue;
+            }
+            if let Some(pattern) = &descr.audience
+                && !audiences.iter().any(|a| claim_matches(pattern, a))
+            {
+                continue;
+            }
+            match matched.iter_mut().find(|(t, _)| t == scope) {
+                Some(entry) => entry.1 = entry.1.max(descr.role),
+                None => matched.push((*scope, descr.role)),
+            }
+        }
+        matched.sort_by_key(|(t, _)| t.0);
+        Ok(matched)
+    }
+
+    async fn resolve_tenant_selector(&self, selector: &str) -> DBResult<TenantId> {
+        // Mirrors the production shape, where the selector semantics live in
+        // one place: `resolve_tenant_selector` delegates to `get_tenant`.
+        Ok(self.get_tenant(selector).await?.id)
+    }
+
+    async fn delete_tenant(&self, tenant_id: TenantId) -> DBResult<()> {
+        let mut s = self.lock().await;
+        if !s.tenants.contains_key(&tenant_id) {
+            return Err(DBError::UnknownTenant { tenant_id });
+        }
+        let pipelines = s.pipelines.keys().filter(|(t, _)| *t == tenant_id).count() as i64;
+        let api_keys = s.api_keys.keys().filter(|(t, _)| *t == tenant_id).count() as i64;
+        let oidc_trusts = s
+            .oidc_trusts
+            .keys()
+            .filter(|(scope, _)| *scope == tenant_id)
+            .count() as i64;
+        if pipelines > 0 || api_keys > 0 || oidc_trusts > 0 {
+            return Err(DBError::TenantNotEmpty {
+                tenant_id,
+                pipelines,
+                api_keys,
+                oidc_trusts,
+            });
+        }
+        s.tenants.remove(&tenant_id);
+        s.memberships.retain(|(t, _), _| *t != tenant_id);
+        s.pipeline_events.retain(|(t, _), _| *t != tenant_id);
+        Ok(())
+    }
+
+    async fn rename_tenant(
+        &self,
+        tenant_id: TenantId,
+        new_name: &str,
+        displace_existing: bool,
+    ) -> DBResult<Option<TenantInfo>> {
+        let mut s = self.lock().await;
+        if !s.tenants.contains_key(&tenant_id) {
+            return Err(DBError::UnknownTenant { tenant_id });
+        }
+        let holder = s
+            .tenants
+            .iter()
+            .find(|(id, t)| **id != tenant_id && t.tenant == new_name)
+            .map(|(id, _)| *id);
+        let displaced = match holder {
+            Some(_) if !displace_existing => return Err(DBError::DuplicateName),
+            Some(id) => {
+                let holder = s.tenants.get_mut(&id).unwrap();
+                holder.tenant = format!("{} ({})", holder.tenant, id);
+                Some(TenantInfo {
+                    id,
+                    name: holder.tenant.clone(),
+                    initial_provider: holder.initial_provider.clone(),
+                })
+            }
+            None => None,
+        };
+        s.tenants.get_mut(&tenant_id).unwrap().tenant = new_name.to_string();
+        Ok(displaced)
+    }
+
+    async fn list_tenants(&self) -> DBResult<Vec<TenantInfo>> {
+        let s = self.lock().await;
+        Ok(s.tenants
+            .iter()
+            .map(|(id, t)| TenantInfo {
+                id: *id,
+                name: t.tenant.clone(),
+                initial_provider: t.initial_provider.clone(),
+            })
+            .collect())
+    }
+
+    /// `resolve_login` is left out of the model: it resolves a tenant by
+    /// `(name, provider)` and creates it when absent, whereas the model takes
+    /// tenant ids straight from proptest and so does not model tenant creation
+    /// by name (see `get_or_create_tenant_id`). It is covered instead by the
+    /// targeted tests `rbac_login_resolution_and_membership`,
+    /// `rbac_first_user_role_configurable` and
+    /// `preprovision_member_survives_first_login`.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_login(
+        &self,
+        _new_tenant_id: Uuid,
+        _new_user_id: Uuid,
+        _tenant_name: String,
+        _provider: String,
+        _subject: String,
+        _email: Option<String>,
+        default_role: Role,
+        _first_user_role: Role,
+        _origin: MembershipOrigin,
+    ) -> DBResult<(TenantId, UserId, Role)> {
+        Ok((TenantId(Uuid::nil()), UserId(Uuid::nil()), default_role))
+    }
+
+    async fn get_or_create_user(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> DBResult<UserId> {
+        let mut s = self.lock().await;
+        let key = (provider.to_string(), subject.to_string());
+        match s.users.get_mut(&key) {
+            Some(user) => {
+                // COALESCE: a token without an email leaves the stored one be,
+                // and an address the provider vouched for outranks this one.
+                if let Some(email) = email
+                    && !user.profile.email_verified
+                {
+                    user.profile.email = Some(email.to_string());
+                }
+                Ok(user.id)
+            }
+            None => {
+                let id = UserId(new_id);
+                s.users.insert(
+                    key,
+                    UserRecord {
+                        id,
+                        profile: UserProfile {
+                            email: email.map(str::to_string),
+                            ..UserProfile::default()
+                        },
+                        refreshed_at: None,
+                        refreshed_auth_time: None,
+                    },
+                );
+                Ok(id)
+            }
+        }
+    }
+
+    async fn claim_profile_refresh(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        auth_time: Option<i64>,
+        ttl_seconds: i64,
+    ) -> DBResult<bool> {
+        let mut s = self.lock().await;
+        let now = Utc::now();
+        let key = (provider.to_string(), subject.to_string());
+        let Some(user) = s.users.get_mut(&key) else {
+            s.users.insert(
+                key,
+                UserRecord {
+                    id: UserId(new_id),
+                    profile: UserProfile::default(),
+                    refreshed_at: Some(now),
+                    refreshed_auth_time: auth_time,
+                },
+            );
+            return Ok(true);
+        };
+        let aged_out = user
+            .refreshed_at
+            .is_none_or(|at| now - at > chrono::Duration::seconds(ttl_seconds));
+        let reauthenticated = match (auth_time, user.refreshed_auth_time) {
+            (Some(now), Some(then)) => now > then,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if !aged_out && !reauthenticated {
+            return Ok(false);
+        }
+        user.refreshed_at = Some(now);
+        user.refreshed_auth_time = auth_time;
+        Ok(true)
+    }
+
+    async fn store_user_profile(
+        &self,
+        provider: &str,
+        subject: &str,
+        profile: &UserProfile,
+    ) -> DBResult<()> {
+        let mut s = self.lock().await;
+        let Some(user) = s
+            .users
+            .get_mut(&(provider.to_string(), subject.to_string()))
+        else {
+            return Ok(());
+        };
+        // An absent field leaves the stored one be, and the verdict travels
+        // with the address it is about.
+        if profile.email.is_some() {
+            user.profile.email = profile.email.clone();
+            user.profile.email_verified = profile.email_verified;
+        }
+        if profile.display_name.is_some() {
+            user.profile.display_name = profile.display_name.clone();
+        }
+        Ok(())
+    }
+
+    async fn list_tenant_members(&self, tenant_id: TenantId) -> DBResult<Vec<TenantMember>> {
+        let s = self.lock().await;
+        let mut members: Vec<TenantMember> = s
+            .memberships
+            .iter()
+            .filter(|((t, _), _)| *t == tenant_id)
+            .filter_map(|((_, user_id), (role, origin, _))| {
+                s.users.iter().find(|(_, user)| user.id == *user_id).map(
+                    |((provider, subject), user)| TenantMember {
+                        user_id: user.id,
+                        provider: provider.clone(),
+                        subject: subject.clone(),
+                        email: user.profile.email.clone(),
+                        email_verified: user.profile.email_verified,
+                        display_name: user.profile.display_name.clone(),
+                        role: *role,
+                        origin: Some(*origin),
+                    },
+                )
+            })
+            .collect();
+        // ORDER BY u.email, u.subject, u.provider. Postgres sorts NULLs last
+        // ascending, whereas `Option::None` sorts first in Rust, so lead the
+        // key with `email.is_none()` to match.
+        members.sort_by(|a, b| {
+            (a.email.is_none(), &a.email, &a.subject, &a.provider).cmp(&(
+                b.email.is_none(),
+                &b.email,
+                &b.subject,
+                &b.provider,
+            ))
+        });
+        Ok(members)
+    }
+
+    async fn enroll_in_existing_tenants(
+        &self,
+        new_user_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        names: &[String],
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> DBResult<()> {
+        let user_id = self
+            .get_or_create_user(new_user_id, provider, subject, email)
+            .await?;
+        let mut s = self.lock().await;
+        for name in names {
+            let Some(tenant_id) = s
+                .tenants
+                .iter()
+                .find(|(_, t)| t.tenant == *name)
+                .map(|(id, _)| *id)
+            else {
+                continue;
+            };
+            // Enroll only where no membership exists; never touch a role.
+            s.memberships
+                .entry((tenant_id, user_id))
+                .or_insert((role, origin, Utc::now()));
+        }
+        Ok(())
+    }
+
+    async fn list_user_memberships(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> DBResult<(Vec<UserMembership>, Option<DateTime<Utc>>)> {
+        let s = self.lock().await;
+        let Some(user) = s.users.get(&(provider.to_string(), subject.to_string())) else {
+            return Ok((vec![], None));
+        };
+        // The model has no memberships from before V36, so the creation time
+        // is the time of the first membership.
+        let created_at = s
+            .memberships
+            .iter()
+            .filter(|((_, u), _)| *u == user.id)
+            .map(|(_, (_, _, created_at))| *created_at)
+            .min();
+        let mut memberships: Vec<UserMembership> = s
+            .memberships
+            .iter()
+            .filter(|((_, u), _)| *u == user.id)
+            .filter_map(|((t, _), (role, _, _))| {
+                s.tenants.get(t).map(|rec| UserMembership {
+                    tenant_id: *t,
+                    name: rec.tenant.clone(),
+                    role: *role,
+                })
+            })
+            .collect();
+        memberships.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok((memberships, created_at))
+    }
+
+    async fn upsert_member_role(
+        &self,
+        tenant_id: TenantId,
+        user_id: UserId,
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> DBResult<()> {
+        let mut s = self.lock().await;
+        if !s.tenants.contains_key(&tenant_id) {
+            return Err(DBError::UnknownTenant { tenant_id });
+        }
+        if !s.users.values().any(|user| user.id == user_id) {
+            return Err(DBError::UnknownUser {
+                user_id: user_id.to_string(),
+            });
+        }
+        // A conflict updates the role and keeps the recorded origin, as the
+        // SQL upsert does.
+        s.memberships
+            .entry((tenant_id, user_id))
+            .and_modify(|(r, _, _)| *r = role)
+            .or_insert((role, origin, Utc::now()));
+        Ok(())
+    }
+
+    async fn remove_member(&self, tenant_id: TenantId, user_id: UserId) -> DBResult<()> {
+        let mut s = self.lock().await;
+        s.memberships
+            .remove(&(tenant_id, user_id))
+            .map(|_| ())
+            .ok_or(DBError::UnknownUser {
+                user_id: user_id.to_string(),
+            })
+    }
+
+    async fn preprovision_member(
+        &self,
+        new_user_id: Uuid,
+        tenant_id: TenantId,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        role: Role,
+    ) -> DBResult<UserId> {
+        let user_id = self
+            .get_or_create_user(new_user_id, provider, subject, email)
+            .await?;
+        self.upsert_member_role(tenant_id, user_id, role, MembershipOrigin::Api)
+            .await?;
+        Ok(user_id)
     }
 
     async fn list_pipelines(
@@ -4860,8 +8276,12 @@ impl Storage for Mutex<DbModel> {
         provision_called: bool,
     ) -> Result<ExtendedPipelineDescrRunner, DBError> {
         let pipeline = self.get_pipeline_by_id(tenant_id, pipeline_id).await?;
+        // Mirror the implementation: a pipeline compiled for a different platform version may
+        // still be runnable, and `is_supported_runtime` is the one place that decides. Exact
+        // string equality here made the model report Monitoring where the implementation
+        // reported Complete, for any request naming a different platform version.
         let is_ready_compiled = pipeline.program_status == ProgramStatus::Success
-            && pipeline.platform_version == platform_version;
+            && crate::is_supported_runtime(platform_version, &pipeline.platform_version);
         if matches!(
             (
                 pipeline.deployment_resources_status,
@@ -5086,6 +8506,23 @@ impl Storage for Mutex<DbModel> {
         Ok(())
     }
 
+    async fn patch_pipeline_deployment(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        patch: &PipelineDeploymentConfig,
+    ) -> Result<ExtendedPipelineDescr, DBError> {
+        let mut pipeline = self.get_pipeline(tenant_id, pipeline_name).await?;
+        let patched = patch_deployment_config(running_deployment_config(&pipeline)?, patch)?;
+        pipeline.deployment_config = Some(patched);
+        pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
+        self.lock()
+            .await
+            .pipelines
+            .insert((tenant_id, pipeline.id), pipeline.clone());
+        Ok(pipeline)
+    }
+
     async fn delete_pipeline(
         &self,
         tenant_id: TenantId,
@@ -5136,6 +8573,7 @@ impl Storage for Mutex<DbModel> {
         pipeline.program_info = None;
         pipeline.program_binary_source_checksum = None;
         pipeline.program_binary_integrity_checksum = None;
+        pipeline.program_info_integrity_checksum = None;
         pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
         self.lock()
             .await
@@ -5160,6 +8598,8 @@ impl Storage for Mutex<DbModel> {
         // Apply changes: update
         pipeline.program_status = new_status;
         pipeline.program_status_since = Utc::now();
+        // Only a Success program has a delivered-artifact checksum.
+        pipeline.program_info_integrity_checksum = None;
         self.lock()
             .await
             .pipelines
@@ -5195,6 +8635,7 @@ impl Storage for Mutex<DbModel> {
             system_error: None,
         };
         pipeline.program_info = Some(program_info.clone());
+        pipeline.program_info_integrity_checksum = None;
         pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
         self.lock()
             .await
@@ -5219,6 +8660,8 @@ impl Storage for Mutex<DbModel> {
         // Apply changes: update
         pipeline.program_status = new_status;
         pipeline.program_status_since = Utc::now();
+        // Only a Success program has a delivered-artifact checksum.
+        pipeline.program_info_integrity_checksum = None;
         self.lock()
             .await
             .pipelines
@@ -5266,6 +8709,49 @@ impl Storage for Mutex<DbModel> {
         Ok(())
     }
 
+    async fn transit_program_status_to_success_no_binary(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        program_version_guard: Version,
+        sql_compilation: &SqlCompilationInfo,
+        program_info: &serde_json::Value,
+        program_info_integrity_checksum: &str,
+    ) -> Result<(), DBError> {
+        // Validate
+        let mut pipeline = self.get_pipeline_by_id(tenant_id, pipeline_id).await?;
+        let new_status = ProgramStatus::Success;
+        validate_new_program_status(&pipeline, program_version_guard, new_status)?;
+        validate_program_info(program_info).map_err(|e| DBError::InvalidProgramInfo {
+            value: program_info.clone(),
+            error: e,
+        })?;
+
+        // A Gen-2 program without Rust UDFs completes at the SQL stage: it carries its SQL log
+        // and program info (CompilingSql stored neither), delivers no binary, and stores no
+        // Rust log.
+        pipeline.program_status = new_status;
+        pipeline.program_status_since = Utc::now();
+        pipeline.program_error = ProgramError {
+            sql_compilation: Some(sql_compilation.clone()),
+            rust_compilation: None,
+            system_error: None,
+        };
+        pipeline.program_info = Some(program_info.clone());
+        pipeline.program_binary_source_checksum = None;
+        pipeline.program_binary_integrity_checksum = None;
+        pipeline.program_info_integrity_checksum =
+            Some(program_info_integrity_checksum.to_string());
+        pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
+        self.lock()
+            .await
+            .pipelines
+            .insert((tenant_id, pipeline.id), pipeline.clone());
+        self.new_pipeline_monitor_event(tenant_id, pipeline_id)
+            .await?;
+        Ok(())
+    }
+
     async fn transit_program_status_to_sql_error(
         &self,
         tenant_id: TenantId,
@@ -5286,6 +8772,7 @@ impl Storage for Mutex<DbModel> {
             rust_compilation: None,
             system_error: None,
         };
+        pipeline.program_info_integrity_checksum = None;
         pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
         self.lock()
             .await
@@ -5316,6 +8803,7 @@ impl Storage for Mutex<DbModel> {
             rust_compilation: Some(rust_compilation.clone()),
             system_error: None,
         };
+        pipeline.program_info_integrity_checksum = None;
         pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
         self.lock()
             .await
@@ -5346,6 +8834,7 @@ impl Storage for Mutex<DbModel> {
             rust_compilation: pipeline.program_error.rust_compilation,
             system_error: Some(system_error.to_string()),
         };
+        pipeline.program_info_integrity_checksum = None;
         pipeline.refresh_version = Version(pipeline.refresh_version.0 + 1);
         self.lock()
             .await
@@ -5756,10 +9245,12 @@ impl Storage for Mutex<DbModel> {
         if storage_status_details.is_some() {
             pipeline.storage_status_details = storage_status_details;
         }
-        pipeline.deployment_id = None;
+        // Stopping keeps the deployment id: the deployment is still being torn down and
+        // the runner needs to know which one. The implementation carries it through here
+        // and clears it at Stopped.
         pipeline.deployment_initial = None;
         pipeline.bootstrap_policy = None;
-        pipeline.deployment_config = None;
+        // Retain: pipeline.deployment_config
         pipeline.deployment_location = None;
         pipeline.deployment_error = deployment_error;
         pipeline.deployment_resources_status = new_resources_status;
@@ -5814,7 +9305,7 @@ impl Storage for Mutex<DbModel> {
         pipeline.deployment_id = None;
         pipeline.deployment_initial = None;
         pipeline.bootstrap_policy = None;
-        pipeline.deployment_config = None;
+        // Retain: pipeline.deployment_config
         pipeline.deployment_location = None;
         pipeline.deployment_error = Some(deployment_error);
         pipeline.deployment_resources_status = new_resources_status;
@@ -5883,7 +9374,7 @@ impl Storage for Mutex<DbModel> {
         pipeline.deployment_id = None;
         pipeline.deployment_initial = None;
         pipeline.bootstrap_policy = None;
-        pipeline.deployment_config = None;
+        // Retain: pipeline.deployment_config
         pipeline.deployment_location = None;
         // Retain: pipeline.deployment_error
         pipeline.deployment_resources_status = new_resources_status;
@@ -5983,7 +9474,7 @@ impl Storage for Mutex<DbModel> {
             .iter()
             .map(|((tid, pid), _)| (*tid, *pid))
             .collect();
-        result.sort_by(|(_, p1), (_, p2)| p1.cmp(p2));
+        result.sort_by_key(|(_, p1)| *p1);
         Ok(result)
     }
 
@@ -5997,7 +9488,7 @@ impl Storage for Mutex<DbModel> {
             .iter()
             .map(|((tid, _), pipeline)| (*tid, convert_descriptor_to_monitoring(pipeline.clone())))
             .collect();
-        result.sort_by(|(_, p1), (_, p2)| p1.id.cmp(&p2.id));
+        result.sort_by_key(|(_, p1)| p1.id);
         Ok(result)
     }
 
@@ -6168,25 +9659,29 @@ impl Storage for Mutex<DbModel> {
         Ok(Some((chosen.0, chosen.1)))
     }
 
+    async fn count_pipelines_needing_compilation(&self) -> Result<u64, DBError> {
+        Ok(self
+            .lock()
+            .await
+            .pipelines
+            .values()
+            .filter(|p| {
+                p.deployment_resources_status == ResourcesStatus::Stopped
+                    && matches!(
+                        p.program_status,
+                        ProgramStatus::Pending
+                            | ProgramStatus::CompilingSql
+                            | ProgramStatus::SqlCompiled
+                            | ProgramStatus::CompilingRust
+                    )
+            })
+            .count() as u64)
+    }
+
     async fn list_pipeline_programs_across_all_tenants(
         &self,
-    ) -> Result<
-        Vec<(
-            PipelineId,
-            Version,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )>,
-        DBError,
-    > {
-        let mut checksums: Vec<(
-            PipelineId,
-            Version,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = self
+    ) -> Result<Vec<PipelineProgramArtifacts>, DBError> {
+        let mut artifacts: Vec<PipelineProgramArtifacts> = self
             .lock()
             .await
             .pipelines
@@ -6194,19 +9689,24 @@ impl Storage for Mutex<DbModel> {
             .filter(|pipeline| {
                 pipeline.program_status == ProgramStatus::Success
                     || pipeline.program_status == ProgramStatus::CompilingRust
+                    || pipeline.program_status == ProgramStatus::CompilingSql
             })
-            .map(|pipeline| {
-                (
-                    pipeline.id,
-                    pipeline.program_version,
-                    pipeline.program_binary_source_checksum.clone(),
-                    pipeline.program_binary_integrity_checksum.clone(),
-                    pipeline.program_info_integrity_checksum.clone(),
-                )
+            .map(|pipeline| PipelineProgramArtifacts {
+                pipeline_id: pipeline.id,
+                program_version: pipeline.program_version,
+                program_status: pipeline.program_status,
+                program_binary_source_checksum: pipeline.program_binary_source_checksum.clone(),
+                program_binary_integrity_checksum: pipeline
+                    .program_binary_integrity_checksum
+                    .clone(),
+                program_info_integrity_checksum: pipeline.program_info_integrity_checksum.clone(),
+                is_gen2: validate_program_config(&pipeline.program_config, true)
+                    .map(|config| config.runtime_version().is_gen2())
+                    .unwrap_or(false),
             })
             .collect();
-        checksums.sort_by(|p1, p2| p1.0.cmp(&p2.0));
-        Ok(checksums)
+        artifacts.sort_by_key(|p1| p1.pipeline_id);
+        Ok(artifacts)
     }
 
     async fn get_support_bundle_data(
@@ -6232,7 +9732,7 @@ impl Storage for Mutex<DbModel> {
                 runner_status: e.runner_status,
             })
             .collect();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.id).cmp(&(e1.recorded_at, e1.id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.id))); // Descending
         Ok(events)
     }
 
@@ -6270,7 +9770,7 @@ impl Storage for Mutex<DbModel> {
     async fn get_latest_cluster_monitor_event_short(&self) -> Result<ClusterMonitorEvent, DBError> {
         let mut events: Vec<ExtendedClusterMonitorEvent> =
             self.lock().await.cluster_events.values().cloned().collect();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.id).cmp(&(e1.recorded_at, e1.id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.id))); // Descending
         if events.is_empty() {
             Err(DBError::NoClusterMonitorEventsAvailable)
         } else {
@@ -6289,7 +9789,7 @@ impl Storage for Mutex<DbModel> {
     ) -> Result<ExtendedClusterMonitorEvent, DBError> {
         let mut events: Vec<ExtendedClusterMonitorEvent> =
             self.lock().await.cluster_events.values().cloned().collect();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.id).cmp(&(e1.recorded_at, e1.id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.id))); // Descending
         if events.is_empty() {
             Err(DBError::NoClusterMonitorEventsAvailable)
         } else {
@@ -6339,7 +9839,7 @@ impl Storage for Mutex<DbModel> {
         let db_model = mutex.borrow_mut();
         let events = db_model.cluster_events.clone();
         let mut events: Vec<ExtendedClusterMonitorEvent> = events.values().cloned().collect();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.id).cmp(&(e1.recorded_at, e1.id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.id))); // Descending
 
         // Exceeding retention period
         let first_event_id = events.first().map(|e| e.id);
@@ -6415,7 +9915,7 @@ impl Storage for Mutex<DbModel> {
                 storage_status: e.storage_status,
             })
             .collect();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.event_id).cmp(&(e1.recorded_at, e1.event_id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.event_id))); // Descending
         Ok(events)
     }
 
@@ -6432,7 +9932,7 @@ impl Storage for Mutex<DbModel> {
             .get(&(tenant_id, pipeline_id))
             .expect("pipeline has just been retrieved by name so it exists")
             .clone();
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.event_id).cmp(&(e1.recorded_at, e1.event_id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.event_id))); // Descending
         Ok(events)
     }
 
@@ -6497,7 +9997,7 @@ impl Storage for Mutex<DbModel> {
             .get(&(tenant_id, pipeline_id))
             .cloned()
             .expect("pipeline has just been retrieved by name so it exists");
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.event_id).cmp(&(e1.recorded_at, e1.event_id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.event_id))); // Descending
         if events.is_empty() {
             Err(DBError::NoPipelineMonitorEventsAvailable)
         } else {
@@ -6528,7 +10028,7 @@ impl Storage for Mutex<DbModel> {
             .get(&(tenant_id, pipeline_id))
             .cloned()
             .expect("pipeline has just been retrieved by name so it exists");
-        events.sort_by(|e1, e2| (e2.recorded_at, e2.event_id).cmp(&(e1.recorded_at, e1.event_id))); // Descending
+        events.sort_by_key(|e| std::cmp::Reverse((e.recorded_at, e.event_id))); // Descending
         if events.is_empty() {
             Err(DBError::NoPipelineMonitorEventsAvailable)
         } else {
@@ -6542,7 +10042,7 @@ impl Storage for Mutex<DbModel> {
     ) -> Result<u64, DBError> {
         let mut state = self.lock().await;
         let mut num_deleted: usize = 0;
-        let keys: Vec<(TenantId, PipelineId)> = state.pipelines.keys().map(|v| v.clone()).collect();
+        let keys: Vec<(TenantId, PipelineId)> = state.pipelines.keys().copied().collect();
         for (tenant_id, pipeline_id) in keys {
             let events = state
                 .pipeline_events

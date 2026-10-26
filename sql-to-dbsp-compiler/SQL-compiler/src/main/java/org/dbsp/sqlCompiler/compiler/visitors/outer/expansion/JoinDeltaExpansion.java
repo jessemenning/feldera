@@ -4,26 +4,29 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPDelayedIntegralOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSumOperator;
 
-import javax.annotation.Nullable;
 
+/** Expansion of a {@link org.dbsp.sqlCompiler.circuit.operator.DBSPJoinOperator}:
+ * ΔL ⋈ z⁻¹R + z⁻¹L ⋈ ΔR + ΔL ⋈ ΔR. */
 public final class JoinDeltaExpansion
         extends OperatorDeltaExpansion
         implements CommonJoinDeltaExpansion {
-    @Nullable
+    /** z⁻¹L, the delayed integral of ΔL */
     public final DBSPDelayedIntegralOperator leftIntegrator;
-    @Nullable
+    /** z⁻¹R, the delayed integral of ΔR */
     public final DBSPDelayedIntegralOperator rightIntegrator;
-    @Nullable
+    /** ΔL ⋈ z⁻¹R */
     public final DBSPStreamJoinOperator leftDelta;
-    @Nullable
+    /** z⁻¹L ⋈ ΔR */
     public final DBSPStreamJoinOperator rightDelta;
+    /** ΔL ⋈ ΔR */
     public final DBSPStreamJoinOperator both;
+    /** The sum of the three terms */
     public final DBSPSumOperator sum;
 
-    public JoinDeltaExpansion(@Nullable DBSPDelayedIntegralOperator leftIntegrator,
-                              @Nullable DBSPDelayedIntegralOperator rightIntegrator,
-                              @Nullable DBSPStreamJoinOperator leftDelta,
-                              @Nullable DBSPStreamJoinOperator rightDelta,
+    public JoinDeltaExpansion(DBSPDelayedIntegralOperator leftIntegrator,
+                              DBSPDelayedIntegralOperator rightIntegrator,
+                              DBSPStreamJoinOperator leftDelta,
+                              DBSPStreamJoinOperator rightDelta,
                               DBSPStreamJoinOperator both,
                               DBSPSumOperator sum) {
         this.leftIntegrator = leftIntegrator;
@@ -34,12 +37,12 @@ public final class JoinDeltaExpansion
         this.sum = sum;
     }
 
-    @Override @Nullable
+    @Override
     public DBSPDelayedIntegralOperator getLeftIntegrator() {
         return this.leftIntegrator;
     }
 
-    @Override @Nullable
+    @Override
     public DBSPDelayedIntegralOperator getRightIntegrator() {
         return this.rightIntegrator;
     }

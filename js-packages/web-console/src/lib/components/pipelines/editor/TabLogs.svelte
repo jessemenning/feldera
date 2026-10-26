@@ -1,11 +1,33 @@
 <script lang="ts" module>
+  import {
+    formatLogCursor,
+    isExactResume,
+    type LogCursor,
+    type LogResume,
+    parseLogResume
+  } from '$lib/functions/pipelines/logCursor'
+
   const streams: Record<
     string,
     {
       firstRowIndex: number
       rows: string[]
-      rowBoundaries: number[]
       totalSkippedBytes: number
+      /** Lines the server discarded before the oldest one on screen, as of the last catch-up. */
+      totalDiscardedLines: number
+      /**
+       * Why the last attempt to connect failed, or null once one succeeds. Held beside the
+       * rows rather than pushed into them: a connection error is not a log line, and an
+       * exact resume keeps the rows, so pushing would strand one notice per failed attempt
+       * in the middle of the log.
+       */
+      connectionError: string | null
+      /**
+       * How far we have read. Sent back on the next connection so the server can carry
+       * on from there. Null if the server does not support resuming, or if we can no
+       * longer trust our line count; either way the next connection starts over.
+       */
+      cursor: LogCursor | null
       stream:
         | { cancelFetch: () => void }
         | { open: ReadableStream<Uint8Array>; stop: () => void }
@@ -13,6 +35,33 @@
         | { closed: {}; cancelRetry: () => void; retryAtTimestamp: number }
     }
   > = {}
+
+  /**
+   * Handles the first batch of a new connection: now that we know where the server picked
+   * us up, decides whether to keep the lines already on screen or clear them out.
+   *
+   * Held back until the first batch rather than done the moment the position arrives, so a
+   * reconnect does not blank the view while it waits for the first byte.
+   */
+  const openConnection = (
+    pipelineName: string,
+    requested: LogCursor | null,
+    resumed: LogResume | null
+  ) => {
+    const stream = streams[pipelineName]
+    if (!isExactResume(requested, resumed)) {
+      stream.rows = []
+      stream.firstRowIndex = 0
+      stream.totalSkippedBytes = 0
+      // Every line before the first one about to arrive is a line we cannot show. `gap`
+      // counts only from the cursor we asked for, which leaves out what the server had
+      // already discarded before that. A server that reports nothing leaves us guessing,
+      // and it prints its own notice as a log line.
+      stream.totalDiscardedLines = resumed?.seq ?? 0
+    }
+    stream.cursor = resumed ? { epoch: resumed.epoch, seq: resumed.seq } : null
+  }
+
   let getStreams = new Ref(streams)
   const pipelineActionCallbacks = usePipelineActionCallbacks()
   const dropLogHistory = async (pipelineName: string) => {
@@ -24,6 +73,7 @@
 </script>
 
 <script lang="ts">
+  import { unionName, type NamesInUnion } from 'common-lib/union'
   import LogsStreamList from '$lib/components/pipelines/editor/LogsStreamList.svelte'
   import { emptySearchState, type SearchState } from 'common-ui'
 
@@ -38,7 +88,6 @@
   import WarningBanner from '$lib/components/pipelines/editor/WarningBanner.svelte'
   import { useInterval } from '$lib/compositions/common/useInterval.svelte'
   import Dayjs from 'dayjs'
-  import { unionName, type NamesInUnion } from '$lib/functions/common/union'
   import { match } from 'ts-pattern'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
   import { Ref } from '$lib/compositions/ref.svelte'
@@ -47,14 +96,15 @@
     pipeline,
     deleted = false,
     logSearch = emptySearchState,
-    onLogSearchShortcut
+    onLogMatchCountChange
   }: {
     pipeline: { current: ExtendedPipeline }
     deleted?: boolean
+    /** Submitted search state, owned by the monitoring panel (which hosts the search bar in
+     *  its toolbar). */
     logSearch?: SearchState
-    /** Invoked when the user presses Ctrl-F / Cmd-F inside the log list — the monitoring
-     *  panel uses this to focus its search input. */
-    onLogSearchShortcut?: () => void
+    /** Reports the current match count so the panel can drive its search counter/nav buttons. */
+    onLogMatchCountChange?: (count: number) => void
   } = $props()
   let pipelineName = $derived(pipeline.current.name)
 
@@ -66,8 +116,10 @@
         firstRowIndex: 0,
         stream: { closed: {} },
         rows: [],
-        rowBoundaries: [],
-        totalSkippedBytes: 0
+        totalSkippedBytes: 0,
+        totalDiscardedLines: 0,
+        connectionError: null,
+        cursor: null
       }
     }
     return getStreams.current[pipelineName]
@@ -127,77 +179,109 @@
       return
     }
     const abortController = new AbortController()
-    streams[pipelineName].stream = {
+    // Identifies this connection before there is an open stream to identify it by.
+    const connection = {
       cancelFetch: () => {
         abortController.abort()
         streams[pipelineName].stream = { closed: {} }
       }
     }
-    api.pipelineLogsStream(pipelineName, { signal: abortController.signal }).then((result) => {
-      if (!streams[pipelineName]) {
-        return
-      }
-      if (streams[pipelineName].stream && 'closed' in streams[pipelineName].stream) {
-        // The stream was cancelled, so we shouldn't re-try it
-        return
-      }
-      if (result instanceof Error) {
-        streams[pipelineName].stream = { closed: {} }
-        streams[pipelineName].rows.push(result.message)
-        const isServerOverloaded = (result.cause as { response: Response }).response.status === 503
-        tryRestartStream(pipelineName, isServerOverloaded ? attempts + 1 : 0)
-        return
-      }
-      // Replace the previous connection's buffer only once fresh data is actually in hand,
-      // not the moment the fetch resolves. Otherwise a reconnect (scroll-resume, retry) blanks
-      // the view between connecting and the first byte. Until then the prior rows stay visible.
-      let freshConnection = true
-      const { cancel } = parseStream<string>(
-        result,
-        newlineTextDecoder({
-          bufferSize: 16 * 1024 * 1024,
-          onBytesSkipped: (bytes) => {
-            streams[pipelineName].totalSkippedBytes += bytes
-          }
-        }),
-        {
-          pushChanges: (changes: string[]) => {
-            if (freshConnection) {
-              freshConnection = false
-              streams[pipelineName].rows = []
-              streams[pipelineName].firstRowIndex = 0
-              streams[pipelineName].rowBoundaries = []
-              streams[pipelineName].totalSkippedBytes = 0
-            }
-            const droppedNum = pushAsCircularBuffer(
-              () => streams[pipelineName].rows,
-              bufferSize,
-              (v: string) => v
-            )(changes)
-            streams[pipelineName].firstRowIndex += droppedNum
-          },
-          onParseEnded: (reason) => {
-            const current = streams[pipelineName]?.stream
-            // Ignore a callback from a stream we've already replaced: scroll-pause can stop
-            // this stream and scroll-resume can open a new one before this 'cancelled' callback
-            // lands. Acting on it would clobber the live stream's handle. Identify "still mine"
-            // by the open ReadableStream reference.
-            if (!current || !('open' in current) || current.open !== result.stream) {
-              return
-            }
-            streams[pipelineName].stream = { closed: {} }
-            if (reason === 'cancelled' || !areLogsExpected(pipelineStatusName)) {
-              return
-            }
-            tryRestartStream(pipelineName, 0)
-          }
+    streams[pipelineName].stream = connection
+    // Ask the server to carry on from where we stopped, so reconnecting only costs us the
+    // lines we missed rather than the whole log again. An empty cursor still asks to be
+    // told our position; leaving the parameter out altogether selects the old behaviour.
+    const requestedCursor = streams[pipelineName].cursor
+    api
+      .pipelineLogsStream(pipelineName, formatLogCursor(requestedCursor), {
+        signal: abortController.signal
+      })
+      .then((result) => {
+        // Ignore the response if this is no longer the current connection. It may have been
+        // cancelled, or replaced by a newer one, or the log history may have been dropped.
+        // Without this check two connections would write to the same rows and cursor.
+        if (streams[pipelineName]?.stream !== connection) {
+          return
         }
-      )
-      // Keep the existing rows in place — only swap in the live stream handle. The buffer is
-      // cleared on the first `pushChanges` above, so the view stays populated until then.
-      streams[pipelineName].stream = { open: result.stream, stop: cancel }
-      getStreams.current = streams
-    })
+        if (result instanceof Error) {
+          streams[pipelineName].stream = { closed: {} }
+          streams[pipelineName].connectionError = result.message
+          // `cause` is the API's error body, with the status added by `streamingFetch`.
+          const cause = result.cause as { error_code?: string; status?: number } | undefined
+          // A cursor the server rejects will not become acceptable by being sent again, so
+          // keeping it would leave the viewer looping over the same error and never showing
+          // another log line. Drop it and let the next attempt start the log over.
+          if (cause?.error_code === 'InvalidLogCursorParam') {
+            streams[pipelineName].cursor = null
+          }
+          // 503 is the server asking for a slower retry, so each one widens the backoff.
+          tryRestartStream(pipelineName, cause?.status === 503 ? attempts + 1 : 0)
+          return
+        }
+        // Where the server picked us up. It arrives with the response headers, so we hold
+        // it until the first batch: touching the rows already on screen the moment the
+        // fetch resolves would leave a reconnect (scroll-resume, retry) blank between
+        // connecting and the first byte. Until then the old rows stay put.
+        const resumed = parseLogResume(result.response.headers)
+        let freshConnection = true
+        // Lines the decoder dropped since the last batch. We hold the count and add it
+        // when that batch arrives, rather than counting it straight away. If the connection
+        // dies in between, none of those lines reached us, and a cursor that had already
+        // counted them would skip past real lines on the next connection.
+        let pendingSkippedLines = 0
+        const { cancel } = parseStream<string>(
+          result,
+          newlineTextDecoder({
+            bufferSize: 16 * 1024 * 1024,
+            onSkipped: ({ bytes, lines }) => {
+              streams[pipelineName].totalSkippedBytes += bytes
+              pendingSkippedLines += lines
+            }
+          }),
+          {
+            pushChanges: (changes: string[]) => {
+              if (freshConnection) {
+                freshConnection = false
+                openConnection(pipelineName, requestedCursor, resumed)
+              }
+              const droppedNum = pushAsCircularBuffer(
+                () => streams[pipelineName].rows,
+                bufferSize,
+                (v: string) => v
+              )(changes)
+              streams[pipelineName].firstRowIndex += droppedNum
+              // Count every line the server sent, including the ones we dropped to keep
+              // up. Otherwise reconnecting would fetch that stretch all over again, when
+              // we had already chosen not to display it.
+              if (streams[pipelineName].cursor) {
+                streams[pipelineName].cursor.seq += changes.length + pendingSkippedLines
+              }
+              pendingSkippedLines = 0
+            },
+            onParseEnded: (reason) => {
+              const current = streams[pipelineName]?.stream
+              // Ignore a callback from a stream we've already replaced: scroll-pause can stop
+              // this stream and scroll-resume can open a new one before this 'cancelled' callback
+              // lands. Acting on it would clobber the live stream's handle. Identify "still mine"
+              // by the open ReadableStream reference.
+              if (!current || !('open' in current) || current.open !== result.stream) {
+                return
+              }
+              streams[pipelineName].stream = { closed: {} }
+              if (reason === 'cancelled' || !areLogsExpected(pipelineStatusName)) {
+                return
+              }
+              tryRestartStream(pipelineName, 0)
+            }
+          }
+        )
+        // Keep the existing rows in place — only swap in the live stream handle. The buffer is
+        // cleared on the first `pushChanges` above, so the view stays populated until then.
+        // Clearing the error here rather than on the first batch keeps it from outliving the
+        // failure on a stream that is caught up and so has no line to send.
+        streams[pipelineName].connectionError = null
+        streams[pipelineName].stream = { open: result.stream, stop: cancel }
+        getStreams.current = streams
+      })
   }
   const backoffDelaysMs = [5, 5, 15, 30, 60].map((s) => s * 1000)
   const getDelayMs = (attempts: number) => backoffDelaysMs.at(attempts) ?? backoffDelaysMs.at(-1)!
@@ -305,6 +389,9 @@
         {:else}
           Retrying in 1s...
         {/if}
+        {#if pipelineLogs.connectionError}
+          <span class="block whitespace-pre-line">{pipelineLogs.connectionError}</span>
+        {/if}
       </WarningBanner>
     {:else if !areLogsExpected(pipelineStatusName)}
       {#if pipelineLogs.rows.length}
@@ -325,7 +412,7 @@
     <LogsStreamList
       logs={pipelineLogs}
       search={logSearch}
-      onSearchShortcut={onLogSearchShortcut}
+      onMatchCountChange={onLogMatchCountChange}
       {onStickToBottomChange}
     ></LogsStreamList>
   {/key}

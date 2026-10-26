@@ -1,15 +1,167 @@
+mod bounded_upload;
 mod deletion_vector;
+mod field_id_adapter;
 mod input;
+mod merge;
 mod output;
 
 #[cfg(test)]
 mod test;
 
+use arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
+};
 use feldera_types::serde_with_context::serde_config::{DecimalFormat, UuidFormat};
 use feldera_types::serde_with_context::{DateFormat, SqlSerdeConfig, TimestampFormat};
 pub use input::DeltaTableInputEndpoint;
 pub use output::DeltaTableWriter;
-use std::sync::Once;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::sync::{Arc, Once};
+
+/// Error classification for Delta table write operations.
+///
+/// Separates deterministic failures (which will recur on every attempt) from
+/// transient I/O failures (which may succeed on retry).
+pub(crate) enum WriteError {
+    /// Data-dependent error that will recur identically on retry.
+    /// Examples: non-unique keys, schema mismatches, serialization failures.
+    Deterministic(anyhow::Error),
+    /// Transient I/O error that may resolve on retry.
+    /// Examples: object store timeouts, network failures.
+    Transient(anyhow::Error),
+}
+
+/// Names the classification, which is what a failing test needs to see.
+impl Debug for WriteError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        let (label, e) = match self {
+            WriteError::Deterministic(e) => ("deterministic: ", e),
+            WriteError::Transient(e) => ("transient: ", e),
+        };
+        f.write_str(label)?;
+        Debug::fmt(e, f)
+    }
+}
+
+/// Delegates rather than reformatting, so `{:#}` still reaches anyhow and prints the chain.
+impl Display for WriteError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            WriteError::Deterministic(e) | WriteError::Transient(e) => Display::fmt(e, f),
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_error_test {
+    use super::WriteError;
+    use anyhow::{Context, anyhow};
+
+    /// `{:#}` must reach anyhow, or the cause of a failed write never leaves the connector.
+    #[test]
+    fn the_alternate_form_still_prints_the_chain() {
+        let e = WriteError::Transient(
+            Err::<(), _>(anyhow!("the socket closed"))
+                .context("while writing a deletion vector")
+                .unwrap_err(),
+        );
+
+        let rendered = format!("{e:#}");
+        assert!(
+            rendered.contains("while writing a deletion vector"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("the socket closed"), "{rendered}");
+        // Plain `{}` is anyhow's own top-level rendering, not the whole chain.
+        assert_eq!(format!("{e}"), "while writing a deletion vector");
+    }
+}
+
+/// The view counterpart of a string or binary type, or `None` for every other
+/// type.
+fn view_counterpart(data_type: &ArrowDataType) -> Option<ArrowDataType> {
+    match data_type {
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Some(ArrowDataType::Utf8View),
+        ArrowDataType::Binary | ArrowDataType::LargeBinary => Some(ArrowDataType::BinaryView),
+        _ => None,
+    }
+}
+
+/// `data_type` with every string and binary type it contains, at any depth,
+/// replaced by its view counterpart. Other types carry over unchanged.
+fn view_data_type(data_type: &ArrowDataType) -> ArrowDataType {
+    if let Some(view) = view_counterpart(data_type) {
+        return view;
+    }
+    match data_type {
+        ArrowDataType::Struct(fields) => {
+            ArrowDataType::Struct(fields.iter().map(view_field).collect())
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(view_field(field)),
+        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(view_field(field)),
+        ArrowDataType::FixedSizeList(field, len) => {
+            ArrowDataType::FixedSizeList(view_field(field), *len)
+        }
+        ArrowDataType::Map(field, sorted) => ArrowDataType::Map(view_field(field), *sorted),
+        other => other.clone(),
+    }
+}
+
+/// [`view_data_type`] applied to `field`, keeping its name, nullability and
+/// metadata. The Parquet reader validates a supplied schema field by field, so
+/// everything but the type must match what it would have produced.
+fn view_field(field: &FieldRef) -> FieldRef {
+    Arc::new(
+        ArrowField::new(
+            field.name(),
+            view_data_type(field.data_type()),
+            field.is_nullable(),
+        )
+        .with_metadata(field.metadata().clone()),
+    )
+}
+
+/// An Arrow schema where every string and binary column, at
+/// any depth, read as a view type.
+///
+/// A `Utf8`/`Binary` array addresses its values with 32-bit offsets, so one
+/// decoded batch cannot hold more than 2 GiB of a single column, and the reader
+/// fails with "index overflow decoding byte array" when a batch would. A view
+/// array spreads values over several buffers and has no such ceiling. It is also
+/// far cheaper for dictionary-encoded data: the decoder references the
+/// dictionary page's buffers rather than copying each repeat, so a value
+/// repeated across a batch costs one copy plus a 16-byte view per row.
+///
+/// The type exists to ensure that a schema that skipped the rewrite cannot reach a
+/// reader.
+///
+/// Note: the initial snapshot needs none of this. It reads through delta-rs's
+/// table provider, which asks for view types itself: `DeltaScanConfig::new`
+/// hard-codes `schema_force_view_types` rather than reading it from the
+/// session, so its string columns are `Utf8View` whatever the session says.
+/// Between that and this type, no read path in the connector decodes 32-bit
+/// strings.
+#[derive(Clone, Debug)]
+pub(super) struct ReadSchema(SchemaRef);
+
+impl ReadSchema {
+    pub(super) fn new(schema: &ArrowSchema) -> Self {
+        Self(Arc::new(
+            ArrowSchema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .map(view_field)
+                    .collect::<Vec<FieldRef>>(),
+            )
+            .with_metadata(schema.metadata().clone()),
+        ))
+    }
+
+    pub(super) fn schema(&self) -> &SchemaRef {
+        &self.0
+    }
+}
 
 static REGISTER_STORAGE_HANDLERS: Once = Once::new();
 

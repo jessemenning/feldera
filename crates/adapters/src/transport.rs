@@ -21,6 +21,7 @@
 //! let reader = endpoint.open(consumer, 0);
 //! ```
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use adhoc::AdHocInputEndpoint;
 use anyhow::Result as AnyResult;
@@ -47,6 +48,9 @@ pub(crate) mod kafka;
 #[cfg(feature = "with-nats")]
 pub(crate) mod nats;
 
+#[cfg(feature = "with-s2")]
+pub(crate) mod s2;
+
 #[cfg(feature = "with-nexmark")]
 mod nexmark;
 
@@ -60,20 +64,24 @@ mod pubsub;
 mod redis;
 
 use feldera_types::config::TransportConfig;
+use feldera_types::coordination::InputShard;
 
 #[cfg(feature = "with-redis")]
 use redis::output::RedisOutputEndpoint;
 
 use crate::transport::empty::EmptyInputEndpoint;
-#[cfg(test)]
-pub use crate::transport::file::set_barrier;
 use crate::transport::file::{FileInputEndpoint, FileOutputEndpoint};
+#[cfg(test)]
+pub use crate::transport::file::{set_barrier, set_failure};
 #[cfg(feature = "with-kafka")]
 use crate::transport::kafka::{KafkaFtInputEndpoint, KafkaFtOutputEndpoint, KafkaOutputEndpoint};
 use crate::transport::null::NullOutputEndpoint;
 
 #[cfg(feature = "with-nats")]
-use crate::transport::nats::NatsInputEndpoint;
+use crate::transport::nats::{NatsInputEndpoint, NatsOutputEndpoint};
+
+#[cfg(feature = "with-s2")]
+use crate::transport::s2::{S2InputEndpoint, S2OutputEndpoint};
 
 #[cfg(feature = "with-solace")]
 use crate::transport::solace::{SolaceInputEndpoint, SolaceOutputEndpoint};
@@ -89,6 +97,10 @@ pub use feldera_adapterlib::transport::*;
 /// Creates an input transport endpoint instance using an input transport
 /// configuration, resolving secrets by reading `secrets_dir`.
 ///
+/// `shard` is `Some` for a distributed connector, and then it specifies the
+/// part of the input that the endpoint reads.  Only transports for which
+/// [TransportConfig::supports_distribution] is true accept `Some`.
+///
 /// Returns an error if there is a invalid configuration for the endpoint.
 /// Returns `None` if the transport configuration variant is incompatible with an input endpoint.
 #[allow(unused_variables)]
@@ -96,31 +108,37 @@ pub fn input_transport_config_to_endpoint(
     config: &TransportConfig,
     endpoint_name: &str,
     secrets_dir: &Path,
+    shard: Option<InputShard>,
 ) -> AnyResult<Option<Box<dyn TransportInputEndpoint>>> {
+    debug_assert!(shard.is_none() || config.supports_distribution());
     let config = resolve_secret_references_via_json(secrets_dir, config)?;
     let endpoint: Box<dyn TransportInputEndpoint> = match config {
         TransportConfig::FileInput(config) => Box::new(FileInputEndpoint::new(config)),
         #[cfg(feature = "with-kafka")]
-        TransportConfig::KafkaInput(config) => Box::new(KafkaFtInputEndpoint::new(config)?),
+        TransportConfig::KafkaInput(config) => Box::new(KafkaFtInputEndpoint::new(config, shard)?),
         #[cfg(not(feature = "with-kafka"))]
         TransportConfig::KafkaInput(_) => return Ok(None),
         #[cfg(feature = "with-nats")]
-        TransportConfig::NatsInput(config) => Box::new(NatsInputEndpoint::new(config)?),
+        TransportConfig::NatsInput(config) => Box::new(NatsInputEndpoint::new(*config)?),
         #[cfg(not(feature = "with-nats"))]
         TransportConfig::NatsInput(_) => return Ok(None),
         #[cfg(feature = "with-solace")]
         TransportConfig::SolaceInput(config) => Box::new(SolaceInputEndpoint::new(config)?),
         #[cfg(not(feature = "with-solace"))]
         TransportConfig::SolaceInput(_) => return Ok(None),
+        #[cfg(feature = "with-s2")]
+        TransportConfig::S2Input(config) => Box::new(S2InputEndpoint::new(config)?),
+        #[cfg(not(feature = "with-s2"))]
+        TransportConfig::S2Input(_) => return Ok(None),
         #[cfg(feature = "with-pubsub")]
-        TransportConfig::PubSubInput(config) => Box::new(PubSubInputEndpoint::new(config.clone())?),
+        TransportConfig::PubSubInput(config) => Box::new(PubSubInputEndpoint::new(config)?),
         #[cfg(not(feature = "with-pubsub"))]
         TransportConfig::PubSubInput(_) => return Ok(None),
         TransportConfig::UrlInput(config) => Box::new(UrlInputEndpoint::new(config)),
         TransportConfig::S3Input(config) => Box::new(S3InputEndpoint::new(config)?),
-        TransportConfig::Datagen(config) => Box::new(GeneratorEndpoint::new(config.clone())),
+        TransportConfig::Datagen(config) => Box::new(GeneratorEndpoint::new(config)),
         #[cfg(feature = "with-nexmark")]
-        TransportConfig::Nexmark(config) => Box::new(NexmarkEndpoint::new(config.clone())),
+        TransportConfig::Nexmark(config) => Box::new(NexmarkEndpoint::new(config)),
         #[cfg(not(feature = "with-nexmark"))]
         TransportConfig::Nexmark(_) => return Ok(None),
         TransportConfig::HttpInput(config) => Box::new(HttpInputEndpoint::new(config)),
@@ -136,10 +154,12 @@ pub fn input_transport_config_to_endpoint(
         | TransportConfig::PostgresCdcInput(_)
         | TransportConfig::PostgresOutput(_)
         | TransportConfig::HttpOutput(_)
+        | TransportConfig::NatsOutput(_)
         | TransportConfig::RedisOutput(_)
         | TransportConfig::IcebergInput(_)
         | TransportConfig::NullOutput
-        | TransportConfig::SolaceOutput(_) => return Ok(None),
+        | TransportConfig::SolaceOutput(_)
+        | TransportConfig::S2Output(_) => return Ok(None),
     };
     Ok(Some(endpoint))
 }
@@ -151,6 +171,10 @@ pub fn input_transport_config_to_endpoint(
 /// fault-tolerant output endpoint (but it will still return a non-FT endpoint
 /// if that's all it can do).
 ///
+/// `shutdown` is `ControllerInner::shutdown_token`; an endpoint that
+/// waits on something outside the pipeline uses it to stop waiting when the
+/// pipeline goes down.
+///
 /// Returns an error if there is a invalid configuration for the endpoint.
 /// Returns `None` if the transport configuration variant is incompatible with an output endpoint.
 #[allow(unused_variables)]
@@ -159,6 +183,7 @@ pub fn output_transport_config_to_endpoint(
     endpoint_name: &str,
     fault_tolerant: bool,
     secrets_dir: &Path,
+    shutdown: CancellationToken,
 ) -> AnyResult<Option<Box<dyn OutputEndpoint>>> {
     let config = resolve_secret_references_via_json(secrets_dir, config)?;
     match config {
@@ -168,12 +193,21 @@ pub fn output_transport_config_to_endpoint(
             false => Ok(Some(Box::new(KafkaOutputEndpoint::new(
                 config,
                 endpoint_name,
+                shutdown,
             )?))),
-            true => Ok(Some(Box::new(KafkaFtOutputEndpoint::new(config)?))),
+            true => Ok(Some(Box::new(KafkaFtOutputEndpoint::new(
+                config, shutdown,
+            )?))),
         },
         #[cfg(feature = "with-redis")]
         TransportConfig::RedisOutput(config) => {
             Ok(Some(Box::new(RedisOutputEndpoint::new(config)?)))
+        }
+        #[cfg(feature = "with-s2")]
+        TransportConfig::S2Output(config) => Ok(Some(Box::new(S2OutputEndpoint::new(config)?))),
+        #[cfg(feature = "with-nats")]
+        TransportConfig::NatsOutput(config) => {
+            Ok(Some(Box::new(NatsOutputEndpoint::new(config, shutdown)?)))
         }
         TransportConfig::NullOutput => Ok(Some(Box::new(NullOutputEndpoint))),
         #[cfg(feature = "with-solace")]

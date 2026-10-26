@@ -5,10 +5,8 @@ from feldera.rest.errors import FelderaAPIError
 from tests import TEST_CLIENT
 from .helper import (
     API_PREFIX,
-    cleanup_pipeline,
     gen_pipeline_name,
     patch_json,
-    post_json,
     put_json,
 )
 
@@ -44,16 +42,21 @@ def test_pipeline_runtime_config(pipeline_name):
                 "workers": 100,
                 "resources": {
                     "cpu_cores_min": 5,
-                    "storage_mb_max": 2000,
+                    "storage_max": "2G",
                     "storage_class": "normal",
                 },
             },
             lambda rc: (
                 rc.get("workers") == 100
                 and rc.get("resources", {}).get("cpu_cores_min") == 5
-                and rc.get("resources", {}).get("storage_mb_max") == 2000
+                and rc.get("resources", {}).get("storage_max") == "2G"
                 and rc.get("resources", {}).get("storage_class") == "normal"
             ),
+        ),
+        (
+            # The deprecated spelling is read and stored under the current name.
+            {"resources": {"storage_mb_max": 2000}},
+            lambda rc: rc.get("resources", {}).get("storage_max") == "2G",
         ),
         (
             {"env": {"TEST_ENV": "value"}},
@@ -78,6 +81,7 @@ def test_pipeline_runtime_config(pipeline_name):
     # Invalid runtime_config cases
     invalid_cases = [
         {"workers": "not-a-number"},
+        {"resources": {"storage_max": "not-a-size"}},
         {"resources": {"storage_mb_max": "not-a-number"}},
         {"env": {"TOKIO_WORKER_THREADS": "1"}},
     ]
@@ -93,32 +97,18 @@ def test_pipeline_runtime_config(pipeline_name):
         # Rust test checks error_code == InvalidRuntimeConfig
         assert err.get("error_code") == "InvalidRuntimeConfig", err
 
-    # Patching original (create with explicit rich config)
-    pipeline_name_2 = pipeline_name + "-2"
-    cleanup_pipeline(pipeline_name_2)
-    original_body = {
-        "name": pipeline_name_2,
-        "program_code": "-- patch original",
-        "program_config": {
-            "profile": "unoptimized",
-            "cache": False,
-        },
-    }
-    resp_orig = post_json(f"{API_PREFIX}/pipelines", original_body)
-    assert resp_orig.status_code in (HTTPStatus.CREATED, HTTPStatus.OK), resp_orig.text
-
     # Patch modifying some nested fields
     patch_body = {
         "runtime_config": {
             "workers": 1,
-            "resources": {"storage_mb_max": 123},
+            "resources": {"storage_max": "123M"},
         }
     }
     resp = patch_json(_pipeline_url(pipeline_name), patch_body)
     assert resp.status_code == HTTPStatus.OK, resp.text
     rc_modified = resp.json()["runtime_config"]
     assert rc_modified.get("workers") == 1
-    assert rc_modified.get("resources", {}).get("storage_mb_max") == 123
+    assert rc_modified.get("resources", {}).get("storage_max") == "123M"
 
 
 @gen_pipeline_name
@@ -177,14 +167,14 @@ def test_pipeline_program_config(pipeline_name):
         "name": pipeline_name,
         "program_code": "sql-2",
         "program_config": {
-            "profile": "unoptimized",
+            "profile": "dev",
             "cache": False,
         },
     }
     resp = put_json(_pipeline_url(pipeline_name), original_body)
     assert resp.status_code in (HTTPStatus.CREATED, HTTPStatus.OK), resp.text
     pc_original = resp.json()["program_config"]
-    assert pc_original.get("profile") == "unoptimized"
+    assert pc_original.get("profile") == "dev"
     assert not pc_original.get("cache")
 
     # Patch no changes

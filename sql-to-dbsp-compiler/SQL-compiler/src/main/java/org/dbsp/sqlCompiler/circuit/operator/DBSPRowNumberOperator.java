@@ -26,7 +26,7 @@ import java.util.Objects;
  * Corresponds to the DBSP operators row_number_custom_order.
  * Similar to {@link DBSPRankOperator}. */
 public class DBSPRowNumberOperator extends DBSPUnaryOperator
-    implements IContainsIntegrator, IIncremental {
+    implements IHasPostIntegrator, IIncremental {
     /** Closure which produces the output tuple.  The signature is
      * (i64, sorted_tuple) -> output_tuple.  i64 is the rank of the current row. */
     public final DBSPClosureExpression outputProducer;
@@ -103,7 +103,6 @@ public class DBSPRowNumberOperator extends DBSPUnaryOperator
     @SuppressWarnings("unused")
     public static DBSPRowNumberOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = commonInfoFromJson(node, decoder);
-        DBSPExpression limit = fromJsonInner(node, "limit", decoder, DBSPExpression.class);
         DBSPClosureExpression outputProducer = fromJsonInner(node, "outputProducer", decoder, DBSPClosureExpression.class);
         return new DBSPRowNumberOperator(CalciteEmptyRel.INSTANCE,
                 info.getFunction(), outputProducer, info.getInput(0))

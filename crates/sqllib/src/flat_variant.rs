@@ -8,13 +8,7 @@
 //! dealloc, and, because the encoding is canonical (map keys are stored
 //! sorted), equality is a memcmp except through float payloads.
 //!
-//! Programs opt in with `SET feldera_flat_variant = 'on'` (or globally with the
-//! `FELDERA_FLAT_VARIANT` environment variable), which makes the SQL compiler
-//! emit `FlatVariant` for VARIANT columns and the `FV` function-name grid
-//! (`cast_to_FV_*`, `indexFV*`, `parse_json_fv`, `to_json_FV`, `typeof_fv`,
-//! `variantnull_fv`, and the JSON_*/VARIANT_* transformation functions; see
-//! `flat_variant::casts` and `flat_variant::functions`). Connector metadata
-//! keeps the enum `Variant`.
+//! This is the default representation of the SQL VARIANT type.
 //!
 //! # Encoding
 //!
@@ -46,7 +40,6 @@
 pub mod casts;
 pub mod functions;
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -54,6 +47,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use casts::type_string;
 use dbsp::algebra::{F32, F64};
 use feldera_fxp::DynamicDecimal;
 use feldera_macros::IsNone;
@@ -63,12 +57,14 @@ use feldera_types::serde_with_context::{
 };
 use rkyv::ser::{ScratchSpace, Serializer as RkyvSerializer};
 use rkyv::vec::{ArchivedVec, VecResolver};
-use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use size_of::SizeOf;
+use std::borrow::Cow;
 
-use crate::variant::Variant;
+#[allow(deprecated)]
+use crate::variant::{NumberTokenValue, TokenValue, Variant};
 use crate::{
     ByteArray, Date, LongInterval, ShortInterval, SqlString, Time, Timestamp, TimestampTz, Uuid,
 };
@@ -98,13 +94,16 @@ pub(crate) const TAG_TIMESTAMP: u8 = 17;
 pub(crate) const TAG_SHORT_INTERVAL: u8 = 18;
 pub(crate) const TAG_LONG_INTERVAL: u8 = 19;
 pub(crate) const TAG_BINARY: u8 = 20;
-pub(crate) const TAG_GEOMETRY: u8 = 21;
+pub(crate) const TAG_GEO_POINT: u8 = 21;
 pub(crate) const TAG_UUID: u8 = 22;
 pub(crate) const TAG_ARRAY: u8 = 23;
 pub(crate) const TAG_MAP: u8 = 24;
 pub(crate) const TAG_TIMESTAMP_TZ: u8 = 25;
 
 // The type
+
+/// The Rust type of a SQL `VARIANT` value.
+pub type SqlVariant = FlatVariant;
 
 /// A SQL VARIANT value stored as one flat, canonically encoded byte buffer.
 ///
@@ -350,7 +349,70 @@ impl Hash for FlatVariant {
 
 impl fmt::Debug for FlatVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FlatVariant({:?})", Variant::from(self))
+        f.debug_tuple("FlatVariant").field(&Decoded(self)).finish()
+    }
+}
+
+/// One encoded value, rendered as its tag and payload.
+///
+/// A wrapper rather than a plain function so that containers nest through
+/// `debug_list`/`debug_map`, which is what gives `{:#?}` its indentation.
+struct Decoded<'a>(&'a FlatVariant);
+
+impl fmt::Debug for Decoded<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::flat_variant::casts::FVRef;
+
+        let value = self.0;
+        let bytes = value.as_bytes();
+        match crate::flat_variant::casts::view(bytes) {
+            FVRef::SqlNull => f.write_str("SqlNull"),
+            FVRef::VariantNull => f.write_str("VariantNull"),
+            FVRef::Boolean(x) => f.debug_tuple("Boolean").field(&x).finish(),
+            FVRef::TinyInt(x) => f.debug_tuple("TinyInt").field(&x).finish(),
+            FVRef::SmallInt(x) => f.debug_tuple("SmallInt").field(&x).finish(),
+            FVRef::Int(x) => f.debug_tuple("Int").field(&x).finish(),
+            FVRef::BigInt(x) => f.debug_tuple("BigInt").field(&x).finish(),
+            FVRef::UTinyInt(x) => f.debug_tuple("UTinyInt").field(&x).finish(),
+            FVRef::USmallInt(x) => f.debug_tuple("USmallInt").field(&x).finish(),
+            FVRef::UInt(x) => f.debug_tuple("UInt").field(&x).finish(),
+            FVRef::UBigInt(x) => f.debug_tuple("UBigInt").field(&x).finish(),
+            FVRef::Real(x) => f.debug_tuple("Real").field(&x).finish(),
+            FVRef::Double(x) => f.debug_tuple("Double").field(&x).finish(),
+            FVRef::Decimal(significand, scale) => f
+                .debug_tuple("Decimal")
+                .field(&DynamicDecimal::new(significand, scale))
+                .finish(),
+            FVRef::String(x) => f.debug_tuple("String").field(&x).finish(),
+            FVRef::Date(x) => f.debug_tuple("Date").field(&x).finish(),
+            FVRef::Time(x) => f.debug_tuple("Time").field(&x).finish(),
+            FVRef::Timestamp(x) => f.debug_tuple("Timestamp").field(&x).finish(),
+            FVRef::TimestampTz(x) => f.debug_tuple("TimestampTz").field(&x).finish(),
+            FVRef::ShortInterval(x) => f.debug_tuple("ShortInterval").field(&x).finish(),
+            FVRef::LongInterval(x) => f.debug_tuple("LongInterval").field(&x).finish(),
+            FVRef::Binary(x) => f.debug_tuple("Binary").field(&x).finish(),
+            FVRef::GeoPoint(x) => f.debug_tuple("GeoPoint").field(&x).finish(),
+            FVRef::Uuid(x) => f.debug_tuple("Uuid").field(&x).finish(),
+            FVRef::Array => {
+                let c = Container::new(bytes);
+                let mut list = f.debug_list();
+                for i in 0..c.count {
+                    list.entry(&Decoded(&value.subvalue(c.element(i))));
+                }
+                list.finish()
+            }
+            FVRef::Map => {
+                let c = Container::new(bytes);
+                let mut map = f.debug_map();
+                for i in 0..c.count {
+                    map.entry(
+                        &Decoded(&value.subvalue(c.element(i))),
+                        &Decoded(&value.subvalue(c.map_value(i))),
+                    );
+                }
+                map.finish()
+            }
+        }
     }
 }
 
@@ -486,7 +548,7 @@ pub(crate) fn cmp_values(a: &[u8], b: &[u8]) -> Ordering {
         }
         TAG_REAL => f32_at(pa, 0).cmp(&f32_at(pb, 0)),
         TAG_DOUBLE => f64_at(pa, 0).cmp(&f64_at(pb, 0)),
-        TAG_GEOMETRY => (f64_at(pa, 0), f64_at(pa, 8)).cmp(&(f64_at(pb, 0), f64_at(pb, 8))),
+        TAG_GEO_POINT => (f64_at(pa, 0), f64_at(pa, 8)).cmp(&(f64_at(pb, 0), f64_at(pb, 8))),
         TAG_DECIMAL => {
             let da = i128::from_le_bytes(payload_array(&pa[..16]));
             let db = i128::from_le_bytes(payload_array(&pb[..16]));
@@ -544,7 +606,7 @@ fn hash_value<H: Hasher>(value: &[u8], state: &mut H) {
     match tag {
         TAG_REAL => f32_at(payload, 0).hash(state),
         TAG_DOUBLE => f64_at(payload, 0).hash(state),
-        TAG_GEOMETRY => {
+        TAG_GEO_POINT => {
             f64_at(payload, 0).hash(state);
             f64_at(payload, 8).hash(state);
         }
@@ -772,9 +834,278 @@ pub(crate) fn sort_map_entries(out: &[u8], entries: &mut Vec<(Range<usize>, Rang
     entries.truncate(w);
 }
 
+// Conversion from the Parquet variant binary encoding
+
+/// Encode a decoded Parquet variant into the writer; returns the value's
+/// range.
+///
+/// The tag mapping mirrors [`encode_variant`], so the two paths into
+/// `FlatVariant` agree value for value. A nanosecond timestamp is the one
+/// lossy step: `TAG_TIMESTAMP` holds microseconds.
+fn encode_parquet_variant(
+    w: &mut Writer,
+    v: parquet_variant::Variant<'_, '_>,
+    depth: usize,
+) -> Result<Range<usize>, String> {
+    use parquet_variant::Variant as PqVariant;
+
+    if depth > crate::variant_binary::MAX_VARIANT_DEPTH {
+        return Err(crate::variant_binary::variant_too_deep());
+    }
+
+    Ok(match v {
+        PqVariant::Null => w.scalar(TAG_VARIANT_NULL, &[]),
+        PqVariant::BooleanTrue => w.scalar(TAG_BOOLEAN, &[1u8]),
+        PqVariant::BooleanFalse => w.scalar(TAG_BOOLEAN, &[0u8]),
+        PqVariant::Int8(x) => w.scalar(TAG_TINYINT, &x.to_le_bytes()),
+        PqVariant::Int16(x) => w.scalar(TAG_SMALLINT, &x.to_le_bytes()),
+        PqVariant::Int32(x) => w.scalar(TAG_INT, &x.to_le_bytes()),
+        PqVariant::Int64(x) => w.scalar(TAG_BIGINT, &x.to_le_bytes()),
+        PqVariant::Float(x) => w.scalar(TAG_REAL, &F32::new(x).into_inner().to_le_bytes()),
+        PqVariant::Double(x) => w.scalar(TAG_DOUBLE, &F64::new(x).into_inner().to_le_bytes()),
+        PqVariant::Decimal4(x) => w.scalar(
+            TAG_DECIMAL,
+            &casts::decimal_payload(x.integer() as i128, x.scale()),
+        ),
+        PqVariant::Decimal8(x) => w.scalar(
+            TAG_DECIMAL,
+            &casts::decimal_payload(x.integer() as i128, x.scale()),
+        ),
+        PqVariant::Decimal16(x) => {
+            w.scalar(TAG_DECIMAL, &casts::decimal_payload(x.integer(), x.scale()))
+        }
+        PqVariant::String(x) => w.scalar(TAG_STRING, x.as_bytes()),
+        PqVariant::ShortString(x) => w.scalar(TAG_STRING, x.as_str().as_bytes()),
+        PqVariant::Binary(x) => w.scalar(TAG_BINARY, x),
+        PqVariant::Uuid(x) => w.scalar(TAG_UUID, &x.as_bytes()[..]),
+        PqVariant::Date(x) => w.scalar(TAG_DATE, &Date::from_date(x).days().to_le_bytes()),
+        PqVariant::Time(x) => w.scalar(TAG_TIME, &Time::from_time(x).nanoseconds().to_le_bytes()),
+        PqVariant::TimestampNtzMicros(x) => {
+            w.scalar(TAG_TIMESTAMP, &x.and_utc().timestamp_micros().to_le_bytes())
+        }
+        PqVariant::TimestampNtzNanos(x) => {
+            w.scalar(TAG_TIMESTAMP, &x.and_utc().timestamp_micros().to_le_bytes())
+        }
+        PqVariant::TimestampMicros(x) => {
+            w.scalar(TAG_TIMESTAMP_TZ, &x.timestamp_micros().to_le_bytes())
+        }
+        PqVariant::TimestampNanos(x) => {
+            w.scalar(TAG_TIMESTAMP_TZ, &x.timestamp_micros().to_le_bytes())
+        }
+        PqVariant::List(list) => {
+            let elements: Vec<_> = list
+                .iter_try()
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            let mut children = Vec::with_capacity(elements.len());
+            for element in elements {
+                children.push(encode_parquet_variant(w, element, depth + 1)?);
+            }
+            w.array(&children)
+        }
+        PqVariant::Object(object) => {
+            let fields: Vec<_> = object
+                .iter_try()
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            let mut entries = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                let key = w.scalar(TAG_STRING, name.as_bytes());
+                let value = encode_parquet_variant(w, value, depth + 1)?;
+                entries.push((key, value));
+            }
+            // A Parquet object's field order follows its metadata dictionary,
+            // which the encoding does not require to be sorted.
+            sort_map_entries(&w.out, &mut entries);
+            w.map(&entries)
+        }
+    })
+}
+
+/// Append the encoded value at `bytes` to a builder that takes an unnamed
+/// value: the top-level builder or a list.
+fn append_flat_variant<B: parquet_variant::VariantBuilderExt>(
+    builder: &mut B,
+    bytes: &[u8],
+    depth: usize,
+) -> Result<(), String> {
+    if depth > crate::variant_binary::MAX_VARIANT_DEPTH {
+        return Err(crate::variant_binary::variant_too_deep());
+    }
+    match bytes[0] {
+        TAG_ARRAY => {
+            let container = Container::new(bytes);
+            let mut list = builder
+                .try_new_list()
+                .map_err(|e| format!("cannot start a variant list: {e}"))?;
+            for i in 0..container.count {
+                append_flat_variant(&mut list, &bytes[container.element(i)], depth + 1)?;
+            }
+            list.finish();
+        }
+        TAG_MAP => {
+            let container = Container::new(bytes);
+            let mut object = builder
+                .try_new_object()
+                .map_err(|e| format!("cannot start a variant object: {e}"))?;
+            for i in 0..container.count {
+                insert_flat_variant(
+                    &mut object,
+                    &bytes[container.element(i)],
+                    &bytes[container.map_value(i)],
+                    depth + 1,
+                )?;
+            }
+            object.finish();
+        }
+        _ => builder.append_value(flat_scalar_to_parquet(bytes)?),
+    }
+    Ok(())
+}
+
+/// Insert one field into a variant object. Objects need the key alongside the
+/// value, so they cannot share [`append_flat_variant`]'s builder trait.
+fn insert_flat_variant<S: parquet_variant::BuilderSpecificState>(
+    object: &mut parquet_variant::ObjectBuilder<'_, S>,
+    key: &[u8],
+    value: &[u8],
+    depth: usize,
+) -> Result<(), String> {
+    if depth > crate::variant_binary::MAX_VARIANT_DEPTH {
+        return Err(crate::variant_binary::variant_too_deep());
+    }
+    let key = flat_variant_object_key(key)?;
+    let key = key.as_ref();
+
+    match value[0] {
+        TAG_ARRAY => {
+            let container = Container::new(value);
+            let mut list = object
+                .try_new_list(key)
+                .map_err(|e| format!("cannot start a variant list: {e}"))?;
+            for i in 0..container.count {
+                append_flat_variant(&mut list, &value[container.element(i)], depth + 1)?;
+            }
+            list.finish();
+        }
+        TAG_MAP => {
+            let container = Container::new(value);
+            let mut nested = object
+                .try_new_object(key)
+                .map_err(|e| format!("cannot start a variant object: {e}"))?;
+            for i in 0..container.count {
+                insert_flat_variant(
+                    &mut nested,
+                    &value[container.element(i)],
+                    &value[container.map_value(i)],
+                    depth + 1,
+                )?;
+            }
+            nested.finish();
+        }
+        _ => object
+            .try_insert(key, flat_scalar_to_parquet(value)?)
+            .map_err(|e| crate::variant_binary::duplicate_variant_key(key, e))?,
+    }
+    Ok(())
+}
+
+/// Render an encoded map key as a Parquet variant object field name; see
+/// `variant_binary::variant_object_key`.
+pub(crate) fn flat_variant_object_key(key: &[u8]) -> Result<Cow<'_, str>, String> {
+    let p = &key[1..];
+    Ok(match key[0] {
+        TAG_STRING => Cow::Borrowed(std::str::from_utf8(p).expect("encoded string must be UTF-8")),
+        TAG_TINYINT => Cow::Owned((p[0] as i8).to_string()),
+        TAG_SMALLINT => Cow::Owned(i16::from_le_bytes(payload_array(p)).to_string()),
+        TAG_INT => Cow::Owned(i32::from_le_bytes(payload_array(p)).to_string()),
+        TAG_BIGINT => Cow::Owned(i64::from_le_bytes(payload_array(p)).to_string()),
+        TAG_UTINYINT => Cow::Owned(p[0].to_string()),
+        TAG_USMALLINT => Cow::Owned(u16::from_le_bytes(payload_array(p)).to_string()),
+        TAG_UINT => Cow::Owned(u32::from_le_bytes(payload_array(p)).to_string()),
+        TAG_UBIGINT => Cow::Owned(u64::from_le_bytes(payload_array(p)).to_string()),
+        _ => {
+            return Err(crate::variant_binary::unencodable_variant_key(type_string(
+                key,
+            )));
+        }
+    })
+}
+
+/// Map one encoded scalar onto the Parquet variant type that holds it; the
+/// tag-driven twin of `variant_binary::to_parquet_scalar`.
+fn flat_scalar_to_parquet(bytes: &[u8]) -> Result<parquet_variant::Variant<'_, '_>, String> {
+    use crate::variant_binary::{parquet_decimal, parquet_u64, unencodable_variant};
+    use parquet_variant::Variant as PqVariant;
+
+    let p = &bytes[1..];
+    Ok(match bytes[0] {
+        // The encoding draws no distinction between the two nulls.
+        TAG_SQL_NULL | TAG_VARIANT_NULL => PqVariant::Null,
+        TAG_BOOLEAN => {
+            if p[0] != 0 {
+                PqVariant::BooleanTrue
+            } else {
+                PqVariant::BooleanFalse
+            }
+        }
+        TAG_TINYINT => PqVariant::Int8(p[0] as i8),
+        TAG_SMALLINT => PqVariant::Int16(i16::from_le_bytes(payload_array(p))),
+        TAG_INT => PqVariant::Int32(i32::from_le_bytes(payload_array(p))),
+        TAG_BIGINT => PqVariant::Int64(i64::from_le_bytes(payload_array(p))),
+        // The encoding has no unsigned types; each widens to the smallest
+        // signed type that holds it.
+        TAG_UTINYINT => PqVariant::Int16(p[0] as i16),
+        TAG_USMALLINT => PqVariant::Int32(u16::from_le_bytes(payload_array(p)) as i32),
+        TAG_UINT => PqVariant::Int64(u32::from_le_bytes(payload_array(p)) as i64),
+        TAG_UBIGINT => parquet_u64(u64::from_le_bytes(payload_array(p)))?,
+        TAG_REAL => PqVariant::Float(f32::from_le_bytes(payload_array(p))),
+        TAG_DOUBLE => PqVariant::Double(f64::from_le_bytes(payload_array(p))),
+        TAG_DECIMAL => parquet_decimal(i128::from_le_bytes(payload_array(&p[..16])), p[16])?,
+        TAG_STRING => {
+            PqVariant::String(std::str::from_utf8(p).expect("encoded string must be UTF-8"))
+        }
+        TAG_BINARY => PqVariant::Binary(p),
+        TAG_UUID => PqVariant::Uuid(uuid::Uuid::from_bytes(payload_array(p))),
+        TAG_DATE => {
+            PqVariant::Date(Date::from_days(i32::from_le_bytes(payload_array(p))).to_date())
+        }
+        TAG_TIME => {
+            PqVariant::Time(Time::from_nanoseconds(u64::from_le_bytes(payload_array(p))).to_time())
+        }
+        TAG_TIMESTAMP => PqVariant::TimestampNtzMicros(
+            Timestamp::from_microseconds(i64::from_le_bytes(payload_array(p)))
+                .to_dateTime()
+                .naive_utc(),
+        ),
+        TAG_TIMESTAMP_TZ => PqVariant::TimestampMicros(
+            TimestampTz::from_microseconds(i64::from_le_bytes(payload_array(p))).to_dateTime(),
+        ),
+        _ => return Err(unencodable_variant(type_string(bytes))),
+    })
+}
+
+/// Encode a `FlatVariant` into the Parquet variant binary encoding, walking
+/// the flat buffer with no intermediate enum tree.
+pub(crate) fn flat_variant_to_parquet(value: &FlatVariant) -> Result<(Vec<u8>, Vec<u8>), String> {
+    // See `to_variant_binary`: without this a colliding key drops an entry.
+    let mut builder = parquet_variant::VariantBuilder::new().with_validate_unique_fields(true);
+    append_flat_variant(&mut builder, value.as_bytes(), 1)?;
+    Ok(builder.finish())
+}
+
+/// Decode the Parquet variant binary encoding straight into a `FlatVariant`,
+/// with no intermediate enum tree.
+pub(crate) fn flat_variant_from_parquet(
+    v: parquet_variant::Variant<'_, '_>,
+) -> Result<FlatVariant, String> {
+    build_document(|w| encode_parquet_variant(w, v, 1))
+}
+
 // Conversion from/to the enum Variant
 
 /// Encode one `Variant` into the writer; returns the value's range.
+#[allow(deprecated)]
 fn encode_variant(w: &mut Writer, v: &Variant) -> Range<usize> {
     match v {
         Variant::SqlNull => w.scalar(TAG_SQL_NULL, &[]),
@@ -805,7 +1136,7 @@ fn encode_variant(w: &mut Writer, v: &Variant) -> Range<usize> {
             let mut payload = [0u8; 16];
             payload[..8].copy_from_slice(&g.left().into_inner().to_le_bytes());
             payload[8..].copy_from_slice(&g.right().into_inner().to_le_bytes());
-            w.scalar(TAG_GEOMETRY, &payload)
+            w.scalar(TAG_GEO_POINT, &payload)
         }
         Variant::Uuid(u) => w.scalar(TAG_UUID, &u.to_bytes()[..]),
         Variant::Array(items) => w.array_in_place(items.len(), |w, i| {
@@ -868,9 +1199,10 @@ pub(crate) fn build_document_infallible(
     }
 }
 
-/// The connector-metadata boundary: the adapters always build metadata as
-/// the enum `Variant`, and a metadata DEFAULT expression for a FlatVariant
+/// The connector-metadata boundary: the record deserializer receives metadata
+/// as the enum `Variant`, and a metadata DEFAULT expression for a FlatVariant
 /// column converts it once here. Goes away with the enum.
+#[allow(deprecated)]
 impl From<&Variant> for FlatVariant {
     fn from(v: &Variant) -> Self {
         build_document_infallible(|w| encode_variant(w, v))
@@ -878,6 +1210,7 @@ impl From<&Variant> for FlatVariant {
 }
 
 /// Decode one complete encoded value back into a `Variant`.
+#[allow(deprecated)]
 fn decode_variant(bytes: &[u8]) -> Variant {
     let payload = &bytes[1..];
     match bytes[0] {
@@ -918,7 +1251,7 @@ fn decode_variant(bytes: &[u8]) -> Variant {
             payload_array(payload),
         ))),
         TAG_BINARY => Variant::Binary(ByteArray::new(payload)),
-        TAG_GEOMETRY => Variant::Geometry(crate::GeoPoint::new(
+        TAG_GEO_POINT => Variant::Geometry(crate::GeoPoint::new(
             f64::from_le_bytes(payload_array(&payload[..8])),
             f64::from_le_bytes(payload_array(&payload[8..])),
         )),
@@ -946,6 +1279,7 @@ fn decode_variant(bytes: &[u8]) -> Variant {
     }
 }
 
+#[allow(deprecated)]
 impl From<&FlatVariant> for Variant {
     fn from(v: &FlatVariant) -> Self {
         decode_variant(v.as_bytes())
@@ -953,6 +1287,7 @@ impl From<&FlatVariant> for Variant {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 impl From<FlatVariant> for Variant {
     fn from(v: FlatVariant) -> Self {
         Variant::from(&v)
@@ -963,6 +1298,7 @@ impl From<FlatVariant> for Variant {
 // as the enum Variant, and a metadata DEFAULT expression for a FlatVariant
 // VARIANT column converts once here. The only sanctioned production use of
 // an enum-to-flat conversion.
+#[allow(deprecated)]
 impl From<Variant> for FlatVariant {
     fn from(v: Variant) -> Self {
         FlatVariant::from(&v)
@@ -972,12 +1308,14 @@ impl From<Variant> for FlatVariant {
 /// See [`From<Variant>`]: the connector-metadata boundary conversion for a
 /// nullable VARIANT column with a metadata DEFAULT.
 #[doc(hidden)]
+#[allow(deprecated)]
 pub fn variant_to_fvN(v: Option<Variant>) -> Option<FlatVariant> {
     v.map(|v| FlatVariant::from(&v))
 }
 
 /// See [`From<Variant>`]: the non-null variant of the boundary conversion.
 #[doc(hidden)]
+#[allow(deprecated)]
 pub fn variant_to_fv(v: Variant) -> FlatVariant {
     FlatVariant::from(&v)
 }
@@ -990,6 +1328,7 @@ pub fn variant_to_fv(v: Variant) -> FlatVariant {
 // on this); it does not become a Rust `None`. Test-only, like the other
 // bridges.
 #[cfg(test)]
+#[allow(deprecated)]
 impl TryFrom<Variant> for Option<FlatVariant> {
     type Error = Box<dyn std::error::Error>;
 
@@ -1111,7 +1450,12 @@ impl rkyv::Archive for FlatVariant {
 
 impl<S: ScratchSpace + RkyvSerializer + ?Sized> rkyv::Serialize<S> for FlatVariant {
     fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
-        ArchivedVec::serialize_from_slice(self.as_bytes(), serializer)
+        // SAFETY: a byte is trivially copyable, has no padding, and archives as
+        // itself, so the copy is exactly the encoding. The safe
+        // `serialize_from_slice` resolves a slice element by element, one
+        // `write` call per byte, which measured 60x slower on a 16 KiB document
+        // (`benches/flat_variant_serialize.rs`).
+        unsafe { ArchivedVec::serialize_copy_from_slice(self.as_bytes(), serializer) }
     }
 }
 
@@ -1138,6 +1482,14 @@ impl Ord for ArchivedFlatVariant {
 impl PartialOrd for ArchivedFlatVariant {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Both forms order by the encoding, so the archived bytes compare with the
+/// value's bytes directly.
+impl dbsp::dynamic::OrdRepr<FlatVariant> for ArchivedFlatVariant {
+    fn ord_cmp(&self, other: &FlatVariant) -> Ordering {
+        cmp_values(self.as_bytes(), other.as_bytes())
     }
 }
 
@@ -1198,7 +1550,9 @@ impl<'de> Visitor<'de> for BuildValue<'_> {
 
     #[inline]
     fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
-        Ok(self.w.scalar(TAG_DOUBLE, &value.to_le_bytes()))
+        Ok(self
+            .w
+            .scalar(TAG_DOUBLE, &F64::new(value).into_inner().to_le_bytes()))
     }
 
     #[inline]
@@ -1244,29 +1598,40 @@ impl<'de> Visitor<'de> for BuildValue<'_> {
     where
         V: MapAccess<'de>,
     {
-        match map.next_key_seed(KeyClassifier)? {
-            Some(KeyClass::Number) => {
-                let number: DynamicDecimal = map.next_value()?;
-                Ok(self.w.scalar(
-                    TAG_DECIMAL,
-                    &casts::decimal_payload(number.significand(), number.exponent()),
-                ))
-            }
+        let first_entry = match map.next_key_seed(KeyClassifier)? {
+            None => return Ok(self.w.map(&[])),
             Some(KeyClass::Map(first_key)) => {
-                let mut entries = Vec::new();
                 let key_range = self.w.scalar(TAG_STRING, first_key.as_bytes());
                 let val_range = map.next_value_seed(BuildValue { w: self.w })?;
-                entries.push((key_range, val_range));
-                while let Some(key) = map.next_key::<String>()? {
-                    let key_range = self.w.scalar(TAG_STRING, key.as_bytes());
-                    let val_range = map.next_value_seed(BuildValue { w: self.w })?;
-                    entries.push((key_range, val_range));
-                }
-                sort_map_entries(&self.w.out, &mut entries);
-                Ok(self.w.map(&entries))
+                (key_range, val_range)
             }
-            None => Ok(self.w.map(&[])),
+            Some(KeyClass::Number) => {
+                match map.next_value_seed(NumberTokenValue(BuildValue { w: self.w }))? {
+                    TokenValue::Number(text) => {
+                        let number = DynamicDecimal::deserialize(
+                            IntoDeserializer::<V::Error>::into_deserializer(text),
+                        )?;
+                        return Ok(self.w.scalar(
+                            TAG_DECIMAL,
+                            &casts::decimal_payload(number.significand(), number.exponent()),
+                        ));
+                    }
+                    TokenValue::Entry(val_range) => {
+                        let key_range = self.w.scalar(TAG_STRING, DECIMAL_KEY_TOKEN.as_bytes());
+                        (key_range, val_range)
+                    }
+                }
+            }
+        };
+
+        let mut entries = vec![first_entry];
+        while let Some(key) = map.next_key::<String>()? {
+            let key_range = self.w.scalar(TAG_STRING, key.as_bytes());
+            let val_range = map.next_value_seed(BuildValue { w: self.w })?;
+            entries.push((key_range, val_range));
         }
+        sort_map_entries(&self.w.out, &mut entries);
+        Ok(self.w.map(&entries))
     }
 }
 
@@ -1332,13 +1697,8 @@ impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for FlatVariant 
     {
         match context.variant_format {
             VariantFormat::Json => FlatVariant::deserialize(deserializer),
-            VariantFormat::JsonString => {
-                let s = Cow::<String>::deserialize(deserializer)?;
-                serde_json::from_str::<FlatVariant>(&s).map_err(|e| {
-                    D::Error::custom(format!(
-                        "error deserializing VARIANT type from a JSON string: {e}"
-                    ))
-                })
+            VariantFormat::JsonString | VariantFormat::ParquetVariant => {
+                crate::variant_binary::deserialize_variant(deserializer)
             }
         }
     }
@@ -1409,7 +1769,7 @@ impl Serialize for Enc<'_> {
                 .serialize_with_context(serializer, self.config),
             // ByteArray honors the config's binary format.
             TAG_BINARY => ByteArray::new(p).serialize_with_context(serializer, self.config),
-            TAG_GEOMETRY => crate::GeoPoint::new(
+            TAG_GEO_POINT => crate::GeoPoint::new(
                 f64::from_le_bytes(payload_array(&p[..8])),
                 f64::from_le_bytes(payload_array(&p[8..])),
             )
@@ -1472,6 +1832,9 @@ impl SerializeWithContext<SqlSerdeConfig> for FlatVariant {
                     ))
                 })?)
             }
+            VariantFormat::ParquetVariant => {
+                crate::variant_binary::serialize_flat_variant(self, serializer)
+            }
             VariantFormat::Json => Enc {
                 bytes: self.as_bytes(),
                 config: context,
@@ -1481,10 +1844,106 @@ impl SerializeWithContext<SqlSerdeConfig> for FlatVariant {
     }
 }
 
+// Both forms hash the same bytes through the same function, just as both
+// compare through the same one, so the archived hash is the decoded hash by
+// construction rather than by coincidence.  See `crate::hash_repr`.
+impl crate::__HashRepr for FlatVariant {
+    const FAITHFUL: bool = true;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        ::std::hash::Hash::hash(self, state)
+    }
+}
+
+impl crate::__HashRepr for ArchivedFlatVariant {
+    const FAITHFUL: bool = true;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        ::std::hash::Hash::hash(self, state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
+    use crate::Map;
     use proptest::prelude::*;
+
+    /// Every tag renders under its own name, and containers render their
+    /// elements rather than their raw bytes.
+    #[test]
+    fn debug_renders_every_tag() {
+        let scalars: Vec<FlatVariant> = vec![
+            FlatVariant::sql_null(),
+            FlatVariant::variant_null(),
+            FlatVariant::from(true),
+            FlatVariant::from(1i8),
+            FlatVariant::from(2i16),
+            FlatVariant::from(3i32),
+            FlatVariant::from(4i64),
+            FlatVariant::from(5u8),
+            FlatVariant::from(6u16),
+            FlatVariant::from(7u32),
+            FlatVariant::from(8u64),
+            FlatVariant::from(F32::new(1.5)),
+            FlatVariant::from(F64::new(2.5)),
+            FlatVariant::from(
+                crate::SqlDecimal::<10, 2>::try_from(DynamicDecimal::new(1234, 2)).unwrap(),
+            ),
+            FlatVariant::from(SqlString::from_ref("s")),
+            FlatVariant::from(Date::from_days(3)),
+            FlatVariant::from(Time::from_nanoseconds(4)),
+            FlatVariant::from(Timestamp::from_microseconds(5)),
+            FlatVariant::from(TimestampTz::from_microseconds(6)),
+            FlatVariant::from(ShortInterval::from_microseconds(7)),
+            FlatVariant::from(LongInterval::from_months(8)),
+            FlatVariant::from(ByteArray::new(&[0xab])),
+            FlatVariant::from(crate::GeoPoint::new(1.0, 2.0)),
+            FlatVariant::from(Uuid::from_bytes([0; 16])),
+        ];
+        let rendered = format!("{:?}", FlatVariant::from(Arc::new(scalars)));
+        for name in [
+            "SqlNull",
+            "VariantNull",
+            "Boolean(true)",
+            "TinyInt(1)",
+            "SmallInt(2)",
+            "Int(3)",
+            "BigInt(4)",
+            "UTinyInt(5)",
+            "USmallInt(6)",
+            "UInt(7)",
+            "UBigInt(8)",
+            "Real(1.5)",
+            "Double(2.5)",
+            "Decimal(12.34)",
+            "String(\"s\")",
+            "Date(",
+            "Time(",
+            "Timestamp(",
+            "TimestampTz(",
+            "ShortInterval(",
+            "LongInterval(",
+            "Binary([171])",
+            "GeoPoint(",
+            "Uuid(",
+        ] {
+            assert!(rendered.contains(name), "{name} missing from {rendered}");
+        }
+
+        let map: Map<FlatVariant, FlatVariant> = Arc::new(BTreeMap::from([(
+            FlatVariant::from(SqlString::from_ref("k")),
+            FlatVariant::from(Arc::new(vec![FlatVariant::from(9i32)])),
+        )]));
+        assert_eq!(
+            format!("{:?}", FlatVariant::from(map)),
+            "FlatVariant({String(\"k\"): [Int(9)]})"
+        );
+    }
 
     fn scalar() -> impl Strategy<Value = Variant> {
         prop_oneof![
@@ -1594,6 +2053,21 @@ mod tests {
             let new = a2.index_string(&key);
             prop_assert_eq!(&Variant::from(&new), &old);
         }
+    }
+
+    /// The archived form is the encoding verbatim. `Serialize` copies the
+    /// document in bulk through an unsafe rkyv entry point, so pin the bytes
+    /// themselves rather than only the value a round trip recovers: a copy that
+    /// drops or shifts bytes can still deserialize equal when the bytes it
+    /// mangles happen to match rkyv's alignment padding.
+    #[test]
+    fn rkyv_archives_the_encoding_verbatim() {
+        let document: FlatVariant =
+            serde_json::from_str(r#"{"a":{"b":[1,2.5,"three",null,true]},"z":"tail"}"#).unwrap();
+        let bytes = dbsp::storage::file::to_bytes(&document).unwrap();
+        // SAFETY: the bytes come from serializing `document` just above.
+        let archived = unsafe { rkyv::archived_root::<FlatVariant>(&bytes) };
+        assert_eq!(archived.as_bytes(), document.as_bytes());
     }
 
     /// The MAP cast must treat a JSON null member exactly like the enum
@@ -1730,8 +2204,8 @@ mod tests {
             check_from(
                 &a,
                 &a2,
-                c1::cast_to_GeoPointN_V,
-                c2::cast_to_GeoPointN_FV,
+                c1::cast_to_geopointN_V,
+                c2::cast_to_geopointN_FV,
                 "geopoint",
             );
             check_interval_units!(
@@ -1944,7 +2418,7 @@ mod tests {
             TimestampTz::from_microseconds(1_700_000_000_000_000)
         );
         check_to_variant!(Uuid, Uuid::from_bytes([9; 16]));
-        check_to_variant!(GeoPoint, crate::GeoPoint::new(1.0, -2.0));
+        check_to_variant!(geopoint, crate::GeoPoint::new(1.0, -2.0));
         let short = ShortInterval::from_microseconds(90_061_000_000);
         check_to_variant!(ShortInterval_DAYS, short);
         check_to_variant!(ShortInterval_HOURS, short);
@@ -2085,7 +2559,7 @@ mod tests {
                 Timestamp,
                 TimestampTz,
                 Uuid,
-                GeoPoint,
+                geopoint,
                 ShortInterval_DAYS,
                 ShortInterval_HOURS,
                 ShortInterval_DAYS_TO_HOURS,
@@ -2355,10 +2829,13 @@ mod tests {
         }
     }
 
-    /// PARSE_JSON agrees with the enum on valid and invalid input.
+    /// PARSE_JSON and TRY_PARSE_JSON agree with the enum on valid input;
+    /// TRY_PARSE_JSON returns SQL NULL on invalid input in both grids.
     #[test]
     fn parse_json_matches_enum() {
-        let cases = [
+        use crate::flat_variant::functions as f2;
+
+        let valid = [
             r#"null"#,
             r#"true"#,
             r#"-5"#,
@@ -2367,23 +2844,44 @@ mod tests {
             r#""hello""#,
             r#"[1, "two", null, {"a": false}]"#,
             r#"{"b": 1, "a": [2.5]}"#,
-            // Invalid inputs; both grids return SQL NULL.
-            "",
-            "{",
-            "nul",
-            "[1,",
-            "\"unterminated",
-            "not json at all",
+            r#"{"$serde_json::private::Number": "1"}"#,
+            r#"{"$serde_json::private::Number": "1", "x": 2}"#,
+            r#"{"$serde_json::private::Number": {"a": 184467440737095516150}}"#,
         ];
-        for case in cases {
+        for case in valid {
             let v1 = crate::string::parse_json_s(SqlString::from_ref(case));
-            let v2 = crate::flat_variant::functions::parse_json_fv_s(SqlString::from_ref(case));
+            let v2 = f2::parse_json_fv_s(SqlString::from_ref(case));
             assert_eq!(
                 FlatVariant::from(&v1),
                 v2,
                 "parse_json diverges for {case:?}"
             );
+            let t1 = crate::string::try_parse_json_s(SqlString::from_ref(case));
+            let t2 = f2::try_parse_json_fv_s(SqlString::from_ref(case));
+            assert_eq!(t1.as_ref().map(FlatVariant::from), t2);
+            assert_eq!(t2, Some(v2), "try_parse_json diverges for {case:?}");
         }
+        let invalid = ["", "{", "nul", "[1,", "\"unterminated", "not json at all"];
+        for case in invalid {
+            assert_eq!(
+                crate::string::try_parse_json_s(SqlString::from_ref(case)),
+                None
+            );
+            assert_eq!(f2::try_parse_json_fv_s(SqlString::from_ref(case)), None);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "PARSE_JSON: invalid JSON 'nul'")]
+    fn parse_json_fails_on_invalid_input() {
+        use crate::flat_variant::functions as f2;
+        f2::parse_json_fv_s(SqlString::from_ref("nul"));
+    }
+
+    #[test]
+    #[should_panic(expected = "PARSE_JSON: invalid JSON 'nul'")]
+    fn parse_json_enum_fails_on_invalid_input() {
+        crate::string::parse_json_s(SqlString::from_ref("nul"));
     }
 
     /// Both types render identical JSON under every serde config whose
@@ -2415,7 +2913,7 @@ mod tests {
                 (
                     Variant::String(SqlString::from_ref("arr")),
                     Variant::Array(
-                        vec![Variant::SqlDecimal((5, 1)), Variant::Real(1.5.into())].into(),
+                        vec![Variant::SqlDecimal((5, 1)), Variant::Real(1.5_f32.into())].into(),
                     ),
                 ),
             ]
@@ -2648,5 +3146,97 @@ mod tests {
         let b = Variant::Map(map.into());
         let b2 = FlatVariant::from(&b);
         assert_eq!(v::json_each_bigint_V(b), functions::json_each_bigint_FV(b2));
+    }
+
+    #[test]
+    fn decimal_to_number_keeps_fraction() {
+        use crate::flat_variant::casts::{DecodeFV, cast_to_dN_FV, cast_to_fN_FV};
+        use crate::{
+            F32, F64, SqlDecimal, cast_to_d_SqlDecimal, cast_to_dN_V, cast_to_f_SqlDecimal,
+            cast_to_fN_V, cast_to_i8_SqlDecimal, cast_to_u8_SqlDecimal,
+        };
+
+        // Conversions to integers round toward zero
+        for (significand, scale, real, integer) in [(15, 1, 1.5, 1), (-275, 2, -2.75, -2)] {
+            let v = Variant::SqlDecimal((significand, scale));
+            let fv = FlatVariant::from(&v);
+            assert_eq!(F64::try_from(v.clone()).unwrap(), F64::from(real));
+            assert_eq!(F64::decode(fv.as_bytes()).unwrap(), F64::from(real));
+            assert_eq!(F32::try_from(v.clone()).unwrap(), F32::from(real as f32));
+            assert_eq!(F32::decode(fv.as_bytes()).unwrap(), F32::from(real as f32));
+            assert_eq!(i32::try_from(v.clone()).unwrap(), integer);
+            assert_eq!(i32::decode(fv.as_bytes()).unwrap(), integer);
+        }
+
+        // The REAL and DOUBLE values of a DECIMAL with the given scale
+        fn typed<const S: usize>(significand: i128) -> (F32, F64) {
+            let decimal = SqlDecimal::<38, S>::new(significand, S as i32).unwrap();
+            let real = cast_to_f_SqlDecimal(decimal).unwrap();
+            let double = cast_to_d_SqlDecimal(decimal).unwrap();
+            (real, double)
+        }
+
+        // A VARIANT holding a DECIMAL converts to the same value as the DECIMAL itself
+        for (significand, scale, (real, double)) in [
+            (79450944636602, 17, typed::<17>(79450944636602)),
+            (1, 38, typed::<38>(1)),
+        ] {
+            let v = Variant::SqlDecimal((significand, scale));
+            let fv = FlatVariant::from(&v);
+            assert_eq!(cast_to_fN_V(v.clone()).unwrap(), Some(real));
+            assert_eq!(F32::try_from(v.clone()).unwrap(), real);
+            assert_eq!(cast_to_fN_FV(fv.clone()).unwrap(), Some(real));
+            assert_eq!(F32::decode(fv.as_bytes()).unwrap(), real);
+            assert_eq!(cast_to_dN_V(v.clone()).unwrap(), Some(double));
+            assert_eq!(F64::try_from(v).unwrap(), double);
+            assert_eq!(cast_to_dN_FV(fv.clone()).unwrap(), Some(double));
+            assert_eq!(F64::decode(fv.as_bytes()).unwrap(), double);
+        }
+
+        let too_large = Variant::SqlDecimal((3005, 1));
+        let too_large_decimal = SqlDecimal::<38, 1>::new(3005, 1).unwrap();
+        assert!(cast_to_i8_SqlDecimal(too_large_decimal).is_err());
+        assert!(i8::try_from(too_large.clone()).is_err());
+        assert!(i8::decode(FlatVariant::from(&too_large).as_bytes()).is_err());
+
+        let negative = Variant::SqlDecimal((-5, 1));
+        let negative_decimal = SqlDecimal::<38, 1>::new(-5, 1).unwrap();
+        assert_eq!(cast_to_u8_SqlDecimal(negative_decimal).unwrap(), 0);
+        assert_eq!(u8::try_from(negative.clone()).unwrap(), 0);
+        assert_eq!(
+            u8::decode(FlatVariant::from(&negative).as_bytes()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn float_payloads_are_canonical() {
+        use parquet_variant::Variant as PqVariant;
+        use serde::de::IntoDeserializer;
+
+        // -0.0 and a NaN with the sign bit set are stored as 0.0 and NAN
+        let negative_nan = f64::from_bits(f64::NAN.to_bits() | (1 << 63));
+        let negative_nan32 = f32::from_bits(f32::NAN.to_bits() | (1 << 31));
+        let double = |x: f64| FlatVariant::from(&Variant::Double(F64::new(x)));
+        let real = |x: f32| FlatVariant::from(&Variant::Real(F32::new(x)));
+        let deserialize = |x: f64| {
+            let deserializer = IntoDeserializer::<serde::de::value::Error>::into_deserializer(x);
+            FlatVariant::deserialize(deserializer).unwrap()
+        };
+        let from_parquet = |v: PqVariant<'_, '_>| flat_variant_from_parquet(v).unwrap();
+        for (input, canonical) in [(-0.0, 0.0), (negative_nan, f64::NAN)] {
+            let expected = double(canonical);
+            assert_eq!(deserialize(input).as_bytes(), expected.as_bytes());
+            assert_eq!(
+                from_parquet(PqVariant::Double(input)).as_bytes(),
+                expected.as_bytes()
+            );
+        }
+        for (input, canonical) in [(-0.0, 0.0), (negative_nan32, f32::NAN)] {
+            assert_eq!(
+                from_parquet(PqVariant::Float(input)).as_bytes(),
+                real(canonical).as_bytes()
+            );
+        }
     }
 }

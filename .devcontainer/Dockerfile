@@ -22,23 +22,38 @@ RUN apt-get update --fix-missing && \
    gnupg2 \
    sudo \
    build-essential \
-   # Go is required to build aws-lc-fips-sys when rustls is built with FIPS
+   # Go builds AWS-LC in scripts/install-librdkafka.sh, and aws-lc-fips-sys
+   # when rustls is built with FIPS
    golang-go \
    openssl \
    cmake \
    pkg-config \
    libssl-dev \
+   # librdkafka links these; scripts/install-librdkafka.sh needs their headers
+   # to enable SASL, zlib and zstd support
    libsasl2-dev \
+   zlib1g-dev \
+   libzstd-dev \
    ca-certificates \
    gnupg \
    protobuf-compiler \
    git \
    jq
 
+# postCreate.sh installs certain packages as root from a shell with no terminal to type the
+# password set above into. sudo owns /etc/sudoers.d, so this has to follow the
+# install. visudo -c fails the build on a syntax error here, which would
+# otherwise leave sudo refusing to run at all, and only at postCreate time.
+RUN echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME && \
+   chmod 0440 /etc/sudoers.d/$USERNAME && \
+   visudo -cf /etc/sudoers.d/$USERNAME
+
 ## Setup Java and Python
 
+# mold is the linker for Rust builds here; see the cargo configuration below.
 RUN apt-get install --no-install-recommends -y \
    gcc clang libclang-dev python3-pip python3-plumbum \
+   mold \
    hub numactl openjdk-21-jdk-headless maven
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -62,9 +77,14 @@ RUN ARCH=`dpkg --print-architecture`; \
 RUN pip3 install --break-system-packages gdown kafka-python-ng
 
 ## Prepare directories for non-root user (for Claude Code)
-RUN mkdir -p /home/$USERNAME/.local/share/claude && chown -R $USERNAME /home/$USERNAME/.local/share/claude
-RUN mkdir -p /home/$USERNAME/.local/state/claude && chown -R $USERNAME /home/$USERNAME/.local/state/claude
-RUN mkdir -p /home/$USERNAME/.local/bin/ && chown -R $USERNAME /home/$USERNAME/.local/bin/
+# The installers above ran as root with HOME set to this directory, so they left
+# root-owned dotfiles behind: uv writes ~/.config and ~/.zshrc. Hand the whole
+# home directory over, or anything the user later runs that wants a new dotfile
+# fails, as the samply installer does on ~/.config/samply.
+RUN mkdir -p /home/$USERNAME/.local/share/claude \
+   /home/$USERNAME/.local/state/claude \
+   /home/$USERNAME/.local/bin && \
+   chown -R $USERNAME /home/$USERNAME
 
 ## Switch to non-root user
 
@@ -75,13 +95,16 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
 ENV PATH="$HOME/.cargo/bin:$PATH"
 
 ## Install Bun.js
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.3"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.10"
 ENV PATH="$HOME/.bun/bin:$PATH"
-RUN $HOME/.bun/bin/bun install --global @hey-api/openapi-ts
+RUN $HOME/.bun/bin/bun install --global @hey-api/openapi-ts @biomejs/biome
 
 ## Install Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
+# Build arg, not a compose `environment:` entry: the latter is set only at run
+# time, which leaves this empty and silently installs `stable` instead.
+ARG RUST_VERSION=1.99.0
 RUN \
    rustup install $RUST_VERSION && \
    rustup default $RUST_VERSION && \
@@ -89,7 +112,19 @@ RUN \
    rustup component add clippy && \
    cargo install cargo-make
 
+# Link with mold, which needs far less memory than GNU ld for a link this size.
+# Scoped to the two Linux targets, so it cannot leak into a host toolchain. This
+# is a user-level file rather than the repository `.cargo/config.toml` because
+# mold runs on Linux only, and Feldera is also developed on macOS.
+RUN mkdir -p $HOME/.cargo && printf '%s\n' \
+   '[target.aarch64-unknown-linux-gnu]' \
+   'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+   '' \
+   '[target.x86_64-unknown-linux-gnu]' \
+   'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+   >> $HOME/.cargo/config.toml
+
 ## Install Samply
-RUN echo "pass" | sudo curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
+RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh
 
 ENV PATH="$HOME/.local/bin:$PATH"

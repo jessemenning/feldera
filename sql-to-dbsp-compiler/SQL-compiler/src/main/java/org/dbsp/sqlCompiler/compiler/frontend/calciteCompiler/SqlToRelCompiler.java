@@ -101,9 +101,11 @@ import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.SqlSetOption;
 import org.apache.calcite.sql.SqlTypeNameSpec;
 import org.apache.calcite.sql.SqlUserDefinedTypeNameSpec;
+import org.apache.calcite.sql.SqlWithItem;
 import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.dialect.OracleSqlDialect;
 import org.apache.calcite.sql.fun.SqlDatetimeSubtractionOperator;
+import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.parser.SqlParseException;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -116,7 +118,6 @@ import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.type.SqlTypeUtil;
-import org.apache.calcite.sql.util.ListSqlOperatorTable;
 import org.apache.calcite.sql.util.SqlBasicVisitor;
 import org.apache.calcite.sql.util.SqlOperatorTables;
 import org.apache.calcite.sql.util.SqlShuttle;
@@ -132,6 +133,8 @@ import org.apache.calcite.util.Litmus;
 import org.apache.calcite.util.Pair;
 import org.dbsp.generated.parser.DbspParserImpl;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.Documentation;
 import org.dbsp.sqlCompiler.compiler.IErrorReporter;
 import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
@@ -140,7 +143,15 @@ import org.dbsp.sqlCompiler.compiler.errors.SourcePosition;
 import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
 import org.dbsp.sqlCompiler.compiler.errors.UnimplementedException;
 import org.dbsp.sqlCompiler.compiler.errors.UnsupportedException;
+import org.dbsp.sqlCompiler.compiler.frontend.CalciteToDBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.ExtendedSqlParserPos;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CalciteFunctions;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CaseInsensitiveOperatorTable;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CustomFunctions;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.ExternalFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlArrayAggFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlUserDefinedAggregationFunction;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.optimizer.CalciteOptimizer;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteObject;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.PropertyList;
@@ -202,7 +213,10 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+
+import static org.apache.calcite.util.Static.RESOURCE;
 
 /**
  * The SqlToRel compiler compiles SQL into Calcite RelNode representations.
@@ -240,7 +254,16 @@ public class SqlToRelCompiler implements IWritesLogs {
     private final CustomFunctions customFunctions;
     /** User-defined types */
     private final HashMap<ProgramIdentifier, RelDataType> udt;
+    /** Literals validated as column default values.  Key is the SQL text of the literal,
+     * value is the validated expression. */
+    private final HashMap<String, RexNode> validatedLiterals;
     private final HashMap<ProgramIdentifier, DeclareViewStatement> declaredViews;
+    /** Names of the relations in the SQL that the compiler synthesizes to validate an
+     * expression.  The clone that compiles that SQL shares the program's catalog and view
+     * declarations, so these names carry the FELDERA_ prefix of the other compiler-defined
+     * relations, such as FELDERA_ERROR_TABLE. */
+    static final String SYNTHESIZED_TABLE = "FELDERA_SYNTHESIZED_TABLE";
+    static final String SYNTHESIZED_VIEW = "FELDERA_SYNTHESIZED_VIEW";
     /** Recursive views which have been referred */
     private final Set<ProgramIdentifier> usedViewDeclarations;
     private final RelBuilder relBuilder;
@@ -315,6 +338,7 @@ public class SqlToRelCompiler implements IWritesLogs {
         connConfigProp.put(CalciteConnectionProperty.CASE_SENSITIVE.camelName(), String.valueOf(true));
         connConfigProp.put(CalciteConnectionProperty.DEFAULT_NULL_COLLATION.camelName(), NULL_COLLATION);
         this.udt = new HashMap<>();
+        this.validatedLiterals = new HashMap<>();
         this.connectionConfig = new CalciteConnectionConfigImpl(connConfigProp);
         this.parserConfig = SqlParser.config()
                 .withLex(Lex.ORACLE)
@@ -348,16 +372,15 @@ public class SqlToRelCompiler implements IWritesLogs {
                 // It is really an annotation attached to a rel node remembering the original AS alias
                 .hintStrategy(HINT_ALIAS, HintStrategy.builder(HintPredicates.JOIN).build())
                 .build();
-        this.cluster = RelOptCluster.create(planner, new RexBuilder(this.typeFactory));
+        this.cluster = RelOptCluster.create(planner, new FelderaRexBuilder(this.typeFactory));
         this.cluster.setHintStrategies(hints);
         var metadataProvider = ChainedRelMetadataProvider.of(List.of(RelMdRowCount.SOURCE,
                 DefaultRelMetadataProvider.INSTANCE));
         this.cluster.setMetadataProvider(metadataProvider);
         this.converterConfig = SqlToRelConverter.config()
-                // Calcite recommends not using withExpand, but there are no
-                // rules to decorrelate some queries that withExpand will produce,
-                // e.g., AggScottTests.testAggregates4
-                .withExpand(true)
+                .withExpand(false)
+                // IN lists with up to 50 constants stay filter predicates instead of joins with VALUES
+                .withInSubQueryThreshold(50)
                 .withTrimUnusedFields(true)
                 .withRelBuilderConfigTransform(t -> t.withSimplify(false))
                 .withHintStrategyTable(hints)
@@ -377,15 +400,21 @@ public class SqlToRelCompiler implements IWritesLogs {
     /** Create a copy of the 'source' compiler which can be used to compile
      * some generated SQL without affecting its data structures */
     public SqlToRelCompiler(SqlToRelCompiler source) {
+        this(source, source.errorReporter);
+    }
+
+    /** A copy of 'source' which reports problems to 'errorReporter' */
+    public SqlToRelCompiler(SqlToRelCompiler source, IErrorReporter errorReporter) {
         this.options = source.options;
         this.parserConfig = source.parserConfig;
         this.cluster = source.cluster;
         this.converterConfig = source.converterConfig;
         this.connectionConfig = source.connectionConfig;
-        this.errorReporter = source.errorReporter;
+        this.errorReporter = errorReporter;
         this.customFunctions = new CustomFunctions(source.customFunctions);
         this.calciteCatalog = new Catalog(source.calciteCatalog);
         this.udt = new HashMap<>(source.udt);
+        this.validatedLiterals = new HashMap<>();
         this.declaredViews = new HashMap<>(source.declaredViews);
         this.rootSchema = CalciteSchema.createRootSchema(false, false).plus();
         this.copySchema(source.rootSchema);
@@ -552,6 +581,14 @@ public class SqlToRelCompiler implements IWritesLogs {
         @Override
         public Void visit(SqlCall call) {
             SourcePositionRange position = new SourcePositionRange(call.getParserPosition());
+            if (call instanceof SqlWithItem item && item.recursive.booleanValue()) {
+                this.errorReporter.reportError(
+                        new SourcePositionRange(item.name.getParserPosition()),
+                        "Not supported",
+                        "RECURSIVE queries in WITH are not supported; " +
+                                "use DECLARE RECURSIVE VIEW instead. " +
+                                RECURSION_DOCUMENTATION.citation());
+            }
             SqlOperator operator = call.getOperator();
             if (operator instanceof SqlFunction) {
                 for (SqlNode node : call.getOperandList()) {
@@ -635,22 +672,6 @@ public class SqlToRelCompiler implements IWritesLogs {
                 }
             }
             return super.visit(type);
-        }
-    }
-
-    /** An operator table which does name matching always in a case-insensitive way.
-     * As a consequence, all function name lookups are case-insensitive in SQL. */
-    static class CaseInsensitiveOperatorTable extends ListSqlOperatorTable {
-        @SuppressWarnings("deprecation")
-        CaseInsensitiveOperatorTable(List<? extends SqlOperator> operators) {
-            //noinspection unchecked
-            super((List<SqlOperator>) operators);
-        }
-
-        @Override
-        protected void lookUpOperators(String name, boolean caseSensitive, Consumer<SqlOperator> consumer) {
-            // always case-insensitive
-            super.lookUpOperators(name, false, consumer);
         }
     }
 
@@ -763,7 +784,12 @@ public class SqlToRelCompiler implements IWritesLogs {
     /** Keep here a number of empty lines.  This is done to fool the SqlParser
      * below: for each invocation of parseStatements we create a new SqlParser.
      * There is no way to reuse the previous parser one, unfortunately. */
+    public static final Documentation.Link RECURSION_DOCUMENTATION = new Documentation.Link("sql/recursion");
     final StringBuilder newlines = new StringBuilder();
+    /** Maps a position in the program being compiled to the position reported to the user.
+     * This is the identity function, except while compiling SQL that the compiler generates:
+     * the body of a user-defined function, a column default value, or a lateness. */
+    UnaryOperator<SqlParserPos> sourcePositionRemap = UnaryOperator.identity();
 
     /** Create a new parser.
      * @param sql       Program to parse.
@@ -796,11 +822,12 @@ public class SqlToRelCompiler implements IWritesLogs {
     /** Given a SQL statement returns a SqlNode - a calcite AST
      * representation of the query.
      * @param sql  SQL query to compile
-     * @param saveLines  True if the lines "take space": are accounted as part of the input program */
-    public SqlNode parse(String sql, boolean saveLines) throws SqlParseException {
+     * @param saveLines  True if the lines "take space": are accounted as part of the input program
+     * @param postprocess  If false, skip {@link #postParsingProcess(ParsedStatement)} */
+    public SqlNode parse(String sql, boolean saveLines, boolean postprocess) throws SqlParseException {
         SqlParser sqlParser = this.createSqlParser(sql, saveLines);
         SqlNode result = sqlParser.parseStmt();
-        return this.postParsingProcess(result, saveLines);
+        return postprocess ? this.postParsingProcess(result, saveLines) : result;
     }
 
     /** Remove calls to unary plus */
@@ -845,6 +872,18 @@ public class SqlToRelCompiler implements IWritesLogs {
         }
     }
 
+    /** Replace calls to Calcite's ARRAY_AGG with calls to {@link SqlArrayAggFunction} */
+    static class ReplaceArrayAgg extends SqlShuttle {
+        @Override
+        public @org.checkerframework.checker.nullness.qual.Nullable SqlNode visit(SqlCall call) {
+            SqlCall newCall = Objects.requireNonNull((SqlCall) super.visit(call));
+            if (newCall.getOperator() == SqlLibraryOperators.ARRAY_AGG)
+                return SqlArrayAggFunction.INSTANCE.createCall(newCall.getFunctionQuantifier(),
+                        newCall.getParserPosition(), newCall.getOperandList());
+            return newCall;
+        }
+    }
+
     SqlNode postParsingProcess(SqlNode node, boolean saveLines) {
         node.accept(this.getExtraValidator());
         if (this.options.languageOptions.unaryPlusNoop) {
@@ -855,30 +894,38 @@ public class SqlToRelCompiler implements IWritesLogs {
         node = Objects.requireNonNull(replace.visitNode(node));
         ReplaceSafeCasts replace1 = new ReplaceSafeCasts();
         node = Objects.requireNonNull(replace1.visitNode(node));
+        ReplaceArrayAgg replace2 = new ReplaceArrayAgg();
+        node = Objects.requireNonNull(replace2.visitNode(node));
         return node;
     }
 
     public SqlNode parse(String sql) throws SqlParseException {
-        SqlNode result = this.parse(sql, true);
-        return this.postParsingProcess(result, true);
+        return this.parse(sql, true, true);
     }
 
     /** Given a list of statements separated by semicolons, parse all of them.
-     * @param saveLines True if the lines are from the user program; false if they are internally generated. */
-    public List<ParsedStatement> parseStatements(String statements, boolean saveLines) throws SqlParseException {
+     * @param saveLines True if the lines are from the user program; false if they are internally generated.
+     * @param postprocess If false, skip {@link #postParsingProcess(ParsedStatement)}. */
+    public List<ParsedStatement> parseStatements(String statements, boolean saveLines, boolean postprocess)
+            throws SqlParseException {
         SqlParser sqlParser = this.createSqlParser(statements, saveLines);
         List<ParsedStatement> result = new ArrayList<>();
         SqlNodeList sqlNodes = sqlParser.parseStmtList();
         for (SqlNode node: sqlNodes) {
-            SqlNode sqlNode = this.postParsingProcess(node, saveLines);
-            ParsedStatement stat = new ParsedStatement(sqlNode, saveLines);
-            result.add(stat);
+            ParsedStatement stat = new ParsedStatement(node, saveLines);
+            result.add(postprocess ? this.postParsingProcess(stat) : stat);
         }
         return result;
     }
 
+    /** Validate a freshly parsed statement, and apply some rewrites. */
+    public ParsedStatement postParsingProcess(ParsedStatement statement) {
+        SqlNode node = this.postParsingProcess(statement.statement(), statement.visible());
+        return new ParsedStatement(node, statement.visible());
+    }
+
     public List<ParsedStatement> parseStatements(String statements) throws SqlParseException {
-        return this.parseStatements(statements, true);
+        return this.parseStatements(statements, true, true);
     }
 
     RelNode optimize(RelNode rel, boolean visible, RelBuilder relBuilder) {
@@ -898,7 +945,8 @@ public class SqlToRelCompiler implements IWritesLogs {
 
         CalciteOptimizer optimizer = new CalciteOptimizer(
                 this.options.languageOptions.optimizationLevel, relBuilder, this.errorReporter);
-        rel = optimizer.apply(rel, this.options);
+        RelNode input = rel;
+        rel = DBSPCompiler.timed("Calcite.optimize", () -> optimizer.apply(input, this.options));
         RelNode finalRel1 = rel;
         if (visible)
             Logger.INSTANCE.belowLevel(this, level)
@@ -1136,26 +1184,29 @@ public class SqlToRelCompiler implements IWritesLogs {
         return result;
     }
 
-    RexNode validateLatenessOrWatermark(SqlIdentifier columnName, SqlDataTypeSpec columnType,
-                                        SqlNode value, SourceFileContents sources) {
+    RexNode validateLateness(SqlIdentifier columnName, SqlDataTypeSpec columnType,
+                             SqlNode value, SourceFileContents sources) {
+        // The generated SQL contains a reformatted copy of 'value', so problems are reported at all of 'value'
+        UnaryOperator<SqlParserPos> remap = generated -> value.getParserPosition();
         try {
             /* We generate the following SQL:
-              CREATE TABLE T(... column WATERMARK expression ...);
-              SELECT column - value FROM tmp;
+              CREATE TABLE FELDERA_SYNTHESIZED_TABLE(column type);
+              CREATE VIEW FELDERA_SYNTHESIZED_VIEW AS SELECT column - value FROM FELDERA_SYNTHESIZED_TABLE;
               and validate it. */
-            String sql = "CREATE TABLE TMP(\"" +
+            String sql = "CREATE TABLE " + SYNTHESIZED_TABLE + "(\"" +
                     columnName + "\" " +
                     columnType + ");\n" +
-                    "CREATE VIEW V AS SELECT \"" +
+                    "CREATE VIEW " + SYNTHESIZED_VIEW + " AS SELECT \"" +
                     columnName +
                     "\" - " + value +
-                    " FROM TMP;\n";
+                    " FROM " + SYNTHESIZED_TABLE + ";\n";
             Logger.INSTANCE.belowLevel(this, 4)
                     .newline()
                     .append(sql)
                     .newline();
             SqlToRelCompiler clone = new SqlToRelCompiler(this);
-            List<ParsedStatement> list = clone.parseStatements(sql, false);
+            clone.sourcePositionRemap = remap;
+            List<ParsedStatement> list = clone.parseStatements(sql, false, true);
             RelStatement lastStatement = null;
             for (ParsedStatement node : list) {
                 lastStatement = clone.compile(node, sources);
@@ -1176,23 +1227,23 @@ public class SqlToRelCompiler implements IWritesLogs {
                     if (subtract.getKind() == SqlKind.CAST) {
                         subtract = ((RexCall) subtract).getOperands().get(0);
                     }
-                    if (subtract instanceof RexCall call) {
-                        if (call.getKind() == SqlKind.MINUS || call.getKind() == SqlKind.CHECKED_MINUS) {
-                            RexNode left = call.getOperands().get(0);
-                            if (left instanceof RexInputRef) {
-                                // This may include some casts
-                                return call.getOperands().get(1);
-                            }
+                    if (subtract instanceof RexCall call
+                            && (call.getKind() == SqlKind.MINUS || call.getKind() == SqlKind.CHECKED_MINUS)) {
+                        RexNode left = call.getOperands().get(0);
+                        if (left instanceof RexInputRef) {
+                            // This may include some casts
+                            return call.getOperands().get(1);
                         }
+                    } else {
+                        // No subtraction: the simplifier removed a subtraction with 0,
+                        // so the lateness must have been zero.
+                        Utilities.enforce(this.converter != null);
+                        return this.converter.convertExpression(value);
                     }
                 }
             }
         } catch (CalciteContextException e) {
-            SqlParserPos pos = value.getParserPosition();
-            String message = e.getMessage();
-            CalciteContextException ex = new CalciteContextException(message != null ? message : "", e.getCause());
-            ex.setPosition(pos.getLineNum(), pos.getColumnNum(), pos.getEndLineNum(), pos.getEndColumnNum());
-            throw ex;
+            throw rewriteException(e, remap);
         } catch (SqlParseException e) {
             // Do we need to rewrite other exceptions?
             throw new RuntimeException(e);
@@ -1202,19 +1253,71 @@ public class SqlToRelCompiler implements IWritesLogs {
                 columnType, CalciteObject.create(value));
     }
 
-    RexNode validateConstantExpression(SqlExtendedColumnDeclaration column,
-                                       SqlNode value, SourceFileContents sources) {
+    /** Forwards problems to another reporter and counts them */
+    static class CountingReporter implements IErrorReporter {
+        final IErrorReporter target;
+        int problems;
+
+        CountingReporter(IErrorReporter target) {
+            this.target = target;
+            this.problems = 0;
+        }
+
+        @Override
+        public void setErrorContext(SourcePositionRange range) {
+            this.target.setErrorContext(range);
+        }
+
+        @Override
+        public void reportProblem(SourcePositionRange range, boolean warning, boolean continuation,
+                                  String errorType, String message) {
+            this.problems++;
+            this.target.reportProblem(range, warning, continuation, errorType, message);
+        }
+
+        @Override
+        public boolean hasErrors() {
+            return this.target.hasErrors();
+        }
+    }
+
+    /** Validate a column default value.  The validation of a literal depends only on its text,
+     * so each distinct literal is validated once. */
+    RexNode validateDefaultValue(SqlExtendedColumnDeclaration column,
+                                 SqlNode value, SourceFileContents sources) {
+        if (!(value instanceof SqlLiteral))
+            return this.validateConstantExpression(column, value, sources, this.errorReporter);
+        String text = value.toSqlString(OracleSqlDialect.DEFAULT).getSql();
+        RexNode validated = this.validatedLiterals.get(text);
+        if (validated != null)
+            return validated;
+        CountingReporter reporter = new CountingReporter(this.errorReporter);
+        validated = this.validateConstantExpression(column, value, sources, reporter);
+        // A literal whose validation reports a problem, or throws, is validated again at each
+        // occurrence, which reports the problem at that occurrence
+        if (reporter.problems == 0)
+            this.validatedLiterals.put(text, validated);
+        return validated;
+    }
+
+    /** Validate 'value', reporting problems to 'reporter' */
+    RexNode validateConstantExpression(SqlExtendedColumnDeclaration column, SqlNode value,
+                                       SourceFileContents sources, IErrorReporter reporter) {
+        // The generated SQL contains a reformatted copy of 'value', so problems are reported at all of 'value'
+        UnaryOperator<SqlParserPos> remap = generated -> value.getParserPosition();
         try {
             /* We generate the following SQL:
-              CREATE VIEW V AS SELECT expression;
+              CREATE VIEW FELDERA_SYNTHESIZED_VIEW AS SELECT expression;
               and validate it. */
-            String sql = "CREATE VIEW V AS SELECT " + value.toSqlString(OracleSqlDialect.DEFAULT) + ";";
+            String sql = "CREATE VIEW " + SYNTHESIZED_VIEW + " AS SELECT " +
+                    value.toSqlString(OracleSqlDialect.DEFAULT) + ";";
             Logger.INSTANCE.belowLevel(this, 4)
                     .newline()
                     .append(sql)
                     .newline();
-            SqlToRelCompiler clone = new SqlToRelCompiler(this);
-            List<ParsedStatement> list = clone.parseStatements(sql, false);
+            SqlToRelCompiler clone = new SqlToRelCompiler(this, reporter);
+            clone.sourcePositionRemap = remap;
+            List<ParsedStatement> list = clone.parseStatements(sql, false, true);
             RelStatement lastStatement = null;
             for (ParsedStatement node : list) {
                 lastStatement = clone.compile(node, sources);
@@ -1234,11 +1337,7 @@ public class SqlToRelCompiler implements IWritesLogs {
                 }
             }
         } catch (CalciteContextException e) {
-            SqlParserPos pos = value.getParserPosition();
-            String message = e.getMessage();
-            CalciteContextException ex = new CalciteContextException(message != null ? message : "", e.getCause());
-            ex.setPosition(pos.getLineNum(), pos.getColumnNum(), pos.getEndLineNum(), pos.getEndColumnNum());
-            throw ex;
+            throw rewriteException(e, remap);
         } catch (SqlParseException e) {
             // Do we need to rewrite other exceptions?
             throw new RuntimeException(e);
@@ -1298,7 +1397,6 @@ public class SqlToRelCompiler implements IWritesLogs {
             SqlDataTypeSpec typeSpec;
             boolean isPrimaryKey;
             RexNode lateness = null;
-            RexNode watermark = null;
             RexNode defaultValue = null;
             SourcePositionRange defaultValueRange = null;
             boolean interned;
@@ -1318,14 +1416,12 @@ public class SqlToRelCompiler implements IWritesLogs {
                 if (declaredPrimary)
                     primaryKeys.remove(name.getSimple());
                 if (cd.lateness != null) {
-                    lateness = this.validateLatenessOrWatermark(cd.name, cd.dataType, cd.lateness, sources);
-                }
-                if (cd.watermark != null) {
-                    watermark = this.validateLatenessOrWatermark(cd.name, cd.dataType, cd.watermark, sources);
+                    lateness = this.validateLateness(cd.name, cd.dataType, cd.lateness, sources);
                 }
                 if (cd.defaultValue != null) {
                     defaultValueRange = new SourcePositionRange(cd.defaultValue.getParserPosition());
-                    defaultValue = this.validateConstantExpression(cd, cd.defaultValue, sources);
+                    defaultValue = DBSPCompiler.timed("Calcite.defaults",
+                            () -> this.validateDefaultValue(cd, cd.defaultValue, sources));
                 }
                 interned = cd.interned;
             } else if (col instanceof SqlPrimaryKey ||
@@ -1380,7 +1476,7 @@ public class SqlToRelCompiler implements IWritesLogs {
                     name.getSimple(), index++, type);
             RelColumnMetadata meta = new RelColumnMetadata(
                     CalciteObject.create(col), field, isPrimaryKey, Utilities.identifierIsQuoted(name),
-                    lateness, watermark, defaultValue, defaultValueRange, interned);
+                    lateness, defaultValue, defaultValueRange, interned);
             result.add(meta);
         }
 
@@ -1473,7 +1569,7 @@ public class SqlToRelCompiler implements IWritesLogs {
             if (perColumnLateness.containsKey(colIdentifier)) {
                 SqlLateness sqlLateness = Utilities.getExists(perColumnLateness, colIdentifier);
                 SqlDataTypeSpec typeSpec = SqlTypeUtil.convertTypeToSpec(field.getType());
-                lateness = this.validateLatenessOrWatermark(id, typeSpec, sqlLateness.getLateness(), sources);
+                lateness = this.validateLateness(id, typeSpec, sqlLateness.getLateness(), sources);
             }
 
             if (colByName.containsKey(actualColumnName)) {
@@ -1497,7 +1593,7 @@ public class SqlToRelCompiler implements IWritesLogs {
             }
             colByName.put(actualColumnName, field);
             RelColumnMetadata meta = new RelColumnMetadata(node,
-                    field, false, nameIsQuoted, lateness, null, null, null, false);
+                    field, false, nameIsQuoted, lateness, null, null, false);
             if (kind != SqlCreateView.ViewKind.LOCAL && !this.options.languageOptions.unrestrictedIOTypes)
                 this.validateColumnType(true, position, field.getType(), field.getName(), viewName);
             columns.add(meta);
@@ -1558,31 +1654,32 @@ public class SqlToRelCompiler implements IWritesLogs {
 
         int newLineNumber = 0;
         SqlParserPos position = body.getParserPosition();
+        UnaryOperator<SqlParserPos> remap = UnaryOperator.identity();
         try {
             /* To compile a function like
               CREATE FUNCTION fun(a type0, b type1) returning type2 as expression;
               we generate the following SQL:
-              CREATE TABLE tmp(a type0, b type1);
-              SELECT expression FROM tmp;
+              CREATE TABLE FELDERA_SYNTHESIZED_TABLE(a type0, b type1);
+              CREATE VIEW FELDERA_SYNTHESIZED_VIEW AS SELECT expression FROM FELDERA_SYNTHESIZED_TABLE;
               The generated code for the query select expression
               is used to obtain the body of the function.
             */
             StringBuilder builder = new StringBuilder();
             SqlWriter writer = new SqlPrettyWriter(SqlPrettyWriter.config(), builder);
-            builder.append("CREATE TABLE TMP(");
+            builder.append("CREATE TABLE ").append(SYNTHESIZED_TABLE).append("(");
             if (decl.getParameters().isEmpty())
                 // Tables need to have at least one column, so create an unused one if needed
                 builder.append("__unused__ INT");
             else
                 decl.getParameters().unparse(writer, 0, 0);
             builder.append(");\n");
-            builder.append("CREATE VIEW TMP0 AS SELECT\n");
+            builder.append("CREATE VIEW ").append(SYNTHESIZED_VIEW).append(" AS SELECT\n");
             newLineNumber = builder.toString().split("\n").length + 1;
 
             SourcePositionRange range = new SourcePositionRange(body.getParserPosition(), false);
             String bodyExpression = sources.getFragment(range, false);
             builder.append(bodyExpression);
-            builder.append("\nFROM TMP;");
+            builder.append("\nFROM ").append(SYNTHESIZED_TABLE).append(";");
 
             String sql = builder.toString();
             Logger.INSTANCE.belowLevel(this, 4)
@@ -1590,7 +1687,10 @@ public class SqlToRelCompiler implements IWritesLogs {
                     .append(sql)
                     .newline();
             SqlToRelCompiler clone = new SqlToRelCompiler(this);
-            List<ParsedStatement> list = clone.parseStatements(sql, true);
+            int bodyStartLine = newLineNumber;
+            remap = generated -> positionInFunctionBody(generated, bodyStartLine, position);
+            clone.sourcePositionRemap = remap;
+            List<ParsedStatement> list = clone.parseStatements(sql, true, true);
             RelStatement statement = null;
             for (ParsedStatement node : list) {
                 statement = clone.compile(node, sources);
@@ -1603,7 +1703,7 @@ public class SqlToRelCompiler implements IWritesLogs {
             extractor.go(node);
             return Objects.requireNonNull(extractor.body);
         } catch (CalciteContextException e) {
-            throw this.rewriteException(e, newLineNumber, position);
+            throw rewriteException(e, remap);
         } catch (SqlParseException e) {
             // Do we need to rewrite other exceptions?
             throw new RuntimeException(e);
@@ -1835,23 +1935,40 @@ public class SqlToRelCompiler implements IWritesLogs {
         return Objects.requireNonNull(query);
     }
 
-    // Adjust the source position in the exception to match the original position
-    CalciteContextException rewriteException(
-            CalciteContextException e,
-            int startLineNumberInGeneratedCode, SqlParserPos original) {
-        int line = original.getLineNum() - e.getPosLine() + startLineNumberInGeneratedCode;
-        int endLine = original.getEndLineNum() - e.getEndPosLine() + startLineNumberInGeneratedCode;
-        // If the error is on the first line, we need to adjust the column, otherwise we don't.
-        // The temporary generated code always starts after a newline.
-        int col = e.getPosColumn();
-        int endCol = e.getEndPosColumn();
-        if (e.getPosLine() == startLineNumberInGeneratedCode)
-            col += original.getColumnNum() - 1;
-        if (e.getEndPosLine() == startLineNumberInGeneratedCode)
-            endCol += original.getColumnNum() - 1;
-        return new CalciteContextException(
-                e.getMessage() == null ? "" : e.getMessage(), e.getCause(),
-                line, col, endLine, endCol);
+    /** Position in the user's program of {@code generated}.  The function body starts at line
+     * {@code bodyStartLine} of the generated program and at {@code body} in the user's program. */
+    static SqlParserPos positionInFunctionBody(SqlParserPos generated, int bodyStartLine, SqlParserPos body) {
+        int line = body.getLineNum() + generated.getLineNum() - bodyStartLine;
+        int endLine = body.getLineNum() + generated.getEndLineNum() - bodyStartLine;
+        // The body is copied verbatim, so only its first line is shifted to the right
+        int column = generated.getColumnNum();
+        if (generated.getLineNum() == bodyStartLine)
+            column += body.getColumnNum() - 1;
+        int endColumn = generated.getEndColumnNum();
+        if (generated.getEndLineNum() == bodyStartLine)
+            endColumn += body.getColumnNum() - 1;
+        return new SqlParserPos(line, column, endLine, endColumn);
+    }
+
+    /** The exception {@code e}, raised while compiling SQL that the compiler generated,
+     * with its position moved by {@code remap} into the user's program.
+     * The message is built again, since Calcite writes the old position into it. */
+    static CalciteContextException rewriteException(
+            CalciteContextException e, UnaryOperator<SqlParserPos> remap) {
+        SqlParserPos generated = new SqlParserPos(
+                e.getPosLine(), e.getPosColumn(), e.getEndPosLine(), e.getEndPosColumn());
+        SqlParserPos position = remap.apply(generated);
+        int line = position.getLineNum();
+        int column = position.getColumnNum();
+        int endLine = position.getEndLineNum();
+        int endColumn = position.getEndColumnNum();
+        // Same context message as SqlUtil.newContextException
+        var context = line == endLine && column == endColumn
+                ? RESOURCE.validatorContextPoint(line, column)
+                : RESOURCE.validatorContext(line, column, endLine, endColumn);
+        CalciteContextException result = context.ex(Objects.requireNonNull(e.getCause()));
+        result.setPosition(line, column, endLine, endColumn);
+        return result;
     }
 
     private DropTableStatement compileDropTable(ParsedStatement node) {
@@ -1924,9 +2041,11 @@ public class SqlToRelCompiler implements IWritesLogs {
         @Nullable PropertyList properties = this.createProperties(ct.tableProperties);
         Properties props = null;
         if (properties != null) {
+            List<ProgramIdentifier> primaryKey = Linq.map(
+                    Linq.where(cols, col -> col.isPrimaryKey), RelColumnMetadata::getName);
             properties.checkDuplicates(this.errorReporter);
             for (var prop: properties) {
-                this.validateTableProperty(tableName, prop.getKey(), prop.getValue());
+                this.validateTableProperty(tableName, primaryKey, prop.getKey(), prop.getValue());
             }
             props = new Properties(properties);
         }
@@ -1991,19 +2110,23 @@ public class SqlToRelCompiler implements IWritesLogs {
 
     RelRoot sqlToRel(SqlNode node) {
         SqlToRelConverter converter = this.getConverter();
-        return converter.convertQuery(node, true, true);
+        // Phase names with a "Calcite." prefix measure parts of the "Calcite" phase
+        SqlNode validated = DBSPCompiler.timed("Calcite.validate", () -> this.getValidator().validate(node));
+        validated.accept(new WarnFloatingPointEquality(
+                this.getValidator(), this.errorReporter, this.sourcePositionRemap));
+        return DBSPCompiler.timed("Calcite.toRel", () -> converter.convertQuery(validated, false, true));
     }
 
-    void validateViewProperty(ProgramIdentifier view, SqlFragment key, SqlFragment value) {
+    void validateViewProperty(ProgramIdentifier view, SqlCreateView.ViewKind viewKind,
+                              SqlFragment key, SqlFragment value) {
         CalciteObject node = CalciteObject.create(key.getParserPosition());
         String keyString = key.getString();
         switch (keyString) {
             case CreateViewStatement.EMIT_FINAL:
                 // Actual value validated elsewhere
                 break;
-            case "rust":
             case "connectors":
-                this.validateConnectorsProperty(node, false, view, key, value);
+                this.validateConnectorsProperty(node, false, view, List.of(), viewKind, key, value);
                 break;
             default:
                 throw new CompilationError("Unknown view property " + Utilities.singleQuote(keyString), node);
@@ -2037,8 +2160,13 @@ public class SqlToRelCompiler implements IWritesLogs {
             return pos.asRange().relativeTo(value.getSourcePosition().start);
     }
 
+    /** @param primaryKey Primary key columns of the table; empty for a view or for a table
+     *                    without a primary key.
+     *  @param viewKind   Kind of the view; null for a table. */
     @SuppressWarnings("unused")
     void validateConnectorsProperty(CalciteObject ignored, boolean isTable, ProgramIdentifier tableView,
+                                    List<ProgramIdentifier> primaryKey,
+                                    @Nullable SqlCreateView.ViewKind viewKind,
                                     SqlFragment keyIgnored, SqlFragment value) {
         final String json = value.getString();
         final Result<JsonNode> jsonNode = Utilities.validateJson(json);
@@ -2048,6 +2176,13 @@ public class SqlToRelCompiler implements IWritesLogs {
             int index = 1;
             final Set<String> names = new HashSet<>();
             final String objectName = (isTable ? "table " : "view ") + tableView.singleQuote();
+            if (viewKind == SqlCreateView.ViewKind.LOCAL && !jsonNode.ok().isEmpty()) {
+                // The compiler builds no sink for a local view, so such a connector never emits data
+                SourcePositionRange pos = elementPositionRange(value, "/0", false);
+                throw new CompilationError(pos, "Connector on LOCAL VIEW",
+                        "LOCAL VIEW (" + objectName + ") is not an output of the pipeline, so it cannot have connectors.\n" +
+                        "Use CREATE VIEW or CREATE MATERIALIZED VIEW instead");
+            }
             for (Iterator<JsonNode> it = jsonNode.ok().elements(); it.hasNext(); index++) {
                 final String path = "/" + (index-1);
                 final JsonNode connector = it.next();
@@ -2069,6 +2204,35 @@ public class SqlToRelCompiler implements IWritesLogs {
                                 " cannot have the same name: " + Utilities.singleQuote(name.asText()), pos);
                     }
                     names.add(name.asText());
+                }
+                JsonNode softDelete = connector.get(CreateTableStatement.SOFT_DELETE);
+                if (softDelete != null && softDelete.asBoolean(false)) {
+                    String sd = path + "/" + CreateTableStatement.SOFT_DELETE;
+                    if (!isTable) {
+                        SourcePositionRange pos = elementPositionRange(value, sd, true);
+                        throw new CompilationError("\"" + CreateTableStatement.SOFT_DELETE +
+                                "\" property for " + objectName +
+                                " must be attached to a table: soft deletes apply to the records a" +
+                                " connector ingests", pos);
+                    }
+                    if (!primaryKey.isEmpty()) {
+                        SourcePositionRange pos = elementPositionRange(value, sd, true);
+                        throw new CompilationError("\"" + CreateTableStatement.SOFT_DELETE +
+                                "\" property cannot be used for " + objectName +
+                                ", which has a primary key (" +
+                                String.join(", ", Linq.map(primaryKey, ProgramIdentifier::name)) +
+                                "); soft deletes are only supported for tables without a primary key", pos);
+                    }
+                }
+                JsonNode sendSnapshot = connector.get(CreateViewStatement.SEND_SNAPSHOT);
+                if (sendSnapshot != null && sendSnapshot.asBoolean(false)
+                        && !isTable && viewKind != SqlCreateView.ViewKind.MATERIALIZED) {
+                    // The pipeline stores the contents of a view only when the view is materialized
+                    SourcePositionRange pos = elementPositionRange(value,
+                            path + "/" + CreateViewStatement.SEND_SNAPSHOT, true);
+                    throw new CompilationError("\"" + CreateViewStatement.SEND_SNAPSHOT +
+                            "\" property for " + objectName +
+                            " requires a materialized view; declare the view with CREATE MATERIALIZED VIEW", pos);
                 }
                 JsonNode preprocessor = connector.get(CreateTableStatement.PREPROCESSOR);
                 if (preprocessor != null) {
@@ -2178,7 +2342,9 @@ public class SqlToRelCompiler implements IWritesLogs {
         }
     }
 
-    void validateTableProperty(ProgramIdentifier table, SqlFragment key, SqlFragment value) {
+    /** @param primaryKey Primary key columns of {@code table}; empty if it has no primary key. */
+    void validateTableProperty(ProgramIdentifier table, List<ProgramIdentifier> primaryKey,
+                               SqlFragment key, SqlFragment value) {
         CalciteObject node = CalciteObject.create(key.getParserPosition());
         String keyString = key.getString();
         switch (key.getString()) {
@@ -2188,7 +2354,7 @@ public class SqlToRelCompiler implements IWritesLogs {
                 this.validateBooleanProperty(node, key, value);
                 break;
             case CreateTableStatement.CONNECTORS:
-                this.validateConnectorsProperty(node, true, table, key, value);
+                this.validateConnectorsProperty(node, true, table, primaryKey, null, key, value);
                 break;
             case CreateTableStatement.EXPECTED_SIZE:
                 this.validateNumericProperty(node, key, value);
@@ -2206,10 +2372,30 @@ public class SqlToRelCompiler implements IWritesLogs {
         return sw.toString();
     }
 
+    /** If the statement is a CREATE VIEW whose query has top-level
+     * common table expressions, convert each into a LOCAL VIEW.
+     * Returns null if the rewrite does not apply. */
+    @Nullable
+    public List<ParsedStatement> hoistCtes(ParsedStatement statement) {
+        return new CteToLocalViews(this).apply(statement);
+    }
+
     @Nullable
     public CreateViewStatement compileCreateView(
             ParsedStatement node, Map<ProgramIdentifier, SqlLateness> lateness,
             SourceFileContents sources) {
+        return this.compileCreateView(node, lateness, sources, false);
+    }
+
+    /** Compile a CREATE VIEW statement.
+     * @param lateness      Lateness declared for the view's columns.
+     * @param allowCteRetry If true and the optimized plan cannot be
+     *                      decorrelated, but the query has hoistable CTEs,
+     *                      throw {@link CteToLocalViews.Retry}. */
+    @Nullable
+    public CreateViewStatement compileCreateView(
+            ParsedStatement node, Map<ProgramIdentifier, SqlLateness> lateness,
+            SourceFileContents sources, boolean allowCteRetry) {
         CalciteObject object = CalciteObject.create(node);
         SqlCreateView cv = (SqlCreateView) node.statement();
         SqlNode query = cv.query;
@@ -2244,36 +2430,26 @@ public class SqlToRelCompiler implements IWritesLogs {
 
             SqlFragment val = viewProperties.getPropertyValue(CreateViewStatement.EMIT_FINAL);
             if (val != null) {
-                try {
-                    int index = Integer.parseInt(val.getString());
-                    if (index < 0 || index >= columns.size())
-                        this.errorReporter.reportError(
-                                new SourcePositionRange(val.getParserPosition()),
-                                "Illegal column number",
-                                "View " + viewName.singleQuote() +
-                            " does not have a column with number " + index);
-                } catch (NumberFormatException ignored) {
-                    ProgramIdentifier canonical =
-                            new ProgramIdentifier(options.canonicalName(
-                                    val.getString(), false));
-                    for (int i = 0; i < columns.size(); i++) {
-                        if (columns.get(i).getName().equals(canonical)) {
-                            emitFinal = i;
-                            break;
-                        }
+                ProgramIdentifier canonical =
+                        new ProgramIdentifier(options.canonicalName(
+                                val.getString(), false));
+                for (int i = 0; i < columns.size(); i++) {
+                    if (columns.get(i).getName().equals(canonical)) {
+                        emitFinal = i;
+                        break;
                     }
-                    if (emitFinal < 0) {
-                        this.errorReporter.reportError(
-                                new SourcePositionRange(val.getParserPosition()),
-                                "Illegal column name",
-                                "Column " + canonical.singleQuote() +
-                                        " not found in " + viewName.singleQuote());
-                    }
+                }
+                if (emitFinal < 0) {
+                    this.errorReporter.reportError(
+                            new SourcePositionRange(val.getParserPosition()),
+                            "Illegal column name",
+                            "Column " + canonical.singleQuote() +
+                                    " not found in " + viewName.singleQuote());
                 }
             }
 
             for (var prop: viewProperties) {
-                this.validateViewProperty(viewName, prop.getKey(), prop.getValue());
+                this.validateViewProperty(viewName, cv.viewKind, prop.getKey(), prop.getValue());
             }
             props = new Properties(viewProperties);
         }
@@ -2292,6 +2468,13 @@ public class SqlToRelCompiler implements IWritesLogs {
 
         RelNode optimized = this.optimize(relRoot.rel, node.visible(), this.getRelBuilder());
         relRoot = relRoot.withRel(optimized);
+        // A correlate that survives the optimizer means the decorrelator has
+        // failed; converting the CTEs to local views often unblocks it.
+        // Thrown before this compiler's state records anything about the view.
+        if (allowCteRetry
+                && CteToLocalViews.canHoist(cv)
+                && CalciteToDBSPCompiler.hasUnimplementableCorrelate(optimized))
+            throw new CteToLocalViews.Retry();
         CreateViewStatement view = new CreateViewStatement(node,
                 viewName, columns, cv, relRoot, emitFinal, props);
         // From Calcite's point of view we treat this view just as another table.
@@ -2392,7 +2575,7 @@ public class SqlToRelCompiler implements IWritesLogs {
             RelDataType type = this.specToRel(cd.dataType, false);
             RelDataTypeField field = new RelDataTypeFieldImpl(name, index++, type);
             var meta = new RelColumnMetadata(CalciteObject.create(n), field, false,
-                    Utilities.identifierIsQuoted(cd.name), null, null, null, null, cd.interned);
+                    Utilities.identifierIsQuoted(cd.name), null, null, null, cd.interned);
             columns.add(meta);
         }
         var result = new DeclareViewStatement(node, ProgramIdentifier.fromSqlId(cv.name), columns);

@@ -8,6 +8,17 @@ The HTTP GET input connector supports [fault
 tolerance](/pipelines/fault-tolerance).  Fault tolerance only makes sense for
 URLs with static, unchanging data.
 
+## HTTP GET input connector configuration
+
+Use transport name `url_input`.
+
+| Property        | Type    | Default | Description |
+|-----------------|---------|---------|-------------|
+| `path`\*        | string  |         | The URL to fetch, e.g. `https://example.com/tools-data.json`. |
+| `pause_linger` | duration | `60s`   | How long a paused connector holds its connection to the server open, for example `60s`. The controller pauses the connector while the pipeline is paused, and whenever the connector reads faster than the pipeline processes. A connector paused for longer than this drops the connection, and reconnects when it starts running again. Replaces the deprecated `pause_timeout`. |
+
+[*]: Required fields
+
 ## Example usage
 
 We will create a pipeline with an HTTP GET connector.

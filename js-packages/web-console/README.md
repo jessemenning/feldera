@@ -19,7 +19,7 @@ sudo apt-get install nodejs -y
 # Install Bun
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl gnupg unzip
-sudo curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.3"
+sudo curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.10"
 
 # Install OpenAPI typings generator
 sudo bun install --global @hey-api/openapi-ts
@@ -33,6 +33,9 @@ Install dependencies (needs to be done whenever package.json depencies change):
 bun install
 ```
 
+This also builds the workspace libraries (`common-lib`, `common-ui`, `profiler-lib`, `profiler-layout`
+and others).
+
 Start the development server:
 
 ```bash
@@ -42,7 +45,17 @@ bun run dev
 Build & export static website:
 
 ```bash
-bun build
+bun run build
+```
+
+`dev`, `build`, `check`, `test-unit` and `test-integration` first run `bun run deps`, which rebuilds
+the workspace libraries.
+
+Run `bunx svelte-kit sync` before `bun run check` if you added or renamed a route, or changed
+`svelte.config.js`, and no dev server runs:
+
+```bash
+bunx svelte-kit sync
 ```
 
 Format the code & linting:
@@ -81,9 +94,28 @@ bun playwright test tests/pipelineDeleted.e2e.ts --headed
 bun playwright test tests/pipelineDeleted.e2e.ts --debug
 ```
 
+Specs under `tests/auth/` need a manager that requires a login, so
+`bun run test-e2e` skips them. They sign in through `scripts/dummy_oidc.py`,
+a development-only provider whose login page grants any identity on click.
+From the repository root:
+
+```bash
+uv run scripts/dummy_oidc.py &   # issuer http://localhost:9876
+AUTH_PROVIDER=generic-oidc FELDERA_AUTH_CLIENT_ID=feldera \
+  FELDERA_AUTH_ISSUER=http://localhost:9876 FELDERA_AUTH_AUDIENCE=feldera-api \
+  cargo run --bin pipeline-manager
+```
+
+Then, in another shell, from `js-packages/web-console` (the specs target
+`http://localhost:8080` unless `PLAYWRIGHT_APP_ORIGIN` is set):
+
+```bash
+bun run test-e2e-auth
+```
+
 ### Build issues
 
-If you experience unexpected build issues, run `bun run clean` from the repository root and make sure you have the supported Node.js (v20) and Bun.js (1.3.3) versions installed:
+If you experience unexpected build issues, run `bun run clean` from the repository root and make sure you have the supported Node.js (v20) and Bun.js (1.3.10) versions installed:
 
 ```bash
 bun run clean
@@ -159,8 +191,12 @@ report one each time.
 - `src/lib/components/`: Reusable Svelte components
 - `src/lib/compositions/`: Stateful functions that app state management
 - `src/lib/functions/`: Pure functions, or functions that perform side effects through dependency injection
-- `src/lib/functions/common`: Utility functions that are not specific to this project
 - `src/lib/services/`: Functions that describe side effects (persistent storage, networking etc.)
 - `src/lib/types/`: Types used throughout the app
 - `src/routes/`: Web app pages used in file-based routing
 - `static/`: Static assets served as-is
+
+Code shared with other packages lives in sibling workspace packages:
+
+- `../common-lib/`: Framework-independent TypeScript utilities, imported per module (e.g. `common-lib/array`)
+- `../common-ui/`: Reusable Svelte components

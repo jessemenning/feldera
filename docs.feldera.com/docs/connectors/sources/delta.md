@@ -25,30 +25,24 @@ exactly once fault tolerance.
 | Property                    | Type   | Default    | Description   |
 |-----------------------------|--------|------------|---------------|
 | `uri`*                      | string |            | Table URI, e.g., `s3://feldera-fraud-detection-data/demographics_train`. Supported URI schemes include: <ul><li>AWS S3: `s3://`, `s3a://`</li><li>Azure Blob Storage: `az://`, `adl://`, `azure://`, `abfs://`, `abfss://`</li><li>Google Cloud Storage: `gs://`</li><li>`uc://` - Unity catalog</li></ul> |
-| `mode`*                     | enum   |            | Table read mode. Four options are available: <ul> <li>`snapshot` - read a snapshot of the table and stop.</li> <li>`follow` - follow the changelog of the table, only ingesting changes (new and deleted rows)</li> <li>`snapshot_and_follow` - Read a snapshot of the table before switching to the `follow` mode.  This mode implements the backfill pattern where we load historical data for the table before ingesting the stream of real-time updates.</li><li>`cdc` - Change-Data-Capture (CDC) mode. The connector treats the table as an append-only log where every row represents an insert or delete action. The order of actions is determined by the `cdc_order_by` property, and the type of each action is determined by the `cdc_delete_filter` property. Removed rows are ignored, so users can clean up old log entries without affecting the contents of the ingested stream. In this mode, the connector does not read the initial snapshot of the table and follows the transaction log starting from the version of the table specified by the `version` or `datetime` property.</li> </ul>|
+| `mode`*                     | enum   |            | Table read mode. Four options are available: <ul> <li>`snapshot` - read a snapshot of the table and stop.</li> <li>`follow` - follow the changelog of the table, only ingesting changes (new and deleted rows)</li> <li>`snapshot_and_follow` - Read a snapshot of the table before switching to the `follow` mode.  This mode implements the backfill pattern where we load historical data for the table before ingesting the stream of real-time updates.</li><li>`cdc` - Change-Data-Capture (CDC) mode. The connector treats the table as an append-only log where every row represents an insert or delete action. The order of actions is determined by the `cdc_order_by` property, and the type of each action is determined by the `cdc_delete_filter` property. Removed rows are ignored, so users can clean up old log entries without affecting the contents of the ingested stream. In this mode, the connector does not read the initial snapshot of the table and follows the transaction log starting from the version of the table specified by the `version` or `datetime` property. This mode reads a change log that the writer encoded as table rows; to read the Delta Lake change data feed (CDF), see [`change_feed`](#reading-the-change-data-feed).</li> </ul>|
 | `transaction_mode`          | enum   | `none`     | Determines how the connector breaks up its input into transactions. Supported values are `none`, `snapshot`, `catchup`, and `always`. See [below](#transactions) for details. |
-| `timestamp_column`          | string |            | Table column that serves as an event timestamp. When this option is specified, and `mode` is one of `snapshot` or `snapshot_and_follow`, table rows are ingested in the timestamp order, respecting the [`LATENESS`](/sql/streaming#lateness-expressions) property of the column: each ingested row has a timestamp no more than `LATENESS` time units earlier than the most recent timestamp of any previously ingested row.  See details [below](#ingesting-time-series-data-from-a-delta-lake). |
+| `change_feed`               | enum   | `off`      | <p>How the connector reads changes: from the table's [Change Data Feed](#reading-the-change-data-feed), or from the data files each commit added and removed. The result is the same either way; the option chooses how a change is read.</p><ul><li>`auto` - read change data when a commit records it, otherwise read the commit's file actions.</li><li>`require` - like `auto`, but fail at startup unless the table has `delta.enableChangeDataFeed` set.</li><li>`off` - never read change data feed.</li></ul><p>Valid only in the `follow` and `snapshot_and_follow` modes.</p>|
+| `timestamp_column`          | string |            | Table column that serves as an event timestamp. When this option is specified, and `mode` takes an initial snapshot (`snapshot` or `snapshot_and_follow`), table rows are ingested in the timestamp order, respecting the [`LATENESS`](/sql/streaming#lateness-expressions) property of the column: each ingested row has a timestamp no more than `LATENESS` time units earlier than the most recent timestamp of any previously ingested row.  For efficient ingest, the Delta log must keep statistics for this column. See details [below](#ingesting-time-series-data-from-a-delta-lake). |
 | <a name="filter">`filter`</a> | string |            | <p>Optional row filter.</p> <p>When specified, only rows that satisfy the filter condition are read from the delta table. The condition must be a valid SQL Boolean expression that can be used in the `where` clause of the `select * from my_table where ...` query.</p> |
-| `snapshot_filter`           | string |            | <p>Optional snapshot filter.</p><p>This option is only valid when `mode` is set to `snapshot` or `snapshot_and_follow`. When specified, only rows that satisfy the filter condition are included in the snapshot.</p> <p>The condition must be a valid SQL Boolean expression that can be used in  the `where` clause of the `select * from snapshot where ...` query.</p><p>Unlike the `filter` option, which applies to all records retrieved from the table, this filter only applies to rows in the initial snapshot of the table. For instance, it can be used to specify the range of event times to include in the snapshot, e.g.: `ts BETWEEN TIMESTAMP '2005-01-01 00:00:00' AND TIMESTAMP '2010-12-31 23:59:59'`. This option can be used together with the `filter` option. During the initial snapshot, only rows that satisfy both `filter` and `snapshot_filter` are retrieved from the Delta table. When subsequently following changes in the the transaction log (`mode = snapshot_and_follow`), all rows that meet the `filter` condition are ingested, regardless of `snapshot_filter`. </p> |
-| `version`, `start_version`  | integer|            | <p>Optional table version.  When this option is set, the connector finds and opens the specified version of the table. In `snapshot` and `snapshot_and_follow` modes, it retrieves the snapshot of this version of the table.  In `follow`, `snapshot_and_follow`, and `cdc` modes, it follows transaction log records **after** this version.</p><p>Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest committed version of the table is used.</p> |
-| `datetime`                  | string |            | <p>Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g., "2024-12-09T16:09:53+00:00". When this option is set, the connector finds and opens the version of the table as of the specified point in time (based on the server time recorded in the transaction log, not the event time encoded in the data).  In `snapshot` and `snapshot_and_follow` modes, it retrieves the snapshot of this version of the table.  In `follow`, `snapshot_and_follow`, and `cdc` modes, it follows transaction log records **after** this version.</p><p> Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest committed version of the table is used.</p>|
-| `end_version`               | integer|            | <p>Optional final table version.</p><p>Valid only when the connector is configured in `follow`, `snapshot_and_follow`, or `cdc` mode.</p><p>When set, the connector will stop scanning the table’s transaction log after reaching this version or any greater version.</p><p>This bound is inclusive: if the specified version appears in the log, it will be processed before signaling end-of-input.</p>|
-| `cdc_delete_filer`          | string |            | <p>A predicate that determines whether the record represents a deletion.</p><p>This setting is only valid in the `cdc` mode. It specifies a predicate applied to each row in the Delta table to determine whether the row represents a deletion event. Its value must be a valid Boolean SQL expression that can be used in a query of the form `SELECT * from <table> WHERE <cdc_delete_filter>`.</p>|
+| `snapshot_filter`           | string |            | <p>Optional snapshot filter.</p><p>This option is only valid in a mode that takes an initial snapshot: `snapshot` or `snapshot_and_follow`. When specified, only rows that satisfy the filter condition are included in the snapshot.</p> <p>The condition must be a valid SQL Boolean expression that can be used in  the `where` clause of the `select * from snapshot where ...` query.</p><p>Unlike the `filter` option, which applies to all records retrieved from the table, this filter only applies to rows in the initial snapshot of the table. For instance, it can be used to specify the range of event times to include in the snapshot, e.g.: `ts BETWEEN TIMESTAMP '2005-01-01 00:00:00' AND TIMESTAMP '2010-12-31 23:59:59'`. This option can be used together with the `filter` option. During the initial snapshot, only rows that satisfy both `filter` and `snapshot_filter` are retrieved from the Delta table. When subsequently following changes in the the transaction log (`mode = snapshot_and_follow`), all rows that meet the `filter` condition are ingested, regardless of `snapshot_filter`. </p><p>The filter skips a data file only when its columns are partition columns or have statistics in the Delta log. Otherwise the connector reads every data file. See [statistics](#ingesting-time-series-data-from-a-delta-lake).</p> |
+| `version`, `start_version`  | integer|            | <p>Optional table version.  When this option is set, the connector finds and opens the specified version of the table. In the snapshot-taking modes it retrieves the snapshot of this version of the table.  In the log-following modes (`follow`, `snapshot_and_follow`, `cdc`) it follows transaction log records **after** this version.</p><p>Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest committed version of the table is used.</p> |
+| `datetime`                  | string |            | <p>Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g., "2024-12-09T16:09:53+00:00". When this option is set, the connector finds and opens the version of the table as of the specified point in time (based on the server time recorded in the transaction log, not the event time encoded in the data).  In the snapshot-taking modes it retrieves the snapshot of this version of the table.  In the log-following modes (`follow`, `snapshot_and_follow`, `cdc`) it follows transaction log records **after** this version.</p><p> Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest committed version of the table is used.</p>|
+| `end_version`               | integer|            | <p>Optional final table version.</p><p>Valid only when the connector follows the transaction log: `follow`, `snapshot_and_follow`, or `cdc` mode.</p><p>When set, the connector will stop scanning the table’s transaction log after reaching this version or any greater version.</p><p>This bound is inclusive: if the specified version appears in the log, it will be processed before signaling end-of-input.</p>|
+| `cdc_delete_filter`          | string |            | <p>A predicate that determines whether the record represents a deletion.</p><p>This setting is only valid in the `cdc` mode. It specifies a predicate applied to each row in the Delta table to determine whether the row represents a deletion event. Its value must be a valid Boolean SQL expression that can be used in a query of the form `SELECT * from <table> WHERE <cdc_delete_filter>`.</p>|
 | `cdc_order_by`              | string |            | <p>An expression that determines the ordering of updates in the Delta table.</p><p>This setting is only valid in the `cdc` mode. It specifies a predicate applied to each row in the Delta table to determine the order in which updates in the table should be applied. Its value must be a valid SQL expression that can be used in a query of the form `SELECT * from <table> ORDER BY <cdc_order_by>`.</p>|
 | `num_parsers`               | integer| 4          | The number of parallel parsing tasks the connector uses to process data read from the table. Increasing this value can enhance performance by allowing more concurrent processing. Recommended range: 1–10.|
 | `max_retries`               | integer| unlimited retries| <p>Maximum number of retries for failed object store operations.</p><p>Controls how many times the connector retries high-level storage operations, such as reading a Delta log entry or a Parquet file.</p><p>This is in addition to lower-level retries (e.g., individual S3 operation retries governed by storage options like `retry_timeout`). If those retries are exhausted or the failure is otherwise unrecoverable at the storage layer, the connector retries the entire operation.</p><p>Defaults to unlimited retries. Set to 0 to disable retries.</p><p>See [retries and at-least-once delivery](#retries-and-at-least-once-delivery)</p>|
-| `skip_unused_columns` (<b>DEPRECATED</b>) | bool   | false | <p>This property is deprecated. Use the [table-level `skip_unused_columns` property](/sql/grammar#ignoring-unused-columns) instead.</p><p>Don't read unused columns from the Delta table.  When set to `true`, this option instructs the connector to avoid reading columns from the Delta table that are not used in any view definitions. To be skipped, the columns must be either nullable or have default values. This can improve ingestion performance, especially for wide tables.</p><p>Note: The simplest way to exclude unused columns is to omit them from the Feldera SQL table declaration. The connector never reads columns that aren't declared in the SQL schema. Additionally, the SQL compiler emits warnings for declared but unused columns—use these as a guide to optimize your schema.</p>|
+| `skip_unused_columns` (<b>DEPRECATED</b>) | bool   | false | <p>This property is deprecated. Use the [table-level `skip_unused_columns` property](/sql/grammar#ignoring-unused-columns) instead.</p><p>Don't read unused columns from the Delta table.  When set to `true`, this option instructs the connector to avoid reading columns from the Delta table that are not used in any view definitions. To be skipped, the columns must be either nullable or have default values. This can improve ingestion performance, especially for wide tables.</p><p>Note: The simplest way to exclude unused columns is to omit them from the Feldera SQL table declaration. The connector reads an undeclared column only when its own configuration names it in `filter`, `snapshot_filter`, `cdc_order_by`, or `cdc_delete_filter`. Additionally, the SQL compiler emits warnings for declared but unused columns—use these as a guide to optimize your schema.</p>|
 | `max_concurrent_readers`    | integer| 6          | <p>Maximum number of concurrent object store reads performed by all Delta Lake connectors.</p><p>This setting is used to limit the number of concurrent reads of the object store in a pipeline with a large number of Delta Lake connectors. When multiple connectors are simultaneously reading from the object store, this can lead to transport timeouts.</p><p>When enabled, this setting limits the number of concurrent reads across all connectors. This is a global setting that affects all Delta Lake connectors, and not just the connector where it is specified. It should therefore be used at most once in a pipeline.  If multiple connectors specify this setting, they must all use the same value.</p><p>The default value is 6.</p>|
+| `verbose`                   | integer| 0          | <p>Verbosity of the connector's logging.</p><ul><li>`0` - no verbose logging.</li><li>`1` - log every Delta log entry read in the log-following modes (`follow`, `snapshot_and_follow`, `cdc`), at INFO level.</li></ul><p>Values above 1 are reserved for future use.</p>|
 
 [*]: Required fields
-
-:::caution
-In `cdc` mode, transactions that need to reconcile Add and Remove actions
-(such as `MERGE` or `UPDATE`) are not currently supported on Delta tables
-whose schema contains a `Map` column. Ingest of such transactions fails
-with an error. Pure-append transactions on the same tables continue to
-work.
-:::
 
 ### Storage parameters
 
@@ -150,7 +144,7 @@ along with the following configuration options
     </TabItem>
 </Tabs>
 
-A typical connector config includes `unity_client_id`, `unity_client_secret`,  and `unity_host` options.
+A typical connector config includes `unity_client_id`, `unity_client_secret`,  and `databricks_host` options.
 You may need to configure additional object store-specific properties,
 e.g., you may need to configure `aws_region` when opening a Delta table in S3.
 
@@ -180,6 +174,13 @@ Additional configuration options to configure HTTP client for remote object stor
 | `connect_timeout`             | Set a timeout for only the connect phase of a client. This is the time allowed for the client to establish a connection and if the connection is not established within this time, the client returns a timeout error.|
 | `user_agent`                  | User-Agent header to be used by this client.                                                                                                                   |
 
+### Advanced configuration
+
+| Property                    | Type   | Default    | Description   |
+|-----------------------------|--------|------------|---------------|
+| `batch_size`                | integer| 8192       | <p>Maximum number of rows the connector decodes into one Arrow batch.</p><p>A batch is the unit the connector decodes a Parquet file into, and its memory cost is this many rows of every column it reads. Lower values reduce the memory a read holds at the cost of throughput. The connector already sizes its reads from the table's statistics, so this setting is rarely needed; reach for it when a read holds too much memory, or when the Delta log carries no row counts and so cannot be measured.</p>|
+| `scan_parallelism`          | integer| `io_workers`| <p>Number of data files the connector decodes concurrently.</p><p>Reading more files at a time is faster and holds more decoded data in memory at once. Unlike `max_concurrent_readers`, which caps concurrent object store reads across every Delta Lake connector in the pipeline, this applies to one connector and governs the parallelism of a single read.</p><p>Defaults to the pipeline's `io_workers`, or its `workers` when `io_workers` is not set.</p>|
+
 ## Data type mapping
 
 The following table lists supported Delta Lake data types and corresponding Feldera types.
@@ -196,13 +197,99 @@ The following table lists supported Delta Lake data types and corresponding Feld
 | `SMALLINT`                  | `SMALLINT`       |               |
 | `STRING`                    | `STRING`         |               |
 | `DECIMAL(P,S)`              | `DECIMAL(P,S)`   | The largest supported precision `P` is 28.|
-| `TIMESTAMP`, `TIMESTAMP_NTZ`| `TIMESTAMP`      | Timestamp values are rounded to the nearest millisecond.  Feldera currently does not support timestamps with time zones.  When using the `TIMESTAMP` DeltaLake type, time zone information gets discarded. |
+| `TIMESTAMP`                 | `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP` | Timestamp values are truncated to the microsecond.  Read into a `TIMESTAMP` column, the time zone information gets discarded. |
+| `TIMESTAMP_NTZ`             | `TIMESTAMP`      | Timestamp values are truncated to the microsecond. |
 | `TINYINT`                   | `TINYINT`        |               |
 | `MAP<K,V>`                  | `MAP<K,V>`       |               |
 | `ARRAY<T>`                  | `T ARRAY`        |               |
 | `STRUCT`                    | `ROW` or [user-defined type](/sql/types#user-defined-types)| structs can be encoded as either anonymous `ROW` types or as named user-defined structs |
-| `VARIANT`                   | `VARIANT`        |               |
+| `VARIANT`                   | `VARIANT`        | Read from the Parquet variant binary encoding, keeping the types the writer encoded (dates, decimals, timestamps and binary stay typed inside the `VARIANT`). A table that enables variant shredding (the `variantShredding` or `variantShredding-preview` table feature) is refused. Timestamps with nanosecond precision are truncated to microseconds. A `VARIANT` column stored as a JSON string is also accepted. |
 
+
+## Reading the Change Data Feed
+
+The `follow` and `snapshot_and_follow` modes reconstruct each change from the
+transaction log: they retract every file a commit removed and insert every file
+it added. The unchanged rows cancel, so the result is correct, but the work is
+proportional to the size of the rewritten files rather than to the size of the
+change. An `UPDATE` of ten rows in a 1 GiB file reads 2 GiB.
+
+Delta Lake can record the change itself. Set the `delta.enableChangeDataFeed`
+property on the source table and every operation that modifies existing rows
+writes the affected rows to a `_change_data` directory, tagged with the kind of
+change. The connector does not read them unless asked to:
+
+```sql
+ALTER TABLE customer SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+```
+
+On the Feldera side, set `change_feed` to `auto`, which reads change data when a
+commit records it and falls back to the commit's file actions when it does not.
+The default is `off`, so enabling the table property alone changes nothing.
+Only changes committed after the property is set are recorded.
+
+The three settings are:
+
+| `change_feed` | Behavior |
+|---------------|----------|
+| `auto` | Read change data when a commit records it. |
+| `require` | The same, but fail at startup unless the table has the property set. Use it when the connector is provisioned for the cost of reading changed rows rather than rewritten files: without the property it still works, but reads as much as `off`. |
+| `off` (default) | Never read change data. |
+
+### What it costs and what it saves
+
+The saving depends on how the table is written:
+
+| Commit | `change_feed = off` reads | `change_feed = auto` reads |
+|--------|---------------------------|----------------------------|
+| Append (`INSERT`) | the added files | the added files, identically |
+| `DELETE` with deletion vectors | the rows the vector newly masks | the same: Delta records no change data for it |
+| `DELETE` rewriting files | the removed file and the rewritten file | the deleted rows |
+| `UPDATE` or `MERGE` rewriting files | every removed file and every new file | the changed rows, before and after |
+| `OPTIMIZE`, compaction | nothing | nothing |
+
+So the change feed is worth enabling for a table maintained by `MERGE` or
+`UPDATE` that rewrites whole files, and makes no difference to an append-only
+table.
+
+Delta Lake does not record change data for a commit that only adds or only
+removes rows. An append is the common case, and so is a `DELETE` on a table with
+deletion vectors: the vector already says which rows left, so Delta writes no
+change data and the connector reads the commit's file actions instead, applying
+the vectors. Two metrics report the split:
+
+| Metric | Meaning |
+|--------|---------|
+| `input_connector_delta_commits_from_change_data` | commits read from change data |
+| `input_connector_delta_commits_from_file_actions` | commits read from added and removed files |
+
+If the second counter rises while the first stays at zero on a table that is
+being updated, the writer is not recording change data even though the property
+is set: check that `changeDataFeed` is among the table's `writerFeatures`.
+
+### Limits
+
+- Change data files are cleaned up by `VACUUM` along with everything else, so a
+  connector that falls further behind than the table's retention window fails
+  whichever way it reads.
+- Some maintenance operations, `RESTORE` among them, record no change data. The
+  connector reads them from their file actions.
+- An `UPDATE` reaches the pipeline as a retraction of the old row and an
+  insertion of the new one. Those can land in different Feldera steps, leaving
+  the row briefly absent from downstream views. Set
+  [`transaction_mode`](#transactions) to `always` to make each Delta commit a
+  single Feldera transaction, or to `catchup` to batch several.
+- `filter` applies to both images of an update, so a row that moves across the
+  filter boundary is retracted or inserted accordingly.
+- The `cdc` mode never reads change data. It interprets each row as an event
+  whose polarity comes from `cdc_delete_filter`, and Delta's `_change_type` is a
+  second, incompatible answer to the same question.
+
+## Column mapping
+
+[Column mapping](https://docs.delta.io/latest/delta-column-mapping.html) lets a
+Delta table rename or reorder columns without rewriting its data files. Feldera
+reads both mapping modes, `name` and `id`.
 
 ## Transactions
 
@@ -232,6 +319,10 @@ each timestamp range of width equal to the `LATENESS` attribute of the `timestam
 ingested in a separate transaction.
 
 See `timestamp_column` documentation for more details.
+
+A [distributed connector](#distributed-connectors) ingests the snapshot
+in one transaction across all of the hosts: the transaction commits
+only after every host has ingested its part of the snapshot.
 
 ### Ingesting the Delta transaction log using transactions
 
@@ -285,6 +376,14 @@ Requirements:
   valid Feldera SQL expressions are accepted by DataFusion.
 * For efficient ingest, the Delta table must be optimized for timestamp-based queries
   using partitioning, Z-ordering, or liquid clustering.
+* For efficient ingest, the Delta table must keep statistics (min and max values) for the
+  timestamp column. Without them, the connector logs a warning and must read every data file,
+  which can take hours on a large table. By default, Delta keeps statistics only for the first
+  32 columns, and each field of a nested column counts as one column. See
+  [data skipping](https://docs.databricks.com/aws/en/tables/data-skipping) to choose the
+  columns that get statistics.
+* When `filter` or `snapshot_filter` is set, the connector does not read the timestamp range
+  from the statistics. It runs a query that reads every data file that the filter cannot skip.
 
 Note that the `timestamp_column` property only controls the initial table snapshot.
 When `mode` is set to `follow` or `snapshot_and_follow` and the connector is following
@@ -301,7 +400,7 @@ the connector will fetch all records with timestamps from `2024-01-01`, then all
 
 ```sql
 CREATE TABLE transaction(
-    trans_date_trans_time TIMESTAMP NOT NULL LATENESS INTERVAL 1 day,
+    trans_date_trans_time TIMESTAMP NOT NULL LATENESS INTERVAL 1 DAY,
     cc_num BIGINT,
     merchant STRING,
     category STRING,
@@ -359,39 +458,75 @@ it is marked **UNHEALTHY** while retrying failed operations.
 If the pipeline is stopped and restarted during a retry, the connector resumes from the last successfully
 ingested table version. This guarantees that no data loss occurs due to object store read errors.
 
-## Optimizing multihost performance for unbalanced large data
+## Distributed connectors
 
-In a multihost pipeline, Feldera currently assigns each input
-connector to one host.  All of the work related to reading data from
-that input connector then takes place on that host.  When a pipeline
-has several input connectors that read comparable amounts of data,
-this spreads the network and CPU load related to them across the
-hosts.
+In a multihost pipeline, Feldera assigns each input connector to one
+host by default.  That host does all of the work to read the
+connector's data.  When one input connector reads most of the
+pipeline's data, one host does most of the work.
 
-On the other hand, if a pipeline that has one input connector that
-reads most of the pipeline's data, only a single host does all the
-work.  In such a case, it makes sense to divide the connector into
-multiple connectors, one per host.  Feldera places input connectors on
-hosts "round robin" in alphabetical order, which means that using the
-default connector names or names with the same prefix and a sequential
-suffix will ensure that they are spread as evenly as possible across
-the hosts.
+To spread the work of reading a Delta Lake table's snapshot across the
+hosts, set the generic [`distributed`](/connectors#distributed)
+attribute to `true`.  Then the connector runs on every host, and each
+host reads a different subset of the snapshot's data files.  Together,
+the hosts read each file exactly once.
 
-When a Delta Lake source is divided into
-[partitions](https://docs.delta.io/best-practices/), its input
-connector can be divided into multiple connectors by specifying a
-different [`filter`](#filter) for each one.  For example, if the
-source is partitioned by an integer column `partition` that takes one
-of the six values 0 through 5, and there are 3 hosts, one might use 3
-copies of the input connector, one with `"filter": "partition = 0 OR
-partition = 1"`, one with `"filter": "partition = 2 OR partition =
-3"`, and one with `"filter": "partition = 4 OR partition = 5`.
+```json
+{
+  "transport": {
+    "name": "delta_table_input",
+    "config": {
+      "uri": "s3://my-bucket/big_table",
+      "mode": "snapshot_and_follow",
+      "transaction_mode": "snapshot"
+    }
+  },
+  "distributed": true
+}
+```
 
-> ⚠️ [Tables with LATENESS] cannot correctly be divided into multiple
-> connectors this way, because the different connectors can read data
-> "out of sync" from one another.
+A distributed connector works as follows:
 
-[Tables with LATENESS]: /sql/streaming/#lateness-expressions
+- Host 0 opens the table at the version that the connector's
+  configuration selects (the latest version, or the one that `version`
+  or `datetime` selects).  The other hosts open the same version, so
+  that all of the hosts read one snapshot.
+- The hosts divide the snapshot's data files, not its partitions, so an
+  unpartitioned table divides as well as a partitioned one.
+- In `follow` and `snapshot_and_follow` modes, only one host follows the
+  table's transaction log after the snapshot, because the log is a
+  single sequence of commits.  The other hosts end their input after
+  their part of the snapshot.
+- In `snapshot_and_follow` mode, a distributed connector requires a
+  [`transaction_mode`](#transactions) other than `none`.  The hosts
+  then read the snapshot in one transaction, which commits after every
+  host has read its part, and the host that follows the table reads
+  changes only after that.  Otherwise, it could read changes to rows
+  before the other hosts read those rows from the snapshot.
+- When the pipeline resumes from a checkpoint, each host continues from
+  its own checkpointed state.  A host that had opened the table but not
+  yet read its part of the snapshot reads it at the version that it
+  opened, so all of the hosts still read one snapshot.  If the
+  snapshot's transaction committed before a host read its part, for
+  example because the host failed, then that host reads its part in a
+  transaction of its own.
+  As for any multihost pipeline, the pipeline must have the same number
+  of hosts as when it took the checkpoint (see [checkpoint
+  sync](/pipelines/checkpoint-sync#how-sync-works)).
+
+Limits:
+
+- A distributed connector does not support
+  [`timestamp_column`](#ingesting-time-series-data-from-a-delta-lake),
+  because each host reads its part of the snapshot in its own order.
+  Thus, [tables with LATENESS] that need the snapshot in timestamp order
+  cannot use a distributed connector.
+- A distributed connector does not support `cdc` mode.
+- The pipeline and its multihost coordinator must both support
+  distributed Delta Lake connectors.  Otherwise, the pipeline fails to
+  start.
+
+[tables with LATENESS]: /sql/streaming/#lateness-expressions
 
 ## Additional examples
 
@@ -472,7 +607,7 @@ Read table snapshot via Unity catalog.
   "mode": "snapshot",
   "unity_client_id": "<CLIENT_ID>",
   "unity_client_secret": "<CLIENT_SECRET>",
-  "unity_host": "https://dbc-XXX-XXX.cloud.databricks.com",
+  "databricks_host": "https://dbc-XXX-XXX.cloud.databricks.com",
   "aws_region": "us-west-1"
 }
 ```

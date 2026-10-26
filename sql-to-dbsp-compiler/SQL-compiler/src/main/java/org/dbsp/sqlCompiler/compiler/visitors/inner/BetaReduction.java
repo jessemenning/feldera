@@ -116,8 +116,8 @@ public class BetaReduction extends InnerRewriteVisitor {
     }
 
     @Override
-    public VisitDecision preorder(DBSPType type) {
-        return VisitDecision.STOP;
+    protected boolean rewritesTypes() {
+        return false;
     }
 
     @Override
@@ -129,8 +129,12 @@ public class BetaReduction extends InnerRewriteVisitor {
             replacement = this.variableValue.get(declaration);
         }
         if (replacement != null) {
-            if (this.needsDeepCopy.contains(replacement))
+            if (this.needsDeepCopy.contains(replacement)) {
                 replacement = replacement.deepCopy();
+                // Do not share parameters
+                replacement = new FreshenParameters(this.compiler)
+                        .apply(replacement).to(DBSPExpression.class);
+            }
             this.map(variable, replacement);
         } else {
             // Map the variable to itself - no replacement

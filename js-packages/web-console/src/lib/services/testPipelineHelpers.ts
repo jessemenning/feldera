@@ -5,6 +5,7 @@
  * duplicating pipeline create/compile/start/stop/delete boilerplate.
  */
 
+import type { CompilationProfile } from '$lib/services/manager'
 import { client } from '$lib/services/manager/client.gen'
 import {
   deletePipeline,
@@ -19,10 +20,19 @@ import {
 export { type ExtendedPipeline }
 
 /**
+ * Compilation profile for every test pipeline: the cheapest Rust build, so a
+ * test waits on compilation for as little time as possible.
+ */
+export const TEST_COMPILATION_PROFILE: CompilationProfile = 'unoptimized'
+
+/**
  * Configure the API client base URL for tests.
  *
  * Reads from `FELDERA_TEST_API_ORIGIN` (shared) or `PLAYWRIGHT_API_ORIGIN`
- * (Playwright-specific), falling back to `http://localhost:8080`.
+ * (Playwright-specific), falling back to `http://localhost:8080` for a local
+ * run. Under CI the fallback throws instead: there `localhost` is the runner's
+ * own loopback, so falling back means testing nothing, and a suite that talks
+ * to no Feldera instance passes while proving nothing (#7167).
  */
 export function configureTestClient() {
   // In browser tests (vitest with browser mode), `process` is undefined — fall
@@ -32,11 +42,13 @@ export function configureTestClient() {
     typeof process !== 'undefined' && process.env
       ? (process.env as Record<string, string | undefined>)
       : ((import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {})
-  const origin = (
-    env.FELDERA_TEST_API_ORIGIN ??
-    env.PLAYWRIGHT_API_ORIGIN ??
-    'http://localhost:8080'
-  ).replace(/\/$/, '')
+  const configured = env.FELDERA_TEST_API_ORIGIN ?? env.PLAYWRIGHT_API_ORIGIN
+  if (!configured && env.CI) {
+    throw new Error(
+      'No Feldera origin configured: set FELDERA_TEST_API_ORIGIN or PLAYWRIGHT_API_ORIGIN'
+    )
+  }
+  const origin = (configured ?? 'http://localhost:8080').replace(/\/$/, '')
   client.setConfig({ baseUrl: origin })
   return origin
 }
@@ -103,6 +115,8 @@ export async function startPipelineAndWaitForRunning(pipelineName: string, timeo
   )
 }
 
+const CLEANUP_STEP_TIMEOUT_MS = 20_000
+
 /**
  * Kill a pipeline and wait until it reaches the Stopped state.
  */
@@ -112,12 +126,12 @@ export async function killPipelineAndWaitForStopped(pipelineName: string) {
   } catch {
     // Ignore if already stopped
   }
-  await waitForPipeline(pipelineName, ({ status }) => status === 'Stopped')
+  await waitForPipeline(pipelineName, ({ status }) => status === 'Stopped', CLEANUP_STEP_TIMEOUT_MS)
 }
 
 export const clearAndDeletePipeline = async (pipelineName: string) => {
   await postPipelineAction(pipelineName, 'clear')
-  await waitForPipeline(pipelineName, (p) => p.storageStatus === 'Cleared', 30_000)
+  await waitForPipeline(pipelineName, (p) => p.storageStatus === 'Cleared', CLEANUP_STEP_TIMEOUT_MS)
   await deletePipeline(pipelineName)
 }
 
@@ -142,7 +156,7 @@ export async function cleanupPipeline(pipelineName: string) {
   }
 }
 
-const WARMUP_PIPELINE = '__test_warmup__'
+const WARMUP_PIPELINE = 'test-warmup'
 
 /**
  * Warm the Rust compilation cache by creating, compiling, and deleting a
@@ -162,7 +176,7 @@ export async function warmCompilationCache() {
     await putPipeline(WARMUP_PIPELINE, {
       name: WARMUP_PIPELINE,
       program_code: 'CREATE TABLE _warmup (id INT);',
-      program_config: { profile: 'unoptimized' }
+      program_config: { profile: TEST_COMPILATION_PROFILE }
     })
   } catch (e) {
     console.error('warmCompilationCache: putPipeline failed:', e)

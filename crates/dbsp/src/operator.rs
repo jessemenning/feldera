@@ -52,6 +52,8 @@ pub mod join;
 mod join_range;
 pub mod neighborhood;
 mod non_incremental;
+#[cfg(test)]
+mod nonlinear_recursion_tests;
 mod recursive;
 pub mod sample;
 mod semijoin;
@@ -78,7 +80,8 @@ pub use generator::{ConstantGenerator, Generator, GeneratorNested, TransactionGe
 pub use group::CmpFunc;
 use input::Mailbox;
 pub use input::{
-    IndexedZSetHandle, Input, InputHandle, MapHandle, SetHandle, StagedBuffers, Update, ZSetHandle,
+    IndexedZSetHandle, Input, InputHandle, LazyMapHandle, MapHandle, StagedBuffers, Update,
+    ZSetHandle,
 };
 pub use inspect::Inspect;
 
@@ -98,6 +101,9 @@ pub use transaction_z1::TransactionZ1;
 pub use z1::{DelayedFeedback, DelayedNestedFeedback, Z1, Z1Nested};
 
 /// Returns a `NoPersistentId` error if `persistent_id` is `None`.
-fn require_persistent_id(persistent_id: Option<&str>, id: impl Display) -> Result<&str, Error> {
+pub(crate) fn require_persistent_id(
+    persistent_id: Option<&str>,
+    id: impl Display,
+) -> Result<&str, Error> {
     persistent_id.ok_or_else(|| Error::Storage(StorageError::NoPersistentId(id.to_string())))
 }

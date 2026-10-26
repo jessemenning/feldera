@@ -12,6 +12,8 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewDeclarationOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.ViewColumnMetadata;
+import org.dbsp.sqlCompiler.compiler.errors.CompilationError;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateView;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
@@ -29,6 +31,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /**
  * Encloses recursive components into separate {@link DBSPNestedOperator} operators.
@@ -53,6 +56,8 @@ class BuildNestedOperators extends CircuitCloneWithGraphsVisitor {
         this.toAdd = new HashSet<>();
         this.viewPort = new HashMap<>();
         this.deltasCreated = new HashMap<>();
+        // Operators moved into a nested circuit and their declarations change kind
+        this.preservesKinds = false;
     }
 
     @Override
@@ -67,7 +72,12 @@ class BuildNestedOperators extends CircuitCloneWithGraphsVisitor {
                 // If the corresponding view is materialized we don't produce a warning, since
                 // the declaration is necessary.
                 DBSPViewOperator view = this.getCircuit().getView(decl.originalViewName());
-                if (view == null || view.metadata.viewKind != SqlCreateView.ViewKind.MATERIALIZED) {
+                // A view that the recursion reads after its definition is read directly, so its
+                // declaration is unused although the view is recursive.
+                boolean viewIsRecursive = view != null &&
+                        this.scc.component.get(Utilities.getExists(this.scc.componentId, view)).size() > 1;
+                if (!viewIsRecursive &&
+                        (view == null || view.metadata.viewKind != SqlCreateView.ViewKind.MATERIALIZED)) {
                     this.compiler.reportWarning(operator.getSourcePosition(), "View is not recursive",
                             "View " + decl.originalViewName().singleQuote() + " is declared" +
                                     " recursive, but is not used in any recursive computation");
@@ -75,6 +85,15 @@ class BuildNestedOperators extends CircuitCloneWithGraphsVisitor {
             }
             super.replace(operator);
             return;
+        }
+
+        DBSPViewOperator lateView = operator.as(DBSPViewOperator.class);
+        if (lateView != null && lateView.hasLateness()) {
+            for (ViewColumnMetadata column : lateView.metadata.columns)
+                if (column.lateness != null)
+                    throw new CompilationError(
+                            "LATENESS on views inside recursive components is not supported: view " +
+                            lateView.viewName.singleQuote(), column.getPositionRange());
         }
 
         DBSPNestedOperator block;
@@ -135,6 +154,9 @@ class BuildNestedOperators extends CircuitCloneWithGraphsVisitor {
 
         DBSPSimpleOperator result = operator.withInputs(sources, this.force)
                 .to(DBSPSimpleOperator.class);
+        if (result.is(DBSPViewDeclarationOperator.class))
+            // Inside the nested circuit the declaration feeds an integrator
+            result = result.to(DBSPViewDeclarationOperator.class).withKind(StreamKind.DELTA);
         block.addOperator(result);
         DBSPViewOperator view = result.as(DBSPViewOperator.class);
         OutputPort port = result.outputPort();

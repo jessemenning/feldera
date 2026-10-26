@@ -12,7 +12,7 @@ CREATE FUNCTION contains_number(str VARCHAR NOT NULL, value INTEGER)
 RETURNS BOOLEAN NOT NULL
 AS (str LIKE ('%' || CAST(value AS VARCHAR) || '%'));
 
-CREATE VIEW V0 AS SELECT contains_number(CAST('YES: 10 NO:5' AS VARCHAR), 5)
+CREATE VIEW v0 AS SELECT contains_number(CAST('YES: 10 NO:5' AS VARCHAR), 5)
 ```
 
 ## User-defined functions written in Rust
@@ -122,6 +122,9 @@ datatypes.  The next section explains what these types are.
 If your UDF uses external crates, list these external dependencies in `udf.toml`.
 The contents of this file are appended to the `[dependencies]` section in the generated
 `Cargo.toml` file.
+If you require a dependency from a private registry, add a `registry` key naming
+a registry your deployment configures; see
+[private cargo registry](/get-started/enterprise/private-cargo-registry).
 
 ```toml
 base64 = "0.22.1"
@@ -280,7 +283,7 @@ crate, which is part of the Feldera SQL runtime.
 | `T ARRAY`                | `feldera_sqllib::Array<T>`              |
 | `MAP<K, V>`              | `feldera_sqllib::Map<K, V>`             |
 | `UUID`                   | `feldera_sqllib::Uuid`                  |
-| `VARIANT`                | `feldera_sqllib::Variant`               |
+| `VARIANT`                | `feldera_sqllib::SqlVariant`            |
 | `ROW`                    | `Tup`N                                  |
 | User-defined struct type | `Tup`N                                  |
 
@@ -299,6 +302,12 @@ Arc<BTreeMap>`, and `feldera_sqllib::Array` is defined as `type Array
 = Arc<Vec>`.  Currently `feldera_sqllib::SqlString` is a thin wrapper
 type around the `ArcStr` type from the `arcstr` crate.
 
+`feldera_sqllib::SqlVariant` is the Rust representation of
+`VARIANT` values.  However, a SQL program compiled with the
+setting [`FELDERA_FLAT_VARIANT`](/sql/grammar/#experimental-options) to `OFF`
+will generate code using `Variant`.  `Variant` will
+be soon removed, and we suggest migrating away from it.
+
 A `ROW` type with N fields is represented by a Rust `Tup`N datatype.  A
 user-defined structure type is also represented by a tuple `Tup`N
 type.  These tuple types can be imported from the current crate.
@@ -306,10 +315,10 @@ type.  These tuple types can be imported from the current crate.
 Here are some examples using `ROW` and user-defined types:
 
 ```sql
-CREATE TYPE X AS (x int);
-CREATE FUNCTION f(arg X) RETURNS X;
-CREATE FUNCTION g(x int NOT NULL) RETURNS ROW(a INT, b INT) NOT NULL;
-CREATE VIEW V AS SELECT f(X(1)), g(2).a;
+CREATE TYPE x AS (x INT);
+CREATE FUNCTION f(arg x) RETURNS x;
+CREATE FUNCTION g(x INT NOT NULL) RETURNS ROW(a INT, b INT) NOT NULL;
+CREATE VIEW v AS SELECT f(x(1)), g(2).a;
 ```
 
 And here is a possible implementation of the user-defined functions
@@ -447,8 +456,15 @@ define 3 Rust objects:
     [`MonoidValue`](https://docs.rs/dbsp/latest/dbsp/algebra/trait.MonoidValue.html).
     `DBData` allows accumulators to be stored in relations which may be
     spilled to disk; among other traits, it requires `Ord` and
-    `ArchivedDBData`.  `MonoidValue` essentially requires the traits
-    `Zero`, `HasZero`, `Add` (and variants such as `AddByRef`).
+    `ArchivedDBData`.  The latter requires the type's archived form to
+    implement
+    [`OrdRepr`](https://docs.rs/dbsp/latest/dbsp/dynamic/trait.OrdRepr.html),
+    which orders an archived value against an unarchived one without
+    deserializing it; storage uses this comparison to search data on disk,
+    so it must agree with `Ord`.  A type whose `Ord` is derived can derive
+    it too, with `#[derive(feldera_macros::OrdRepr)]`.  `MonoidValue`
+    essentially requires the traits `Zero`, `HasZero`, `Add` (and variants
+    such as `AddByRef`).
 
   - [`MulByRef`](https://docs.rs/dbsp/latest/dbsp/algebra/trait.MulByRef.html)
     which allows accumulator values to be multiplied by integer
@@ -485,16 +501,16 @@ represent 128-bit numbers.  The first step requires declaring the
 user-defined aggregate function in SQL:
 
 ```sql
-CREATE LINEAR AGGREGATE i128_sum(value BINARY(16)) RETURNS BINARY(16);
+CREATE linear AGGREGATE i128_sum(value BINARY(16)) RETURNS BINARY(16);
 ```
 
 Notice that the type of the argument and result are both nullable.  We
 can then use the user-defined aggregate in a SQL program:
 
 ```sql
-CREATE TABLE T(value BINARY(16));
+CREATE TABLE t(value BINARY(16));
 
-CREATE MATERIALIZED VIEW V0 AS SELECT i128_sum(value) FROM T;
+CREATE MATERIALIZED VIEW v0 AS SELECT i128_sum(value) FROM t;
 ```
 
 In SQL the `SUM` function is polymorphic, since it works for any
@@ -628,6 +644,12 @@ impl<D: Fallible + ?Sized> rkyv::Deserialize<I256Wrapper, D> for ArchivedI256Wra
     }
 }
 
+impl dbsp::dynamic::OrdRepr<I256Wrapper> for ArchivedI256Wrapper {
+    fn ord_cmp(&self, other: &I256Wrapper) -> std::cmp::Ordering {
+        I256::from_be_bytes(self.bytes).cmp(&other.data)
+    }
+}
+
 pub type i128_sum_accumulator_type = I256Wrapper;
 
 pub fn i128_sum_map(val: ByteArray) -> i128_sum_accumulator_type {
@@ -723,6 +745,9 @@ pub struct PreprocessorConfig {
     pub message_oriented: bool,
     /// Arbitrary additional configuration as a JSON Value.
     pub config: Value,
+    /// Maximum allowed duration of one call to the preprocessor.
+    /// When not set it defaults to 1 second; `null` disables the check.
+    pub max_allowed_call_duration: Option<Option<ConfigDuration>>,
 }
 ```
 
@@ -817,36 +842,35 @@ a decryption key based on the topic a record arrived on.
 
 ```rust
 /// Connector metadata attached to each input record.
-pub struct ConnectorMetadata(BTreeMap<Variant, Variant>);
+pub struct ConnectorMetadata(BTreeMap<String, VariantValue>);
 ```
 
-Attribute names are `Variant::String` keys; values are
-[`Variant`](/sql/json/#the-variant-type)s.
-For example, the Kafka connector may attach an attribute `kafka_timestamp` with a
-type `feldera_sqllib::Timestamp`.
+Attribute names are strings. Values are `feldera_sqllib::VariantValue`s:
+owned [`VARIANT`](/sql/json/#the-variant-type) values with arms such as
+`VariantValue::String`, `VariantValue::Int64`, `VariantValue::Binary`, and
+`VariantValue::Object`.
+For example, the Kafka connector may attach an attribute `kafka_timestamp`
+that holds a `VariantValue::TimestampNtzMicros`, which wraps a
+`chrono::NaiveDateTime`.
 
 If the connector does not provide metadata, its value is `None`.
 
-A preprocessor reads attributes from the `ConnectorMetadata` through two getters:
+A preprocessor reads an attribute from the `ConnectorMetadata` by its name:
 
 ```rust
 impl ConnectorMetadata {
-    /// Returns the attribute stored under `key`, or `None` if absent.
-    pub fn get(&self, key: &Variant) -> Option<&Variant>;
-
-    /// Returns the attribute stored under the string key `name`, or `None`
-    /// if absent.
-    pub fn get_by_name(&self, name: &str) -> Option<&Variant>;
+    /// Returns the attribute stored under `name`, or `None` if absent.
+    pub fn get_by_name(&self, name: &str) -> Option<&VariantValue>;
 }
 ```
 
-Because connectors key their attributes by string, `get_by_name` is the
-common lookup; `get` accepts an arbitrary `Variant` key.  For example, a
-preprocessor can select its behavior based on the Kafka topic a record
-arrived on:
+For example, a preprocessor can select its behavior based on the Kafka
+topic a record arrived on:
 
 ```rust
-if let Some(Variant::String(topic)) = metadata.get_by_name("kafka_topic") {
+use feldera_sqllib::VariantValue;
+
+if let Some(VariantValue::String(topic)) = metadata.get_by_name("kafka_topic") {
     // Choose a transformation based on the topic name.
 }
 ```
@@ -857,7 +881,7 @@ Here is an example extracting a string value:
 // Retrieve the topic name as a string; use "" when the attribute is
 // absent or is not a string.
 let topic: &str = match metadata.get_by_name("kafka_topic") {
-    Some(Variant::String(topic)) => topic.str(),
+    Some(VariantValue::String(topic)) => topic.as_str(),
     _ => "",
 };
 ```
@@ -982,7 +1006,11 @@ Preprocessors are enabled by adding a `preprocessor` field to the connector conf
 Each entry has
 - a string `name` (matching a registered factory)
 - a boolean `message_oriented` property
-- a `config` object, passed verbatim to `PreprocessorFactory::create`.
+- a `config` object, passed verbatim to `PreprocessorFactory::create`
+- an optional `max_allowed_call_duration` string, such as `"10s"` or `"2m"`:
+  the maximum allowed duration of one call to the preprocessor.
+  The default is `"1s"`, and `null` disables the check.  Values less than
+  1 second are raised to 1 second.
 
 ```json
 {
@@ -991,10 +1019,23 @@ Each entry has
   "preprocessor": [{
       "name": "logger",
       "message_oriented": true,
-      "config": { <logger-specific configuration> }
+      "config": { <logger-specific configuration> },
+      "max_allowed_call_duration": "10s"
   }]
 }
 ```
+
+While a call to the preprocessor runs longer than `max_allowed_call_duration`,
+the connector status reports the connector as unhealthy, and the pipeline
+log contains a warning with the name of the preprocessor and the number
+of its instances that have a late call.  As soon as the late calls return,
+the connector status again reports the health that the connector itself
+reports, and the pipeline log contains a message that the calls returned.
+The pipeline checks the calls once per second, so it may not report a call
+that runs only a little longer than `max_allowed_call_duration`.
+
+The pipeline does not interrupt an outstanding call: a preprocessor that
+waits for another service must set its own timeouts.
 
 :::note
 

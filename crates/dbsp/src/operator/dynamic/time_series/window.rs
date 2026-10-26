@@ -6,7 +6,7 @@ use crate::{
     circuit::{
         Circuit, GlobalNodeId, Scope, Stream,
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
-        operator_traits::Operator,
+        operator_traits::{FileOperatorCheckpoint, Operator, OperatorCheckpoint},
         splitter_output_chunk_size,
     },
     dynamic::{
@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use async_stream::stream;
-use feldera_storage::{FileCommitter, StoragePath};
+use feldera_storage::StoragePath;
 use futures::Stream as AsyncStream;
 use rkyv::Deserialize;
 use rkyv::bytecheck;
@@ -34,7 +34,6 @@ use std::{
     cell::{Cell, RefCell},
     marker::PhantomData,
     rc::Rc,
-    sync::Arc,
 };
 
 impl Stream<RootCircuit, MonoIndexedZSet> {
@@ -61,30 +60,33 @@ where
         inclusive: (bool, bool),
         bounds: &Stream<C, (Box<B::Key>, Box<B::Key>)>,
     ) -> Stream<C, B> {
-        self.circuit()
-            .region("window", || {
-                let bound = TraceBound::new();
-                let bound_clone = bound.clone();
-                bounds.apply(move |(lower, _upper)| {
-                    bound_clone.set(lower.clone());
-                });
-                let trace = self
-                    .dyn_accumulate_integrate_trace_with_bound(factories, bound, TraceBound::new())
-                    .accumulate_delay_trace();
-                self.circuit().add_ternary_operator(
-                    StreamingTernaryWrapper::new(<Window<B, SpineSnapshot<B>>>::new(
-                        factories, inclusive,
-                    )),
-                    &trace,
-                    &self.dyn_accumulate(factories).into_enabled_stream(),
-                    bounds,
-                )
-            })
-            .clone()
+        self.circuit().region("window", || {
+            let bound = TraceBound::new();
+            let bound_clone = bound.clone();
+            bounds.apply(move |(lower, _upper)| {
+                bound_clone.set(lower.clone());
+            });
+            let trace = self
+                .dyn_accumulate_integrate_trace_with_bound(factories, bound, TraceBound::new())
+                .accumulate_delay_trace();
+            self.circuit().add_ternary_operator(
+                StreamingTernaryWrapper::new(<Window<B, SpineSnapshot<B>>>::new(
+                    factories, inclusive,
+                )),
+                &trace,
+                &self.dyn_accumulate(factories).into_enabled_stream(),
+                bounds,
+            )
+        })
     }
 }
 
 /// A window that is serialized to a file.
+//
+// The bounds stay on rkyv's per-element path, unlike the state blobs in
+// `CommittedZ1`: `CopyOptimize` applies to a `Vec` field, not through an
+// `Option` of a tuple, and a pair of serialized keys is too small to be worth
+// reshaping the struct for.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
 #[archive_attr(derive(rkyv::CheckBytes))]
 struct CommittedWindow {
@@ -152,8 +154,8 @@ where
     }
 
     /// Return the absolute path of the file for a checkpointed Window.
-    fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
-        base.child(format!("window-{}.dat", persistent_id))
+    fn checkpoint_file(persistent_id: &str) -> String {
+        format!("window-{}.dat", persistent_id)
     }
 }
 
@@ -189,27 +191,21 @@ where
 
     fn checkpoint(
         &mut self,
-        base: &StoragePath,
         persistent_id: Option<&str>,
-        files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<Box<dyn OperatorCheckpoint>>, Error> {
         let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
-        let window_path = Self::checkpoint_file(base, persistent_id);
-
         let committed: CommittedWindow = (self as &Self).into();
-        let as_bytes = to_bytes(&committed).expect("Serializing CommittedWindow should work.");
-        files.push(
-            Runtime::storage_backend()
-                .unwrap()
-                .write(&window_path, as_bytes)?,
-        );
-        Ok(())
+        let content = to_bytes(&committed).expect("Serializing CommittedWindow should work.");
+        Ok(Some(Box::new(FileOperatorCheckpoint {
+            name: Self::checkpoint_file(persistent_id),
+            content,
+        })))
     }
 
     fn restore(&mut self, base: &StoragePath, persistent_id: Option<&str>) -> Result<(), Error> {
         let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
 
-        let window_path = Self::checkpoint_file(base, persistent_id);
+        let window_path = base.clone().join(Self::checkpoint_file(persistent_id));
         let content = Runtime::storage_backend().unwrap().read(&window_path)?;
         let archived = rkyv::check_archived_root::<CommittedWindow>(&content).map_err(|e| {
             crate::circuit::checkpointer::checkpoint_invalid_data_error(
@@ -360,7 +356,7 @@ where
                 return;
             };
 
-            self.input_batch_stats.borrow_mut().add_batch(delta.len());
+            self.input_batch_stats.borrow_mut().add_batch(delta.len_upper_bound());
 
             //           ┌────────────────────────────────────────┐
             //           │       previous window                  │
@@ -406,7 +402,7 @@ where
 
                         if tuples.len() >= chunk_size {
                             let result = B::dyn_from_tuples(&self.factories, (), &mut tuples);
-                            self.output_batch_stats.borrow_mut().add_batch(result.len());
+                            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                             yield (result, false, None);
                             tuples = self.factories.weighted_items_factory().default_box();
                             tuples.reserve(chunk_size);
@@ -437,7 +433,7 @@ where
 
                             if tuples.len() >= chunk_size {
                                 let result = B::dyn_from_tuples(&self.factories, (), &mut tuples);
-                                self.output_batch_stats.borrow_mut().add_batch(result.len());
+                                self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                                 yield (result, false, None);
                                 tuples = self.factories.weighted_items_factory().default_box();
                                 tuples.reserve(chunk_size);
@@ -469,7 +465,7 @@ where
 
                         if tuples.len() >= chunk_size {
                             let result = B::dyn_from_tuples(&self.factories, (), &mut tuples);
-                            self.output_batch_stats.borrow_mut().add_batch(result.len());
+                            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                             yield (result, false, None);
                             tuples = self.factories.weighted_items_factory().default_box();
                             tuples.reserve(chunk_size);
@@ -497,7 +493,7 @@ where
 
                     if tuples.len() >= chunk_size {
                         let result = B::dyn_from_tuples(&self.factories, (), &mut tuples);
-                        self.output_batch_stats.borrow_mut().add_batch(result.len());
+                        self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                         yield (result, false, None);
                         tuples = self.factories.weighted_items_factory().default_box();
                         tuples.reserve(chunk_size);
@@ -511,7 +507,7 @@ where
             *self.window.borrow_mut() = Some((start1, end1));
 
             let result = B::dyn_from_tuples(&self.factories, (), &mut tuples);
-            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
             yield (result, true, None);
         }
     }
@@ -526,7 +522,10 @@ mod test {
         dynamic::{DowncastTrait, DynData, Erase},
         indexed_zset,
         operator::dynamic::trace::TraceBound,
-        typed_batch::{IndexedZSetReader, OrdIndexedZSet, SpineSnapshot, TypedBox},
+        trace::Trace as _,
+        typed_batch::{
+            BatchReader as _, IndexedZSetReader, OrdIndexedZSet, SpineSnapshot, TypedBox,
+        },
         utils::{Tup2, Tup3},
     };
     use anyhow::Error as AnyError;
@@ -700,7 +699,7 @@ mod test {
             .into_iter();
 
         let (mut circuit, (bounds_handle, index1_handle, output_handle)) =
-            Runtime::init_circuit(1, move |circuit| window_test_circuit(circuit)).unwrap();
+            Runtime::init_circuit(1, window_test_circuit).unwrap();
 
         for clock in 1000..1006 {
             bounds_handle.set_for_all(((clock - 100), clock));
@@ -768,7 +767,7 @@ mod test {
         const WINDOW_SIZE: Time = 5;
 
         let (mut circuit, (bounds_handle, index1_handle, output_handle)) =
-            Runtime::init_circuit(1, move |circuit| window_test_circuit(circuit)).unwrap();
+            Runtime::init_circuit(1, window_test_circuit).unwrap();
 
         for clock in 1000..1011 {
             bounds_handle.set_for_all((
@@ -854,7 +853,7 @@ mod test {
         .into_iter();
 
         let (mut circuit, (bounds_handle, index1_handle, output_handle)) =
-            Runtime::init_circuit(1, move |circuit| window_test_circuit(circuit)).unwrap();
+            Runtime::init_circuit(1, window_test_circuit).unwrap();
 
         for _ in 1000..1006 {
             bounds_handle.set_for_all(windows.next().unwrap());
@@ -874,9 +873,9 @@ mod test {
         }
     }
 
-    // It's hard to make this test reliable with async background compactor threads.
+    /// `window` bounds the trace of its input, so the trace retains only keys
+    /// that the window can still admit.
     #[test]
-    #[ignore]
     fn bounded_memory() {
         let (mut dbsp, input_handle) = Runtime::init_circuit(8, |circuit| {
             let (input, input_handle) = circuit.add_input_indexed_zset::<i64, i64>();
@@ -890,17 +889,26 @@ mod test {
                         )
                     });
 
+            // The effective bound is the minimum of all bounds on the trace, so `i64::MAX`
+            // leaves the window's own bound in charge and this probe observes the same
+            // trace the window GCs.
             let bound = TraceBound::new();
             bound.set(Box::new(i64::MAX).erase_box());
 
             input.window((true, false), &bounds);
 
             input
-                .integrate_trace_with_bound(bound, TraceBound::new())
+                .accumulate_integrate_trace_with_bound(bound, TraceBound::new())
                 .apply(|trace| {
-                    let trace_size = trace.size_of().total_bytes();
+                    // Background merges enforce the bound lazily, so measure a fork merged
+                    // to completion: that is the trace with GC fully applied.
+                    let mut merged = trace.inner().fork();
+                    merged.complete_merges();
+
+                    // The window spans 1000 keys, which is under 8KB per worker.
+                    let trace_size = merged.size_of().total_bytes();
                     assert!(
-                        trace_size < 70000,
+                        trace_size < 16000,
                         "trace_size {trace_size} is larger than expected"
                     );
                 });

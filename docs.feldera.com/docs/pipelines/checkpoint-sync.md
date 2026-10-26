@@ -32,7 +32,7 @@ Here is a minimal configuration to sync checkpoints to S3:
         "access_key": "ACCESS_KEY",
         "secret_key": "SECRET_KEY",
         "start_from_checkpoint": "latest",
-        "push_interval": 120
+        "checkpoint_push_interval": "120s"
       }
     }
   }
@@ -62,12 +62,53 @@ configuration or ownership file is corrected. Pulling checkpoints is less
 strict: if a pipeline pulls from a location owned by another pipeline, Feldera
 logs a warning but does not fail the pull.
 
+### Taking over a checkpoint location
+
+Ownership belongs to the pipeline, identified by its system-generated name,
+not by the name you give it. Stopping and restarting a pipeline, changing its
+program or configuration, or renaming it keeps ownership. Deleting a pipeline
+and creating a new one with the same name does not: the new pipeline is a
+different owner, so its pushes to the old location fail.
+
+To hand a location over to a new pipeline, set `take_bucket_ownership`:
+
+```json
+"sync": {
+  "bucket": "BUCKET_NAME/DIRECTORY_NAME",
+  "provider": "AWS",
+  "access_key": "ACCESS_KEY",
+  "secret_key": "SECRET_KEY",
+  "start_from_checkpoint": "latest",
+  "take_bucket_ownership": true
+}
+```
+
+When the pipeline starts (a standby pipeline, when it is activated), it
+overwrites `owner.json` with its own name and logs a warning that names the
+previous and the new owner. From then on, the previous owner's pushes to the
+location fail.
+
+The takeover happens only at startup. Pushes never take ownership: if another
+pipeline takes the location over while this pipeline is running, this
+pipeline's pushes fail until it is restarted.
+
+- Stop the previous owner before starting the new pipeline. A previous owner
+  that is still running can complete one more push around the takeover.
+- Ownership changes before the new pipeline opens its checkpoint. If the
+  pipeline then fails to start, for example because its program cannot use
+  the checkpoint, it still owns the location and the previous owner's pushes
+  keep failing. To give the location back, start the previous owner with
+  `take_bucket_ownership` set.
+- Set `take_bucket_ownership` on only one of the pipelines that share a
+  location. Two pipelines that both set it take the location from each other
+  whenever one of them restarts.
+
 ## Standby mode
 
 Pipelines can start in **standby** mode by passing `initial=standby` to the
 [start pipeline](/api/start-pipeline) endpoint. A standby
 pipeline does not process data. Instead, it continuously pulls the latest
-checkpoint from object store at the interval specified by `pull_interval`,
+checkpoint from object store at the interval specified by `standby_pull_interval`,
 staying ready for immediate activation.
 
 To activate a standby pipeline:
@@ -136,27 +177,29 @@ On its first start **B** pulls from `bucket-a/pipeline-a` (because
 
 | Field                   | Type            | Default     | Description                                                                                                                                                                                                                                                                                                                                                                         |
 | ----------------------- | --------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `endpoint`              | `string`        |             | The S3-compatible object store endpoint (e.g., `http://localhost:9000` for MinIO).                                                                                                                                                                                                                                                                                                  |
-| `bucket` \*             | `string`        |             | The bucket name and optional prefix to store checkpoints (e.g., `mybucket/checkpoints`). This is the pipeline's read/write checkpoint location and must be unique to this pipeline. See [Bucket ownership](#bucket-ownership).                                                                                                                                                      |
-| `read_bucket`           | `string`        |             | A read-only fallback bucket used to seed the pipeline when `bucket` has no checkpoint. Uses the same connection settings as `bucket` (`provider`, `access_key`, `secret_key`, `endpoint`, `region`). The pipeline **never writes** to `read_bucket`. Must point to a different location than `bucket`. See [Seeding from an existing pipeline](#seeding-from-an-existing-pipeline). |
+| `endpoint`              | `string`        |             | The S3-compatible object store endpoint (e.g., `http://localhost:9000` for MinIO). For a `gs://` bucket, the Google Cloud Storage JSON API base URL; a bare host gets `/storage/v1/` appended. Leave empty for the public service.                                                                                                                                                                                                                                                                                                  |
+| `bucket` \*             | `string`        |             | The bucket name and optional prefix to store checkpoints (e.g., `mybucket/checkpoints`). Prefix it with `gs://` to sync to Google Cloud Storage through its native API instead of S3; `provider`, `access_key`, and `secret_key` are then ignored and rclone authenticates with Application Default Credentials (for example a GKE Workload Identity). This is the pipeline's read/write checkpoint location and must be unique to this pipeline. See [Bucket ownership](#bucket-ownership).                                                                                                                                                      |
+| `read_bucket`           | `string`        |             | A read-only fallback bucket used to seed the pipeline when `bucket` has no checkpoint. Uses the same connection settings as `bucket` and, for Google Cloud Storage, the same `gs://` prefix (`provider`, `access_key`, `secret_key`, `endpoint`, `region`). The pipeline **never writes** to `read_bucket`. Must point to a different location than `bucket`. See [Seeding from an existing pipeline](#seeding-from-an-existing-pipeline). |
+| `take_bucket_ownership` | `boolean`       | `false`     | When `true`, the pipeline takes ownership of `bucket` as it starts, even if another pipeline owns it, and logs a warning that names both owners. Applies only at startup: if another pipeline takes `bucket` over while this pipeline is running, this pipeline's pushes fail. See [Taking over a checkpoint location](#taking-over-a-checkpoint-location). |
 | `region`                | `string`        | `us-east-1` | The region of the bucket. Leave empty for MinIO. If `provider` is AWS, and no region is specified, `us-east-1` is used.                                                                                                                                                                                                                                                             |
-| `provider` \*           | `string`        |             | The S3 provider identifier. Must match [rclone's list](https://rclone.org/s3/#providers). Case-sensitive. Use `"Other"` if unsure.                                                                                                                                                                                                                                                  |
+| `provider` \*           | `string`        |             | The S3 provider identifier. Must match [rclone's list](https://rclone.org/s3/#providers). Case-sensitive. Use `"Other"` if unsure. Not required for `gs://` buckets, which ignore it.                                                                                                                                                                                                                                                  |
 | `access_key`            | `string`        |             | S3 access key. Not required if using environment-based auth (e.g., IRSA).                                                                                                                                                                                                                                                                                                           |
 | `secret_key`            | `string`        |             | S3 secret key. Not required if using environment-based auth.                                                                                                                                                                                                                                                                                                                        |
 | `start_from_checkpoint` | `string`        |             | Checkpoint UUID to resume from, or `latest` to restore from the latest checkpoint.                                                                                                                                                                                                                                                                                                  |
 | `fail_if_no_checkpoint` | `boolean`       | `false`     | When `true`, the pipeline fails to start if no checkpoint is found in any source (local storage, `bucket`, or `read_bucket`). When `false`, the pipeline starts from scratch instead.                                                                                                                                                                                               |
 | `standby`               | `boolean`       | `false`     | **Deprecated.** Use `initial=standby` when starting the pipeline instead. See [Standby mode](#standby-mode).                                                                                                                                                                                                                                                                        |
-| `pull_interval`         | `integer(u64)`  | `10`        | Interval (in seconds) between fetch attempts for the latest checkpoint while in standby.                                                                                                                                                                                                                                                                                            |
-| `push_interval`         | `integer(u64)`  |             | Interval (in seconds) between automatic syncs of a local checkpoint to object store, measured from the completion of the previous sync. Disabled by default. See [Automatic checkpoint synchronization](#automatic-checkpoint-synchronization).                                                                                                                                     |
+| `standby_pull_interval` | duration       | `10s`       | Interval between fetch attempts for the latest checkpoint while in standby, for example `10s`. Replaces the deprecated `pull_interval`.                                                                                                                                                                                                                                                                                            |
+| `checkpoint_push_interval` | duration       |             | Interval between automatic syncs of a local checkpoint to object store, measured from the completion of the previous sync, for example `2m`. Disabled by default; `null` disables periodic syncs explicitly. Replaces the deprecated `push_interval`. See [Automatic checkpoint synchronization](#automatic-checkpoint-synchronization).                                                                                                                                     |
 | `transfers`             | `integer (u8)`  | `20`        | Number of concurrent file transfers.                                                                                                                                                                                                                                                                                                                                                |
 | `checkers`              | `integer (u8)`  | `20`        | Number of parallel checkers for verification.                                                                                                                                                                                                                                                                                                                                       |
+| `optimize_download_resources` | `boolean`  | `true`      | When `true`, a checkpoint download scales `transfers` and `checkers` to the number of CPUs and allows the download buffer to use most of the available memory, maximizing throughput at the cost of CPU and memory during the pull. When `false`, the download uses the configured `transfers` and `checkers` and the rclone defaults. |
 | `ignore_checksum`       | `boolean`       | `false`     | Skip checksum verification after transfer and only check the file size. May improve throughput.                                                                                                                                                                                                                                                                                     |
 | `multi_thread_streams`  | `integer (u8)`  | `10`        | Number of streams for multi-threaded downloads.                                                                                                                                                                                                                                                                                                                                     |
 | `multi_thread_cutoff`   | `string`        | `100M`      | File size threshold to enable multi-threaded downloads (e.g., `100M`, `1G`). Supported suffixes: `k`, `M`, `G`, `T`.                                                                                                                                                                                                                                                                |
 | `upload_concurrency`    | `integer (u8)`  | `10`        | Number of concurrent chunks to upload during multipart uploads.                                                                                                                                                                                                                                                                                                                     |
 | `flags`                 | `array[string]` |             | Extra flags to pass to `rclone`. Incorrect or conflicting flags may break behavior. See [rclone flags](https://rclone.org/flags/) and [S3 flags](https://rclone.org/s3/).                                                                                                                                                                                                           |
 | `retention_min_count`   | `integer (u32)` | `10`        | The minimum number of checkpoints to retain in object store. No checkpoints will be deleted if the total count is below this threshold.                                                                                                                                                                                                                                             |
-| `retention_min_age`     | `integer (u32)` | `30`        | The minimum age (in days) a checkpoint must reach before it becomes eligible for deletion. All younger checkpoints will be preserved.                                                                                                                                                                                                                                               |
+| `min_retention` | duration   | `30d`       | The minimum age a checkpoint must reach before it becomes eligible for deletion, for example `30d`. All younger checkpoints will be preserved. Replaces the deprecated `retention_min_age`.                                                                                                                                                                                                                                               |
 
 \*Fields marked with an asterisk are required.
 
@@ -223,6 +266,20 @@ For more details, refer to [rclone S3 permissions](https://rclone.org/s3/#s3-per
 These permissions also cover the `owner.json` ownership file stored at the
 root of the configured `bucket` location.
 
+## Google Cloud Storage permissions
+
+With a `gs://` bucket, rclone authenticates through Application Default
+Credentials, for example the Workload Identity of the pipeline's Kubernetes
+service account on GKE. That identity needs:
+
+- `roles/storage.objectAdmin` on `bucket`: checkpoints are listed, read,
+  written, and deleted when retention removes old ones.
+- `roles/storage.objectViewer` on `read_bucket`, if configured.
+
+Access checks use bucket-level IAM only (rclone's `--gcs-bucket-policy-only`),
+so buckets with uniform bucket-level access work and no per-object ACL is
+ever set.
+
 ## IRSA
 
 To use **IRSA** (IAM Roles for Service Accounts), **omit** the `access_key`
@@ -231,11 +288,11 @@ and `secret_key` fields. This loads credentials from the environment.
 ## Automatic checkpoint synchronization
 
 Feldera can automatically synchronize checkpoints to the configured object store
-at regular intervals by setting the `push_interval` field in the `sync`
+at regular intervals by setting the `checkpoint_push_interval` field in the `sync`
 configuration.
 
 When enabled, Feldera periodically pushes the latest local checkpoint to the
-object store every `push_interval` seconds after the previous sync operation
+object store every `checkpoint_push_interval` after the previous sync operation
 completes.
 
 Automatic sync is **disabled by default**.
@@ -246,8 +303,8 @@ The status of the most recent automatic sync operation can be queried with:
 curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status' | jq '.periodic'
 ```
 
-It is recommended to set `push_interval` greater than
-`fault_tolerance.checkpoint_interval_secs` to avoid syncing more frequently
+It is recommended to set `checkpoint_push_interval` greater than
+`fault_tolerance.checkpoint_interval` to avoid syncing more frequently
 than checkpoints are created.
 
 ### Trigger conditions
@@ -255,7 +312,7 @@ than checkpoints are created.
 An automatic checkpoint synchronization is triggered only when all of the
 following conditions are met:
 
-- The configured `push_interval` has elapsed.
+- The configured `checkpoint_push_interval` has elapsed.
 - No checkpoint sync is currently in progress.
 - Checkpoint sync has not been manually requested.
 - A valid checkpoint exists.
@@ -269,11 +326,24 @@ A sync operation can be triggered by making a `POST` request to:
 curl -X POST 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync'
 ```
 
-This initiates the sync and returns the UUID of the checkpoint being synced:
+This initiates the sync and returns the UUID of the checkpoint being synced,
+along with the UUID of the pipeline process that accepted the request:
 
 ```json
-{ "checkpoint_uuid": "019779b4-8760-75f2-bdf0-71b825e63610" }
+{
+    "checkpoint_uuid": "019779b4-8760-75f2-bdf0-71b825e63610",
+    "incarnation_uuid": "019779b4-8760-75f2-bdf0-71b825e63611"
+}
 ```
+
+Pass `incarnation_uuid` to `sync_status` while waiting for the sync, as described
+under [detecting a pipeline restart](#detecting-a-pipeline-restart).
+
+Requesting a sync for a checkpoint that is already syncing joins the sync in
+progress rather than starting a second one.  The response is `202 Accepted`
+either way, so treat it as "a sync for this checkpoint is under way", not as
+proof that a fresh one started; watch `running` in
+[sync status](#checking-sync-status) to follow it.
 
 ## Checking sync status
 
@@ -289,19 +359,47 @@ curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status'
 | ---------- | ---------------- | ----------------------------------------------------------------------------------------------------------- |
 | `success`  | `uuid \| null`   | UUID of the most recently successful manually triggered checkpoint sync (`POST /checkpoint/sync`).          |
 | `failure`  | `object \| null` | Details of the most recently failed manually triggered checkpoint sync. Contains `uuid` and `error` fields. |
-| `periodic` | `uuid \| null`   | UUID of the most recently successful automatic periodic checkpoint sync (configured via `push_interval`).   |
+| `periodic` | `uuid \| null`   | UUID of the most recently successful automatic periodic checkpoint sync (configured via `checkpoint_push_interval`).   |
+| `running`  | `uuid[]`         | UUIDs of the checkpoint syncs running right now.  Empty when none is in progress.                           |
 
 `success` and `periodic` track different sync mechanisms:
 
 - `success` is updated only by manual syncs triggered via `POST /checkpoint/sync`.
-- `periodic` is updated only by automatic syncs configured via `push_interval`.
+- `periodic` is updated only by automatic syncs configured via `checkpoint_push_interval`.
+
+`success`, `failure` and `periodic` are sticky: each keeps naming the last sync
+to reach that outcome, long after it finished.  `running` is the field that says
+what is happening now, so a UUID that appears in both `running` and `failure` is
+a sync in progress that failed on an earlier attempt.
+
+If `success` and `failure` would otherwise name the same UUID, then
+the most recent result is kept and the other is set to `null`.
+
+`running` lists only manual syncs.  Automatic periodic syncs do not pass through
+the endpoint that records it, so an in-flight periodic sync leaves `running`
+empty; watch `periodic` for its result instead.
+
+A pipeline older than the release that introduced `running` omits the field
+entirely.  Absent means "this pipeline cannot report progress", which is not the
+same as the empty list.
 
 ### Response examples
 
 **No syncs yet:**
 
 ```json
-{ "success": null, "failure": null, "periodic": null }
+{ "success": null, "failure": null, "periodic": null, "running": [] }
+```
+
+**Manual sync in progress:**
+
+```json
+{
+    "success": null,
+    "failure": null,
+    "periodic": null,
+    "running": ["019779b4-8760-75f2-bdf0-71b825e63610"]
+}
 ```
 
 **Successful manual sync:**
@@ -310,7 +408,8 @@ curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status'
 {
     "success": "019779b4-8760-75f2-bdf0-71b825e63610",
     "failure": null,
-    "periodic": null
+    "periodic": null,
+    "running": []
 }
 ```
 
@@ -323,7 +422,8 @@ curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status'
         "uuid": "019779c1-8317-7a71-bd78-7b971f4a3c43",
         "error": "Error pushing checkpoint to object store: ... SignatureDoesNotMatch ..."
     },
-    "periodic": null
+    "periodic": null,
+    "running": []
 }
 ```
 
@@ -333,7 +433,8 @@ curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status'
 {
     "success": null,
     "failure": null,
-    "periodic": "019779c1-8317-7a71-bd78-7b971f4a3c43"
+    "periodic": "019779c1-8317-7a71-bd78-7b971f4a3c43",
+    "running": []
 }
 ```
 
@@ -343,9 +444,52 @@ curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status'
 {
     "success": "019779b4-8760-75f2-bdf0-71b825e63610",
     "failure": null,
-    "periodic": "019779c1-8317-7a71-bd78-7b971f4a3c43"
+    "periodic": "019779c1-8317-7a71-bd78-7b971f4a3c43",
+    "running": []
 }
 ```
+
+### Detecting a pipeline restart
+
+If a pipeline restarts while a sync is in flight (e.g. because its pod
+was evicted), the request dies with it.  The client can detect this by
+passing the `incarnation_uuid` returned by `POST /checkpoint/sync`
+back to `sync_status`:
+
+```bash
+curl 'http://localhost/v0/pipelines/{PIPELINE_NAME}/checkpoint/sync_status?incarnation_uuid=019779b4-8760-75f2-bdf0-71b825e63611'
+```
+
+If the pipeline has restarted since the sync was requested, the incarnation
+no longer matches and the request fails with HTTP 400 and error code
+`IncarnationUuidMismatch` instead of returning an ambiguous status:
+
+```json
+{
+    "message": "Incarnation UUID mismatch (019779b4-8760-75f2-bdf0-71b825e63611 in request, expected 019779c1-8317-7a71-bd78-7b971f4a3c99)",
+    "error_code": "IncarnationUuidMismatch",
+    "details": {
+        "requested": "019779b4-8760-75f2-bdf0-71b825e63611",
+        "expected": "019779c1-8317-7a71-bd78-7b971f4a3c99"
+    }
+}
+```
+
+Trigger a new sync in response; the old one no longer exists. The parameter
+is optional, so a client that omits it keeps the previous behavior and cannot
+tell a restart apart from a sync in progress.
+
+The same parameter and error apply to `POST /checkpoint` and
+`GET /checkpoint_status`, which track local checkpoints the same way.
+
+`Pipeline.sync_checkpoint(wait=True)` in the Python SDK does this for you: it
+detects the restart and retries with a fresh sync. `Pipeline.checkpoint(wait=True)`
+and `fda pipeline checkpoint` do the same for local checkpoints.
+
+To poll status yourself instead, use `sync_checkpoint_response()`, or
+`checkpoint_response()` for a local checkpoint. Only these return the
+`incarnation_uuid` that the later status check needs; `sync_checkpoint()` and
+`checkpoint()` return just the UUID or sequence number.
 
 ## Multihost pipelines
 
@@ -428,3 +572,4 @@ average speeds were observed in testing:
 - Both GP2 and GP3 can briefly hit maximum download speeds of around 1 GiB/s, but performance drops off quickly.
 - NVMe speeds were tested on an i4i.4xlarge instance type.
 - Performance may improve by tuning sync parameters such as `transfers`, `checkers`, `upload_concurrency`, etc.
+- Downloads already scale `transfers` and `checkers` to the host's CPUs and allow the download buffer to use most of the available memory. Set `optimize_download_resources` to `false` to cap a download at the configured `transfers` and `checkers` instead, leaving CPU and memory for other work on the host.

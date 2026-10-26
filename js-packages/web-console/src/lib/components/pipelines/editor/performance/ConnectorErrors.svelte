@@ -1,18 +1,17 @@
 <script lang="ts">
+  import type { ConnectorErrorFilter } from 'common-lib/connectorMetrics'
+  import { getCaseDependentName } from 'common-lib/felderaRelation'
+  import { formatDateTime, formatServerTime } from 'common-lib/format'
   import { SegmentedControl, Tooltip } from 'common-ui'
   import Dayjs from 'dayjs'
   import { fade, slide } from 'svelte/transition'
   import InlineDropdown from '$lib/components/common/InlineDropdown.svelte'
-  import { getCaseDependentName } from '$lib/functions/felderaRelation'
-  import { formatDateTime } from '$lib/functions/format'
   import {
     type ConnectorError,
     type InputEndpointStatus,
     type OutputEndpointStatus
   } from '$lib/services/manager'
   import { getInputConnectorStatus, getOutputConnectorStatus } from '$lib/services/pipelineManager'
-
-  export type ConnectorErrorFilter = 'all' | 'parse' | 'transport' | 'encode'
 
   const inputFilterOptions = ['all', 'parse', 'transport'] as const
   const outputFilterOptions = ['all', 'encode', 'transport'] as const
@@ -190,7 +189,7 @@
                 {#if status?.fatal_error != null && item.error.message === status.fatal_error}
                   <span class="fd fd-circle-x text-error-500"></span>
                 {/if}
-                <span class="ml-auto">{Dayjs(item.error.timestamp).format('HH:mm:ss')}</span>
+                <span class="ml-auto">{formatServerTime(item.error.timestamp)}</span>
                 <Tooltip placement="top">{formatDateTime(Dayjs(item.error.timestamp))}</Tooltip>
               </div>
             {/snippet}

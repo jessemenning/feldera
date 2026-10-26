@@ -1,9 +1,12 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
+import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapIndexOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPHopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWaterlineOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.TestUtil;
 import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
@@ -551,16 +554,16 @@ public class Regression3Tests extends SqlIoTest {
         String expected = """
                  customer_id | previous
                 ------------------------
-                 1               | 10
-                 1               | 30
-                 1               | 25
-                 2               | 0
-                 2               | 7
-                 2               | 10
-                 3               | 100
-                 4               | 3
-                 4               | 3
-                 4               | 6""";
+                 1           | 10
+                 1           | 30
+                 1           | 25
+                 2           | 0
+                 2           | 7
+                 2           | 10
+                 3           | 100
+                 4           | 3
+                 4           | 3
+                 4           | 6""";
 
         var ccs = this.getCCS(program);
         ccs.stepWeightOne(data, expected);
@@ -574,16 +577,16 @@ public class Regression3Tests extends SqlIoTest {
         String expected2 = """
                  customer_id | previous
                 ------------------------
-                 1               | 10
-                 1               | 30
-                 1               | 25
-                 2               | 0
-                 2               | 7
-                 2               | 10
-                 3               | 100
-                 4               | 3
-                 4               | 3
-                 4               | 6""";
+                 1            | 10
+                 1            | 30
+                 1            | 25
+                 2            | 0
+                 2            | 7
+                 2            | 10
+                 3            | 100
+                 4            | 3
+                 4            | 3
+                 4            | 6""";
         ccs.stepWeightOne(data, expected2);
     }
 
@@ -717,6 +720,7 @@ public class Regression3Tests extends SqlIoTest {
                 CREATE VIEW Z AS SELECT b, r.b, t.b FROM T;""");
     }
 
+    /** ENFORCE_POSITIVE_INPUTS catches a delete of an absent row in a non-incremental circuit. */
     @Test
     public void testEnforcePositiveInputs() {
         String sql = """
@@ -860,5 +864,170 @@ public class Regression3Tests extends SqlIoTest {
                 Assert.assertTrue(this.filterFound);
             }
         });
+    }
+
+    @Test
+    public void issue5940() {
+        // Without inlining CRT_DATE this generates a very inefficient implementation using JOIN
+        // With inlining this generates a Window operator
+        var ccs = this.getCCS("""
+                CREATE FUNCTION CRT_DATE(T TIMESTAMP) RETURNS DATE AS CAST(T AS DATE);
+                CREATE TABLE T(D DATE, X INT);
+                CREATE VIEW V AS SELECT * FROM T WHERE T.D < CRT_DATE(NOW())""");
+        var visitor = new CircuitVisitor(ccs.compiler) {
+            boolean windowFound = false;
+
+            @Override
+            public void postorder(DBSPStreamJoinOperator node) {
+                Assert.fail("JOIN should not be present");
+            }
+
+            @Override
+            public void postorder(DBSPWindowOperator node) {
+                this.windowFound = true;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertTrue(this.windowFound);
+                super.endVisit();
+            }
+        };
+        ccs.visit(visitor);
+
+        /// inline multiple nested functions
+        ccs = this.getCCS("""
+                CREATE FUNCTION CRT_DATE(T TIMESTAMP) RETURNS DATE AS CAST(T AS DATE);
+                CREATE FUNCTION YR(D DATE) RETURNS BIGINT AS EXTRACT(YEAR FROM D);
+                CREATE TABLE T(X BIGINT);
+                CREATE VIEW V AS SELECT * FROM T WHERE T.X < YR(CRT_DATE(NOW()));""");
+        ccs.visit(visitor);
+    }
+
+    /** Test case for <a href="https://issues.apache.org/jira/browse/CALCITE-7784">
+     * [CALCITE-7784] Parse fails for ROW(CASE ...)</a> */
+    @Test
+    public void calcite7784() {
+        // A CASE expression as a named ROW field
+        var ccs = this.getCCS("""
+                CREATE TABLE T(given VARCHAR, family VARCHAR, formatted VARCHAR);
+                CREATE LOCAL VIEW V AS SELECT ROW(
+                    CASE WHEN given IS NULL AND family IS NULL THEN formatted
+                         ELSE NULLIF(CONCAT_WS(' ', given, family), '') END AS fullName,
+                    given AS givenName) AS r
+                FROM T;
+                CREATE VIEW W AS SELECT (r).fullName AS fullName, (r).givenName AS givenName FROM V;""")
+                .withStringTrim();
+        ccs.stepWeightOne("INSERT INTO T VALUES('Ann', 'Lee', 'unused')", """
+                 fullName       | givenName
+                ----------------------------
+                 Ann Lee        | Ann""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL, NULL, 'Only Formatted')", """
+                 fullName       | givenName
+                ----------------------------
+                 Only Formatted |NULL""");
+
+        // A CASE without ELSE as the first field of an aggregated ROW, the shape
+        // that failed to parse
+        ccs = this.getCCS("""
+                CREATE TABLE S(id INT, a INT, b INT);
+                CREATE LOCAL VIEW V2 AS
+                SELECT id, ARRAY_AGG(ROW(CASE WHEN a > 0 THEN a END, b)) AS arr
+                FROM S GROUP BY id;
+                CREATE VIEW W2 AS SELECT id, TRANSFORM(arr, x -> x[1]) AS first FROM V2;""");
+        ccs.stepWeightOne("INSERT INTO S VALUES(1, 2, 3)", """
+                 id | first
+                ------------
+                 1  | { 2 }""");
+        ccs.stepWeightOne("INSERT INTO S VALUES(2, -1, 3)", """
+                 id | first
+                -------------
+                 2  | { NULL }""");
+    }
+
+    /** Indexing a collection whose element is a ROW with a non-nullable ARRAY field */
+    @Test
+    public void nestedArrayInNullableRow() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW W AS SELECT ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][1].b[1] AS r FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2, 3])", """
+                 r
+                ---
+                 2""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL)", """
+                 r
+                ------
+                 NULL""");
+
+        // The same with a MAP
+        ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW W AS SELECT MAP['k', ROW(COALESCE(x, ARRAY()) AS b)]['k'].b[1] AS r FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2, 3])", """
+                 r
+                ---
+                 2""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL)", """
+                 r
+                ------
+                 NULL""");
+
+        // Two levels of nesting, each one indexing a ROW field that cannot be NULL
+        ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW W AS SELECT
+                  ARRAY[ROW(ARRAY[ROW(COALESCE(x, ARRAY()) AS c)] AS b)][1].b[1].c[1] AS r
+                FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2, 3])", """
+                 r
+                ---
+                 2""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL)", """
+                 r
+                ------
+                 NULL""");
+
+        // An index out of bounds and a missing map key produce a NULL ROW result
+        ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW W AS SELECT
+                  ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][2].b AS r,
+                  ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][2].b[1] AS s,
+                  MAP['k', ROW(COALESCE(x, ARRAY()) AS b)]['nope'].b AS t
+                FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2, 3])", """
+                 r    | s    | t
+                ---------------------
+                 NULL | NULL | NULL""");
+
+        // SAFE_OFFSET 
+        ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW W AS SELECT
+                  ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][SAFE_OFFSET(0)].b[1] AS r,
+                  ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][SAFE_OFFSET(1)].b AS s
+                FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2, 3])", """
+                 r | s
+                ----------
+                 2 | NULL""");
+
+        // A DECIMAL element type, which carries a precision and a scale
+        ccs = this.getCCS("""
+                CREATE TABLE T(x DECIMAL(6, 2) ARRAY);
+                CREATE VIEW W AS SELECT ARRAY[ROW(COALESCE(x, ARRAY()) AS b)][1].b[1] AS r FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[2.50, 3.50])", """
+                 r
+                ------
+                 2.50""");
+    }
+
+    /** A NULL ROW constant reaching the monotonicity analysis */
+    @Test
+    public void nullRowConstantMonotone() {
+        this.getCC("""
+                CREATE TABLE T(ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR, x INT);
+                CREATE VIEW V AS SELECT ts, CAST(NULL AS ROW(a INT)) AS r FROM T;""");
     }
 }

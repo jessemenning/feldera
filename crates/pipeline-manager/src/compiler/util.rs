@@ -1,13 +1,13 @@
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::version::Version;
-use base64::prelude::{Engine, BASE64_STANDARD};
+use aws_lc_rs::digest;
+use base64::prelude::{BASE64_STANDARD, Engine};
 use flate2::Compression;
 use hex;
-use nix::libc::pid_t;
-use nix::sys::signal::{killpg, Signal};
-use nix::unistd::Pid;
 use nix::NixPath;
-use openssl::sha::sha256;
+use nix::libc::pid_t;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,13 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 use tracing::{debug, error, warn};
+
+/// SHA-256 of `data`, computed by the cryptographic module the binary links.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut checksum = [0u8; 32];
+    checksum.copy_from_slice(digest::digest(&digest::SHA256, data).as_ref());
+    checksum
+}
 
 /// Automatically terminates a process and all subprocesses it spawns using
 /// the group they are all in. The process must have set a process group ID
@@ -69,7 +76,10 @@ impl Drop for ProcessGroupTerminator {
             };
             // Send the SIGKILL to the PGRP
             if let Err(e) = killpg(Pid::from_raw(pgrp), Signal::SIGKILL) {
-                error!("Failed to cancel {}: attempt to kill the process and its subprocesses (PGRP: {}) failed: {e}", self.subject, self.process_group);
+                error!(
+                    "Failed to cancel {}: attempt to kill the process and its subprocesses (PGRP: {}) failed: {e}",
+                    self.subject, self.process_group
+                );
             }
             debug!(
                 "Successfully cancelled {} by killing its process group",
@@ -237,6 +247,20 @@ pub async fn copy_file_if_checksum_differs(
             Ok(())
         }
     }
+}
+
+/// Writes `content` to the file unless it already holds exactly that, so that an unchanged
+/// file keeps its modification time and cargo does not rebuild what depends on it.
+pub async fn write_file_if_content_differs(
+    target_file_path: &Path,
+    content: &str,
+) -> Result<(), UtilError> {
+    if target_file_path.is_file()
+        && read_file_content_bytes(target_file_path).await? == content.as_bytes()
+    {
+        return Ok(());
+    }
+    write_file(content.as_bytes(), target_file_path).await
 }
 
 /// Removes the directory recursively if it already exists, and then creates the directory anew empty.
@@ -518,7 +542,10 @@ pub async fn cleanup_specific_files(
                 }
             }
         } else if warn_ignore {
-            warn!("{cleanup_name} cleanup: ignoring '{}' (unexpected directory entry which is not a file)", path.display());
+            warn!(
+                "{cleanup_name} cleanup: ignoring '{}' (unexpected directory entry which is not a file)",
+                path.display()
+            );
         }
     }
     Ok(keep_motivations)
@@ -530,14 +557,20 @@ pub async fn cleanup_specific_files(
 pub async fn cleanup_specific_directories(
     cleanup_name: &str,
     dir: &Path,
-    decide: Arc<dyn Fn(&str) -> CleanupDecision + Send + Sync>,
+    decide: DecisionFn,
     warn_ignore: bool,
+    add_metadata: bool,
 ) -> Result<Vec<String>, UtilError> {
     let content = DirectoryContent::new(dir).await?.content;
     let mut keep_motivations = vec![];
     for (path, name, is_file) in content {
         if !is_file {
-            match decide(&name) {
+            let metadata = if add_metadata {
+                fs::metadata(&path).await.ok()
+            } else {
+                None
+            };
+            match decide(&name, metadata) {
                 CleanupDecision::Keep { motivation } => {
                     // If it should be kept, nothing needs to happen to the directory
                     keep_motivations.push(motivation);
@@ -561,7 +594,10 @@ pub async fn cleanup_specific_directories(
                 }
             }
         } else if warn_ignore {
-            warn!("{cleanup_name} cleanup: ignoring '{}' (unexpected directory entry which is not a directory)", path.display());
+            warn!(
+                "{cleanup_name} cleanup: ignoring '{}' (unexpected directory entry which is not a directory)",
+                path.display()
+            );
         }
     }
     Ok(keep_motivations)
@@ -619,6 +655,11 @@ pub fn crate_name_pipeline_globals(pipeline_id: PipelineId) -> String {
         "feldera_pipe_{}_globals",
         crate_name_pipeline_base(pipeline_id)
     )
+}
+
+/// Name of the crate in which the Rust UDFs of a Gen-2 pipeline are compiled.
+pub fn crate_name_pipeline_udf(pipeline_id: PipelineId) -> String {
+    format!("feldera_pipe_{}_udf", crate_name_pipeline_base(pipeline_id))
 }
 
 /// Generate filename for pipeline binary based on pipeline ID, version, and checksums.
@@ -710,17 +751,15 @@ impl DiskSpace {
 #[cfg(test)]
 mod test {
     use crate::compiler::util::{
-        cleanup_specific_directories, cleanup_specific_files, copy_file,
-        copy_file_if_checksum_differs, crate_name_pipeline_base, crate_name_pipeline_globals,
-        crate_name_pipeline_main, create_dir_if_not_exists, create_new_file,
-        create_new_file_with_content, decode_string_as_dir, encode_dir_as_string,
+        CleanupDecision, DirectoryContent, cleanup_specific_directories, cleanup_specific_files,
+        copy_file, copy_file_if_checksum_differs, crate_name_pipeline_base,
+        crate_name_pipeline_globals, crate_name_pipeline_main, create_dir_if_not_exists,
+        create_new_file, create_new_file_with_content, decode_string_as_dir, encode_dir_as_string,
         pipeline_binary_filename, read_file_content, read_file_content_bytes, recreate_dir,
-        recreate_file_with_content, truncate_sha256_checksum, validate_is_sha256_checksum,
-        CleanupDecision, DirectoryContent,
+        recreate_file_with_content, sha256, truncate_sha256_checksum, validate_is_sha256_checksum,
     };
     use crate::db::types::pipeline::PipelineId;
     use crate::db::types::version::Version;
-    use openssl::sha::sha256;
     use std::fs::Metadata;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1135,7 +1174,7 @@ mod test {
         cleanup_specific_directories(
             "",
             &dir_path,
-            Arc::new(|name: &str| {
+            Arc::new(|name: &str, _metadata: Option<std::fs::Metadata>| {
                 if name.starts_with("dir-") {
                     CleanupDecision::Remove
                 } else {
@@ -1145,6 +1184,7 @@ mod test {
                 }
             }),
             true,
+            false,
         )
         .await
         .unwrap();

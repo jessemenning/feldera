@@ -21,7 +21,11 @@ from feldera.testutils import (
     FELDERA_TEST_NUM_WORKERS,
     FELDERA_TEST_NUM_HOSTS,
 )
-from .helper import wait_for_condition, wait_for_records
+from .helper import (
+    wait_for_condition,
+    wait_for_records,
+    wait_for_pipeline_reachable,
+)
 
 
 class TestPipeline(SharedTestPipeline):
@@ -159,7 +163,7 @@ class TestPipeline(SharedTestPipeline):
             self.pipeline.name, "SELECT * FROM tbl ORDER BY id"
         )
         assert (
-            resp == "CCACBC763D343FB9855F285385B5A8A04FB5DAC4926DA3802F071B0C05BDF852"
+            resp == "EAA17D83271D48F5B0A2871210F102DAF5A0FC6F3CB8367FB757BBA6B0378086"
         )
 
     def test_adhoc_query_parquet(self):
@@ -338,6 +342,36 @@ class TestPipeline(SharedTestPipeline):
         wait_for_records(out, 100)
         df = out.to_pandas()
         assert df.shape[0] == 100
+        self.pipeline.stop(force=True)
+
+    def test_listen_null_strings(self):
+        """
+        CREATE TABLE nullable_strings (
+            id INT NOT NULL,
+            n INT,
+            s VARCHAR,
+            c CHAR(4)
+        );
+        CREATE MATERIALIZED VIEW nullable_strings_view AS
+            SELECT * FROM nullable_strings;
+        """
+        self.pipeline.start()
+        out = self.pipeline.listen("nullable_strings_view")
+        self.pipeline.input_json(
+            "nullable_strings",
+            [
+                {"id": 1, "n": None, "s": None, "c": None},
+                {"id": 2, "n": 0, "s": "None", "c": "None"},
+                {"id": 3, "n": 3, "s": "a", "c": "a"},
+            ],
+        )
+        wait_for_records(out, 3)
+        rows = sorted(out.to_dict(), key=lambda row: row["id"])
+        assert rows == [
+            {"id": 1, "n": None, "s": None, "c": None, "insert_delete": 1},
+            {"id": 2, "n": 0, "s": "None", "c": "None", "insert_delete": 1},
+            {"id": 3, "n": 3, "s": "a", "c": "a", "insert_delete": 1},
+        ]
         self.pipeline.stop(force=True)
 
     def test_foreach_chunk(self):
@@ -783,7 +817,17 @@ class TestPipeline(SharedTestPipeline):
         got = TEST_CLIENT.get_pipeline(
             self.pipeline.name, PipelineFieldSelector.ALL
         ).runtime_config["resources"]
-        assert got == config
+        # The sizes were given under their deprecated names; the manager stores
+        # them under the current ones, as sizes, and leaves out an unset size.
+        assert got == {
+            "cpu_cores_max": 3,
+            "cpu_cores_min": 2,
+            "memory_max": "500M",
+            "memory_min": "300M",
+            "storage_class": None,
+            "namespace": None,
+            "service_account_name": None,
+        }
 
     def test_support_bundle(self):
         self.pipeline.start()
@@ -798,7 +842,18 @@ class TestPipeline(SharedTestPipeline):
             with zipfile.ZipFile(io.BytesIO(support_bundle_bytes), "r") as zip_file:
                 file_list = zip_file.namelist()
                 # Files now live inside per-collection timestamp directories.
-                assert any(item.endswith("/circuit_profile.json") for item in file_list)
+                # The JSON profile is stored gzip-compressed, as the pipeline sent it.
+                json_profiles = [
+                    item
+                    for item in file_list
+                    if item.endswith("/circuit_profile.json.gz")
+                ]
+                assert json_profiles, file_list
+                with zip_file.open(json_profiles[0]) as member:
+                    with gzip.GzipFile(fileobj=member) as gz:
+                        profile = json.load(gz)
+                assert "worker_profiles" in profile
+                assert any(item.endswith("/circuit_profile.zip") for item in file_list)
                 assert "metadata.txt" in file_list
                 assert "metadata.json" in file_list
         except zipfile.BadZipFile:
@@ -948,7 +1003,7 @@ class TestPipeline(SharedTestPipeline):
     # Give this test a different name than the one in platform/test_completion_tokens.
     def test_completion_tokens_sdk(self):
         self.pipeline.start()
-        self.pipeline.resume_connector("tbl", "d1")
+        self.pipeline.start_input_connector("tbl", "d1")
         token = self.pipeline.generate_completion_token("tbl", "d1")
         self.pipeline.wait_for_token(token)
         assert (
@@ -998,6 +1053,7 @@ class TestPipeline(SharedTestPipeline):
     # is already compressed).
     def test_circuit_profile_streaming(self):
         self.pipeline.start()
+        wait_for_pipeline_reachable(self.pipeline.name)
 
         resp = http_request(
             "GET",
@@ -1032,6 +1088,7 @@ class TestPipeline(SharedTestPipeline):
     # is transparent (compressed and uncompressed responses yield the same data).
     def test_circuit_json_profile_streaming(self):
         self.pipeline.start()
+        wait_for_pipeline_reachable(self.pipeline.name)
 
         # Request with gzip — the pipeline compresses and the streaming
         # proxy passes the compressed bytes through.  `requests`

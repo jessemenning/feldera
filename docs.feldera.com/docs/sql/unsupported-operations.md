@@ -9,9 +9,14 @@ resolved in future releases.
 ## Aggregate functions
 
 The following aggregate functions are not supported:
-`PERCENTILE_DISC`, `PERCENTILE_CONT`, `MODE`, `CORR`, `COVAR_POP`,
-`COVAR_SAMP`, `REGR_SLOPE`, `REGR_INTERCEPT`, `REGR_R2`, `JSON_AGG`,
+`PERCENTILE_DISC`, `PERCENTILE_CONT`, `CORR`,
+`REGR_SLOPE`, `REGR_INTERCEPT`, `REGR_R2`, `JSON_AGG`,
 `JSON_OBJECT_AGG`, `LISTAGG`.
+
+### `WITHIN DISTINCT` not supported
+
+The `WITHIN DISTINCT` clause of aggregate functions, as in `SUM(x)
+WITHIN DISTINCT (k)`, is not supported.
 
 ## Window functions (`OVER` clause)
 
@@ -51,6 +56,27 @@ Windowed aggregate functions with frames require `ORDER BY` on
 exactly one column.  Plain window functions such as `RANK` and
 `DENSE_RANK` support `ORDER BY` on multiple columns.
 See [#457](https://github.com/feldera/feldera/issues/457).
+
+### `RANGE` frames with offsets over nullable columns
+
+A `RANGE` window frame with a bound of the form `n PRECEDING` or `n
+FOLLOWING`, such as `RANGE BETWEEN 2 PRECEDING AND CURRENT ROW`,
+requires an `ORDER BY` column that cannot be `NULL`.  To use such a
+frame over a nullable column, filter out the `NULL` values first, for
+example with `WHERE ts IS NOT NULL`.
+See [#7277](https://github.com/feldera/feldera/issues/7277).
+
+### `DISTINCT` in window aggregates
+
+Window aggregates cannot use `DISTINCT`; for example,
+`COUNT(DISTINCT x) OVER (PARTITION BY p ORDER BY ts RANGE BETWEEN
+INTERVAL 1 HOUR PRECEDING AND CURRENT ROW)` is rejected.  The
+exceptions are the aggregates whose results are the same with or
+without `DISTINCT`: `MIN`, `MAX`, `BIT_AND`, `BIT_OR`, `EVERY`,
+`SOME`, `BOOL_AND`, `BOOL_OR`, `LOGICAL_AND`, and `LOGICAL_OR`.  An
+aggregate over a whole partition,
+such as `COUNT(DISTINCT x) OVER (PARTITION BY p)`, can be computed with
+`GROUP BY p` and joined back on `p`.
 
 ### Constant Window Boundaries
 
@@ -118,12 +144,18 @@ columns. Refer to [PIVOT documentation](./aggregates.md#pivots) for
 example usage.  Dynamic `PIVOT` is not yet supported.
 
 ## `MULTISET` Data Type
+
 The `MULTISET` data type is not currently supported.
 
-## Session windows
+## Equality between `ROW` values
 
-Session windows (grouping events into sessions based on a gap in
-activity) are not yet supported.
+`=`, `<>`, and `!=` are rejected between `ROW` values, and so are the
+forms that imply such a comparison: a join condition, `NATURAL JOIN`,
+`USING`, `IN`, `CASE`, and `NULLIF`.  A user-defined structure type is
+a `ROW` type, so the restriction covers its values too.  Use `IS [NOT]
+DISTINCT FROM` instead, and see [comparing `ROW`
+values](comparisons.md#comparing-row-values) for the accepted rewrite
+of each form.
 
 ## `TIME` with timezone
 
@@ -144,7 +176,7 @@ details.
 
 The `NOW()` function returns the current timestamp and is updated at
 every processing step (every 1 second by default, configurable via
-`clock_resolution_usecs`).
+`clock_resolution`).
 
 - **In filters**: `NOW()` in `WHERE` clauses for temporal filtering
   (e.g., `WHERE ts >= NOW() - INTERVAL 1 DAY`) is efficient and

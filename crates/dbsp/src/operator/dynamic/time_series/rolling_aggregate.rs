@@ -396,9 +396,18 @@ where
     {
         self.circuit()
             .region("partitioned_rolling_aggregate_with_waterline", || {
-                // Shift the aggregation window so that its right end is at 0.
+                // A change at time `t` affects the rows at `t - max(range.to, 0)` and later, and
+                // these rows read inputs from `t + min(range.from, 0) - max(range.to, 0)` on.
+                let before = match range.from {
+                    RelOffset::After(_) => RelOffset::Before(HasZero::zero()),
+                    before => before,
+                };
+                let after = match range.to {
+                    RelOffset::Before(_) => RelOffset::Before(HasZero::zero()),
+                    after => after,
+                };
                 let shifted_range =
-                    RelRange::new(range.from - range.to, RelOffset::Before(HasZero::zero()));
+                    RelRange::new(before - after, RelOffset::Before(HasZero::zero()));
 
                 // Trace bound used inside `partitioned_rolling_aggregate_inner` to
                 // bound its output trace.  This is the same bound we use to construct
@@ -413,7 +422,7 @@ where
                     .default_box();
 
                 // Restrict the input stream to the `[lb -> ∞)` time window,
-                // where `lb = waterline - (range.to - range.from)` is the lower
+                // where `lb = waterline + min(range.from, 0) - max(range.to, 0)` is the lower
                 // bound on input timestamps that may be used to compute
                 // changes to the rolling aggregate operator.
                 let bounds = waterline.apply_mut(move |wm| {
@@ -883,7 +892,7 @@ where
             }
 
             let input_delta = self.input_delta.borrow_mut().take().unwrap();
-            self.input_batch_stats.borrow_mut().add_batch(input_delta.len());
+            self.input_batch_stats.borrow_mut().add_batch(input_delta.len_upper_bound());
 
             let mut delta_cursor = input_delta.cursor();
             let mut output_trace_cursor = output_trace.unwrap().cursor();
@@ -935,7 +944,7 @@ where
                             if retraction_builder.num_tuples() >= chunk_size {
                                 retraction_builder.push_key(delta_cursor.key());
                                 let result = retraction_builder.done();
-                                self.output_batch_stats.borrow_mut().add_batch(result.len());
+                                self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                                 yield (result, false, delta_cursor.position());
                                 any_values = false;
                                 retraction_builder = O::Builder::with_capacity(&self.output_factories, chunk_size, chunk_size);
@@ -1002,7 +1011,7 @@ where
                                     any_values = false;
 
                                     let result = insertion_builder.done();
-                                    self.output_batch_stats.borrow_mut().add_batch(result.len());
+                                    self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
 
                                     yield (result, false, delta_cursor.position());
                                     insertion_builder =
@@ -1030,7 +1039,7 @@ where
             let insertions = insertion_builder.done();
 
             let result = merge_batches(&insertions.factories(), [insertions,retractions], &None, &None);
-            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
             yield (result, true, delta_cursor.position());
         }
     }
@@ -1038,6 +1047,7 @@ where
 
 #[cfg(test)]
 mod test {
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
         DBData, DBSPHandle, IndexedZSetHandle, OrdIndexedZSet, OutputHandle, RootCircuit, Runtime,
         Stream, TypedBox, ZWeight,
@@ -1147,7 +1157,7 @@ mod test {
                     .gather(0)
                     .integrate()
                     .apply(move |batch: &TypedBatch<_, _, _, DataBatch>| {
-                        let mut tuples = Vec::with_capacity(batch.len());
+                        let mut tuples = Vec::with_capacity(batch.len_upper_bound());
 
                         let mut cursor = batch.cursor();
 
@@ -1464,6 +1474,79 @@ mod test {
         circuit.kill().unwrap();
     }
 
+    /// Compare the rolling aggregate with a waterline, for lateness 0, with the reference
+    /// implementation after each batch of `trace`.
+    fn test_rolling_aggregate_with_waterline(range: RelRange<u64>, trace: Vec<InputBatch>) {
+        let (mut circuit, (input, output, expected)) = Runtime::init_circuit(
+            CircuitConfig::from(2).with_splitter_chunk_size_records(6),
+            move |circuit| {
+                let (input_stream, input_handle) =
+                    circuit.add_input_indexed_zset::<u64, Tup2<u64, i64>>();
+                let input_by_time = input_stream
+                    .map_index(|(partition, Tup2(ts, val))| (*ts, Tup2(*partition, *val)));
+                let input_stream = input_stream.as_partitioned_zset();
+                let waterline: Stream<_, TypedBox<u64, DynDataTyped<u64>>> = input_by_time
+                    .waterline_monotonic(|| 0, |ts| *ts)
+                    .transaction_delay_with_initial_value(TypedBox::new(0));
+                let aggregator = <Fold<i64, i64, DefaultSemigroup<_>, _, _>>::new(
+                    0i64,
+                    |agg: &mut i64, val: &i64, w: ZWeight| *agg += val * w,
+                );
+                let output = Stream::partitioned_rolling_aggregate_with_waterline(
+                    &input_by_time,
+                    &waterline,
+                    |Tup2(partition, val)| (*partition, *val),
+                    aggregator,
+                    range,
+                )
+                .accumulate_integrate()
+                .accumulate_output();
+                let expected = partitioned_rolling_aggregate_slow(&input_stream.inner(), range)
+                    .accumulate_output();
+                Ok((input_handle, output, expected))
+            },
+        )
+        .unwrap();
+
+        for mut batch in trace {
+            input.append(&mut batch);
+            circuit.transaction().unwrap();
+            assert_eq!(
+                output.concat().consolidate(),
+                expected.concat().consolidate()
+            );
+        }
+        circuit.kill().unwrap();
+    }
+
+    // The row at the waterline, 5, reads the input at 0 through its window [0, 4] of the
+    // range [-5, -1].
+    #[test]
+    fn test_rolling_aggregate_waterline_preceding_upper_bound() {
+        test_rolling_aggregate_with_waterline(
+            RelRange::new(RelOffset::Before(5), RelOffset::Before(1)),
+            vec![
+                vec![Tup2(0u64, Tup2(Tup2(0u64, 1i64), 1))],
+                vec![Tup2(0u64, Tup2(Tup2(5u64, 1i64), 1))],
+                vec![Tup2(0u64, Tup2(Tup2(5u64, 2i64), 1))],
+            ],
+        );
+    }
+
+    // The row at the waterline, 3, changes the output of row 0 through its window [1, 3]
+    // of the range [1, 3].
+    #[test]
+    fn test_rolling_aggregate_waterline_following_lower_bound() {
+        test_rolling_aggregate_with_waterline(
+            RelRange::new(RelOffset::After(1), RelOffset::After(3)),
+            vec![
+                vec![Tup2(0u64, Tup2(Tup2(0u64, 1i64), 1))],
+                vec![Tup2(0u64, Tup2(Tup2(3u64, 1i64), 1))],
+                vec![Tup2(0u64, Tup2(Tup2(3u64, 2i64), 1))],
+            ],
+        );
+    }
+
     #[test]
     fn test_partitioned_over_range_2() {
         test_partition_rolling_aggregate(
@@ -1733,24 +1816,34 @@ mod test {
             .collect::<Vec<_>>()
     }
 
+    // 100 batches stepping a 10_000-wide window by 2_000 sweeps the window
+    // forward 20 times over, which is what exercises retention.  Cost grows
+    // with the square of the batch count, because the reference implementation
+    // rescans the whole integral every step, so batches buy coverage dearly:
+    // 200 batches cost 36s per case against 9.9s here.
+    //
+    // The 30_000-byte bound holds the trace to roughly 3x its measured peak of
+    // 10.4KB.  That peak does not move with the batch count, or with the input
+    // volume at all, so a longer run does not tighten the bound: see
+    // https://github.com/feldera/feldera/issues/7183.
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(5))]
+        #![proptest_config(ProptestConfig::with_cases(10))]
 
         #[test]
-        fn proptest_partitioned_rolling_aggregate_quasi_monotone_small_steps(trace in input_trace_quasi_monotone(5, 10_000, 2_000, 20, 200)) {
-            // 10_000 is an empirically established bound: without GC this test needs >10KB.
+        fn proptest_partitioned_rolling_aggregate_quasi_monotone_small_steps(trace in input_trace_quasi_monotone(5, 10_000, 2_000, 20, 100)) {
             test_partition_rolling_aggregate(10000, Some(30_000), trace, false);
         }
 
         #[test]
         #[ignore = "https://github.com/feldera/feldera/issues/4764"]
-        fn proptest_partitioned_rolling_aggregate_quasi_monotone_big_step(trace in input_trace_quasi_monotone(5, 10_000, 2_000, 20, 200)) {
-            // 10_000 is an empirically established bound: without GC this test needs >10KB.
+        fn proptest_partitioned_rolling_aggregate_quasi_monotone_big_step(trace in input_trace_quasi_monotone(5, 10_000, 2_000, 20, 100)) {
             test_partition_rolling_aggregate(10000, Some(30_000), trace, true);
         }
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn proptest_partitioned_over_range_sparse_small_steps(trace in input_trace(5, 1_000_000, 10, 10)) {
             test_partition_rolling_aggregate(u64::MAX, None, trace, false);

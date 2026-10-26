@@ -1,6 +1,6 @@
 //! JSON format parser.
 
-use super::{DebeziumUpdate, InsDelUpdate, WeightedUpdate};
+use super::{DebeziumUpdate, InsDelUpdate};
 use crate::catalog::InputCollectionHandle;
 use crate::format::{InputBuffer, LineSplitter};
 use crate::{
@@ -8,7 +8,6 @@ use crate::{
     catalog::{DeCollectionStream, RecordFormat},
     format::{InputFormat, ParseError, Parser},
 };
-use actix_web::HttpRequest;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
 use feldera_adapterlib::ConnectorMetadata;
@@ -16,8 +15,8 @@ use feldera_adapterlib::format::Splitter;
 use feldera_sqllib::Variant;
 use feldera_types::format::json::{JsonLines, JsonParserConfig, JsonUpdateFormat};
 use serde::Deserialize;
-use serde_json::json;
 use serde_json::value::RawValue;
+use serde_json::{Value as JsonValue, json};
 use serde_urlencoded::Deserializer as UrlDeserializer;
 use std::borrow::Cow;
 
@@ -141,34 +140,6 @@ impl UpdateFormat for DebeziumUpdate<&'_ RawValue> {
     }
 }
 
-impl UpdateFormat for WeightedUpdate<&'_ RawValue> {
-    fn error() -> &'static str {
-        "error deserializing JSON string as a weighted record"
-    }
-
-    fn array_error() -> &'static str {
-        "error deserializing string as a JSON array of weighted records"
-    }
-
-    fn example() -> Option<&'static str> {
-        Some("Example valid JSON: '{{\"weight\": 1, \"data\": {{...}} }}'")
-    }
-
-    fn array_example() -> Option<&'static str> {
-        Some(
-            "Example valid JSON: '[{{\"weight\": 1, \"data\": {{...}} }}, {{\"weight\": -1, \"data\": {{...}} }}]'",
-        )
-    }
-
-    fn apply(
-        self,
-        _parser: &mut JsonParser,
-        _metadata: &Option<Variant>,
-    ) -> Result<usize, ParseError> {
-        todo!()
-    }
-}
-
 impl UpdateFormat for &'_ RawValue {
     fn error() -> &'static str {
         "failed to parse JSON string"
@@ -218,22 +189,16 @@ impl InputFormat for JsonInputFormat {
         Ok(Box::new(JsonParser::new(input_stream, config)) as Box<dyn Parser>)
     }
 
-    fn config_from_http_request(
+    fn config_from_http_query(
         &self,
         endpoint_name: &str,
-        request: &HttpRequest,
+        query: &str,
     ) -> Result<Box<dyn ErasedSerialize>, ControllerError> {
         Ok(Box::new(
             JsonParserConfig::deserialize(UrlDeserializer::new(form_urlencoded::parse(
-                request.query_string().as_bytes(),
+                query.as_bytes(),
             )))
-            .map_err(|e| {
-                ControllerError::parser_config_parse_error(
-                    endpoint_name,
-                    &e,
-                    request.query_string(),
-                )
-            })?,
+            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e, query))?,
         ))
     }
 }
@@ -242,17 +207,62 @@ fn validate_parser_config(
     config: &JsonParserConfig,
     endpoint_name: &str,
 ) -> Result<(), ControllerError> {
-    if config.update_format == JsonUpdateFormat::Snowflake {
-        return Err(ControllerError::input_format_not_supported(
-            endpoint_name,
-            &format!(
-                "{:?} is not supported for JSON input streams",
-                config.update_format
-            ),
-        ));
+    // No wildcard: a new update format must be classified here, because the
+    // parser panics on a format it does not support.
+    match config.update_format {
+        JsonUpdateFormat::InsertDelete | JsonUpdateFormat::Debezium | JsonUpdateFormat::Raw => {
+            Ok(())
+        }
+        JsonUpdateFormat::Snowflake | JsonUpdateFormat::Redis => {
+            Err(ControllerError::input_format_not_supported(
+                endpoint_name,
+                &unsupported_update_format(&config.update_format),
+            ))
+        }
     }
+}
 
-    Ok(())
+/// Error message for an update format that JSON input does not support.
+///
+/// The list of formats here must match the ones that `validate_parser_config`
+/// accepts.
+fn unsupported_update_format(update_format: &JsonUpdateFormat) -> String {
+    format!(
+        "update format '{update_format}' is not supported for JSON input streams; use one of \
+         'insert_delete', 'debezium', or 'raw'"
+    )
+}
+
+fn looks_like_insert_delete_envelope_object(value: &JsonValue) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    let mut has_action_key = false;
+    for (key, value) in object {
+        match key.as_str() {
+            "table" => (),
+            "insert" | "delete" | "update" => {
+                if has_action_key || (!value.is_object() && !value.is_array()) {
+                    return false;
+                }
+                has_action_key = true;
+            }
+            _ => return false,
+        }
+    }
+    has_action_key
+}
+
+fn looks_like_insert_delete_envelope(update: &RawValue) -> bool {
+    let Ok(value) = serde_json::from_str::<JsonValue>(update.get()) else {
+        return false;
+    };
+
+    looks_like_insert_delete_envelope_object(&value)
+        || value.as_array().is_some_and(|array| {
+            !array.is_empty() && array.iter().all(looks_like_insert_delete_envelope_object)
+        })
 }
 
 struct JsonParser {
@@ -263,6 +273,18 @@ struct JsonParser {
 }
 
 impl JsonParser {
+    fn raw_format_insert_delete_mismatch_error(update: &RawValue) -> Option<ParseError> {
+        looks_like_insert_delete_envelope(update).then(|| {
+            ParseError::text_envelope_error(
+                "payload looks like an insert/delete envelope; the configured `raw` update format expects plain rows".to_string(),
+                update.get(),
+                Some(Cow::from(
+                    "Set `format.config.update_format` to `insert_delete` for payloads like {\"insert\": {...}} or {\"delete\": {...}}.",
+                )),
+            )
+        })
+    }
+
     fn new(input_stream: Box<dyn DeCollectionStream>, config: JsonParserConfig) -> Self {
         Self {
             input_stream,
@@ -400,14 +422,28 @@ impl Parser for JsonParser {
                 JsonUpdateFormat::Debezium => {
                     self.apply_update::<DebeziumUpdate<_>>(update, &metadata, &mut errors)
                 }
-                JsonUpdateFormat::Weighted => {
-                    self.apply_update::<WeightedUpdate<_>>(update, &metadata, &mut errors)
-                }
                 JsonUpdateFormat::Raw => {
-                    self.apply_update::<&RawValue>(update, &metadata, &mut errors)
+                    let errors_before = errors.len();
+                    self.apply_update::<&RawValue>(update, &metadata, &mut errors);
+                    // On parse failure, check if the user sent insert/delete
+                    // envelopes with the raw format and provide a better hint.
+                    if errors.len() > errors_before
+                        && let Some(error) = Self::raw_format_insert_delete_mismatch_error(update)
+                    {
+                        errors.truncate(errors_before);
+                        errors.push(error);
+                    }
                 }
                 JsonUpdateFormat::Redis | JsonUpdateFormat::Snowflake => {
-                    panic!("Unexpected update format: {:?}", &self.config.update_format)
+                    // `validate_parser_config` rejects these formats, so this
+                    // is unreachable.  Report an error instead of panicking:
+                    // a panic here would happen while a transport holds locks.
+                    errors.push(ParseError::text_envelope_error(
+                        unsupported_update_format(&self.config.update_format),
+                        update.get(),
+                        None,
+                    ));
+                    break;
                 }
             }
         }
@@ -561,6 +597,7 @@ mod test {
         format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat},
         program_schema::Relation,
         serde_with_context::{DeserializeWithContext, SqlSerdeConfig},
+        variant::VariantValue,
     };
     use std::{
         borrow::Cow, collections::BTreeMap, fmt::Debug, hash::Hash, panic::Location, sync::Arc,
@@ -850,6 +887,45 @@ mod test {
                 vec![ (r#"[[true, 0, "e"]]"#.to_string(), Vec::new())
                             , (r#"[[false, 100, "foo"]]"#.to_string(), Vec::new())],
                 vec![MockUpdate::with_polarity(TestStruct::new(true, 0, Some("e")), true), MockUpdate::with_polarity(TestStruct::new(false, 100, Some("foo")), true)],
+            ),
+            // raw: insert/delete envelope hint.
+            TestCase::new(
+                JsonParserConfig {
+                    update_format: JsonUpdateFormat::Raw,
+                    json_flavor: JsonFlavor::Default,
+                    array: false,
+                    lines: JsonLines::Single,
+                },
+                vec![(
+                    r#"{"insert": {"b": true, "i": 0}}"#.to_string(),
+                    vec![ParseError::text_envelope_error(
+                        "payload looks like an insert/delete envelope; the configured `raw` update format expects plain rows".to_string(),
+                        "{\"insert\": {\"b\": true, \"i\": 0}}",
+                        Some(Cow::from(
+                            "Set `format.config.update_format` to `insert_delete` for payloads like {\"insert\": {...}} or {\"delete\": {...}}.",
+                        )),
+                    )],
+                )],
+                Vec::new(),
+            ),
+            TestCase::new(
+                JsonParserConfig {
+                    update_format: JsonUpdateFormat::Raw,
+                    json_flavor: JsonFlavor::Default,
+                    array: true,
+                    lines: JsonLines::Single,
+                },
+                vec![(
+                    r#"[{"insert": {"b": true, "i": 0}}]"#.to_string(),
+                    vec![ParseError::text_envelope_error(
+                        "payload looks like an insert/delete envelope; the configured `raw` update format expects plain rows".to_string(),
+                        "[{\"insert\": {\"b\": true, \"i\": 0}}]",
+                        Some(Cow::from(
+                            "Set `format.config.update_format` to `insert_delete` for payloads like {\"insert\": {...}} or {\"delete\": {...}}.",
+                        )),
+                    )],
+                )],
+                Vec::new(),
             ),
             // raw: invalid json.
             TestCase::new(
@@ -1193,14 +1269,18 @@ mod test {
         init_test_logger();
 
         let mut metadata = ConnectorMetadata::new();
-        metadata.insert("kafka_headers", Variant::Map(Arc::new(BTreeMap::new())));
-        metadata.insert("kafka_topic", Variant::String(SqlString::from("my_topic")));
+        metadata.insert("kafka_headers", VariantValue::Object(BTreeMap::new()));
+        metadata.insert("kafka_topic", VariantValue::String("my_topic".into()));
         metadata.insert(
             "kafka_timestamp",
-            Variant::Timestamp(Timestamp::from_milliseconds(1763626606441)),
+            VariantValue::TimestampNtzMicros(
+                chrono::DateTime::from_timestamp_millis(1763626606441)
+                    .unwrap()
+                    .naive_utc(),
+            ),
         );
-        metadata.insert("kafka_partition", Variant::Int(10));
-        metadata.insert("kafka_offset", Variant::Int(1_000_000));
+        metadata.insert("kafka_partition", VariantValue::Int32(10));
+        metadata.insert("kafka_offset", VariantValue::Int32(1_000_000));
 
         let test_cases: Vec<TestCase<TestStructMetadata, ()>> = vec![
             TestCase::new(
@@ -1227,6 +1307,25 @@ mod test {
         ];
 
         run_test_cases(test_cases);
+    }
+
+    /// Update formats that JSON input does not support must be rejected when
+    /// the parser is created.  Otherwise, the parser panics on the first
+    /// record.
+    #[test]
+    fn unsupported_update_formats_are_rejected() {
+        for update_format in [JsonUpdateFormat::Snowflake, JsonUpdateFormat::Redis] {
+            let config = JsonParserConfig {
+                update_format: update_format.clone(),
+                ..JsonParserConfig::default()
+            };
+            let error = super::validate_parser_config(&config, "endpoint")
+                .expect_err(&format!("{update_format:?} was accepted for input"));
+            assert!(
+                error.to_string().contains("not supported for JSON input"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

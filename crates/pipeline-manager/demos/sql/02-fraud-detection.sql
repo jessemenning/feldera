@@ -38,7 +38,11 @@
 --
 -- See https://feldera.com/fraud_detection for more details.
 
+-- The schema is more complete than what is used in the views
 SET FELDERA_IGNORE_WARNING_UNUSED_COLUMN = 1;
+-- aggregating over transactions is not size-bound
+SET FELDERA_IGNORE_WARNING_UNBOUNDED_STATE = 1;
+
 
 -- Credit card holders.
 CREATE TABLE CUSTOMER (
@@ -47,6 +51,7 @@ CREATE TABLE CUSTOMER (
     lat DOUBLE,                         -- Customer home address latitude
     long DOUBLE                         -- Customer home address longitude
 ) WITH (
+    'expected_size' = '100000',
     'materialized' = 'true',
     -- Configure the random data generator to generate 100000 customer records.
     -- (see https://www.feldera.com/docs/connectors/sources/datagen)
@@ -71,7 +76,7 @@ CREATE TABLE CUSTOMER (
 
 -- Credit card transactions.
 CREATE TABLE TRANSACTION (
-    ts TIMESTAMP LATENESS INTERVAL 10 MINUTES, -- Transaction time
+    ts TIMESTAMP NOT NULL LATENESS INTERVAL 10 MINUTES, -- Transaction time
     amt DECIMAL(38, 2),                        -- Transaction amount
     cc_num BIGINT NOT NULL,                    -- Credit card number
     shipping_lat DOUBLE,                       -- Shipping address latitude

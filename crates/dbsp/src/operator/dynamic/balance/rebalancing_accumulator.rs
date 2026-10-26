@@ -15,7 +15,7 @@ use crate::{
         },
         operator_traits::{Operator, OperatorName, UnaryOperator},
     },
-    trace::{Batch, BatchReader, Spine, Trace},
+    trace::{Batch, BatchReader, Spine, Trace, TraceRole},
 };
 
 impl<C, B> Stream<C, B>
@@ -74,7 +74,7 @@ where
         let name = OperatorName::new("RebalancingAccumulator");
         Self {
             factories: factories.clone(),
-            state: Spine::new(factories, name.get()),
+            state: Spine::new(factories, name.get(), TraceRole::Accumulator),
             name,
             flush: false,
             location,
@@ -85,7 +85,7 @@ where
     }
 
     pub fn clear_state(&mut self) {
-        self.state = Spine::new(&self.factories, self.name.get());
+        self.state = Spine::new(&self.factories, self.name.get(), TraceRole::Accumulator);
         self.flush = false;
     }
 
@@ -93,7 +93,7 @@ where
         &mut self,
         feedback_stream: RefStreamValue<EmptyCheckpoint<Vec<Arc<B>>>>,
     ) {
-        self.feedback_stream = Some(feedback_stream.clone());
+        self.feedback_stream = Some(feedback_stream);
     }
 }
 
@@ -149,11 +149,12 @@ where
     }
 
     fn clock_start(&mut self, _scope: Scope) {
-        debug_assert!(self.0.borrow().state.is_empty());
+        // The state holds no batches at all, not merely batches that cancel.
+        debug_assert!(self.0.borrow().state.len_upper_bound() == 0);
     }
 
     fn clock_end(&mut self, _scope: Scope) {
-        debug_assert!(self.0.borrow().state.is_empty());
+        debug_assert!(self.0.borrow().state.len_upper_bound() == 0);
     }
 
     fn fixedpoint(&self, _scope: Scope) -> bool {
@@ -163,7 +164,7 @@ where
     /// Clear the operator's state.
     fn clear_state(&mut self) -> Result<(), Error> {
         let mut inner = self.0.borrow_mut();
-        let state = Spine::new(&inner.factories, inner.name.get());
+        let state = Spine::new(&inner.factories, inner.name.get(), TraceRole::Accumulator);
         inner.state = state;
         inner.flush = false;
         Ok(())
@@ -174,8 +175,8 @@ where
         // of every transaction (see `eval`), so it is empty between
         // transactions.  Cutover happens between transactions, so there is
         // nothing to move -- the integral node carries the transferred state.
-        debug_assert!(self.0.borrow().state.is_empty());
-        debug_assert!(other.0.borrow().state.is_empty());
+        debug_assert!(self.0.borrow().state.len_upper_bound() == 0);
+        debug_assert!(other.0.borrow().state.len_upper_bound() == 0);
         Ok(())
     }
 
@@ -198,7 +199,7 @@ where
     async fn eval(&mut self, batch: &B) -> Option<Spine<B>> {
         let mut inner = self.0.borrow_mut();
 
-        let len = batch.len();
+        let len = batch.len_upper_bound();
 
         if len > 0 {
             inner.input_batch_stats.add_batch(len);
@@ -208,10 +209,11 @@ where
         let result = if inner.flush {
             inner.flush = false;
 
-            let mut spine = Spine::<B>::new(&inner.factories, inner.name.get());
+            let mut spine =
+                Spine::<B>::new(&inner.factories, inner.name.get(), TraceRole::Accumulator);
             std::mem::swap(&mut inner.state, &mut spine);
 
-            inner.output_batch_stats.add_batch(spine.len());
+            inner.output_batch_stats.add_batch(spine.len_upper_bound());
             Some(spine)
         } else {
             None
@@ -232,7 +234,7 @@ where
     async fn eval_owned(&mut self, batch: B) -> Option<Spine<B>> {
         let mut inner = self.0.borrow_mut();
 
-        let len = batch.len();
+        let len = batch.len_upper_bound();
 
         if len > 0 {
             inner.input_batch_stats.add_batch(len);
@@ -242,10 +244,11 @@ where
         let result = if inner.flush {
             inner.flush = false;
 
-            let mut spine = Spine::<B>::new(&inner.factories, inner.name.get());
+            let mut spine =
+                Spine::<B>::new(&inner.factories, inner.name.get(), TraceRole::Accumulator);
             std::mem::swap(&mut inner.state, &mut spine);
 
-            inner.output_batch_stats.add_batch(spine.len());
+            inner.output_batch_stats.add_batch(spine.len_upper_bound());
             Some(spine)
         } else {
             None

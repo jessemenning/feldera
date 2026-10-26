@@ -1,9 +1,6 @@
 package org.dbsp.sqlCompiler.circuit.operator;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
-import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
@@ -14,6 +11,10 @@ import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
 import java.util.List;
+import com.fasterxml.jackson.databind.JsonNode;
+import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /** This operator does not exist in DBSP, it is purely used while computing monotonicity */
 @NonCoreIR
@@ -25,6 +26,16 @@ public final class DBSPBinaryDistinctOperator extends DBSPBinaryOperator
     public DBSPBinaryDistinctOperator(CalciteRelNode node, OutputPort integral, OutputPort delta, boolean positive) {
         super(node, "distinct_component", null, delta.outputType(), false, integral, delta);
         this.positive = positive;
+    }
+
+    @Override
+    public boolean equivalent(DBSPOperator other) {
+        if (!super.equivalent(other))
+            return false;
+        DBSPBinaryDistinctOperator otherOperator = other.as(DBSPBinaryDistinctOperator.class);
+        if (otherOperator == null)
+            return false;
+        return this.positive == otherOperator.positive;
     }
 
     @Override
@@ -55,5 +66,12 @@ public final class DBSPBinaryDistinctOperator extends DBSPBinaryOperator
         boolean positive = Utilities.getBooleanProperty(node, "positive");
         return new DBSPBinaryDistinctOperator(CalciteEmptyRel.INSTANCE, info.getInput(0), info.getInput(1), positive)
                 .addAnnotations(info.annotations(), DBSPBinaryDistinctOperator.class);
+    }
+
+    @Override
+    protected StreamKind computeOutputKind() {
+        this.requireInputAmong(0, StreamKind.COLLECTION);
+        this.requireInputAmong(1, StreamKind.DELTA);
+        return StreamKind.DELTA;
     }
 }

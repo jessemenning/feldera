@@ -95,7 +95,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -103,6 +102,8 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.CustomFunctions;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.functions.SqlSafeCastFunction;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
@@ -280,6 +281,13 @@ public class ConvertletTable extends ReflectiveConvertletTable {
                         SqlStdOperatorTable.NOT.createCall(call.getParserPosition(),
                                 SqlLibraryOperators.RLIKE.createCall(call.getParserPosition(),
                                         call.getOperandList()))));
+
+        // Convert "x RLIKE y" into "RLIKE(x, y)", so that constant folding
+        // does not evaluate the regular expression with Java semantics
+        registerOp(SqlLibraryOperators.RLIKE,
+                (cx, call) -> cx.convertExpression(
+                        CustomFunctions.RlikeFunction.INSTANCE.createCall(call.getParserPosition(),
+                                call.getOperandList())));
 
         // Expand "x NOT SIMILAR y" into "NOT (x SIMILAR y)"
         registerOp(SqlStdOperatorTable.NOT_SIMILAR_TO,
@@ -853,26 +861,23 @@ public class ConvertletTable extends ReflectiveConvertletTable {
             final SqlIntervalLiteral literal = call.operand(0);
             SqlIntervalLiteral.IntervalValue interval =
                     literal.getValueAs(SqlIntervalLiteral.IntervalValue.class);
-            BigDecimal val =
-                    interval.getIntervalQualifier().getStartUnit().multiplier;
+            final SqlIntervalQualifier qualifier = interval.getIntervalQualifier();
+            BigDecimal val = qualifier.getStartUnit().multiplier;
             RexNode rexInterval = cx.convertExpression(literal);
 
             final RexBuilder rexBuilder = cx.getRexBuilder();
             RexNode zero = rexBuilder.makeExactLiteral(BigDecimal.valueOf(0));
             RexNode cond = ge(pos, rexBuilder, rexInterval, zero);
 
-            RexNode pad =
-                    rexBuilder.makeExactLiteral(val.subtract(BigDecimal.ONE));
-            RexNode cast =
-                    rexBuilder.makeReinterpretCast(pos, rexInterval.getType(), pad,
-                            rexBuilder.makeLiteral(false));
+            RexNode pad = rexBuilder.makeIntervalLiteral(val.subtract(BigDecimal.ONE), qualifier);
             RexNode sum =
-                    floor ? minus(pos, rexBuilder, rexInterval, cast)
-                            : plus(pos, rexBuilder, rexInterval, cast);
+                    floor ? minus(pos, rexBuilder, rexInterval, pad)
+                            : plus(pos, rexBuilder, rexInterval, pad);
 
+            // CASE operands are (when, then, else)
             RexNode kase = floor
-                    ? case_(rexBuilder, rexInterval, cond, sum)
-                    : case_(rexBuilder, sum, cond, rexInterval);
+                    ? case_(rexBuilder, cond, rexInterval, sum)
+                    : case_(rexBuilder, cond, sum, rexInterval);
 
             RexNode factor = rexBuilder.makeExactLiteral(val);
             RexNode div = divideInt(pos, rexBuilder, kase, factor);
@@ -1205,6 +1210,12 @@ public class ConvertletTable extends ReflectiveConvertletTable {
         final List<RexNode> exprs = convertOperands(cx, call, consistency);
         RelDataType type = rexBuilder.deriveReturnType(op, exprs);
 
+        /*
+        Deliberately removed.
+
+        Calcite expands 'ROW (x0, x1, ...) = ROW (y0, y1, ...)' into
+        'x0 = y0 AND x1 = y1 AND ...'.  Feldera rejects '=' between ROW values
+
         // Expand 'ROW (x0, x1, ...) = ROW (y0, y1, ...)'
         // to 'x0 = y0 AND x1 = y1 AND ...'
         // If there are casts to ROW, apply them fieldwise:
@@ -1266,6 +1277,7 @@ public class ConvertletTable extends ReflectiveConvertletTable {
                 return RexUtil.composeConjunction(rexBuilder, eqList);
             }
         }
+        */
         return rexBuilder.makeCall(call.getParserPosition(), type, op, RexUtil.flatten(exprs, op));
     }
 
@@ -1741,19 +1753,19 @@ public class ConvertletTable extends ReflectiveConvertletTable {
             final SqlNode sum0;
             final SqlNode sum1;
             final SqlNode count;
+            // Calcite's version of this expansion generates internal 2-argument
+            // calls SUM(x, guard); we generate an a CASE statment.
             if (dependent == null) {
                 sumArgSquared = SqlStdOperatorTable.SUM.createCall(pos, argSquared);
-                sum0 = SqlStdOperatorTable.SUM.createCall(pos, arg0, arg1);
-                sum1 = SqlStdOperatorTable.SUM.createCall(pos, arg1, arg0);
+                sum0 = guardedSum(pos, arg0, arg1, highPrecision);
+                sum1 = guardedSum(pos, arg1, arg0, highPrecision);
                 count = SqlStdOperatorTable.REGR_COUNT.createCall(pos, arg0, arg1);
             } else {
-                sumArgSquared = SqlStdOperatorTable.SUM.createCall(pos, argSquared, dependent);
-                sum0 =
-                        SqlStdOperatorTable.SUM.createCall(pos, arg0,
-                                Objects.equals(dependent, arg0Input) ? arg1 : dependent);
-                sum1 =
-                        SqlStdOperatorTable.SUM.createCall(pos, arg1,
-                                Objects.equals(dependent, arg1Input) ? arg0 : dependent);
+                sumArgSquared = guardedSum(pos, argSquared, dependent, highPrecision);
+                sum0 = guardedSum(pos, arg0,
+                        Objects.equals(dependent, arg0Input) ? arg1 : dependent, highPrecision);
+                sum1 = guardedSum(pos, arg1,
+                        Objects.equals(dependent, arg1Input) ? arg0 : dependent, highPrecision);
                 count =
                         SqlStdOperatorTable.REGR_COUNT.createCall(pos, arg0,
                                 Objects.equals(dependent, arg0Input) ? arg1 : dependent);
@@ -1781,6 +1793,19 @@ public class ConvertletTable extends ReflectiveConvertletTable {
             }
 
             return SqlStdOperatorTable.DIVIDE.createCall(pos, diff, denominator);
+        }
+
+        /** SUM of value over the rows where guard is not NULL:
+         * SUM(CASE WHEN guard IS NOT NULL THEN value ELSE NULL END). */
+        private static SqlNode guardedSum(
+                SqlParserPos pos, SqlNode value, SqlNode guard, RelDataType type) {
+            SqlNode nullLiteral = CAST.createCall(pos, SqlLiteral.createNull(pos),
+                    SqlTypeUtil.convertTypeToSpec(type));
+            SqlNode guarded = new SqlCase(pos, null,
+                    SqlNodeList.of(SqlStdOperatorTable.IS_NOT_NULL.createCall(pos, guard)),
+                    SqlNodeList.of(value),
+                    nullLiteral);
+            return SqlStdOperatorTable.SUM.createCall(pos, guarded);
         }
 
         private static SqlNode getCastedSqlNode(SqlNode argInput,

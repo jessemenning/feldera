@@ -76,6 +76,8 @@ class GlobalPipelineMetrics:
         self.total_initiated_steps: Optional[int] = None
         self.total_completed_steps: Optional[int] = None
         self.pipeline_complete: Optional[bool] = None
+        self.platform_version: Optional[str] = None
+        self.runtime_version: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]):
@@ -86,7 +88,21 @@ class GlobalPipelineMetrics:
         metrics.start_time = datetime.fromtimestamp(d["start_time"])
         metrics.initial_start_time = datetime.fromtimestamp(d["start_time"])
         metrics.transaction_status = TransactionStatus.from_str(d["transaction_status"])
+        commit_progress = d.get("commit_progress")
+        metrics.commit_progress = (
+            CommitProgressSummary.from_dict(commit_progress)
+            if commit_progress is not None
+            else None
+        )
         return metrics
+
+    def progress_summary(self) -> str:
+        """Human-readable progress indicator for long-running wait loops:
+        commit progress while a transaction is committing, otherwise the
+        overall record count processed so far."""
+        if self.commit_progress is not None:
+            return str(self.commit_progress)
+        return f"{self.total_processed_records}/{self.total_input_records} records processed"
 
 
 class ConnectorError:
@@ -260,6 +276,7 @@ class OutputEndpointStatus:
         self.encode_errors: Optional[list[ConnectorError]] = None
         self.transport_errors: Optional[list[ConnectorError]] = None
         self.health: Optional[ConnectorHealth] = None
+        self.paused: Optional[bool] = None
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]):
@@ -267,6 +284,9 @@ class OutputEndpointStatus:
         status.endpoint_name = expect_str(d, "endpoint_name")
         status.config = expect_mapping(d, "config")
         status.metrics = OutputEndpointMetrics.from_dict(expect_mapping(d, "metrics"))
+        # Pipelines that predate pausable output connectors omit this field.
+        paused = d.get("paused")
+        status.paused = paused if isinstance(paused, bool) else False
         fatal_error = d.get("fatal_error")
         if fatal_error is not None and not isinstance(fatal_error, str):
             raise ValueError(
@@ -333,6 +353,16 @@ class CommitProgressSummary:
         status = cls()
         status.__dict__.update(d)
         return status
+
+    def __str__(self) -> str:
+        # Mirrors CommitProgressSummary's Display impl in
+        # crates/feldera-types/src/transaction.rs.
+        return (
+            f"completed: {self.completed} operators, "
+            f"evaluating: {self.in_progress} operators "
+            f"[{self.in_progress_processed_records}/{self.in_progress_total_records} "
+            f"changes processed], remaining: {self.remaining} operators"
+        )
 
 
 class TransactionInitiators:

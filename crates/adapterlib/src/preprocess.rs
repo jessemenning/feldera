@@ -9,12 +9,17 @@
 //! Transport → Preprocessor → Parser → Circuit
 //! ```
 
+// The connector layer still builds record metadata as the enum `Variant`.
+#![allow(deprecated)]
+
 use crate::ConnectorMetadata;
 use crate::format::{ParseError, Splitter};
+use crate::utils::transition_counter::{TransitionCounter, TransitionReader};
 use feldera_types::preprocess::PreprocessorConfig;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // Errors that can occur during creation of a preprocessor
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,10 +135,75 @@ impl PreprocessorRegistry {
     }
 }
 
+/// Shared state that tracks the calls to one connector's preprocessor.
+#[derive(Clone)]
+pub struct PreprocessorWatchdog(Arc<PreprocessorWatchdogInner>);
+
+struct PreprocessorWatchdogInner {
+    /// The name of the preprocessor, from the [PreprocessorConfig].
+    name: String,
+
+    /// The maximum allowed duration of one call to the preprocessor, from
+    /// the [PreprocessorConfig].  A limit, not a measurement.  `None` if the
+    /// check is disabled.
+    max_allowed_call_duration: Option<Duration>,
+
+    /// One [TransitionReader] for the [TransitionCounter] of each preprocessor
+    /// instance.  A connector has several instances when its transport forks
+    /// the parser to parse on several threads.  The instances call the
+    /// preprocessor at the same time, so each instance needs its own counter.
+    /// [PreprocessorWatchdog::new_counter] adds a reader for each new
+    /// instance, and [PreprocessorWatchdog::readers] removes the readers of
+    /// dropped instances.  Instances are created and the list is read on
+    /// different threads, so the list is in a `Mutex`.  The lock is taken only
+    /// when an instance is created and when the list is read, never during a
+    /// call to the preprocessor.
+    readers: Mutex<Vec<TransitionReader>>,
+}
+
+impl PreprocessorWatchdog {
+    pub fn new(config: &PreprocessorConfig) -> Self {
+        Self(Arc::new(PreprocessorWatchdogInner {
+            name: config.name.clone(),
+            max_allowed_call_duration: config.max_allowed_call_duration(),
+            readers: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// The name of the preprocessor.
+    pub fn name(&self) -> &str {
+        &self.0.name
+    }
+
+    /// The maximum allowed duration of one call, or `None` if the check is
+    /// disabled.
+    pub fn max_allowed_call_duration(&self) -> Option<Duration> {
+        self.0.max_allowed_call_duration
+    }
+
+    /// Creates a [TransitionCounter], keeps a [TransitionReader] for it, and
+    /// returns the counter.
+    pub fn new_counter(&self) -> TransitionCounter {
+        let counter = TransitionCounter::default();
+        self.0.readers.lock().unwrap().push(counter.reader());
+        counter
+    }
+
+    /// Returns the readers of the counters that still exist, and forgets the
+    /// others.
+    pub fn readers(&self) -> Vec<TransitionReader> {
+        let mut readers = self.0.readers.lock().unwrap();
+        readers.retain(|reader| reader.get().is_some());
+        // A copy, so that the caller does not hold the lock while it reads the
+        // counters.
+        readers.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feldera_sqllib::{SqlString, Variant};
+    use feldera_types::variant::VariantValue;
     use serde_json::json;
 
     /// Preprocessor whose output depends on connector metadata: it prepends
@@ -153,8 +223,8 @@ mod tests {
                 return (data.to_vec(), vec![]);
             };
             let mut output = Vec::new();
-            if let Some(Variant::String(topic)) = metadata.get_by_name("topic") {
-                output.extend_from_slice(topic.str().as_bytes());
+            if let Some(VariantValue::String(topic)) = metadata.get_by_name("topic") {
+                output.extend_from_slice(topic.as_bytes());
                 output.push(b':');
             }
             output.extend_from_slice(data);
@@ -203,12 +273,13 @@ mod tests {
             name: name.to_string(),
             message_oriented: false,
             config: json!({}),
+            max_allowed_call_duration: None,
         }
     }
 
     fn make_metadata() -> ConnectorMetadata {
         let mut metadata = ConnectorMetadata::new();
-        metadata.insert("topic", Variant::String(SqlString::from("events")));
+        metadata.insert("topic", VariantValue::String("events".into()));
         metadata
     }
 

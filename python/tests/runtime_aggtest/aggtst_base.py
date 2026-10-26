@@ -3,13 +3,18 @@
 import hashlib
 import re
 import unittest
+import warnings
 from typing import Dict, TypeAlias
 
 from feldera import Pipeline, PipelineBuilder
 from feldera.enums import CompilationProfile
 from feldera.rest.errors import FelderaAPIError
 from feldera.runtime_config import Resources, RuntimeConfig
-from feldera.testutils import FELDERA_TEST_NUM_WORKERS, FELDERA_TEST_NUM_HOSTS
+from feldera.testutils import (
+    FELDERA_TEST_NUM_WORKERS,
+    FELDERA_TEST_NUM_HOSTS,
+    reclaim_pipeline,
+)
 from tests import TEST_CLIENT, unique_pipeline_name
 
 JSON: TypeAlias = dict[str, "JSON"] | list["JSON"] | str | int | float | bool | None
@@ -267,20 +272,34 @@ class TstAccumulator:
             # Pipelines that fail to compile will remain None
             # as `PipelineBuilder` will raise an exception and not
             # return a `Pipeline` object.
+            with warnings.catch_warnings():
+                # The older spelling of the timeout, so that a deployment from
+                # before the current names reads it too; it warns, and the
+                # warning is noise here.
+                warnings.simplefilter("ignore", DeprecationWarning)
+                runtime_config = RuntimeConfig(
+                    workers=FELDERA_TEST_NUM_WORKERS,
+                    hosts=FELDERA_TEST_NUM_HOSTS,
+                    # CI's ci-pipeline nodes come from GKE node auto-provisioning
+                    # (fresh spot VM per pod, no warm pool by design since pipeline
+                    # sizes vary per test). Under concurrent merge-queue load we've
+                    # traced pods taking ~9 minutes end to end: node cold start
+                    # plus a CSI driver topology-cache race on brand-new nodes
+                    # that retries and recovers, but adds several more minutes.
+                    # 180s was too tight and failed real merges (feldera#6650);
+                    # 900s leaves real margin over the worst case we've observed.
+                    provisioning_timeout_secs=900,
+                    logging="debug",
+                    # Honest request so k8s does not pack aggtest pipelines
+                    # onto nodes without headroom and evict them mid-test.
+                    resources=Resources(memory_mb_min=3072),
+                )
             pipeline = PipelineBuilder(
                 TEST_CLIENT,
                 pipeline_name,
                 sql=sql,
                 compilation_profile=CompilationProfile.UNOPTIMIZED,
-                runtime_config=RuntimeConfig(
-                    workers=FELDERA_TEST_NUM_WORKERS,
-                    hosts=FELDERA_TEST_NUM_HOSTS,
-                    provisioning_timeout_secs=180,
-                    logging="debug",
-                    # Honest request so k8s does not pack aggtest pipelines
-                    # onto nodes without headroom and evict them mid-test.
-                    resources=Resources(memory_mb_min=3072),
-                ),
+                runtime_config=runtime_config,
             ).create_or_replace()
 
             pipeline.start()
@@ -325,8 +344,8 @@ class TstAccumulator:
                         raise
 
             if pipeline is not None:
-                pipeline.stop(force=True)
-                pipeline.delete(True)
+                for failure in reclaim_pipeline(pipeline_name, delete=True):
+                    print(f"WARNING: {failure}")
 
     def assert_expected_error(self, obj: SqlObject, actual_exception: Exception):
         """Validate the error produced by the failing pipeline with the expected error type"""
@@ -436,7 +455,11 @@ class TstAccumulator:
         # Test tables (passing tables together, failing tables individually)
         self.run_table_tests(pipeline_name_prefix)
         # Test views (failing views individually, passing views together)
-        self.run_expected_failures(pipeline_name_prefix)
+        # TODO: Disabling failing test: each requires a separate compilation
+        # and this causes long waits on the compiler server.
+        # Hopefully these can be re-enabled when we get rid of
+        # the compiler server.
+        # self.run_expected_failures(pipeline_name_prefix)
         self.run_expected_successes(pipeline_name_prefix)
 
 

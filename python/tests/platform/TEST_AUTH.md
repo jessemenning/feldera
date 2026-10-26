@@ -136,8 +136,14 @@ uv run pytest tests/platform -v
 The platform tests automatically select authentication in this order:
 
 1. **OIDC Token** (if all OIDC environment variables are set)
-2. **API Key** (if `FELDERA_API_KEY` is set)
-3. **No Authentication** (fallback for development)
+2. **Token file** (if `FELDERA_OIDC_TOKEN_FILE` names a file; in CI,
+   `feldera/oidc-auth-action` exports it and keeps the file current)
+3. **API Key** (if `FELDERA_API_KEY` is set)
+4. **No Authentication** (fallback for development)
+
+`feldera.testutils.feldera_bearer_token()` resolves this order. Call it per
+request rather than caching what it returns: a CI token expires well inside a
+long suite, and each call reads whatever the file holds now.
 
 ## CI/CD Configuration
 

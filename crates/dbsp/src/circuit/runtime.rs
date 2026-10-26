@@ -11,7 +11,8 @@ use crate::operator::communication::{Exchange, ExchangeActivity};
 use crate::storage::backend::StorageBackend;
 use crate::storage::file::format::Compression;
 use crate::storage::file::writer::Parameters;
-use crate::utils::process_rss_bytes;
+use crate::trace::BatchLayout;
+use crate::utils::{available_memory_bytes, process_rss_bytes};
 use crate::{
     DetailedError,
     storage::{
@@ -21,6 +22,7 @@ use crate::{
     },
 };
 use core_affinity::{CoreId, get_core_ids};
+use crossbeam::channel::{Receiver, Sender, TryRecvError, bounded};
 use crossbeam::sync::{Parker, Unparker};
 use enum_map::{Enum, EnumMap, enum_map};
 use feldera_buffer_cache::ThreadType;
@@ -32,16 +34,18 @@ use feldera_types::memory_pressure::{
     CRITICAL_MEMORY_PRESSURE_THRESHOLD, HIGH_MEMORY_PRESSURE_THRESHOLD,
     MODERATE_MEMORY_PRESSURE_THRESHOLD, MemoryPressure,
 };
+use feldera_types::size::ConfigSize;
 use indexmap::IndexSet;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::convert::identity;
 use std::iter::repeat;
+use std::marker::PhantomData;
 use std::net::TcpListener;
 use std::ops::{Index, Range};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 use std::{
     backtrace::Backtrace,
@@ -62,19 +66,31 @@ use tokio::runtime::Builder as TokioBuilder;
 use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use typedmap::TypedDashMap;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Error {
     /// Specified persistent id is not found in the circuit.
     UnknownPersistentId(String),
+    /// Two operators in the circuit have the same persistent id.
+    DuplicatePersistentId {
+        persistent_id: String,
+        first: String,
+        second: String,
+    },
+    /// An operator in the circuit has an empty persistent id.
+    EmptyPersistentId {
+        operator: String,
+    },
     /// One of the worker threads terminated unexpectedly.
     WorkerPanic {
         // Detailed panic information from all threads that
         // reported panics.
         panic_info: Vec<(usize, ThreadType, WorkerPanicInfo)>,
     },
+    /// Panic while writing a checkpoint.
+    CheckpointPanic(Option<String>),
     /// The storage directory supplied does not match the runtime circuit.
     IncompatibleStorage,
     /// Error deserializing checkpointed state.
@@ -90,7 +106,10 @@ impl DetailedError for Error {
     fn error_code(&self) -> Cow<'static, str> {
         match self {
             Self::UnknownPersistentId(_) => Cow::from("UnknownPersistentId"),
+            Self::DuplicatePersistentId { .. } => Cow::from("DuplicatePersistentId"),
+            Self::EmptyPersistentId { .. } => Cow::from("EmptyPersistentId"),
             Self::WorkerPanic { .. } => Cow::from("WorkerPanic"),
+            Self::CheckpointPanic(_) => Cow::from("CheckpointPanic"),
             Self::Terminated => Cow::from("Terminated"),
             Self::IncompatibleStorage => Cow::from("IncompatibleStorage"),
             Self::CheckpointParseError(_) => Cow::from("CheckpointParseError"),
@@ -105,12 +124,32 @@ impl Display for Error {
             Self::UnknownPersistentId(persistent_id) => {
                 write!(f, "Unknown persistent node id: {persistent_id}")
             }
+            Self::DuplicatePersistentId {
+                persistent_id,
+                first,
+                second,
+            } => {
+                write!(
+                    f,
+                    "Operators {first} and {second} have the same persistent id {persistent_id}"
+                )
+            }
+            Self::EmptyPersistentId { operator } => {
+                write!(f, "Operator {operator} has an empty persistent id")
+            }
             Self::WorkerPanic { panic_info } => {
                 writeln!(f, "One or more worker threads terminated unexpectedly")?;
 
                 for (worker, thread_type, worker_panic_info) in panic_info.iter() {
                     writeln!(f, "{thread_type} worker thread {worker} panicked")?;
                     writeln!(f, "{worker_panic_info}")?;
+                }
+                Ok(())
+            }
+            Self::CheckpointPanic(message) => {
+                write!(f, "Panic while writing checkpoint")?;
+                if let Some(message) = message {
+                    write!(f, ": {message}")?;
                 }
                 Ok(())
             }
@@ -271,6 +310,20 @@ struct RuntimeStorage {
     locked_directory: LockedDirectory,
 }
 
+/// Stored in `RuntimeInner::max_rss` to mean "no memory limit".
+const UNLIMITED_RSS: u64 = u64::MAX;
+
+/// Returns the circuit's memory limit: the smaller of the `configured` budget
+/// and the `available` memory, minus the memory `reserved` outside the circuit.
+///
+/// The reservation never takes more than half of the available memory, so a
+/// container smaller than the reservation still leaves the circuit a limit.
+fn circuit_max_rss(configured: Option<u64>, available: Option<u64>, reserved: u64) -> Option<u64> {
+    let from_configured = configured.map(|bytes| bytes.saturating_sub(reserved));
+    let from_available = available.map(|bytes| bytes - reserved.min(bytes / 2));
+    from_configured.into_iter().chain(from_available).min()
+}
+
 struct RuntimeInner {
     layout: Layout,
     mode: Mode,
@@ -278,8 +331,16 @@ struct RuntimeInner {
     allow_input_during_commit: bool,
     dev_tweaks: DevTweaks,
 
-    /// User-configured process memory limit.
-    max_rss: Option<u64>,
+    /// Process memory budget from the circuit config.
+    configured_max_rss: Option<u64>,
+
+    /// Part of the budget used outside the circuit.
+    reserved_memory: u64,
+
+    /// The circuit's memory limit in bytes, or [`UNLIMITED_RSS`] if there is
+    /// none. See [`circuit_max_rss`]. The RSS monitor refreshes it every
+    /// second, so it picks up changes to the container's memory limit.
+    max_rss: AtomicU64,
 
     /// Current process RSS.
     process_rss: AtomicU64,
@@ -296,8 +357,7 @@ struct RuntimeInner {
 
     storage: Option<RuntimeStorage>,
     store: LocalStore,
-    kill_signal: AtomicBool,
-    cancellation_token: CancellationToken,
+    kill_signal: KillSignal,
     aux_threads: Mutex<Vec<(JoinHandle<()>, Unparker)>>,
     buffer_caches: Vec<EnumMap<ThreadType, Arc<BufferCache>>>,
 
@@ -310,7 +370,7 @@ struct RuntimeInner {
     worker_sequence_numbers: Vec<AtomicUsize>,
     /// Panic info collected from failed worker threads.
     panic_info: Vec<EnumMap<ThreadType, RwLock<Option<WorkerPanicInfo>>>>,
-    panicked: AtomicBool,
+    panic_signal: PanicSignal,
 
     /// Tokio runtime that runs async merger tasks (see `AsyncMerger`).
     tokio_merger_runtime: Mutex<Option<TokioRuntime>>,
@@ -327,8 +387,11 @@ struct RuntimeInner {
 }
 
 impl Drop for RuntimeInner {
+    /// Raises the kill signal, so that a runtime that goes away without ever
+    /// being killed still releases whoever waits on it.
     fn drop(&mut self) {
         debug!("dropping RuntimeInner");
+        self.kill_signal.raise();
     }
 }
 
@@ -412,7 +475,109 @@ fn map_pin_cpus(config: &CircuitConfig) -> (Vec<CoreId>, Vec<CoreId>) {
     (fg_pinning, bg_pinning)
 }
 
+/// The runtime's "stop what you are doing" flag.
+///
+/// This is a [CancellationToken] paired with an [AtomicBool] shortcut, because
+/// [CancellationToken::is_cancelled] locks a mutex and every operator polls
+/// this flag.
+///
+/// If https://github.com/tokio-rs/tokio/issues/7775 is ever fixed (e.g. by
+/// https://github.com/martin-augment/tokio/pull/59), then this can be replaced
+/// by a plain [CancellationToken].
+#[derive(Debug, Default)]
+struct KillSignal {
+    raised: AtomicBool,
+    token: CancellationToken,
+}
+
+impl KillSignal {
+    /// Raises the signal.  Idempotent, and never lowered again.
+    fn raise(&self) {
+        self.raised.store(true, Ordering::SeqCst);
+        self.token.cancel();
+    }
+
+    /// Whether the signal is raised.  Cheap enough to poll.
+    fn is_raised(&self) -> bool {
+        self.raised.load(Ordering::SeqCst)
+    }
+
+    /// A token that [KillSignal::raise] cancels, for awaiting the signal
+    /// rather than polling it.
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+/// The runtime's "a thread panicked" latch.
+///
+/// Unlike a flag, it can be waited on in a crossbeam [Select] next to the
+/// workers' reply channels.  A panic on a thread that is not a worker, e.g. a
+/// merger that a worker is blocked on, then still wakes the waiter.
+///
+/// Nothing is ever sent on the channel: raising the signal drops the only
+/// sender, and a disconnected channel stays ready for every receiver.
+///
+/// [Select]: crossbeam::channel::Select
+#[derive(Debug)]
+struct PanicSignal {
+    sender: Mutex<Option<Sender<()>>>,
+    receiver: Receiver<()>,
+}
+
+impl PanicSignal {
+    fn new() -> Self {
+        let (sender, receiver) = bounded(0);
+        Self {
+            sender: Mutex::new(Some(sender)),
+            receiver,
+        }
+    }
+
+    /// Raises the signal.  Idempotent, and never lowered again.
+    ///
+    /// Runs in the panic hook, so it must not panic itself.
+    fn raise(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+
+    /// Whether the signal is raised.
+    fn is_raised(&self) -> bool {
+        matches!(self.receiver.try_recv(), Err(TryRecvError::Disconnected))
+    }
+
+    /// A receiver that is ready once the signal is raised.
+    fn receiver(&self) -> Receiver<()> {
+        self.receiver.clone()
+    }
+}
+
 impl RuntimeInner {
+    /// Wakes every aux thread so that it can notice the kill signal.
+    fn unpark_aux_threads(&self) {
+        for (_handle, unparker) in self.aux_threads.lock().unwrap().iter() {
+            unparker.unpark();
+        }
+    }
+
+    /// Waits for every aux thread to terminate.
+    ///
+    /// Callers must have signaled the kill first: an aux thread runs until
+    /// then, so joining one before that never returns.
+    ///
+    /// The threads are taken out from under the lock before being joined.  An
+    /// aux thread that reaches for `aux_threads` on its way out would
+    /// otherwise deadlock against the join waiting for it.
+    fn join_aux_threads(&self) {
+        let aux_threads: Vec<_> = self.aux_threads.lock().unwrap().drain(..).collect();
+        for (handle, _unparker) in aux_threads {
+            let _ = handle.join();
+        }
+    }
+
     fn new(config: CircuitConfig) -> Result<Self, DbspError> {
         let nworkers = config.layout.local_workers().len();
         let buffer_cache_strategy = config.dev_tweaks.buffer_cache_strategy();
@@ -420,10 +585,7 @@ impl RuntimeInner {
         let buffer_cache_allocation_strategy = config
             .dev_tweaks
             .effective_buffer_cache_allocation_strategy();
-        let fbuf_slab_bytes_per_class = config
-            .dev_tweaks
-            .fbuf_slab_bytes_per_class
-            .unwrap_or(FBufSlabs::DEFAULT_BYTES_PER_CLASS);
+        let fbuf_slab_bytes_per_class = config.dev_tweaks.fbuf_slab_bytes_per_class();
         let storage = if let Some(storage) = config.storage.clone() {
             let locked_directory =
                 LockedDirectory::new_blocking(storage.config.path(), Duration::from_secs(60))?;
@@ -431,7 +593,7 @@ impl RuntimeInner {
 
             if let Some(init_checkpoint) = storage.init_checkpoint
                 && !backend
-                    .exists(&Checkpointer::checkpoint_dir(init_checkpoint).child("CHECKPOINT"))?
+                    .exists(&Checkpointer::checkpoint_dir(init_checkpoint).join("CHECKPOINT"))?
             {
                 return Err(DbspError::Storage(StorageError::CheckpointNotFound(
                     init_checkpoint,
@@ -449,8 +611,8 @@ impl RuntimeInner {
         };
 
         let total_cache_bytes = if let Some(storage) = &storage {
-            match storage.options.cache_mib {
-                Some(cache_mib) => cache_mib.saturating_mul(1024 * 1024),
+            match storage.options.cache_size {
+                Some(cache_size) => cache_size.as_usize(),
                 None => 256usize
                     .saturating_mul(1024 * 1024)
                     .saturating_mul(nworkers)
@@ -507,15 +669,19 @@ impl RuntimeInner {
             step_size: config.step_size,
             allow_input_during_commit: config.allow_input_during_commit,
             dev_tweaks: config.dev_tweaks,
-            max_rss: config.max_rss_bytes,
+            configured_max_rss: config.max_rss_bytes,
+            reserved_memory: config.reserved_memory_bytes,
+            max_rss: AtomicU64::new(
+                circuit_max_rss(config.max_rss_bytes, None, config.reserved_memory_bytes)
+                    .unwrap_or(UNLIMITED_RSS),
+            ),
             process_rss: AtomicU64::new(process_rss_bytes().unwrap_or_default()),
             memory_pressure: AtomicU8::new(MemoryPressure::Low as u8),
             memory_pressure_epoch: AtomicU64::new(0),
             memory_pressure_notify: Arc::new(Notify::new()),
             storage,
             store: TypedDashMap::new(),
-            kill_signal: AtomicBool::new(false),
-            cancellation_token: CancellationToken::new(),
+            kill_signal: KillSignal::default(),
             aux_threads: Mutex::new(Vec::new()),
             buffer_caches,
             fbuf_slab_allocators,
@@ -523,7 +689,7 @@ impl RuntimeInner {
             panic_info: (0..nworkers)
                 .map(|_| EnumMap::from_fn(|_| RwLock::new(None)))
                 .collect(),
-            panicked: AtomicBool::new(false),
+            panic_signal: PanicSignal::new(),
             tokio_merger_runtime: Mutex::new(None),
             exchange_listener: Mutex::new(config.exchange_listener),
         })
@@ -565,13 +731,48 @@ impl RuntimeInner {
         MemoryPressure::try_from(self.memory_pressure.load(Ordering::Relaxed)).unwrap()
     }
 
+    fn max_rss(&self) -> Option<u64> {
+        Some(self.max_rss.load(Ordering::Relaxed)).filter(|&bytes| bytes != UNLIMITED_RSS)
+    }
+
+    /// Recomputes the circuit's memory limit from the `available` memory, and
+    /// logs the new limit if it changed.
+    fn update_max_rss(&self, available: Option<u64>) {
+        let max_rss = circuit_max_rss(self.configured_max_rss, available, self.reserved_memory);
+        let previous = self
+            .max_rss
+            .swap(max_rss.unwrap_or(UNLIMITED_RSS), Ordering::Relaxed);
+        if previous != max_rss.unwrap_or(UNLIMITED_RSS) {
+            let mb = |bytes: Option<u64>| {
+                bytes.map_or("none".to_string(), |bytes| {
+                    format!("{} MB", bytes / 1_000_000)
+                })
+            };
+            info!(
+                "process memory limit set to {} (configured: {}, available: {}, reserved: {})",
+                mb(max_rss),
+                mb(self.configured_max_rss),
+                mb(available),
+                mb(Some(self.reserved_memory))
+            );
+            if available.is_some_and(|available| self.reserved_memory > available / 2) {
+                warn!(
+                    "reserved memory ({}) exceeds half of the available memory ({}); \
+reserving only half",
+                    mb(Some(self.reserved_memory)),
+                    mb(available)
+                );
+            }
+        }
+    }
+
     /// Compute memory pressure based on the current process RSS.
     ///
     /// Final memory pressure is computed taking into account the previous memory pressure level as well.
     fn raw_memory_pressure(&self, process_rss: u64) -> MemoryPressure {
         let process_rss = process_rss as f64;
 
-        let Some(max_rss) = self.max_rss else {
+        let Some(max_rss) = self.max_rss() else {
             return MemoryPressure::Low;
         };
 
@@ -741,6 +942,7 @@ impl Runtime {
 
             let mut pressure_span = None;
             while !Runtime::kill_in_progress() {
+                runtime.inner().update_max_rss(available_memory_bytes());
                 let process_rss = process_rss_bytes().unwrap_or_default();
                 runtime
                     .inner()
@@ -916,20 +1118,6 @@ impl Runtime {
             }
         } else {
             // Fallback path for threads outside a [Runtime].
-            //
-            // This cache is shared by all auxiliary threads in the runtime.  In
-            // particular, output connector threads use it to maintain their
-            // output buffers.
-            //
-            // FIXME: We may need a tunable strategy for aux threads. We cannot
-            // simply give each of them the same cache as DBSP worker threads,
-            // as there can be dozens of aux threads (currently one per output
-            // connector), which do not necessarily need a large cache. OTOH,
-            // sharing the same cache across all of them may potentially cause
-            // performance issues.
-            static AUXILIARY_CACHE: LazyLock<Arc<BufferCache>> =
-                LazyLock::new(|| Arc::new(BufferCache::new(1024 * 1024 * 256)));
-
             let buffer_cache = AUXILIARY_CACHE.clone();
             BUFFER_CACHE.set(Some(buffer_cache.clone()));
             Some(buffer_cache)
@@ -938,15 +1126,30 @@ impl Runtime {
 
     /// Spawn an auxiliary thread inside the runtime.
     ///
-    /// The auxiliary thread will have access to the runtime's resources, including the
-    /// storage backend. The current use case for this is to be able to use spines outside
-    /// of the DBSP worker threads, e.g., to maintain output buffers.
+    /// The auxiliary thread will have access to the runtime's resources,
+    /// including the storage backend. The current use case for this is to be
+    /// able to use spines outside of the DBSP worker threads, e.g., to maintain
+    /// output buffers.
+    ///
+    /// This doesn't give the thread a worker index or a [ThreadType], so it
+    /// won't have access to a particular worker's storage cache.  Instead, it
+    /// will use the small global storage cache, which is probably sufficient
+    /// for simple purposes like output buffers or writing checkpoints.
+    ///
+    /// `f` must return once [Runtime::kill_in_progress] holds, because
+    /// [RuntimeHandle::join] joins the aux threads. An aux thread that waits
+    /// for anything else deadlocks whoever kills the runtime, and a kill can
+    /// come from any thread, including one the aux thread expects to hear from.
+    ///
+    /// The rule reaches further than `f` itself: it binds everything `f` waits
+    /// for, however long the chain. The controller's output threads are aux
+    /// threads, so it binds every output connector too.
     ///
     /// # Arguments
     ///
     /// * `thread_name` - The name of the thread.
-    /// * `parker` - The thread will use this parker when waiting for work. Use it to unpark
-    ///   the thread when terminating the runtime.
+    /// * `parker` - The thread will use this parker when waiting for work. The runtime
+    ///   unparks the thread through it when terminating.
     /// * `f` - The function to execute in the thread.
     pub fn spawn_aux_thread<F>(&self, thread_name: &str, parker: Parker, f: F)
     where
@@ -957,7 +1160,7 @@ impl Runtime {
         let handle = Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                RUNTIME.with(|rt| *rt.borrow_mut() = Some(runtime));
+                let _guard = runtime.enter();
                 f(parker)
             })
             .expect("failed to spawn auxiliary thread");
@@ -967,6 +1170,31 @@ impl Runtime {
             .lock()
             .unwrap()
             .push((handle, unparker))
+    }
+
+    /// Makes the current thread run in this runtime.  [Runtime::runtime] will
+    /// return this runtime and [Runtime::storage_backend] will return its
+    /// storage backend.  Returns a guard that, when dropped, will take this
+    /// thread out of the runtime.
+    ///
+    /// This doesn't give the thread a worker index or a [ThreadType], so it
+    /// won't have access to a particular worker's storage cache.  Instead, it
+    /// will use the small global storage cache, which is probably sufficient
+    /// for simple purposes like output buffers or writing checkpoints.
+    ///
+    /// This must not be called from a thread that is already running in a
+    /// thread associated with a runtime.
+    ///
+    /// This is meant for short-lived uses of the runtime that will complete on
+    /// their own.  For daemon threads, [Runtime::spawn_aux_thread] is a better
+    /// choice.
+    pub fn enter(&self) -> RuntimeGuard {
+        RUNTIME.with(|rt| {
+            let mut runtime = rt.borrow_mut();
+            assert!(runtime.is_none());
+            *runtime = Some(self.clone());
+        });
+        RuntimeGuard::new()
     }
 
     /// Returns this runtime's buffer-cache handle for thread type `thread_type`
@@ -1076,6 +1304,23 @@ impl Runtime {
             .unwrap_or_else(|| f(&DEFAULT))
     }
 
+    /// Returns the configured Bloom filter false-positive rate.
+    ///
+    /// Prefers `storage.bloom_false_positive_rate` when set; falls back to
+    /// the deprecated `dev_tweaks.bloom_false_positive_rate`.
+    pub fn bloom_false_positive_rate() -> f64 {
+        let from_storage: Option<f64> = RUNTIME.with(|rt| {
+            rt.borrow()
+                .as_ref()?
+                .inner()
+                .storage
+                .as_ref()?
+                .options
+                .bloom_false_positive_rate
+        });
+        from_storage.unwrap_or_else(|| Self::with_dev_tweaks(|dt| dt.bloom_false_positive_rate()))
+    }
+
     pub fn get_mode(&self) -> Mode {
         self.inner().mode
     }
@@ -1124,8 +1369,11 @@ impl Runtime {
         self.inner().memory_pressure()
     }
 
+    /// Returns the circuit's memory limit, which is the smaller of the
+    /// configured budget and the memory available to the process, minus the
+    /// memory reserved outside the circuit.
     pub fn max_rss_bytes(&self) -> Option<u64> {
-        self.inner().max_rss
+        self.inner().max_rss()
     }
 
     pub fn memory_pressure_epoch(&self) -> u64 {
@@ -1138,8 +1386,8 @@ impl Runtime {
 
     /// Returns the minimum number of bytes in a batch produced by a merge operator to spill it to storage.
     ///
-    /// The output is determined by the current memory pressure level and the user-configured `min_storage_bytes` option.
-    /// When memory pressure is low, the output is `min_storage_bytes`; when memory pressure is moderate, high or critical,
+    /// The output is determined by the current memory pressure level and the user-configured `min_spill_size` option.
+    /// When memory pressure is low, the output is `min_spill_size`; when memory pressure is moderate, high or critical,
     /// the output is `0`, meaning all batches are spilled to storage.
     ///
     /// # Returns
@@ -1156,61 +1404,62 @@ impl Runtime {
             if inner.memory_pressure() >= MemoryPressure::Moderate {
                 Some(0)
             } else {
-                Some(storage.options.min_storage_bytes.unwrap_or({
-                    // This reduces the files stored on disk to a reasonable number.
-
-                    10 * 1024 * 1024
-                }))
+                Some(
+                    storage
+                        .options
+                        .min_spill_size
+                        .map(ConfigSize::as_usize)
+                        // This reduces the files stored on disk to a reasonable number.
+                        .unwrap_or(10 * 1024 * 1024),
+                )
             }
         })
     }
 
     /// Returns the minimum number of bytes in a batch inserted into a spine by a foreground worker to spill it to storage.
     ///
-    /// The output is determined by the current memory pressure level and the user-configured `min_storage_bytes` option.
-    /// When memory pressure is low the output is `usize::MAX`, when memory pressure is moderate, the output is `min_storage_bytes`,
+    /// The output is determined by the current memory pressure level and the user-configured `min_spill_size` option.
+    /// When memory pressure is low the output is `usize::MAX`, when memory pressure is moderate, the output is `min_spill_size`,
     /// when memory pressure is high or critical, the output is `0`, meaning all batches are spilled to storage.
     ///
     /// # Returns
     ///
-    /// - `None` - if this thread doesn't have a Runtime or if it doesn't have storage configured.
+    /// - `None` - if this `Runtime` doesn't have storage configured.
     /// - `Some(0)` - spill all batches to storage.
     /// - `Some(N)` - spill batches with size >= N to storage.
-    pub fn min_insert_storage_bytes() -> Option<usize> {
-        RUNTIME.with(|rt| {
-            let rt = rt.borrow();
-            let inner = rt.as_ref()?.inner();
-            let storage = inner.storage.as_ref()?;
+    pub fn min_insert_storage_bytes(&self) -> Option<usize> {
+        let inner = &self.0;
+        let storage = inner.storage.as_ref()?;
 
-            if inner.memory_pressure() >= MemoryPressure::High {
-                Some(0)
-            } else if inner.memory_pressure() >= MemoryPressure::Moderate {
-                // Moderate pressure: spill large batches to storage in the foreground; the merger will take care of the rest.
-                Some(
-                    storage
-                        .options
-                        .min_storage_bytes
-                        .unwrap_or(10 * 1024 * 1024),
-                )
-            } else {
-                // When there is no memory pressure, we leave it to the merger to write the batches to storage
-                // eventually.
-                Some(usize::MAX)
-            }
-        })
+        if inner.memory_pressure() >= MemoryPressure::High {
+            Some(0)
+        } else if inner.memory_pressure() >= MemoryPressure::Moderate {
+            // Moderate pressure: spill large batches to storage in the foreground; the merger will take care of the rest.
+            Some(
+                storage
+                    .options
+                    .min_spill_size
+                    .map(ConfigSize::as_usize)
+                    .unwrap_or(10 * 1024 * 1024),
+            )
+        } else {
+            // When there is no memory pressure, we leave it to the merger to write the batches to storage
+            // eventually.
+            Some(usize::MAX)
+        }
     }
 
     /// Returns the minimum number of bytes in a transient batch exchanged between DBSP operators during a step of the
     /// circuit to spill it to storage.
     ///
-    /// The output is determined by the current memory pressure level and the user-configured `min_step_storage_bytes` option.
-    /// When memory pressure is below critical, the output is `min_step_storage_bytes`, when memory pressure is critical,
-    /// the output is `0`, meaning all batches are spilled to storage.
+    /// The output is determined by the current memory pressure level and the user-configured `min_step_spill_size` option.
+    /// When memory pressure is below critical, the output is `min_step_spill_size`, when memory pressure is critical,
+    /// the output is `0`, meaning every batch that holds anything is spilled to storage.
     ///
     /// # Returns
     ///
     /// - `None` - if this thread doesn't have a Runtime or if it doesn't have storage configured.
-    /// - `Some(0)` - spill all batches to storage.
+    /// - `Some(0)` - spill every batch with content to storage; an empty batch has nothing to spill and stays in memory.
     /// - `Some(N)` - spill batches with size >= N to storage.
     pub fn min_step_storage_bytes() -> Option<usize> {
         RUNTIME.with(|rt| {
@@ -1221,25 +1470,58 @@ impl Runtime {
             if inner.memory_pressure() >= MemoryPressure::Critical {
                 Some(0)
             } else {
-                Some(storage.options.min_step_storage_bytes.unwrap_or(usize::MAX))
+                Some(
+                    storage
+                        .options
+                        .min_step_spill_size
+                        .map(ConfigSize::as_usize)
+                        .unwrap_or(usize::MAX),
+                )
             }
         })
     }
 
     pub fn file_writer_parameters() -> Parameters {
-        let compression = Runtime::runtime()
+        let options = Runtime::runtime()
             .unwrap()
             .inner()
             .storage
             .as_ref()
             .unwrap()
             .options
-            .compression;
-        let compression = match compression {
-            StorageCompression::Default | StorageCompression::Snappy => Some(Compression::Snappy),
+            .clone();
+        Parameters::default()
+            .with_compression(Self::file_compression(options.compression))
+            .with_compression_level(options.compression_level)
+    }
+
+    /// The parameters a layer file writer takes for a batch laid out as
+    /// `layout` asks.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout` - what the batch being written asks of its file.
+    ///
+    /// # Returns
+    ///
+    /// The writer's defaults with `layout` applied, which for a batch that asks nothing
+    /// are the defaults themselves.
+    pub fn file_writer_parameters_for(layout: BatchLayout) -> Parameters {
+        let parameters = Self::file_writer_parameters();
+        match layout.key_block_bytes {
+            Some(bytes) => parameters.with_min_key_data_block(bytes),
+            None => parameters,
+        }
+    }
+
+    /// Maps the configured storage compression to the file-format algorithm.
+    fn file_compression(compression: StorageCompression) -> Option<Compression> {
+        match compression {
+            StorageCompression::Snappy => Some(Compression::Snappy),
             StorageCompression::None => None,
-        };
-        Parameters::default().with_compression(compression)
+            StorageCompression::Default | StorageCompression::Lz4 => Some(Compression::Lz4),
+            StorageCompression::Zstd => Some(Compression::Zstd),
+        }
     }
 
     fn inner(&self) -> &RuntimeInner {
@@ -1255,6 +1537,29 @@ impl Runtime {
             rt.borrow()
                 .as_ref()
                 .map_or(1, |runtime| runtime.layout().n_workers())
+        })
+    }
+
+    /// Returns the number of hosts in the runtime's [`Layout`].
+    ///
+    /// If this thread is not in a [Runtime], returns 1.
+    pub fn num_hosts() -> usize {
+        RUNTIME.with(|rt| {
+            rt.borrow()
+                .as_ref()
+                .map_or(1, |runtime| runtime.layout().n_hosts())
+        })
+    }
+
+    /// Returns the 0-based index of this thread's host in the runtime's
+    /// [`Layout`].
+    ///
+    /// If this thread is not in a [Runtime], returns 0.
+    pub fn host_index() -> usize {
+        RUNTIME.with(|rt| {
+            rt.borrow()
+                .as_ref()
+                .map_or(0, |runtime| runtime.layout().local_host_idx())
         })
     }
 
@@ -1298,6 +1603,10 @@ impl Runtime {
     /// `true` if the current worker thread has received a kill signal
     /// and should exit asap.  Schedulers should use this method before
     /// scheduling the next operator and after parking.
+    ///
+    /// This returns `false` on a thread that is not in a [Runtime], which has
+    /// no runtime to ask.  Such a thread can use [Runtime::kill_requested] on
+    /// a [Runtime] it carries instead.
     pub fn kill_in_progress() -> bool {
         // Only a circuit with a `Runtime` can receive a kill signal, which is
         // OK because a kill request can only be sent via a `RuntimeHandle`
@@ -1306,13 +1615,17 @@ impl Runtime {
             runtime
                 .borrow()
                 .as_ref()
-                .map(|runtime| runtime.inner().kill_signal.load(Ordering::SeqCst))
-                .unwrap_or(false)
+                .is_some_and(Runtime::kill_requested)
         })
     }
 
+    /// `true` if this runtime has received a kill signal.
+    pub fn kill_requested(&self) -> bool {
+        self.inner().kill_signal.is_raised()
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.inner().cancellation_token.clone()
+        self.inner().kill_signal.token()
     }
 
     pub fn worker_panic_info(
@@ -1332,16 +1645,17 @@ impl Runtime {
     fn panic(&self, panic_info: &PanicHookInfo) {
         let local_worker_offset = Self::local_worker_offset();
         let Some(thread_type) = current_thread_type() else {
-            // We only install panic hooks on foreground and background threads,
-            // so this shouldn't happen, but we cannot panic here.
-            error!("panic hook called outside of a runtime or on an aux thread");
+            // The panic hook is process-wide, so it also runs on aux and helper
+            // threads, which have `RUNTIME` but no worker slot.  Their owners
+            // report the panic through the thread's `JoinHandle`.
+            debug!("panic on a runtime thread that is not a worker");
             return;
         };
         let panic_info = WorkerPanicInfo::new(panic_info);
         let _ = self.inner().panic_info[local_worker_offset][thread_type]
             .write()
             .map(|mut guard| *guard = Some(panic_info));
-        self.inner().panicked.store(true, Ordering::Release);
+        self.inner().panic_signal.raise();
     }
 
     /// Handle to the tokio merger runtime associated with this DBSP runtime.
@@ -1372,6 +1686,64 @@ impl Runtime {
     /// Use [Runtime::with_dev_tweaks] if there's not a `Runtime` handy already.
     pub fn dev_tweaks(&self) -> &DevTweaks {
         &self.inner().dev_tweaks
+    }
+}
+
+/// Buffer cache for threads that have no worker's cache.
+///
+/// This cache is shared by all auxiliary threads in the runtime.  In
+/// particular, output connector threads use it to maintain their output
+/// buffers.
+///
+/// FIXME: We may need a tunable strategy for aux threads. We cannot simply give
+/// each of them the same cache as DBSP worker threads, as there can be dozens
+/// of aux threads (currently one per output connector), which do not
+/// necessarily need a large cache. OTOH, sharing the same cache across all of
+/// them may potentially cause performance issues.
+pub(crate) static AUXILIARY_CACHE: LazyLock<Arc<BufferCache>> =
+    LazyLock::new(|| Arc::new(BufferCache::new(1024 * 1024 * 256)));
+
+/// A guard returned by [Runtime::enter].
+///
+/// Dropping the guard takes the thread out of the runtime, so it must be kept
+/// for as long as the thread uses the runtime.
+#[must_use = "the thread leaves the runtime as soon as the guard is dropped"]
+pub struct RuntimeGuard {
+    /// Set to true if `with_private_cache` was used.
+    has_private_cache: bool,
+    /// Make this type `!Send` and `!Sync`.
+    _phantom: PhantomData<*const ()>,
+}
+
+impl RuntimeGuard {
+    fn new() -> Self {
+        Self {
+            has_private_cache: false,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Installs a thread-local buffer cache of `max_cost` size.  The buffer
+    /// cache will be uninstalled when the guard is dropped.
+    pub fn with_private_cache(mut self, max_cost: usize) -> Self {
+        assert!(!self.has_private_cache);
+        BUFFER_CACHE.set(Some(Arc::new(BufferCache::new(max_cost))));
+        self.has_private_cache = true;
+        self
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        RUNTIME.with(|rt| {
+            let mut runtime = rt.borrow_mut();
+            debug_assert!(runtime.is_some());
+            *runtime = None;
+        });
+
+        if self.has_private_cache {
+            BUFFER_CACHE.set(None);
+        }
     }
 }
 
@@ -1526,29 +1898,18 @@ impl RuntimeHandle {
     // Signals all worker threads to exit, and returns immediately without
     // waiting for them to exit.
     pub fn kill_async(&self) {
-        self.runtime
-            .inner()
-            .kill_signal
-            .store(true, Ordering::SeqCst);
-        self.runtime.inner().cancellation_token.cancel();
+        self.runtime.inner().kill_signal.raise();
         for (_worker, unparker) in self.workers.iter() {
             unparker.unpark();
         }
-
-        self.runtime
-            .inner()
-            .aux_threads
-            .lock()
-            .unwrap()
-            .iter()
-            .for_each(|(_h, unparker)| {
-                unparker.unpark();
-            });
+        self.runtime.inner().unpark_aux_threads();
     }
 
     /// Wait for all workers in the runtime to terminate.
     ///
-    /// The calling thread blocks until all worker threads have terminated.
+    /// The calling thread blocks until all worker threads have terminated, and
+    /// then until every aux thread registered with [Runtime::spawn_aux_thread]
+    /// has terminated too.
     pub fn join(self) -> ThreadResult<()> {
         // Insist on joining all threads even if some of them fail.
         #[allow(clippy::needless_collect)]
@@ -1562,31 +1923,9 @@ impl RuntimeHandle {
         // Normally this is not needed, since this function is usually called from `kill_async`,
         // which already signals the aux threads to terminate, but it is useful when it is called
         // directly, e.g., in some tests.
-        self.runtime
-            .inner()
-            .kill_signal
-            .store(true, Ordering::SeqCst);
-
-        self.runtime
-            .inner()
-            .aux_threads
-            .lock()
-            .unwrap()
-            .iter()
-            .for_each(|(_h, unparker)| {
-                unparker.unpark();
-            });
-
-        // Wait for aux threads.
-        self.runtime
-            .inner()
-            .aux_threads
-            .lock()
-            .unwrap()
-            .drain(..)
-            .for_each(|(h, _unparker)| {
-                let _ = h.join();
-            });
+        self.runtime.inner().kill_signal.raise();
+        self.runtime.inner().unpark_aux_threads();
+        self.runtime.inner().join_aux_threads();
 
         // Terminate the tokio merger runtime.
         //
@@ -1640,7 +1979,13 @@ impl RuntimeHandle {
 
     /// Returns true if any worker has panicked.
     pub fn panicked(&self) -> bool {
-        self.runtime.inner().panicked.load(Ordering::Acquire)
+        self.runtime.inner().panic_signal.is_raised()
+    }
+
+    /// Returns a receiver that becomes ready, as disconnected, once any
+    /// runtime thread has panicked.
+    pub(crate) fn panic_receiver(&self) -> Receiver<()> {
+        self.runtime.inner().panic_signal.receiver()
     }
 }
 
@@ -1727,8 +2072,8 @@ impl Iterator for WorkerLocations {
 impl ExactSizeIterator for WorkerLocations {}
 
 #[cfg(test)]
-mod tests {
-    use super::{Runtime, RuntimeInner};
+pub(crate) mod tests {
+    use super::{Parker, Runtime, RuntimeInner};
     use crate::{
         Circuit, RootCircuit,
         circuit::{
@@ -1749,13 +2094,37 @@ mod tests {
         dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy},
     };
     use feldera_types::memory_pressure::MemoryPressure;
+    use feldera_types::size::ConfigSize;
     use std::{
         cell::RefCell,
         rc::Rc,
-        sync::{Arc, LazyLock, Mutex},
+        sync::{
+            Arc, LazyLock, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         thread::sleep,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn file_compression_mapping() {
+        use crate::storage::file::format::Compression;
+        use feldera_types::config::StorageCompression;
+
+        for (configured, expected) in [
+            (StorageCompression::Default, Some(Compression::Lz4)),
+            (StorageCompression::None, None),
+            (StorageCompression::Snappy, Some(Compression::Snappy)),
+            (StorageCompression::Lz4, Some(Compression::Lz4)),
+            (StorageCompression::Zstd, Some(Compression::Zstd)),
+        ] {
+            assert_eq!(
+                Runtime::file_compression(configured),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
 
     struct TestCacheEntry(usize);
 
@@ -1775,6 +2144,16 @@ mod tests {
         }
     }
 
+    fn set_mock_available_memory_bytes(bytes: Option<u64>) {
+        // Safety: We assume that only DBSP code accesses the environment variables.
+        unsafe {
+            match bytes {
+                Some(bytes) => std::env::set_var("MOCK_AVAILABLE_MEMORY_BYTES", bytes.to_string()),
+                None => std::env::remove_var("MOCK_AVAILABLE_MEMORY_BYTES"),
+            }
+        }
+    }
+
     struct MockRssVarGuard;
 
     impl Drop for MockRssVarGuard {
@@ -1782,8 +2161,18 @@ mod tests {
             // Safety: We assume that only DBSP code accesses the environment variables.
             unsafe {
                 std::env::remove_var("MOCK_PROCESS_RSS_BYTES");
+                std::env::remove_var("MOCK_AVAILABLE_MEMORY_BYTES");
             }
         }
+    }
+
+    /// Runs `f` with the runtime's view of the process size pinned at `bytes`,
+    /// serialized against the other tests that pin it.
+    pub(crate) fn with_mock_process_rss<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+        let _lock = MOCK_RSS_LOCK.lock().unwrap();
+        let _clear = MockRssVarGuard;
+        set_mock_process_rss_bytes(bytes);
+        f()
     }
 
     fn query_runtime_memory_state(runtime: &Runtime) -> (MemoryPressure, usize, usize, usize) {
@@ -1792,10 +2181,13 @@ mod tests {
             "memory-pressure-test-query",
             super::Parker::new(),
             move |_parker| {
+                let runtime = Runtime::runtime().expect("query thread should run inside runtime");
                 let _ = sender.send((
                     Runtime::memory_pressure().expect("query thread should run inside runtime"),
                     Runtime::min_merge_storage_bytes().expect("runtime has storage configured"),
-                    Runtime::min_insert_storage_bytes().expect("runtime has storage configured"),
+                    runtime
+                        .min_insert_storage_bytes()
+                        .expect("runtime has storage configured"),
                     Runtime::min_step_storage_bytes().expect("runtime has storage configured"),
                 ));
             },
@@ -2032,7 +2424,7 @@ mod tests {
                 cache: StorageCacheConfig::default(),
             },
             StorageOptions {
-                cache_mib: Some(8),
+                cache_size: Some(ConfigSize::from_mib(8)),
                 ..StorageOptions::default()
             },
         )
@@ -2066,7 +2458,7 @@ mod tests {
                 cache: StorageCacheConfig::default(),
             },
             StorageOptions {
-                cache_mib: Some(8),
+                cache_size: Some(ConfigSize::from_mib(8)),
                 ..StorageOptions::default()
             },
         )
@@ -2167,6 +2559,86 @@ mod tests {
         test_kill::<DynamicScheduler>();
     }
 
+    /// `RuntimeHandle::join` cancels the cancellation token as well as setting
+    /// the kill signal, so a thread that watches either one sees a teardown.
+    #[test]
+    fn join_cancels_the_cancellation_token() {
+        let hruntime = Runtime::run(2, |_parker| {}).expect("failed to start runtime");
+        let token = hruntime.runtime().cancellation_token();
+        assert!(!token.is_cancelled());
+
+        hruntime.join().unwrap();
+        assert!(token.is_cancelled());
+    }
+
+    /// An aux thread that waits for a plain helper thread must be able to
+    /// release it on the kill signal alone.  `RuntimeHandle::kill` joins the
+    /// aux threads, so whatever they wait for has to end when the runtime is
+    /// killed, however deep the chain runs.
+    ///
+    /// The helper cannot ask [Runtime::kill_in_progress], which answers for
+    /// the calling thread and so reports `false` on a thread the runtime did
+    /// not spawn.  It carries a [Runtime] and asks
+    /// [Runtime::kill_requested] instead.  This is the shape that hung the
+    /// Postgres output connector, whose worker threads gave up only once the
+    /// controller reached `Terminated`, which the thread doing the killing was
+    /// itself the one that would have set.
+    #[test]
+    fn kill_releases_an_aux_thread_waiting_on_a_helper_thread() {
+        let hruntime = Runtime::run(2, |_parker| {
+            while !Runtime::kill_in_progress() {
+                sleep(Duration::from_millis(1));
+            }
+        })
+        .expect("failed to start runtime");
+
+        let runtime = hruntime.runtime().clone();
+        let (helper_done, helper_finished) = std::sync::mpsc::channel();
+        let kill_in_progress_lied = Arc::new(AtomicBool::new(false));
+
+        let helper_runtime = runtime.clone();
+        let lied = kill_in_progress_lied.clone();
+        let helper = std::thread::spawn(move || {
+            while !helper_runtime.kill_requested() {
+                sleep(Duration::from_millis(1));
+            }
+
+            // The trap this test guards, sampled with the kill already under
+            // way: the runtime did not spawn this thread, so the thread-local
+            // query does not report the kill even now.  Sampling before the
+            // loop would find the flag false whatever it answers on a foreign
+            // thread, and assert nothing.
+            lied.store(!Runtime::kill_in_progress(), Ordering::SeqCst);
+
+            let _ = helper_done.send(());
+        });
+
+        // Blocks for the helper's answer, the way an output endpoint blocks
+        // for its connector's worker threads.
+        runtime.spawn_aux_thread("waits-on-helper", Parker::new(), move |_parker| {
+            let _ = helper_finished.recv();
+        });
+
+        // Kill from a thread of its own, so that a regression fails this test
+        // rather than hanging the whole run.
+        let (killed, kill_returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            hruntime.kill().unwrap();
+            let _ = killed.send(());
+        });
+
+        kill_returned
+            .recv_timeout(Duration::from_secs(30))
+            .expect("`kill` must not wait for a thread that only the kill signal releases");
+        helper.join().unwrap();
+
+        assert!(
+            kill_in_progress_lied.load(Ordering::SeqCst),
+            "`kill_in_progress` reported a kill on a foreign thread; if it now \
+             answers there, this test and `kill_requested` need revisiting"
+        );
+    }
+
     // Test `RuntimeHandle::kill`.
     fn test_kill<S>()
     where
@@ -2204,7 +2676,100 @@ mod tests {
         hruntime.kill().unwrap();
     }
 
-    // Test the memory pressure thresholds and how merger threads behave under different memory pressure levels.
+    /// Waits for the runtime's memory limit and memory pressure to reach the
+    /// expected values.
+    fn wait_for_max_rss(runtime: &Runtime, max_rss: Option<u64>, pressure: MemoryPressure) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runtime.max_rss_bytes() != max_rss || runtime.current_memory_pressure() != pressure {
+            assert!(
+                Instant::now() < deadline,
+                "expected memory limit {max_rss:?} and pressure {pressure:?}, got {:?} and {:?}",
+                runtime.max_rss_bytes(),
+                runtime.current_memory_pressure()
+            );
+            sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The memory limit tracks the memory available to the process, for
+    /// example when the container's memory limit changes at runtime.
+    #[test]
+    fn max_rss_follows_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let _mock_guard = MOCK_RSS_LOCK.lock().unwrap();
+        let _clear_mock_rss = MockRssVarGuard;
+        set_mock_process_rss_bytes(4 * GIB);
+
+        let config = CircuitConfig::with_workers(1).with_max_rss_bytes(Some(10 * GIB));
+        let (circuit, _input_handle) =
+            Runtime::init_circuit(config, |circuit| Ok(circuit.add_input_zset::<u64>().1)).unwrap();
+        let runtime = circuit.runtime();
+        wait_for_max_rss(runtime, Some(10 * GIB), MemoryPressure::Low);
+
+        // Available memory drops below the configured limit and becomes the
+        // new limit. Using 4 GiB out of 4.3 GiB is high pressure.
+        set_mock_available_memory_bytes(Some(43 * GIB / 10));
+        wait_for_max_rss(runtime, Some(43 * GIB / 10), MemoryPressure::High);
+
+        // Available memory rises above the configured limit, so the
+        // configured limit applies again.
+        set_mock_available_memory_bytes(Some(20 * GIB));
+        wait_for_max_rss(runtime, Some(10 * GIB), MemoryPressure::Low);
+    }
+
+    /// With no configured limit, the memory available to the process becomes
+    /// the limit.
+    #[test]
+    fn max_rss_defaults_to_available_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let _mock_guard = MOCK_RSS_LOCK.lock().unwrap();
+        let _clear_mock_rss = MockRssVarGuard;
+        set_mock_process_rss_bytes(4 * GIB);
+
+        let config = CircuitConfig::with_workers(1);
+        let (circuit, _input_handle) =
+            Runtime::init_circuit(config, |circuit| Ok(circuit.add_input_zset::<u64>().1)).unwrap();
+        let runtime = circuit.runtime();
+        wait_for_max_rss(runtime, None, MemoryPressure::Low);
+
+        set_mock_available_memory_bytes(Some(43 * GIB / 10));
+        wait_for_max_rss(runtime, Some(43 * GIB / 10), MemoryPressure::High);
+    }
+
+    /// Memory reserved outside the circuit comes out of the budget, whether the
+    /// budget is the configured limit or the available memory.
+    #[test]
+    fn max_rss_excludes_reserved_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let _mock_guard = MOCK_RSS_LOCK.lock().unwrap();
+        let _clear_mock_rss = MockRssVarGuard;
+        set_mock_process_rss_bytes(GIB / 10);
+        set_mock_available_memory_bytes(Some(20 * GIB));
+
+        // A 10 GiB budget with 2 GiB reserved leaves 8 GiB for the circuit.
+        let config = CircuitConfig::with_workers(1)
+            .with_max_rss_bytes(Some(10 * GIB))
+            .with_reserved_memory_bytes(2 * GIB);
+        let (circuit, _input_handle) =
+            Runtime::init_circuit(config, |circuit| Ok(circuit.add_input_zset::<u64>().1)).unwrap();
+        let runtime = circuit.runtime();
+        wait_for_max_rss(runtime, Some(8 * GIB), MemoryPressure::Low);
+
+        // The container shrinks to 6 GiB, and the 2 GiB stay reserved.
+        set_mock_available_memory_bytes(Some(6 * GIB));
+        wait_for_max_rss(runtime, Some(4 * GIB), MemoryPressure::Low);
+
+        // The container shrinks below the reservation. The reservation takes
+        // at most half, so the circuit keeps a limit and pressure stays low.
+        set_mock_available_memory_bytes(Some(GIB));
+        wait_for_max_rss(runtime, Some(GIB / 2), MemoryPressure::Low);
+    }
+
+    /// Test the memory pressure thresholds and how merger threads behave
+    /// under different memory pressure levels.
     #[test]
     fn memory_pressure_thresholds_and_spill_behavior() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -2240,7 +2805,7 @@ mod tests {
             query_runtime_memory_state(circuit.runtime());
         assert_eq!(pressure, MemoryPressure::Low);
 
-        // Verify the spill thresholds: at low pressure, merge threshold is set to the user-configured `min_storage_bytes`,
+        // Verify the spill thresholds: at low pressure, merge threshold is set to the user-configured `min_spill_size`,
         // insert threshold is set to `usize::MAX`, and step threshold is set to `usize::MAX`.
         assert_eq!(min_merge, TEN_MIB);
         assert_eq!(min_insert, usize::MAX);

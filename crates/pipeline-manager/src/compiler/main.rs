@@ -2,13 +2,16 @@ use crate::api::error::ApiError;
 use crate::common_error::CommonError;
 use crate::compiler::error::CompilerError;
 use crate::compiler::rust_compiler::{
-    perform_rust_compilation, rust_compiler_task, RustCompilationError, RustCompilationResult,
+    CLEANUP_INTERVAL, RustCompilationError, RustCompilationResult, cleanup_pipeline_binaries,
+    perform_rust_compilation, rust_compiler_task,
 };
 use crate::compiler::sql_compiler::{
-    ephemeral_compilation_dir, perform_sql_compilation, sql_compiler_task, validate_program,
-    ProgramValidationRequest, SqlCompilationError, SqlCompilationOutput,
+    ProgramValidationRequest, SqlCompilationError, SqlCompilationOutput, decide_stale_jar,
+    ephemeral_compilation_dir, jar_cache_dir, perform_sql_compilation, sql_compiler_task,
+    validate_program,
 };
 use crate::compiler::util::{
+    CleanupDecision, DiskSpace, cleanup_specific_directories, cleanup_specific_files,
     pipeline_binary_filename, program_info_filename, validate_is_sha256_checksum,
 };
 use crate::config::{CommonConfig, CompilerConfig};
@@ -20,14 +23,18 @@ use crate::db::types::tenant::TenantId;
 use crate::db::types::version::Version;
 use crate::error::ManagerError;
 use actix_files::NamedFile;
-use actix_web::{get, post, web, HttpRequest, HttpResponse, HttpServer, Responder};
-use futures_util::StreamExt;
+use actix_web::error::PayloadError;
+use actix_web::{HttpRequest, HttpResponse, HttpServer, Responder, get, post, web};
+use futures_util::{Stream, StreamExt};
 use std::net::TcpListener;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tokio::{fs, io::AsyncWriteExt, spawn, sync::Mutex};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Decodes the URL encoded parameter value as a string.
@@ -45,7 +52,9 @@ fn decode_url_encoded_parameter(
 
 /// Checks if the required compilation artifacts exist for the specified pipeline and version.
 /// If `program_info_integrity_checksum` is "none", only the binary existence is checked.
-#[get("/artifacts/{pipeline_id}/{program_version}/{source_checksum}/{binary_integrity_checksum}/{program_info_integrity_checksum}")]
+#[get(
+    "/artifacts/{pipeline_id}/{program_version}/{source_checksum}/{binary_integrity_checksum}/{program_info_integrity_checksum}"
+)]
 async fn check_compilation_artifacts(
     config: web::Data<CompilerConfig>,
     req: HttpRequest,
@@ -89,25 +98,34 @@ async fn check_compilation_artifacts(
         })
     })?;
 
-    validate_is_sha256_checksum(&binary_integrity_checksum).map_err(|e| {
-        ManagerError::from(ApiError::InvalidChecksumParam {
-            value: binary_integrity_checksum.to_string(),
-            error: e,
-        })
-    })?;
+    // A Gen-2 program compiles no binary; the caller passes "none" for the
+    // binary integrity checksum to check only the program info artifact.
+    let binary_expected = binary_integrity_checksum != "none";
+    if binary_expected {
+        validate_is_sha256_checksum(&binary_integrity_checksum).map_err(|e| {
+            ManagerError::from(ApiError::InvalidChecksumParam {
+                value: binary_integrity_checksum.to_string(),
+                error: e,
+            })
+        })?;
+    }
 
     // Form file paths
-    let binary_file_path = config
-        .working_dir()
-        .join("rust-compilation")
-        .join("pipeline-binaries")
-        .join(pipeline_binary_filename(
-            &pipeline_id,
-            program_version,
-            &source_checksum,
-            &binary_integrity_checksum,
-        ));
-    let binary_exists = binary_file_path.exists();
+    let binary_exists = if binary_expected {
+        config
+            .working_dir()
+            .join("rust-compilation")
+            .join("pipeline-binaries")
+            .join(pipeline_binary_filename(
+                &pipeline_id,
+                program_version,
+                &source_checksum,
+                &binary_integrity_checksum,
+            ))
+            .exists()
+    } else {
+        false
+    };
 
     if program_info_integrity_checksum == "none" {
         let resp = if binary_exists {
@@ -143,7 +161,13 @@ async fn check_compilation_artifacts(
     // Check artifact existence and return status + headers indicating presence
     let program_info_exists = program_info_file_path.exists();
 
-    let resp = if binary_exists && program_info_exists {
+    // The Gen-2 engine has no binary, so only the program info must be present.
+    let artifacts_present = if binary_expected {
+        binary_exists && program_info_exists
+    } else {
+        program_info_exists
+    };
+    let resp = if artifacts_present {
         HttpResponse::Ok().finish()
     } else {
         // return binary / program info not found as json body
@@ -357,7 +381,14 @@ async fn upload_binary(
         &expected_integrity_checksum,
     ));
 
-    let total_size = save_file(&target_file_path, payload, &expected_integrity_checksum).await?;
+    let total_size = match save_file(&target_file_path, payload, &expected_integrity_checksum).await
+    {
+        Ok(total_size) => total_size,
+        Err(error) => match unwritable_store_cause(&error) {
+            Some(cause) => return Ok(insufficient_storage_response(cause, &error)),
+            None => return Err(error),
+        },
+    };
 
     info!(
         pipeline_id = %pipeline_id,
@@ -452,7 +483,14 @@ async fn upload_program_info(
         &expected_integrity_checksum,
     ));
 
-    let total_size = save_file(&target_file_path, payload, &expected_integrity_checksum).await?;
+    let total_size = match save_file(&target_file_path, payload, &expected_integrity_checksum).await
+    {
+        Ok(total_size) => total_size,
+        Err(error) => match unwritable_store_cause(&error) {
+            Some(cause) => return Ok(insufficient_storage_response(cause, &error)),
+            None => return Err(error),
+        },
+    };
 
     info!(
         pipeline_id = %pipeline_id,
@@ -496,20 +534,82 @@ async fn validate_program_endpoint(
     Ok(HttpResponse::Ok().json(response))
 }
 
+/// Streams the payload to a temp file next to `target_file_path`, verifies the
+/// sha256 checksum, and only then renames the temp file onto the final path.
+/// The final path therefore never holds a partially written or corrupt file;
+/// on any error the temp file is removed.
 async fn save_file(
     target_file_path: &Path,
-    mut payload: web::Payload,
+    payload: impl Stream<Item = Result<web::Bytes, PayloadError>> + Unpin,
     expected_integrity_checksum: &str,
 ) -> Result<usize, ManagerError> {
-    // Stream the binary directly to disk with integrity checksum validation
-    let mut file = fs::File::create(&target_file_path).await.map_err(|e| {
+    let temp_file_path = target_file_path.with_added_extension(format!("tmp-{}", Uuid::now_v7()));
+
+    let write_result =
+        stream_to_file_and_verify(&temp_file_path, payload, expected_integrity_checksum).await;
+
+    match write_result {
+        Ok(total_size) => match fs::rename(&temp_file_path, target_file_path).await {
+            Ok(()) => {
+                // Persist the rename: without a directory fsync a crash can
+                // lose the entry while the database already says Success.
+                fsync_parent_dir(target_file_path).await?;
+                Ok(total_size)
+            }
+            Err(e) => {
+                remove_temp_upload_file(&temp_file_path).await;
+                Err(ManagerError::from(CommonError::io_error(
+                    format!(
+                        "renaming '{}' to '{}'",
+                        temp_file_path.display(),
+                        target_file_path.display()
+                    ),
+                    e,
+                )))
+            }
+        },
+        Err(e) => {
+            remove_temp_upload_file(&temp_file_path).await;
+            Err(e)
+        }
+    }
+}
+
+/// Fsyncs the directory containing `path` so that a rename into it is durable.
+async fn fsync_parent_dir(path: &Path) -> Result<(), ManagerError> {
+    let Some(parent_dir) = path.parent() else {
+        return Ok(());
+    };
+    let parent_dir_handle = fs::File::open(parent_dir).await.map_err(|e| {
         ManagerError::from(CommonError::io_error(
-            format!("creating file '{}'", target_file_path.display()),
+            format!("opening directory '{}'", parent_dir.display()),
+            e,
+        ))
+    })?;
+    parent_dir_handle.sync_all().await.map_err(|e| {
+        ManagerError::from(CommonError::io_error(
+            format!("syncing directory '{}'", parent_dir.display()),
+            e,
+        ))
+    })
+}
+
+/// Streams the payload to `file_path` and validates the sha256 checksum after
+/// flushing. Returns the total size in bytes. The caller removes the file on
+/// any error.
+async fn stream_to_file_and_verify(
+    file_path: &Path,
+    mut payload: impl Stream<Item = Result<web::Bytes, PayloadError>> + Unpin,
+    expected_integrity_checksum: &str,
+) -> Result<usize, ManagerError> {
+    let mut file = fs::File::create(&file_path).await.map_err(|e| {
+        ManagerError::from(CommonError::io_error(
+            format!("creating file '{}'", file_path.display()),
             e,
         ))
     })?;
 
-    let mut hasher = openssl::sha::Sha256::new();
+    let mut hasher = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     let mut total_size = 0usize;
 
     while let Some(chunk) = payload.next().await {
@@ -527,16 +627,23 @@ async fn save_file(
         // Write chunk to file
         file.write_all(&chunk).await.map_err(|e| {
             ManagerError::from(CommonError::io_error(
-                format!("writing to file '{}'", target_file_path.display()),
+                format!("writing to file '{}'", file_path.display()),
                 e,
             ))
         })?;
     }
 
-    // Flush and close file
+    // Flush and persist to disk before the rename makes the file visible
+    // under its final name.
     file.flush().await.map_err(|e| {
         ManagerError::from(CommonError::io_error(
-            format!("flushing file '{}'", target_file_path.display()),
+            format!("flushing file '{}'", file_path.display()),
+            e,
+        ))
+    })?;
+    file.sync_all().await.map_err(|e| {
+        ManagerError::from(CommonError::io_error(
+            format!("syncing file '{}'", file_path.display()),
             e,
         ))
     })?;
@@ -545,8 +652,6 @@ async fn save_file(
     // Validate integrity checksum
     let actual_integrity_checksum = hex::encode(hasher.finish());
     if actual_integrity_checksum != expected_integrity_checksum {
-        // Remove the invalid file
-        let _ = fs::remove_file(&target_file_path).await;
         return Err(ManagerError::from(ApiError::InvalidChecksumParam {
             value: format!(
                 "Expected integrity checksum '{}', but calculated '{}'",
@@ -559,9 +664,115 @@ async fn save_file(
     Ok(total_size)
 }
 
+/// Operator documentation on resolving a full or read-only storage volume.
+const OUT_OF_STORAGE_DOCS_URL: &str =
+    "https://docs.feldera.com/operations/guide/#out-of-storage-errors";
+
+/// Why the binary store cannot accept writes, phrased as the cause plus the
+/// action that resolves it, or `None` when the error is something else. Only
+/// ENOSPC and EROFS qualify: both need an operator, so an upload that hits
+/// either must fail rather than retry.
+fn unwritable_store_cause(error: &ManagerError) -> Option<&'static str> {
+    let ManagerError::CommonError {
+        common_error: CommonError::IoError { io_error, .. },
+    } = error
+    else {
+        return None;
+    };
+    match io_error.kind() {
+        std::io::ErrorKind::StorageFull => Some(
+            "the storage volume is full; an operator must grow it or delete unused pipelines \
+             to reclaim space",
+        ),
+        // EROFS in practice means the underlying disk failed and the kernel
+        // remounted the filesystem read-only.
+        std::io::ErrorKind::ReadOnlyFilesystem => Some(
+            "the storage volume is read-only, which usually means the underlying disk failed; \
+             an operator must repair or replace it",
+        ),
+        _ => None,
+    }
+}
+
+/// 507 Insufficient Storage response naming the cause and how to resolve it.
+/// The distinct status lets workers fail the compilation fast with this
+/// message instead of burning their retry budget on a volume that only an
+/// operator can grow or repair.
+fn insufficient_storage_response(cause: &str, error: &ManagerError) -> HttpResponse {
+    HttpResponse::InsufficientStorage().json(serde_json::json!({
+        "message": format!(
+            "Unable to write to the binary store: {cause}. \
+             See {OUT_OF_STORAGE_DOCS_URL}. Underlying error: {error}"
+        ),
+    }))
+}
+
+/// Removes a temp upload file. Failure only leaves an orphan file behind, so
+/// it is logged rather than propagated.
+async fn remove_temp_upload_file(temp_file_path: &Path) {
+    if let Err(e) = fs::remove_file(temp_file_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Unable to remove temp upload file '{}': {e}",
+            temp_file_path.display()
+        );
+    }
+}
+
+/// Fraction of the working-directory filesystem above which `/healthz` reports
+/// storage pressure: binary uploads are about to fail with ENOSPC and an
+/// operator must grow the volume or reclaim space.
+const STORAGE_PRESSURE_THRESHOLD: f64 = 0.95;
+
+/// Message reported when the working-directory filesystem is at or above
+/// `used_fraction_threshold`, `None` when it is below.
+fn storage_pressure_message(
+    disk_space: &DiskSpace,
+    used_fraction_threshold: f64,
+) -> Option<String> {
+    if disk_space.used_fraction < used_fraction_threshold {
+        return None;
+    }
+    Some(format!(
+        "unhealthy: compiler working directory filesystem is {:.1}% full ({} of {} bytes used); \
+         binary uploads will fail until an operator grows the volume or storage is reclaimed",
+        disk_space.used_fraction * 100.0,
+        disk_space.used_byte,
+        disk_space.total_byte
+    ))
+}
+
+/// Query parameters of the `/healthz` endpoint.
+#[derive(serde::Deserialize)]
+struct HealthzQuery {
+    /// Also report storage pressure of the working-directory filesystem.
+    #[serde(default)]
+    check_storage: bool,
+}
+
 /// Health check which returns success if it is able to reach the database.
+/// With `?check_storage=true` it also fails when the working-directory
+/// filesystem is nearly full.
+///
+/// Kubernetes probes must omit the parameter, because restarting the pod
+/// cannot free disk space and the pod still serves already compiled binaries.
+/// The cluster monitor passes it so that /v0/cluster_healthz surfaces the
+/// condition to operators, who can act on it.
 #[get("/healthz")]
-async fn healthz(probe: web::Data<Arc<Mutex<DbProbe>>>) -> Result<impl Responder, ManagerError> {
+async fn healthz(
+    probe: web::Data<Arc<Mutex<DbProbe>>>,
+    config: web::Data<CompilerConfig>,
+    query: web::Query<HealthzQuery>,
+) -> Result<impl Responder, ManagerError> {
+    if query.check_storage
+        && let Some(disk_space) = DiskSpace::new_from_path(&config.working_dir())
+        && let Some(message) = storage_pressure_message(&disk_space, STORAGE_PRESSURE_THRESHOLD)
+    {
+        return Ok(
+            HttpResponse::ServiceUnavailable().json(serde_json::json!({ "status": message }))
+        );
+    }
     Ok(probe.lock().await.as_http_response())
 }
 
@@ -742,6 +953,54 @@ pub async fn compiler_main(
     ));
 
     // Spawn HTTP server thread
+    let http_server = spawn_compiler_http_server(&common_config, &config, &db).await;
+
+    // All threads should run indefinitely
+    let error = tokio::select! {
+        _ = sql_task => "Compiler SQL task ended prematurely",
+        _ = rust_task => "Compiler Rust task ended prematurely",
+        _ = http_server => "Compiler HTTP(S) server task ended prematurely",
+    };
+    error!("{error}");
+    error!("Returning compiler thread");
+    Err(ManagerError::from(CompilerError::TaskFailed {
+        error: error.to_string(),
+    }))
+}
+
+/// Runs the artifact-store variant of the compiler server: the full HTTP
+/// surface plus a janitor, but no SQL or Rust compilation tasks. Serves
+/// deployments where compiler workers are ephemeral and this process is the
+/// durable binary store (see enterprise compiler autoscaling).
+pub async fn artifact_server_main(
+    common_config: CommonConfig,
+    config: CompilerConfig,
+    db: Arc<Mutex<StoragePostgres>>,
+) -> Result<(), ManagerError> {
+    create_working_directory_if_not_exists(&config).await?;
+
+    // Spawn janitor and HTTP server threads
+    let janitor_task = spawn(artifact_server_janitor_task(config.clone(), db.clone()));
+    let http_server = spawn_compiler_http_server(&common_config, &config, &db).await;
+
+    // Both threads should run indefinitely
+    let error = tokio::select! {
+        _ = janitor_task => "Artifact server janitor task ended prematurely",
+        _ = http_server => "Artifact server HTTP(S) server task ended prematurely",
+    };
+    error!("{error}");
+    Err(ManagerError::from(CompilerError::TaskFailed {
+        error: error.to_string(),
+    }))
+}
+
+/// Spawns the compiler HTTP(S) server serving artifacts, uploads, program
+/// validation, and health checks. Panics if the listener cannot be bound.
+async fn spawn_compiler_http_server(
+    common_config: &CommonConfig,
+    config: &CompilerConfig,
+    db: &Arc<Mutex<StoragePostgres>>,
+) -> JoinHandle<Result<(), std::io::Error>> {
     let config = web::Data::new(config.clone());
     let common_config_data = web::Data::new(common_config.clone());
     let probe = web::Data::new(DbProbe::new(db.clone()).await);
@@ -793,34 +1052,92 @@ pub async fn compiler_main(
         common_config.compiler_port,
         common_config.http_workers,
     );
+    http_server
+}
 
-    // All threads should run indefinitely
-    let error = tokio::select! {
-        _ = sql_task => "Compiler SQL task ended prematurely",
-        _ = rust_task => "Compiler Rust task ended prematurely",
-        _ = http_server => "Compiler HTTP(S) server task ended prematurely",
+/// Age above which an ephemeral validation directory is an orphan of a crashed
+/// validation; live validations finish within seconds.
+const ORPHANED_EPHEMERAL_DIR_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Removes an ephemeral validation directory whose modification time exceeds
+/// [`ORPHANED_EPHEMERAL_DIR_MAX_AGE`]. Missing or future modification times
+/// never remove.
+fn decide_orphaned_ephemeral_dir(
+    _dir_name: &str,
+    metadata: Option<std::fs::Metadata>,
+) -> CleanupDecision {
+    let Some(modified_time) = metadata.and_then(|metadata| metadata.modified().ok()) else {
+        return CleanupDecision::Ignore;
     };
-    error!("{error}");
-    error!("Returning compiler thread");
-    Err(ManagerError::from(CompilerError::TaskFailed {
-        error: error.to_string(),
-    }))
+    if modified_time
+        .elapsed()
+        .is_ok_and(|age| age >= ORPHANED_EPHEMERAL_DIR_MAX_AGE)
+    {
+        CleanupDecision::Remove
+    } else {
+        CleanupDecision::Keep {
+            motivation: "Validation may still be in progress".to_string(),
+        }
+    }
+}
+
+/// Janitor of the artifact server: garbage-collects pipeline binaries of
+/// deleted or recompiled pipelines, ephemeral validation directories orphaned
+/// by crashed validations, and stale SQL compiler jars. Errors within a pass
+/// are logged and the loop continues.
+async fn artifact_server_janitor_task(config: CompilerConfig, db: Arc<Mutex<StoragePostgres>>) {
+    loop {
+        if let Err(e) = cleanup_pipeline_binaries(&config, db.clone()).await {
+            error!("Artifact server janitor: pipeline binaries cleanup failed: {e}");
+        }
+        let ephemeral_dir = ephemeral_compilation_dir(&config);
+        if ephemeral_dir.is_dir()
+            && let Err(e) = cleanup_specific_directories(
+                "Ephemeral validation directories",
+                &ephemeral_dir,
+                Arc::new(decide_orphaned_ephemeral_dir),
+                false,
+                true,
+            )
+            .await
+        {
+            error!("Artifact server janitor: ephemeral validation directory cleanup failed: {e}");
+        }
+        let jar_cache_dir = jar_cache_dir(&config);
+        if jar_cache_dir.is_dir()
+            && let Err(e) = cleanup_specific_files(
+                "SQL JAR cache",
+                &jar_cache_dir,
+                Arc::new(decide_stale_jar),
+                true,
+                true,
+            )
+            .await
+        {
+            error!("Artifact server janitor: SQL compiler jar cache cleanup failed: {e}");
+        }
+        sleep(CLEANUP_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
 mod test {
     use crate::api::error::ApiError;
     use crate::compiler::main::{
-        create_working_directory_if_not_exists, decode_url_encoded_parameter, upload_binary,
+        create_working_directory_if_not_exists, decide_orphaned_ephemeral_dir,
+        decode_url_encoded_parameter, save_file, upload_binary,
     };
+    use crate::compiler::util::CleanupDecision;
     use crate::compiler::util::pipeline_binary_filename;
+    use crate::compiler::util::sha256;
     use crate::config::CompilerConfig;
     use crate::db::types::pipeline::PipelineId;
     use crate::db::types::program::CompilationProfile;
     use crate::db::types::version::Version;
     use crate::error::ManagerError;
-    use actix_web::{test as actix_test, web, App};
-    use openssl::sha::sha256;
+    use actix_web::error::PayloadError;
+    use actix_web::{App, test as actix_test, web};
+    use std::time::Duration;
     use tokio::fs;
     use uuid::Uuid;
 
@@ -867,6 +1184,8 @@ mod test {
             binary_upload_timeout_secs: 600,
             binary_upload_max_retries: 3,
             binary_upload_retry_delay_ms: 1000,
+            gen2_udf_sdk_path: None,
+            gen2_udf_sdk_version: None,
             precompile: false,
         })
         .await
@@ -887,6 +1206,8 @@ mod test {
             binary_upload_timeout_secs: 600,
             binary_upload_max_retries: 3,
             binary_upload_retry_delay_ms: 1000,
+            gen2_udf_sdk_path: None,
+            gen2_udf_sdk_version: None,
             precompile: false,
         })
         .await
@@ -961,6 +1282,14 @@ mod test {
                 "Checksum should match for test case: {}",
                 test_case.name
             );
+
+            // No temp file may be left behind
+            let dir_names =
+                list_file_names(expected_path.parent().expect("path must have a parent")).await;
+            assert!(
+                dir_names.iter().all(|name| !name.contains(".tmp-")),
+                "No temp file may remain, found: {dir_names:?}"
+            );
         }
     }
 
@@ -1003,6 +1332,158 @@ mod test {
         assert!(
             !expected_path.exists(),
             "Binary file should not exist after checksum failure"
+        );
+
+        // Neither the final file nor a temp file may remain
+        let dir_names =
+            list_file_names(expected_path.parent().expect("path must have a parent")).await;
+        assert!(
+            dir_names.is_empty(),
+            "No file may remain after checksum failure, found: {dir_names:?}"
+        );
+    }
+
+    /// An upload whose payload errors mid-stream leaves no file under the
+    /// final name and no temp file behind.
+    #[tokio::test]
+    async fn test_interrupted_upload_leaves_no_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let pipeline_binaries_dir = tempdir.path().join("pipeline-binaries");
+        fs::create_dir_all(&pipeline_binaries_dir).await.unwrap();
+        let target_file_path = pipeline_binaries_dir.join("pipeline_example_binary");
+
+        let data = b"partial data";
+        let interrupted_payload = futures_util::stream::iter(vec![
+            Ok(web::Bytes::from_static(data)),
+            Err(PayloadError::Incomplete(None)),
+        ]);
+        let result = save_file(
+            &target_file_path,
+            interrupted_payload,
+            &hex::encode(sha256(data)),
+        )
+        .await;
+        assert!(result.is_err(), "Interrupted upload should fail");
+
+        let dir_names = list_file_names(&pipeline_binaries_dir).await;
+        assert!(
+            dir_names.is_empty(),
+            "No file may remain after an interrupted upload, found: {dir_names:?}"
+        );
+    }
+
+    /// A full or read-only store yields a cause naming the fix; other I/O
+    /// errors yield none.
+    #[test]
+    fn unwritable_store_cause_detection() {
+        let io_error = |kind| {
+            ManagerError::from(crate::common_error::CommonError::io_error(
+                "writing".to_string(),
+                std::io::Error::new(kind, "test"),
+            ))
+        };
+        let full = super::unwritable_store_cause(&io_error(std::io::ErrorKind::StorageFull))
+            .expect("a full volume is unwritable");
+        assert!(full.contains("full"), "unexpected cause: {full}");
+        let read_only =
+            super::unwritable_store_cause(&io_error(std::io::ErrorKind::ReadOnlyFilesystem))
+                .expect("a read-only volume is unwritable");
+        assert!(
+            read_only.contains("read-only"),
+            "unexpected cause: {read_only}"
+        );
+        assert!(
+            super::unwritable_store_cause(&io_error(std::io::ErrorKind::PermissionDenied))
+                .is_none()
+        );
+    }
+
+    /// The 507 response names the cause and links the operator documentation.
+    #[actix_web::test]
+    async fn insufficient_storage_response_is_actionable() {
+        let error = ManagerError::from(crate::common_error::CommonError::io_error(
+            "writing".to_string(),
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "test"),
+        ));
+        let cause = super::unwritable_store_cause(&error).unwrap();
+        let response = super::insufficient_storage_response(cause, &error);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INSUFFICIENT_STORAGE
+        );
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let message = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.starts_with("Unable to write to the binary store:"),
+            "unexpected message: {message}"
+        );
+        assert!(message.contains(super::OUT_OF_STORAGE_DOCS_URL));
+    }
+
+    /// The kernel errnos the upload path actually sees map to the
+    /// `ErrorKind`s `unwritable_store_cause` matches on.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_store_errnos_map_to_expected_error_kinds() {
+        assert_eq!(
+            std::io::Error::from_raw_os_error(libc::ENOSPC).kind(),
+            std::io::ErrorKind::StorageFull
+        );
+        assert_eq!(
+            std::io::Error::from_raw_os_error(libc::EROFS).kind(),
+            std::io::ErrorKind::ReadOnlyFilesystem
+        );
+    }
+
+    /// Storage pressure is reported at or above the threshold and stays silent
+    /// below it.
+    #[test]
+    fn storage_pressure_threshold() {
+        let disk_space = |used_fraction: f64| crate::compiler::util::DiskSpace {
+            total_byte: 100,
+            used_byte: (used_fraction * 100.0) as u64,
+            used_fraction,
+            available_byte: 100 - (used_fraction * 100.0) as u64,
+            available_fraction: 1.0 - used_fraction,
+        };
+        assert!(super::storage_pressure_message(&disk_space(0.5), 0.95).is_none());
+        assert!(super::storage_pressure_message(&disk_space(0.95), 0.95).is_some());
+        let message = super::storage_pressure_message(&disk_space(1.0), 0.95).unwrap();
+        assert!(message.contains("100.0% full"));
+    }
+
+    /// An old ephemeral validation directory is removed, a fresh one is kept,
+    /// and missing metadata never removes.
+    #[test]
+    fn orphaned_ephemeral_dir_decision() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let dir_path = tempdir.path();
+        let recent = std::fs::metadata(dir_path).unwrap();
+        assert!(matches!(
+            decide_orphaned_ephemeral_dir("d", Some(recent)),
+            CleanupDecision::Keep { .. }
+        ));
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(old_time)
+            .set_modified(old_time);
+        std::fs::File::open(dir_path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let old = std::fs::metadata(dir_path).unwrap();
+        assert_eq!(
+            decide_orphaned_ephemeral_dir("d", Some(old)),
+            CleanupDecision::Remove
+        );
+        assert_eq!(
+            decide_orphaned_ephemeral_dir("d", None),
+            CleanupDecision::Ignore
         );
     }
 
@@ -1055,6 +1536,67 @@ mod test {
     }
 
     // Test helper functions and constants
+    /// A Gen-2 pipeline delivers no binary, so the artifact check passes "none"
+    /// for the binary integrity checksum. The endpoint must then verify only the
+    /// program info: an absent binary is expected, not a missing artifact.
+    #[actix_web::test]
+    async fn artifacts_present_for_gen2_without_binary() {
+        use crate::compiler::util::program_info_filename;
+
+        let (_tempdir, config) = create_test_config("gen2_artifacts");
+        let pipeline_id = PipelineId(Uuid::now_v7());
+        let program_version = 1i64;
+        // The Gen-2 engine names the program info artifact by its own integrity checksum and
+        // reuses that value as the source checksum.
+        let checksum = hex::encode(sha256(b"gen2-program-info"));
+
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(config.clone()))
+                .service(super::check_compilation_artifacts),
+        )
+        .await;
+        let url = format!("/artifacts/{pipeline_id}/{program_version}/{checksum}/none/{checksum}");
+
+        // Program info not yet delivered: reported missing (drives a recompile),
+        // and not an error merely because there is no binary.
+        let resp =
+            actix_test::call_service(&app, actix_test::TestRequest::get().uri(&url).to_request())
+                .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = actix_test::read_body_json(resp).await;
+        assert_eq!(body["binary_exists"], serde_json::json!(false));
+        assert_eq!(body["program_info_exists"], serde_json::json!(false));
+
+        // Deliver the program info where the endpoint serves it from.
+        let pipeline_binaries_dir = std::path::PathBuf::from(&config.compiler_working_directory)
+            .join("rust-compilation")
+            .join("pipeline-binaries");
+        fs::create_dir_all(&pipeline_binaries_dir).await.unwrap();
+        fs::write(
+            pipeline_binaries_dir.join(program_info_filename(
+                &pipeline_id,
+                Version(program_version),
+                &checksum,
+                &checksum,
+            )),
+            b"{}",
+        )
+        .await
+        .unwrap();
+
+        // Program info present and no binary expected: artifacts are present even
+        // though binary_exists is false.
+        let resp =
+            actix_test::call_service(&app, actix_test::TestRequest::get().uri(&url).to_request())
+                .await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::OK,
+            "Gen-2 artifacts are present with program info delivered and no binary"
+        );
+    }
+
     const SMALL_TEST_DATA: &[u8] = b"Hello, World! This is test binary data.";
     const VALID_SHA256: &str = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
 
@@ -1074,6 +1616,8 @@ mod test {
             binary_upload_timeout_secs: 600,
             binary_upload_max_retries: 3,
             binary_upload_retry_delay_ms: 1000,
+            gen2_udf_sdk_path: None,
+            gen2_udf_sdk_version: None,
             precompile: false,
         };
 
@@ -1099,6 +1643,16 @@ mod test {
     /// Creates test binary data of specified size with predictable pattern
     fn create_test_data(size: usize) -> Vec<u8> {
         (0..size).map(|i| (i % 256) as u8).collect()
+    }
+
+    /// Lists the file names in a directory
+    async fn list_file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut file_names = vec![];
+        let mut entries = fs::read_dir(dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            file_names.push(entry.file_name().to_string_lossy().to_string());
+        }
+        file_names
     }
 
     /// Builds upload URL from parameters

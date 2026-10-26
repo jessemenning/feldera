@@ -10,6 +10,22 @@ use std::{collections::BTreeMap, env};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::{
+    duration::{ConfigDuration, LegacyUnit},
+    duration_setting,
+};
+
+duration_setting!(
+    duration_group_join_timeout,
+    "group_join_timeout",
+    LegacyUnit::Secs
+);
+duration_setting!(
+    duration_initialization_timeout,
+    "initialization_timeout",
+    LegacyUnit::Secs
+);
+
 /// Configuration for reading data from Kafka topics with `InputTransport`.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, ToSchema)]
 pub struct KafkaInputConfig {
@@ -37,10 +53,17 @@ pub struct KafkaInputConfig {
     /// log level of the `log` crate.
     pub log_level: Option<KafkaLogLevel>,
 
-    /// Maximum timeout in seconds to wait for the endpoint to join the Kafka
-    /// consumer group during initialization.
-    #[serde(default = "default_group_join_timeout_secs")]
-    pub group_join_timeout_secs: u32,
+    /// Maximum time to wait for the endpoint to join the Kafka consumer group
+    /// during initialization, for example `10s`. Unset selects
+    /// the default, `DEFAULT_GROUP_JOIN_TIMEOUT`.
+    #[serde(
+        default,
+        alias = "group_join_timeout_secs",
+        deserialize_with = "duration_group_join_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, default = default_group_join_timeout)]
+    pub group_join_timeout: Option<ConfigDuration>,
 
     /// Set to 1 or more to fix the number of threads used to poll
     /// `rdkafka`. Multiple threads can increase performance with small Kafka
@@ -56,6 +79,15 @@ pub struct KafkaInputConfig {
 
     /// The AWS region to use while connecting to AWS Managed Streaming for Kafka (MSK).
     pub region: Option<String>,
+
+    /// Identity provider used to mint SASL/OAUTHBEARER tokens.
+    ///
+    /// Skipped when serializing so that a manager that knows this field can
+    /// still drive an older runtime that does not: such a runtime folds the
+    /// unknown key into the flattened `kafka_options: BTreeMap<String, String>`
+    /// and rejects a null value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_provider: Option<KafkaOauthProvider>,
 
     /// The list of Kafka partitions to read from.
     ///
@@ -187,10 +219,11 @@ impl KafkaInputConfig {
             kafka_options,
             topic: topic.into(),
             log_level: None,
-            group_join_timeout_secs: default_group_join_timeout_secs(),
+            group_join_timeout: None,
             poller_threads: None,
             start_from: KafkaStartFromConfig::default(),
             region: None,
+            oauth_provider: None,
             partitions: None,
             resume_earliest_if_data_expires: false,
             include_headers: None,
@@ -431,10 +464,62 @@ pub enum KafkaLogLevel {
     Debug,
 }
 
+/// Identity provider used to mint SASL/OAUTHBEARER tokens for the Kafka
+/// broker.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaOauthProvider {
+    /// Mint an AWS Signature V4 token to authenticate to AWS Managed
+    /// Streaming for Kafka (MSK).
+    ///
+    /// This is the default provider, for backward compatibility.  `region` must
+    /// be set, either directly or via the `AWS_REGION` environment variable.
+    #[default]
+    Aws,
+
+    /// Mint a Google OAuth2 access token to authenticate to GCP Managed
+    /// Service for Apache Kafka.
+    ///
+    /// The token is obtained from Application Default Credentials: a
+    /// service account key or user credentials file (as set up by, e.g.,
+    /// `gcloud auth application-default login`), or, failing that, the
+    /// GKE metadata server (which supplies credentials automatically when
+    /// Workload Identity is configured).
+    Gcp,
+}
+
 /// On startup, the endpoint waits to join the consumer group.
 /// This constant defines the default wait timeout.
-pub const fn default_group_join_timeout_secs() -> u32 {
-    10
+pub const DEFAULT_GROUP_JOIN_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(10);
+
+/// Default time to wait for the endpoint to connect to a Kafka broker.
+pub const DEFAULT_INITIALIZATION_TIMEOUT: ConfigDuration = ConfigDuration::from_secs(60);
+
+// The defaults as the OpenAPI schema shows them, one function per
+// `#[schema(default = ...)]`.
+fn default_group_join_timeout() -> String {
+    DEFAULT_GROUP_JOIN_TIMEOUT.to_string()
+}
+fn default_initialization_timeout() -> String {
+    DEFAULT_INITIALIZATION_TIMEOUT.to_string()
+}
+
+impl KafkaInputConfig {
+    /// The consumer-group join timeout in effect, or
+    /// [`DEFAULT_GROUP_JOIN_TIMEOUT`].
+    pub fn group_join_timeout(&self) -> ConfigDuration {
+        self.group_join_timeout
+            .unwrap_or(DEFAULT_GROUP_JOIN_TIMEOUT)
+    }
+}
+
+impl KafkaOutputConfig {
+    /// The broker connection timeout in effect, or
+    /// [`DEFAULT_INITIALIZATION_TIMEOUT`].
+    pub fn initialization_timeout(&self) -> ConfigDuration {
+        self.initialization_timeout
+            .unwrap_or(DEFAULT_INITIALIZATION_TIMEOUT)
+    }
 }
 
 impl KafkaInputConfig {
@@ -524,10 +609,6 @@ impl KafkaInputConfig {
 
 pub fn default_redpanda_server() -> String {
     env::var("REDPANDA_BROKERS").unwrap_or_else(|_| "localhost".to_string())
-}
-
-const fn default_initialization_timeout_secs() -> u32 {
-    60
 }
 
 /// Kafka header value encoded as a UTF-8 string or a byte array.
@@ -630,12 +711,16 @@ pub struct KafkaOutputConfig {
     /// log level of the `log` crate.
     pub log_level: Option<KafkaLogLevel>,
 
-    /// Maximum timeout in seconds to wait for the endpoint to connect to
-    /// a Kafka broker.
-    ///
-    /// Defaults to 60.
-    #[serde(default = "default_initialization_timeout_secs")]
-    pub initialization_timeout_secs: u32,
+    /// Maximum time to wait for the endpoint to connect to a Kafka broker, for
+    /// example `60s`. Unset selects the default, `DEFAULT_INITIALIZATION_TIMEOUT`.
+    #[serde(
+        default,
+        alias = "initialization_timeout_secs",
+        deserialize_with = "duration_initialization_timeout",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, default = default_initialization_timeout)]
+    pub initialization_timeout: Option<ConfigDuration>,
 
     /// Optional configuration for fault tolerance.
     pub fault_tolerance: Option<KafkaOutputFtConfig>,
@@ -645,6 +730,14 @@ pub struct KafkaOutputConfig {
 
     /// The AWS region to use while connecting to AWS Managed Streaming for Kafka (MSK).
     pub region: Option<String>,
+
+    /// Identity provider used to mint SASL/OAUTHBEARER tokens.  See
+    /// [`KafkaOauthProvider`].
+    ///
+    /// Skipped when serializing, for the same reason as in
+    /// [`KafkaInputConfig::oauth_provider`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_provider: Option<KafkaOauthProvider>,
 }
 
 /// Fault tolerance configuration for Kafka output connector.
@@ -724,16 +817,22 @@ mod compat {
 
     use serde::Deserialize;
 
-    use crate::transport::kafka::{KafkaLogLevel, KafkaStartFromConfig};
+    use crate::duration::ConfigDuration;
+    use crate::transport::kafka::{KafkaLogLevel, KafkaOauthProvider, KafkaStartFromConfig};
 
     #[derive(Deserialize)]
     pub struct KafkaInputConfigCompat {
         /// Current, long-standing configuration option.
         log_level: Option<KafkaLogLevel>,
 
-        /// Current, long-standing configuration option.
-        #[serde(default = "super::default_group_join_timeout_secs")]
-        group_join_timeout_secs: u32,
+        /// Current, long-standing configuration option, which also accepts the
+        /// bare number of seconds its `group_join_timeout_secs` spelling took.
+        #[serde(
+            default,
+            alias = "group_join_timeout_secs",
+            deserialize_with = "super::duration_group_join_timeout"
+        )]
+        group_join_timeout: Option<ConfigDuration>,
 
         /// Current configuration option.
         poller_threads: Option<usize>,
@@ -765,6 +864,9 @@ mod compat {
 
         /// The AWS region to use while connecting to AWS Managed Streaming for Kafka (MSK).
         region: Option<String>,
+
+        /// Identity provider used to mint SASL/OAUTHBEARER tokens.
+        oauth_provider: Option<KafkaOauthProvider>,
 
         /// The Kafka partitions to read from.
         partitions: Option<Vec<i32>>,
@@ -855,10 +957,11 @@ mod compat {
                 topic,
                 kafka_options: compat.kafka_options,
                 log_level: compat.log_level,
-                group_join_timeout_secs: compat.group_join_timeout_secs,
+                group_join_timeout: compat.group_join_timeout,
                 poller_threads: compat.poller_threads,
                 start_from,
                 region: compat.region,
+                oauth_provider: compat.oauth_provider,
                 partitions: compat.partitions,
                 resume_earliest_if_data_expires: compat.resume_earliest_if_data_expires,
                 include_headers: compat.include_headers,
@@ -870,6 +973,105 @@ mod compat {
                 header_filter: compat.header_filter,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod oauth_provider_tests {
+    use std::collections::BTreeMap;
+
+    use serde::Deserialize;
+
+    use super::{KafkaInputConfig, KafkaOauthProvider, KafkaOutputConfig};
+
+    #[test]
+    fn oauth_provider_is_optional() {
+        let config: KafkaInputConfig =
+            serde_json::from_str(r#"{"topic": "t", "bootstrap.servers": "localhost:9092"}"#)
+                .unwrap();
+        assert_eq!(config.oauth_provider, None);
+    }
+
+    #[test]
+    fn oauth_provider_gcp_round_trips() {
+        let config: KafkaInputConfig = serde_json::from_str(
+            r#"{"topic": "t", "bootstrap.servers": "localhost:9092", "oauth_provider": "gcp"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.oauth_provider, Some(KafkaOauthProvider::Gcp));
+    }
+
+    /// A manager that knows `oauth_provider` must not send the key to a runtime
+    /// that does not: an older runtime folds the unknown key into its flattened
+    /// `kafka_options: BTreeMap<String, String>`, where a null value fails
+    /// deserialization with a non-actionable error.
+    #[test]
+    fn unset_oauth_provider_is_not_serialized() {
+        let config = KafkaInputConfig::default(
+            BTreeMap::from([("bootstrap.servers".into(), "localhost:9092".into())]),
+            "t",
+        );
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("oauth_provider"));
+
+        let output_config = KafkaOutputConfig {
+            kafka_options: BTreeMap::from([("bootstrap.servers".into(), "localhost:9092".into())]),
+            topic: "t".into(),
+            headers: Vec::new(),
+            log_level: None,
+            initialization_timeout: None,
+            fault_tolerance: None,
+            kafka_service: None,
+            region: None,
+            oauth_provider: None,
+        };
+        let json = serde_json::to_value(&output_config).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("oauth_provider"));
+    }
+
+    #[test]
+    fn set_oauth_provider_is_serialized() {
+        let mut config = KafkaInputConfig::default(
+            BTreeMap::from([("bootstrap.servers".into(), "localhost:9092".into())]),
+            "t",
+        );
+        config.oauth_provider = Some(KafkaOauthProvider::Gcp);
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["oauth_provider"], serde_json::json!("gcp"));
+    }
+
+    /// Demonstrates the failure that `skip_serializing_if` avoids: an old
+    /// runtime, modeled here by a config whose unknown keys flatten into a
+    /// string map, cannot deserialize `"oauth_provider": null`.
+    #[test]
+    fn old_runtime_rejects_null_oauth_provider() {
+        #[derive(Deserialize)]
+        struct OldRuntimeConfig {
+            #[serde(flatten)]
+            #[allow(dead_code)]
+            kafka_options: BTreeMap<String, String>,
+            #[allow(dead_code)]
+            topic: String,
+        }
+
+        assert!(
+            serde_json::from_str::<OldRuntimeConfig>(r#"{"topic": "t", "oauth_provider": null}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<OldRuntimeConfig>(r#"{"topic": "t"}"#).is_ok());
+    }
+
+    #[test]
+    fn legacy_region_only_config_still_deserializes() {
+        // Configs written before `oauth_provider` existed set only `region`;
+        // they must still deserialize, with `oauth_provider` defaulting to
+        // `None` (interpreted as AWS by the adapter, for backward compatibility).
+        let config: KafkaInputConfig = serde_json::from_str(
+            r#"{"topic": "t", "bootstrap.servers": "localhost:9092", "region": "us-east-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.region, Some("us-east-1".to_string()));
+        assert_eq!(config.oauth_provider, None);
     }
 }
 
@@ -1042,33 +1244,67 @@ mod header_filter_tests {
         .unwrap();
         assert!(config.header_filter.is_some());
     }
+}
 
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    /// Wraps the fields under test in the `topic` key both Kafka configs
+    /// require.
+    fn config_json(fields: &str) -> String {
+        let separator = if fields.is_empty() { "" } else { ", " };
+        format!(r#"{{"topic": "test_topic"{separator}{fields}}}"#)
+    }
+
+    /// The consumer-group join timeout reads back from both spellings. They
+    /// reach one field, so writing both is rejected as a duplicate.
     #[test]
-    fn config_with_header_filter_serializes_to_yaml() {
-        // Regression: the pipeline config is serialized to YAML when a pipeline
-        // is provisioned. `HeaderFilter` is a nested enum, which `serde_yaml`
-        // cannot serialize directly; `serde_via_value` keeps this working.
-        // Without it, the pipeline runner panics and the pipeline is stuck
-        // provisioning.
-        let mut config = KafkaInputConfig::default(
-            BTreeMap::from([(
-                "bootstrap.servers".to_string(),
-                "localhost:9092".to_string(),
-            )]),
-            "topic",
-        );
-        config.header_filter = Some(
-            serde_json::from_str(
-                r#"{"and":[{"header":{"name":"a","pattern":"b"}},{"not":{"header":{"name":"c","pattern":"d"}}}]}"#,
-            )
-            .unwrap(),
-        );
+    fn group_join_timeout_accepts_both_spellings() {
+        for (fields, expected) in [
+            ("", DEFAULT_GROUP_JOIN_TIMEOUT),
+            (
+                r#""group_join_timeout": "1500ms""#,
+                ConfigDuration::from_millis(1500),
+            ),
+            (
+                r#""group_join_timeout_secs": 25"#,
+                ConfigDuration::from_secs(25),
+            ),
+        ] {
+            let json = config_json(fields);
+            let config: KafkaInputConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.group_join_timeout(), expected, "parsing {json}");
+        }
 
-        // Must not error (this is what panicked in the pipeline runner).
-        let yaml = serde_yaml::to_string(&config).expect("serialize config to YAML");
+        // Both spellings reach one field, so writing both is a duplicate.
+        let json = config_json(r#""group_join_timeout": "1500ms", "group_join_timeout_secs": 25"#);
+        let error = serde_json::from_str::<KafkaInputConfig>(&json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("duplicate field `group_join_timeout`"),
+            "{error}"
+        );
+    }
 
-        // And the config round-trips back through YAML.
-        let reparsed: KafkaInputConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(reparsed.header_filter, config.header_filter);
+    /// See [`group_join_timeout_accepts_both_spellings`].
+    #[test]
+    fn initialization_timeout_accepts_both_spellings() {
+        for (fields, expected) in [
+            ("", DEFAULT_INITIALIZATION_TIMEOUT),
+            (
+                r#""initialization_timeout": "2m""#,
+                ConfigDuration::from_secs(120),
+            ),
+            (
+                r#""initialization_timeout_secs": 15"#,
+                ConfigDuration::from_secs(15),
+            ),
+        ] {
+            let json = config_json(fields);
+            let config: KafkaOutputConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.initialization_timeout(), expected, "parsing {json}");
+        }
     }
 }

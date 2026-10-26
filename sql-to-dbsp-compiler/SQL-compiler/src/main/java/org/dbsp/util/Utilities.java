@@ -124,6 +124,13 @@ public class Utilities {
             throw new InternalCompilerError(message.get() + System.lineSeparator() + getCurrentStackTrace());
     }
 
+    /** Signal that a code path must not be reached.
+     * @param message  Explanation included in the exception */
+    @Contract("_ -> fail")
+    public static void fail(String message) {
+        throw new InternalCompilerError(message + System.lineSeparator() + getCurrentStackTrace());
+    }
+
     /** Delete a file/directory recursively
      *
      * @param file File to delete.
@@ -468,7 +475,7 @@ public class Utilities {
     }
 
     /** Number of cargo jobs to use when testing locally */
-    static final int LOCAL_CARGO_JOBS = 6;
+    static final int LOCAL_CARGO_JOBS = 8;
 
     static final HashMap<String, String> STACK = new HashMap<>() {{ put("RUST_MIN_STACK", "8388608"); }};
 
@@ -515,7 +522,15 @@ public class Utilities {
     }
 
     /** Compile the rust code generated and check it using 'cargo check' */
-    public static void compileAndCheckRust(String directory, boolean quiet, String... packages)
+    public static void compileAndCheckRust(String directory, boolean quiet)
+            throws IOException, InterruptedException {
+        compileAndCheckRust(directory, quiet, "");
+    }
+
+    /** Compile the rust code generated and check it using 'cargo check'.
+     * @param features Comma-separated cargo features to enable; empty for none. */
+    public static void compileAndCheckRust(
+            String directory, boolean quiet, String features, String... packages)
             throws IOException, InterruptedException {
         List<String> args = new ArrayList<>();
         args.add("cargo");
@@ -526,6 +541,10 @@ public class Utilities {
         }
         if (quiet)
             args.add("--quiet");
+        if (!features.isEmpty()) {
+            args.add("--features");
+            args.add(features);
+        }
         addExtraArgs(args, packages);
         // 'cargo check' and 'cargo test' carry different per-profile fingerprints.
         // Sharing one target dir makes every switch between a checking test and a
@@ -625,6 +644,20 @@ public class Utilities {
         return prop;
     }
 
+    /** True if {@code node} is present and is not the JSON {@code null}. */
+    public static boolean isNotNull(@Nullable JsonNode node) {
+        return node != null && !node.isNull();
+    }
+
+    /**
+     * True if both fields appear in a parsed document, even with a JSON {@code null}
+     * value.  Jackson reads an explicit {@code null} as a {@code NullNode} and leaves an
+     * absent field {@code null}, so the two are told apart.
+     */
+    public static boolean bothNonNull(@Nullable JsonNode first, @Nullable JsonNode second) {
+        return first != null && second != null;
+    }
+
     public static boolean getBooleanProperty(JsonNode node, String property) {
         JsonNode prop = Utilities.getProperty(node, property);
         return prop.asBoolean();
@@ -701,5 +734,23 @@ public class Utilities {
     /** Return the number of times 'pattern' occurs in 'string' (non-overlapping matches) */
     public static int countMatches(String string, String pattern) {
         return string.split(Pattern.quote(pattern), -1).length - 1;
+    }
+
+    /** The number of digits after the last period in {@code value}, or 0 if the characters
+     * after the period are not all digits. */
+    public static int fractionalDigits(String value) {
+        int period = value.lastIndexOf('.');
+        if (period < 0)
+            return 0;
+        String fraction = value.substring(period + 1);
+        if (fraction.isEmpty() || !fraction.chars().allMatch(Character::isDigit))
+            return 0;
+        return fraction.length();
+    }
+
+    /** True if the TIME or TIMESTAMP string {@code value} has a fraction of a second that is not zero */
+    public static boolean hasFraction(String value) {
+        int period = value.indexOf('.');
+        return period >= 0 && value.substring(period + 1).chars().anyMatch(c -> c != '0');
     }
 }

@@ -2,9 +2,12 @@ use crate::controller::{ControllerInner, EndpointId};
 use crate::transport::IntegratedInputEndpoint;
 use crate::{ControllerError, Encoder, InputConsumer, OutputEndpoint};
 use datafusion::execution::runtime_env::RuntimeEnv;
+pub use feldera_adapterlib::transport::DistributedInput;
+use feldera_adapterlib::utils::datafusion::with_private_object_store_registry;
 use feldera_types::config::{ConnectorConfig, PipelineConfig, TransportConfig};
 use feldera_types::program_schema::Relation;
 use std::sync::{Arc, Weak};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "with-deltalake")]
 pub mod delta_table;
@@ -50,6 +53,7 @@ pub fn create_integrated_output_endpoint(
     key_schema: &Option<Relation>,
     schema: &Relation,
     controller: Weak<ControllerInner>,
+    shutdown: CancellationToken,
     continue_previous_state: bool,
     is_index: bool,
 ) -> Result<Box<dyn IntegratedOutputEndpoint>, ControllerError> {
@@ -62,8 +66,10 @@ pub fn create_integrated_output_endpoint(
             key_schema,
             schema,
             controller,
+            shutdown,
             continue_previous_state,
             is_index,
+            connector_config.output_buffer_config.enable_output_buffer,
         )?),
         TransportConfig::PostgresOutput(config) => Box::new(PostgresOutputEndpoint::new(
             endpoint_id,
@@ -82,6 +88,7 @@ pub fn create_integrated_output_endpoint(
             key_schema,
             schema,
             controller,
+            shutdown,
             is_index,
         )?),
         transport => {
@@ -105,6 +112,8 @@ pub fn create_integrated_output_endpoint(
     Ok(ep)
 }
 
+/// Creates an integrated input endpoint.  `distributed` is `Some` only for a
+/// distributed connector, whose transport must support distribution.
 #[allow(unused_variables)]
 pub fn create_integrated_input_endpoint(
     endpoint_name: &str,
@@ -112,7 +121,14 @@ pub fn create_integrated_input_endpoint(
     pipeline_config: &PipelineConfig,
     runtime_env: Arc<RuntimeEnv>,
     consumer: Box<dyn InputConsumer>,
+    distributed: Option<DistributedInput>,
 ) -> Result<Box<dyn IntegratedInputEndpoint>, ControllerError> {
+    debug_assert!(distributed.is_none() || config.transport.supports_distribution());
+    // Every connector gets its own object store registry: DataFusion keys stores
+    // by scheme, host and port, so a shared registry lets one connector reroute
+    // another's reads (#7080). The memory pool and caches stay shared.
+    let runtime_env = with_private_object_store_registry(&runtime_env)?;
+
     let ep: Box<dyn IntegratedInputEndpoint> = match &config.transport {
         #[cfg(feature = "with-deltalake")]
         TransportConfig::DeltaTableInput(config) => {
@@ -122,6 +138,7 @@ pub fn create_integrated_input_endpoint(
                 pipeline_config,
                 runtime_env,
                 consumer,
+                distributed,
             ))
         }
         #[cfg(feature = "with-iceberg")]
@@ -132,6 +149,7 @@ pub fn create_integrated_input_endpoint(
                 pipeline_config,
                 runtime_env,
                 consumer,
+                distributed,
             ))
         }
         TransportConfig::PostgresInput(config) => {

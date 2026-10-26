@@ -5,8 +5,11 @@
 // The module contains various string operations.
 
 #![allow(non_snake_case)]
+#[allow(deprecated)]
+use crate::Variant;
+use crate::variant::LegacyVariant;
 use crate::{
-    Variant, array::Array, some_function1, some_function2, some_function3, some_function4,
+    array::Array, some_function1, some_function2, some_function3, some_function4,
     some_polymorphic_function1, some_polymorphic_function2, some_polymorphic_null_function1,
     string_interner::*,
 };
@@ -200,6 +203,15 @@ where
     #[inline]
     fn deserialize(&self, _: &mut D) -> Result<SqlString, D::Error> {
         Ok(SqlString::from_ref(self.as_str()))
+    }
+}
+
+/// `SqlString` orders as its text does, so the archived form compares its
+/// bytes with the text directly.
+impl dbsp::dynamic::OrdRepr<SqlString> for ArchivedString {
+    #[inline]
+    fn ord_cmp(&self, other: &SqlString) -> std::cmp::Ordering {
+        self.as_str().cmp(other.str())
     }
 }
 
@@ -675,31 +687,43 @@ some_function3!(
     SqlString
 );
 
+/// Panics on invalid JSON.
 #[doc(hidden)]
-pub fn writelog<T: std::fmt::Display>(format: SqlString, argument: T) -> T {
-    let format_arg = format!("{}", argument);
-    let formatted = format.str().replace("%%", &format_arg);
-    print!("{}", formatted);
-    argument
-}
-
-#[doc(hidden)]
+#[allow(deprecated)]
 pub fn parse_json_s(value: SqlString) -> Variant {
-    let var = serde_json::from_str::<Variant>(value.str());
-    match var {
-        Ok(v) => v,
-        Err(_) => Variant::SqlNull,
-    }
+    serde_json::from_str::<Variant>(value.str()).unwrap_or_else(|e| {
+        panic!(
+            "PARSE_JSON: invalid JSON '{}': {e}; use TRY_PARSE_JSON to return NULL for invalid input",
+            value.str()
+        )
+    })
 }
 
 #[doc(hidden)]
+#[allow(deprecated)]
 pub fn parse_json_nullN(_value: Option<()>) -> Option<Variant> {
     None
 }
 
-some_polymorphic_function1!(parse_json, s, SqlString, Variant);
+some_polymorphic_function1!(parse_json, s, SqlString, LegacyVariant);
+
+/// Returns None on invalid JSON.
+#[doc(hidden)]
+#[allow(deprecated)]
+pub fn try_parse_json_s(value: SqlString) -> Option<Variant> {
+    serde_json::from_str::<Variant>(value.str()).ok()
+}
 
 #[doc(hidden)]
+#[allow(deprecated)]
+pub fn try_parse_json_nullN(_value: Option<()>) -> Option<Variant> {
+    None
+}
+
+some_polymorphic_null_function1!(try_parse_json, s, SqlString, LegacyVariant);
+
+#[doc(hidden)]
+#[allow(deprecated)]
 pub fn to_json_V(value: Variant) -> Option<SqlString> {
     match value.to_json_string() {
         Ok(s) => Some(SqlString::from(s)),
@@ -707,7 +731,7 @@ pub fn to_json_V(value: Variant) -> Option<SqlString> {
     }
 }
 
-some_polymorphic_null_function1!(to_json, V, Variant, SqlString);
+some_polymorphic_null_function1!(to_json, V, LegacyVariant, SqlString);
 
 #[doc(hidden)]
 pub fn to_json_nullN(_value: Option<()>) -> Option<SqlString> {
@@ -1032,5 +1056,16 @@ mod test {
             std::mem::size_of::<ArchivedString>()
                 < std::mem::size_of::<ArchivedOption<ArchivedString>>()
         )
+    }
+}
+
+/// A `SqlString` archives to `ArchivedString`, whose hash already matches the
+/// decoded one, so only the decoded side needs saying.
+impl crate::__HashRepr for SqlString {
+    const FAITHFUL: bool = true;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        ::std::hash::Hash::hash(self, state)
     }
 }

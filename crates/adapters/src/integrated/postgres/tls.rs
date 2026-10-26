@@ -1,28 +1,13 @@
 use anyhow::{Context, Result as AnyResult};
 use feldera_types::transport::postgres::PostgresTlsConfig;
-use openssl::{
-    pkey::PKey,
-    rsa::Rsa,
-    ssl::{SslConnector, SslConnectorBuilder, SslFiletype, SslMethod},
-    x509::X509,
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
-use postgres_openssl::MakeTlsConnector;
-use std::{io::Write, path::PathBuf};
-use tempfile::NamedTempFile;
-
-/// Writes the given certificate to file and returns the file path.
-fn write_ca_cert_to_file(cert: &str) -> AnyResult<PathBuf> {
-    let mut file =
-        NamedTempFile::new().context("failed to create tempfile to write CA certificate to")?;
-
-    file.write_all(cert.as_bytes())
-        .context("failed to write CA certificate to tempfile")?;
-    file.flush()
-        .context("failed to flush CA certificate to tempfile")?;
-
-    let (_, path) = file.keep()?;
-    Ok(path)
-}
+use std::sync::Arc;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Resolves the configured certificate-authority certificate(s) to PEM text.
 ///
@@ -53,104 +38,60 @@ pub(crate) fn resolve_ca_pem(
     }
 }
 
-/// Configures SSL certificates for the PostgreSQL connection if enabled.
-///
-/// Sets the CA certificate (`ssl_ca_pem`) and optionally the client certificate
-/// and private key when provided.
-fn set_certs(
-    builder: &mut SslConnectorBuilder,
-    config: &PostgresTlsConfig,
-    endpoint_name: &str,
-) -> AnyResult<()> {
-    let Some(ca_cert) = resolve_ca_pem(config, endpoint_name)? else {
-        return Ok(());
-    };
-    let ca_cert_path = write_ca_cert_to_file(&ca_cert)?;
-
-    builder
-        .set_ca_file(ca_cert_path)
-        .context("failed to set CA certificate in SSL connector")?;
-
-    fn builder_set_client_from_pem(builder: &mut SslConnectorBuilder, pem: &str) -> AnyResult<()> {
-        let cert =
-            X509::from_pem(pem.as_bytes()).context("failed to parse client certificate as X509")?;
-        builder
-            .set_certificate(&cert)
-            .context("failed to set client certificate in SSL connector")?;
-        Ok(())
-    }
-
-    fn builder_set_client_key_from_pem(
-        builder: &mut SslConnectorBuilder,
-        pem: &str,
-    ) -> AnyResult<()> {
-        let rsa = Rsa::private_key_from_pem(pem.as_bytes())
-            .context("failed to parse client private key as RSA")?;
-        let key = PKey::from_rsa(rsa).context("failed to client private key from RSA")?;
-        builder
-            .set_private_key(key.as_ref())
-            .context("failed to set client private key")?;
-        Ok(())
-    }
-
-    // Set the client certificate, `ssl_client_pem` takes priority.
+/// Resolves the client certificate chain, preferring inline PEM over a path.
+fn resolve_client_cert_pem(config: &PostgresTlsConfig) -> AnyResult<Option<String>> {
     match (&config.ssl_client_pem, &config.ssl_client_location) {
         (Some(pem), Some(_)) => {
             tracing::warn!(
                 "postgres: both `ssl_client_pem` and `ssl_client_location` are provided; using `ssl_client_pem`"
             );
-            builder_set_client_from_pem(builder, pem)?;
+            Ok(Some(pem.clone()))
         }
-        (Some(pem), None) => {
-            builder_set_client_from_pem(builder, pem)?;
-        }
-        (None, Some(location)) => {
-            builder
-                .set_certificate_file(location, SslFiletype::PEM)
-                .context("failed to set client certificate")?;
-        }
-        // No client cert — ssl_certificate_chain_location only applies to the
-        // client-side cert chain, so nothing more to configure here.
-        (None, None) => return Ok(()),
+        (Some(pem), None) => Ok(Some(pem.clone())),
+        (None, Some(location)) => Ok(Some(
+            std::fs::read_to_string(location)
+                .with_context(|| format!("failed to read client certificate at '{location}'"))?,
+        )),
+        (None, None) => Ok(None),
     }
+}
 
-    // Set the client key, `ssl_client_key` takes priority.
+/// Resolves the client private key, preferring inline PEM over a path.
+fn resolve_client_key_pem(config: &PostgresTlsConfig) -> AnyResult<Option<String>> {
     match (&config.ssl_client_key, &config.ssl_client_key_location) {
         (Some(key), Some(_)) => {
             tracing::warn!(
                 "postgres: both `ssl_client_key` and `ssl_client_key_location` are provided; using `ssl_client_key`"
             );
-            builder_set_client_key_from_pem(builder, key)?;
+            Ok(Some(key.clone()))
         }
-        (Some(key), None) => {
-            builder_set_client_key_from_pem(builder, key)?;
-        }
-        (None, Some(location)) => {
-            builder
-                .set_private_key_file(location, SslFiletype::PEM)
-                .context("failed to set client private key")?;
-        }
-        (None, None) => return Ok(()),
+        (Some(key), None) => Ok(Some(key.clone())),
+        (None, Some(location)) => Ok(Some(
+            std::fs::read_to_string(location)
+                .with_context(|| format!("failed to read client private key at '{location}'"))?,
+        )),
+        (None, None) => Ok(None),
     }
-
-    // Set the SSL chain certificate.
-    if let Some(chain) = &config.ssl_certificate_chain_location {
-        builder
-            .set_certificate_chain_file(chain)
-            .context("failed to set certificate chain")?;
-    }
-
-    Ok(())
 }
 
-/// Builds a [`MakeTlsConnector`] from the given TLS configuration.
+/// Parses every certificate in `pem`.
+fn parse_certs(pem: &str, what: &str) -> AnyResult<Vec<CertificateDer<'static>>> {
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem.as_bytes()).collect();
+    let certs = certs.with_context(|| format!("failed to parse {what} as PEM certificates"))?;
+    if certs.is_empty() {
+        anyhow::bail!("{what} contains no certificates");
+    }
+    Ok(certs)
+}
+
+/// Builds a [`MakeRustlsConnect`] from the given TLS configuration.
 ///
 /// Returns `None` if no TLS configuration is provided, meaning the caller
 /// should use `NoTls` instead.
 pub(crate) fn make_tls_connector(
     tls: &PostgresTlsConfig,
     endpoint_name: &str,
-) -> AnyResult<Option<MakeTlsConnector>> {
+) -> AnyResult<Option<MakeRustlsConnect>> {
     if !tls.has_tls()
         && (tls.ssl_client_pem.is_some()
             || tls.ssl_client_location.is_some()
@@ -168,23 +109,110 @@ pub(crate) fn make_tls_connector(
         return Ok(None);
     }
 
-    let mut builder =
-        SslConnector::builder(SslMethod::tls()).context("failed to build SSL connection")?;
+    let Some(ca_pem) = resolve_ca_pem(tls, endpoint_name)? else {
+        return Ok(None);
+    };
 
-    set_certs(&mut builder, tls, endpoint_name)?;
-
-    let mut connector = MakeTlsConnector::new(builder.build());
-
-    if Some(false) == tls.verify_hostname {
-        let endpoint_name = endpoint_name.to_owned();
-        connector.set_callback(move |ctx, _| {
-            tracing::warn!("postgres: ssl: disabling hostname verification in connector '{endpoint_name}'. The PostgreSQL server's hostname may not match the one specified in the SSL certificate.");
-            ctx.set_verify_hostname(false);
-            Ok(())
-        });
+    let mut roots = RootCertStore::empty();
+    for cert in parse_certs(&ca_pem, "CA certificate")? {
+        roots
+            .add(cert)
+            .context("failed to add CA certificate to the trust store")?;
     }
 
-    Ok(Some(connector))
+    // `verify_hostname: false` keeps its openssl-connector semantics: the
+    // chain is verified against the CA, but the server name need not appear
+    // in the certificate.
+    let builder = if tls.verify_hostname == Some(false) {
+        tracing::warn!(
+            "postgres: TLS hostname verification is disabled in endpoint '{endpoint_name}'; \
+             the server certificate is still verified against the configured CA."
+        );
+        let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .context("failed to build the TLS certificate verifier")?;
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipHostnameVerification(verifier)))
+    } else {
+        ClientConfig::builder().with_root_certificates(roots)
+    };
+
+    // A client certificate needs its key, and the chain file extends it.
+    let config = match (resolve_client_cert_pem(tls)?, resolve_client_key_pem(tls)?) {
+        (Some(cert_pem), Some(key_pem)) => {
+            let mut chain = parse_certs(&cert_pem, "client certificate")?;
+            if let Some(location) = &tls.ssl_certificate_chain_location {
+                let chain_pem = std::fs::read_to_string(location)
+                    .with_context(|| format!("failed to read certificate chain at '{location}'"))?;
+                chain.extend(parse_certs(&chain_pem, "certificate chain")?);
+            }
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .context("failed to parse client private key as PEM")?
+                .context("client private key PEM contains no key")?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .context("failed to configure client certificate authentication")?
+        }
+        (Some(_), None) => {
+            anyhow::bail!("postgres: a client certificate was provided without a private key")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("postgres: a client private key was provided without a certificate")
+        }
+        (None, None) => builder.with_no_client_auth(),
+    };
+
+    Ok(Some(MakeRustlsConnect::new(config)))
+}
+
+/// Verifies the certificate chain but tolerates a name mismatch,
+/// the semantics for the `verify_hostname: false` setting.
+#[derive(Debug)]
+struct SkipHostnameVerification(Arc<WebPkiServerVerifier>);
+
+impl ServerCertVerifier for SkipHostnameVerification {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(rustls::Error::InvalidCertificate(CertificateError::NotValidForName))
+            | Err(rustls::Error::InvalidCertificate(CertificateError::NotValidForNameContext {
+                ..
+            })) => Ok(ServerCertVerified::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
 }
 
 /// Extracts the trusted root certificates from [`PostgresTlsConfig`]
@@ -300,5 +328,80 @@ mod tests {
         .unwrap();
         assert!(tls.enabled);
         assert!(tls.trusted_root_certs.contains("BEGIN CERTIFICATE"));
+    }
+
+    /// CA plus a leaf certificate whose only SAN is `san`.
+    fn ca_and_leaf(san: &str) -> (String, CertificateDer<'static>) {
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_pem = ca_params.clone().self_signed(&ca_key).unwrap().pem();
+
+        let mut leaf_params = rcgen::CertificateParams::default();
+        leaf_params.subject_alt_names = vec![rcgen::SanType::DnsName(san.try_into().unwrap())];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        (ca_pem, leaf.der().clone())
+    }
+
+    fn webpki_verifier(ca_pem: &str) -> Arc<WebPkiServerVerifier> {
+        // The binary installs the process-level provider at startup; tests
+        // must do it themselves.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut roots = RootCertStore::empty();
+        for cert in parse_certs(ca_pem, "CA certificate").unwrap() {
+            roots.add(cert).unwrap();
+        }
+        WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap()
+    }
+
+    fn verify(
+        verifier: &dyn ServerCertVerifier,
+        leaf: &CertificateDer<'static>,
+        host: &str,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        verifier.verify_server_cert(
+            leaf,
+            &[],
+            &ServerName::try_from(host.to_string()).unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+    }
+
+    /// `verify_hostname: false` semantics: a name mismatch passes, but only a
+    /// name mismatch.
+    #[test]
+    fn test_skip_hostname_tolerates_name_mismatch_only() {
+        let (ca_pem, leaf) = ca_and_leaf("server.example");
+        let inner = webpki_verifier(&ca_pem);
+
+        assert!(matches!(
+            verify(inner.as_ref(), &leaf, "other.example"),
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. }
+            ))
+        ));
+
+        let skip = SkipHostnameVerification(inner);
+        assert!(verify(&skip, &leaf, "other.example").is_ok());
+        assert!(verify(&skip, &leaf, "server.example").is_ok());
+    }
+
+    /// The chain is still verified: a certificate from an untrusted CA fails
+    /// even with hostname verification disabled.
+    #[test]
+    fn test_skip_hostname_rejects_untrusted_ca() {
+        let (trusted_ca_pem, _) = ca_and_leaf("server.example");
+        let (_, other_leaf) = ca_and_leaf("server.example");
+
+        let skip = SkipHostnameVerification(webpki_verifier(&trusted_ca_pem));
+        assert!(matches!(
+            verify(&skip, &other_leaf, "server.example"),
+            Err(rustls::Error::InvalidCertificate(_))
+        ));
     }
 }

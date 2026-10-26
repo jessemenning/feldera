@@ -8,6 +8,8 @@ it on as an open-source patch. The e-mail address used to sign must match the e-
 author. If you set your `user.name` and `user.email` git config values, you can sign your commit automatically
 with `git commit -s`.
 
+Please also read our [AI Policy](AI_POLICY.md). It explains when you must file a design first and how to disclose AI use.
+
 ## Dependencies
 
 Our team develops and tests using Linux and MacOS. Windows Subsystem for Linux works fine too.
@@ -15,22 +17,9 @@ Our team develops and tests using Linux and MacOS. Windows Subsystem for Linux w
 The Feldera container images and CI workflows use Linux. You can see our setup in
 our [Dockerfile](deploy/Dockerfile).
 
-Our dependencies for building the project are:
-
-  - C and C++ compiler toolchain (e.g., gcc, gcc++)
-  - cmake
-  - libssl-dev
-  - libsasl2-dev
-  - zlib1g-dev
-  - a Rust tool chain (install rustup and the default toolchain)
-  - a Java Virtual Machine (at least Java 19)
-  - maven
-  - graphviz
-  - Python 3.10
-  - Bun (https://bun.sh/docs/installation)
-
-Additional dependencies are automatically installed by the Rust,
-maven, Python, and TypeScript build tools.
+See [Running Feldera from sources](README.md#️-running-feldera-from-sources) in the README
+for the list of build dependencies and how to install them, including librdkafka, which the
+Kafka connectors link dynamically and which the workspace will not build without.
 
 ## Contribution Flow
 
@@ -148,20 +137,8 @@ When opening a new issue, try to roughly follow the commit message format conven
 
 ## Building Feldera from sources
 
-Feldera is implemented in Rust and uses Rust's `cargo` build system. The SQL
-to DBSP compiler is implemented in Java and uses `maven` as its build system.
-
-You can build the rust sources by runnning the following at the top level of this tree.
-
-```
-cargo build
-```
-
-To build the SQL to DBSP compiler, run the following from `sql-to-dbsp-compiler`:
-
-```
-./build.sh
-```
+See [Running Feldera from sources](README.md#️-running-feldera-from-sources) in the README
+for build dependencies and steps.
 
 If you want to develop Feldera without installing the required toolchains
 locally, you can use Github Codespaces; from
@@ -262,7 +239,22 @@ the new version. The release CI scripts will then run in this order:
   - Releases the rust crates to crates.io
   - Determines the next version (this is controlled by a `RELEASE_NEXT_VERSION` variable in the repo settings)
   - Bumps the versions in Cargo.toml and pyproject.toml and openapi.yaml to the next version
+  - Files the changelog entries the released commit carried under a `## v$version` heading
   - Commits and pushes the changes to main
 
 Note that the release process requires that the commit you want to release was merged into main
 through the merge queue, otherwise the build artifacts will not be available.
+
+### Changelog entries
+
+Add a user-visible change as a bullet under `## Unreleased` in
+`docs.feldera.com/docs/changelog.md`, and leave it there.  The post-release job
+files the entries the release carried under its own heading by running
+
+```
+scripts/file_changelog_release.py --tag v0.348.0 --changelog docs.feldera.com/docs/changelog.md
+```
+
+The script that refiles changlog entries at release time may fail;
+this will produce a warning and the entries will remain `## Unreleased`.
+

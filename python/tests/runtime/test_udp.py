@@ -4,11 +4,7 @@ from feldera import PipelineBuilder
 from tests import TEST_CLIENT
 from tests.platform.helper import PipelineTestCase
 from feldera.runtime_config import Resources, RuntimeConfig
-from feldera.testutils import (
-    FELDERA_TEST_NUM_WORKERS,
-    FELDERA_TEST_NUM_HOSTS,
-    min_datafusion_memory_mb,
-)
+from feldera.testutils import FELDERA_TEST_NUM_WORKERS, FELDERA_TEST_NUM_HOSTS
 
 
 # Test user-defined preprocessor
@@ -101,22 +97,19 @@ impl PreprocessorFactory for LoggerPreprocessorFactory {
 tracing = { version = "0.1.40" }
 """
 
-        # Scales with FELDERA_TEST_NUM_WORKERS/_HOSTS so the ad-hoc ORDER BY
-        # query below doesn't fail with "Resources exhausted" if either
-        # changes. See min_datafusion_memory_mb.
-        datafusion_memory_mb = min_datafusion_memory_mb(
-            FELDERA_TEST_NUM_WORKERS, FELDERA_TEST_NUM_HOSTS
-        )
-
         pipeline = PipelineBuilder(
             TEST_CLIENT,
             name=self.register_for_cleanup("test_udps"),
             sql=sql,
             udf_rust=udfs,
             udf_toml=toml,
+            # A 512 MB pool across 8 workers is the shape that used to fail:
+            # the ad-hoc ORDER BY below pre-booked 64 MiB per worker, more
+            # than the whole pool, before reading a row. Keep it small so the
+            # test keeps covering that.
             runtime_config=RuntimeConfig(
-                datafusion_memory_mb=datafusion_memory_mb,
-                resources=Resources(memory_mb_min=datafusion_memory_mb + 512),
+                datafusion_memory_mb=512,
+                resources=Resources(memory_mb_min=1024),
                 workers=FELDERA_TEST_NUM_WORKERS,
                 hosts=FELDERA_TEST_NUM_HOSTS,
             ),
@@ -132,7 +125,7 @@ tracing = { version = "0.1.40" }
                 break
         hash = pipeline.query_hash("SELECT * FROM v ORDER BY i, ti, si, bi")
         assert (
-            hash == "29C468885BA59EAD1A0BA70C07A997401030261AB1CDEB9EA7B13B0DE6722646"
+            hash == "C1B57E4FEE396A3AFE4DD80EE429D89B13790106F86DF5FC4B04F114320844E2"
         ), "Hash does not match"
         pipeline.stop(force=True)
         pipeline.delete(True)

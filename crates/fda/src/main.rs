@@ -1,25 +1,30 @@
 //! A CLI App for the Feldera REST API.
 
 use chrono::Utc;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::CompleteEnv;
-use feldera_observability as observability;
 use feldera_rest_api::types::*;
 use feldera_rest_api::*;
+use feldera_types::checkpoint::CheckpointResponse;
 use feldera_types::config::{FtModel, RuntimeConfig, StorageOptions};
+use feldera_types::duration::ConfigDuration;
 use feldera_types::error::ErrorResponse;
+use feldera_types::size::ConfigSize;
 use feldera_types::transport::clock::ClockAdvanceRequest;
 use futures_util::StreamExt;
 use json_to_table::json_to_table;
 use log::{debug, error, info, trace, warn};
+use progenitor_client::ClientInfo;
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue};
 use serde_json::json;
 use std::convert::Infallible;
+use std::fmt::Display;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::path::PathBuf;
+use std::str::FromStr;
 use tabled::builder::Builder;
 use tabled::settings::Style;
 use tempfile::tempfile;
@@ -35,12 +40,14 @@ mod cli;
 mod debug;
 mod shell;
 mod tags;
+mod util;
 
 pub(crate) const UPGRADE_NOTICE: &str = "Try upgrading to the latest CLI version to resolve this issue. Also make sure the pipeline is recompiled with the latest version of feldera. Report it on github.com/feldera/feldera if the issue persists.";
 
 use crate::adhoc::handle_adhoc_query;
 use crate::cli::*;
 use crate::shell::shell;
+use crate::util::{is_sensitive_header, parse_header, terminal_safe};
 
 /// Creates a unique filename by appending a number to the base name if it already exists.
 fn unique_file(base: &str, extension: &str) -> Result<(PathBuf, File), std::io::Error> {
@@ -75,20 +82,64 @@ fn make_auth_headers(auth: &Option<String>) -> Result<HeaderMap, InvalidHeaderVa
     Ok(headers)
 }
 
-/// Create a client with the given host, auth, and timeout.  If `insecure` is
-/// true, then the client won't verify TLS certificates.  If `tls_cert` is
-/// provided, its contents are parsed as one or more PEM-encoded certificates
-/// and each is added to the set of trusted roots for HTTPS connections.
-pub(crate) fn make_client(
-    host: String,
-    insecure: bool,
-    tls_cert: Option<std::path::PathBuf>,
-    auth: Option<String>,
-    timeout: Option<u64>,
-) -> Result<Client, Box<dyn std::error::Error>> {
-    let mut client_builder = reqwest::ClientBuilder::new().danger_accept_invalid_certs(insecure);
+/// Connection settings for [`make_client`], straight from the global CLI
+/// flags of the same names.
+pub(crate) struct ClientOpts {
+    pub host: String,
+    /// Accept invalid TLS certificates.
+    pub insecure: bool,
+    /// Extra PEM-encoded root certificates to trust for HTTPS.
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// Static API key.
+    pub auth: Option<String>,
+    /// File holding a bearer token; overrides `auth`.
+    pub oidc_token_file: Option<std::path::PathBuf>,
+    /// Extra headers, each spelled `Name: Value`, sent on every request.
+    pub headers: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    /// Sent as the `Feldera-Tenant` header on every request.
+    pub tenant: Option<String>,
+    /// How often a transiently failed request is resent.
+    pub retries: u32,
+}
 
-    if let Some(timeout) = timeout {
+impl ClientOpts {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            host: cli.host.clone(),
+            insecure: cli.insecure,
+            tls_cert: cli.tls_cert.clone(),
+            auth: cli.auth.clone(),
+            oidc_token_file: cli.oidc_token_file.clone(),
+            headers: cli.headers.clone(),
+            timeout_secs: cli.timeout,
+            tenant: cli.tenant.clone(),
+            retries: cli.retries,
+        }
+    }
+}
+
+/// Create a client from the connection settings in `opts`.
+pub(crate) fn make_client(opts: ClientOpts) -> Result<Client, Box<dyn std::error::Error>> {
+    let ClientOpts {
+        host,
+        insecure,
+        tls_cert,
+        auth,
+        oidc_token_file,
+        headers: extra_headers,
+        timeout_secs,
+        tenant,
+        retries,
+    } = opts;
+    // reqwest-websocket needs HTTP/1.1. Over TLS, ALPN would otherwise
+    // negotiate h2 and the websocket upgrade in `handle_adhoc_query` fails
+    // with "the server responded with a different http version".
+    let mut client_builder = reqwest::ClientBuilder::new()
+        .http1_only()
+        .danger_accept_invalid_certs(insecure);
+
+    if let Some(timeout) = timeout_secs {
         client_builder = client_builder.timeout(Duration::from_secs(timeout));
     }
 
@@ -117,16 +168,74 @@ pub(crate) fn make_client(
         }
     }
 
+    // The tenant selector is not a credential and travels on any scheme;
+    // bearer credentials go over https alone. Only read the token file if
+    // the credentials will actually be sent.
+    let mut headers = HeaderMap::new();
+    if let Some(tenant) = &tenant {
+        headers.insert(
+            "Feldera-Tenant",
+            HeaderValue::from_str(tenant)
+                .map_err(|e| format!("Invalid --tenant value `{tenant}`: {e}"))?,
+        );
+    }
     if host.starts_with("https://") {
-        client_builder = client_builder.default_headers(make_auth_headers(&auth)?);
-    } else if host.starts_with("http://") && auth.is_some() {
+        let resolved_auth = match oidc_token_file {
+            Some(path) => Some(read_oidc_token_file(&path)?),
+            None => auth,
+        };
+        headers.extend(make_auth_headers(&resolved_auth)?);
+    } else if host.starts_with("http://") && (auth.is_some() || oidc_token_file.is_some()) {
         warn!(
-            "The provided API key is not added to the request because {host} does not use `https`."
+            "The provided credentials are not added to the request because {host} does not use `https`."
         );
     }
 
+    // Applied last, so that `--header` overrides what fda would otherwise send
+    // under that name. Each name carries one value: `default_headers` keeps a
+    // single value per name, so a repeated name is the later value.
+    for spec in &extra_headers {
+        let (name, value) = parse_header(spec)?;
+        if host.starts_with("http://") && is_sensitive_header(&name) {
+            warn!("Header `{name}` is sent in the clear because {host} does not use `https`.");
+        }
+        headers.insert(name, value);
+    }
+    client_builder = client_builder.default_headers(headers);
+
     let client = client_builder.build()?;
-    Ok(Client::new_with_client(host.as_str(), client))
+    let retry_policy = RetryPolicy {
+        max_retries: retries,
+        ..RetryPolicy::default()
+    };
+    Ok(Client::new_with_client(host.as_str(), client, retry_policy))
+}
+
+/// Read the bearer token in `path`, trimmed. Errors if the file is unreadable,
+/// holds nothing but whitespace, or holds a character that cannot travel in a
+/// header value, which is what a second line is.
+fn read_oidc_token_file(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let token = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read OIDC token file `{}`: {e}", path.display()))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(format!("OIDC token file `{}` is empty", path.display()).into());
+    }
+    // The header rejects the same set; checking here names the file and the
+    // spot instead of a bare "failed to parse header value".
+    if let Some(offset) = token.find(|c: char| c.is_ascii_control() && c != '\t') {
+        let found = match token.as_bytes()[offset] {
+            b'\n' | b'\r' => "a line break",
+            _ => "a control character",
+        };
+        return Err(format!(
+            "OIDC token file `{}` does not hold a single-line token: found {found} at byte {offset}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(token)
 }
 
 /// A helper struct that disables the cache for a pipeline.
@@ -177,11 +286,12 @@ impl CacheDisabler {
                 udf_toml: None,
                 program_config: Some(pc),
                 runtime_config: None,
+                deployment_config: None,
             })
             .send()
             .await
             .map_err(handle_errors_fatal(
-                self.client.baseurl().clone(),
+                self.client.baseurl().to_string(),
                 format!("Failed to set compilation cache to {flag}").leak(),
                 1,
             ))
@@ -198,7 +308,7 @@ fn handle_errors_fatal(
     Box::new(move |err: Error<ErrorResponse>| -> Infallible {
         match err {
             Error::ErrorResponse(e) => {
-                eprintln!("{}", e.message);
+                eprintln!("{}", terminal_safe(&e.message));
                 debug!("Details: {:#?}", e.details);
             }
             Error::InvalidRequest(s) => {
@@ -238,53 +348,68 @@ fn handle_errors_fatal(
                 error!("{}", UPGRADE_NOTICE);
             }
             Error::UnexpectedResponse(r) => {
-                if r.status() == StatusCode::UNAUTHORIZED {
-                    // The unauthorized error is often missing in the spec, and we can't currently have multiple
-                    // return types until https://github.com/oxidecomputer/progenitor/pull/857 lands.
-                    eprint!("{}: ", msg);
-                    eprintln!("Unauthorized. Check your API key for {server}.");
-                    if server.starts_with("http://") {
-                        eprintln!("Did you mean to use https?");
+                // Auth (401) and permission (403) failures are correct, expected
+                // responses that the OpenAPI spec does not declare (so progenitor
+                // surfaces them here rather than as `ErrorResponse`). Prefer the
+                // server's own `message` so a routine RBAC denial reads cleanly
+                // instead of the misleading "version mismatch / file a bug" notice.
+                let status = r.status();
+                let is_http = server.starts_with("http://");
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().flush().unwrap();
+                let h = Handle::current();
+                // A separate thread because making this fn async is impractical here.
+                let body = std::thread::spawn(move || h.block_on(r.text()).ok())
+                    .join()
+                    .unwrap();
+                // Lenient parse: pull `message` out of any JSON body (the minimal
+                // auth error lacks the `details` field a strict `ErrorResponse` needs).
+                let server_msg = body.as_deref().and_then(|b| {
+                    serde_json::from_str::<serde_json::Value>(b)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("message")
+                                .and_then(|m| m.as_str())
+                                .map(str::to_string)
+                        })
+                });
+                match server_msg {
+                    Some(m) => {
+                        eprintln!("{msg}: {}", terminal_safe(&m));
+                        if status == StatusCode::UNAUTHORIZED && is_http {
+                            eprintln!("Did you mean to use https?");
+                        }
                     }
-                } else {
-                    warn!(
-                        "Unexpected error response from {server} -- this can happen if you're running different fda and feldera versions."
-                    );
-                    warn!("{}", UPGRADE_NOTICE);
-                    debug!(
-                        "Received HTTP status `{}` which is not declared as an expected response in OpenAPI.",
-                        r.status()
-                    );
-                    std::io::stdout().flush().unwrap();
-                    std::io::stderr().flush().unwrap();
-
-                    eprint!("{}", msg);
-                    let h = Handle::current();
-                    // This spawns a separate thread because it's very hard to make this function async, I tried.
-                    let st = std::thread::spawn(move || match h.block_on(r.text()) {
-                        Ok(body) => {
-                            if let Ok(error) = serde_json::from_str::<ErrorResponse>(&body) {
-                                eprintln!(": {}", error.message);
-                            } else {
-                                eprintln!(": {body}");
-                            }
+                    // A bodyless 401 is what the auth middleware answers when
+                    // no credentials arrived at all; the version-mismatch
+                    // notice would point in exactly the wrong direction.
+                    None if status == StatusCode::UNAUTHORIZED => {
+                        eprintln!("{msg}: authentication failed.");
+                        if is_http {
+                            eprintln!(
+                                "fda sends credentials only over https, so this request carried none. Did you mean to use https?"
+                            );
+                        } else {
+                            eprintln!("Check that the API key or token is valid and not expired.");
                         }
-                        _ => {
-                            eprintln!();
+                    }
+                    None => {
+                        warn!(
+                            "Unexpected error response from {server} -- this can happen if you're running different fda and feldera versions."
+                        );
+                        warn!("{}", UPGRADE_NOTICE);
+                        debug!(
+                            "Received HTTP status `{status}` which is not declared as an expected response in OpenAPI."
+                        );
+                        match body {
+                            Some(b) if !b.is_empty() => eprintln!("{msg}: {b}"),
+                            _ => eprintln!("{msg}"),
                         }
-                    });
-                    st.join().unwrap();
+                    }
                 }
             }
-            Error::PreHookError(e) => {
-                eprintln!("{}: ", msg);
-                error!("Unable to execute authentication pre-hook ({})", e);
-                error!("{}", UPGRADE_NOTICE);
-            }
-            Error::PostHookError(e) => {
-                eprintln!("{}: ", msg);
-                eprint!("ERROR: Unable to execute authentication post-hook ({})", e);
-                eprintln!("{}", UPGRADE_NOTICE);
+            Error::Custom(e) => {
+                eprintln!("{}: {}", msg, e);
             }
         };
         std::process::exit(exit_code);
@@ -293,22 +418,33 @@ fn handle_errors_fatal(
 
 async fn api_key_commands(format: OutputFormat, action: ApiKeyActions, client: Client) {
     match action {
-        ApiKeyActions::Create { name } => {
+        ApiKeyActions::Create { name, role } => {
             debug!("Creating API key: {}", name);
+            let role = match role {
+                ApiKeyRole::Read => feldera_rest_api::types::MintableKeyRole::Read,
+                ApiKeyRole::Write => feldera_rest_api::types::MintableKeyRole::Write,
+            };
             let response = client
                 .post_api_key()
-                .body(NewApiKeyRequest { name })
+                .body(NewApiKeyRequest {
+                    name,
+                    role: Some(role),
+                })
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to create API key",
                     1,
                 ))
                 .unwrap();
             match format {
                 OutputFormat::Text => {
-                    println!("API key '{}' created: {}", response.name, response.api_key);
+                    println!(
+                        "API key '{}' created: {}",
+                        terminal_safe(&response.name),
+                        response.api_key
+                    );
                 }
                 OutputFormat::Json => {
                     println!(
@@ -331,7 +467,7 @@ async fn api_key_commands(format: OutputFormat, action: ApiKeyActions, client: C
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to delete API key",
                     1,
                 ))
@@ -345,7 +481,7 @@ async fn api_key_commands(format: OutputFormat, action: ApiKeyActions, client: C
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to list API keys",
                     1,
                 ))
@@ -353,9 +489,13 @@ async fn api_key_commands(format: OutputFormat, action: ApiKeyActions, client: C
             match format {
                 OutputFormat::Text => {
                     let mut rows = vec![];
-                    rows.push(["name".to_string(), "id".to_string()]);
+                    rows.push(["name".to_string(), "role".to_string(), "id".to_string()]);
                     for key in response.iter() {
-                        rows.push([key.name.to_string(), key.id.0.to_string()]);
+                        rows.push([
+                            terminal_safe(&key.name),
+                            key.role.to_string(),
+                            key.id.0.to_string(),
+                        ]);
                     }
                     println!(
                         "{}",
@@ -378,6 +518,429 @@ async fn api_key_commands(format: OutputFormat, action: ApiKeyActions, client: C
     }
 }
 
+async fn oidc_trust_commands(format: OutputFormat, action: OidcTrustActions, client: Client) {
+    match action {
+        OidcTrustActions::Create {
+            name,
+            issuer,
+            subject,
+            audience,
+            description,
+            role,
+        } => {
+            debug!("Creating OIDC trust relationship: {name}");
+            let role = role.map(|r| match r {
+                TrustRole::Read => feldera_rest_api::types::MemberRole::Read,
+                TrustRole::Write => feldera_rest_api::types::MemberRole::Write,
+                TrustRole::Admin => feldera_rest_api::types::MemberRole::Admin,
+            });
+            let body = NewOidcTrustRequest::builder()
+                .name(name.clone())
+                .issuer(issuer)
+                .subject(subject)
+                .audience(audience)
+                .description(description)
+                .role(role);
+            let response = client
+                .post_oidc_trust()
+                .body(body)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to create OIDC trust relationship",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    println!(
+                        "OIDC trust '{}' created (id: {})",
+                        response.name, response.id.0
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize OIDC trust response")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        OidcTrustActions::Delete { name } => {
+            debug!("Deleting OIDC trust relationship: {name}");
+            client
+                .delete_oidc_trust()
+                .name(name.as_str())
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to delete OIDC trust relationship",
+                    1,
+                ))
+                .unwrap();
+            println!("OIDC trust '{name}' deleted");
+        }
+        OidcTrustActions::List => {
+            debug!("Listing OIDC trust relationships");
+            let response = client
+                .list_oidc_trust()
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to list OIDC trust relationships",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![[
+                        "name".to_string(),
+                        "role".to_string(),
+                        "issuer".to_string(),
+                        "subject".to_string(),
+                        "audience".to_string(),
+                        "description".to_string(),
+                    ]];
+                    for t in response.iter() {
+                        rows.push([
+                            terminal_safe(&t.name),
+                            t.role.to_string(),
+                            terminal_safe(&t.issuer),
+                            terminal_safe(&t.subject),
+                            terminal_safe(&t.audience.clone().unwrap_or_default()),
+                            terminal_safe(&t.description.clone().unwrap_or_default()),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize OIDC trust list")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+async fn member_commands(format: OutputFormat, action: MemberActions, client: Client) {
+    match action {
+        MemberActions::List => {
+            debug!("Listing tenant members");
+            let response = client
+                .list_tenant_users()
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to list tenant members",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![[
+                        "user id".to_string(),
+                        "name".to_string(),
+                        "subject".to_string(),
+                        "email".to_string(),
+                        "verified".to_string(),
+                        "role".to_string(),
+                        "origin".to_string(),
+                    ]];
+                    for m in response.iter() {
+                        rows.push([
+                            m.user_id.0.to_string(),
+                            terminal_safe(&m.display_name.clone().unwrap_or_default()),
+                            terminal_safe(&m.subject),
+                            terminal_safe(&m.email.clone().unwrap_or_default()),
+                            // Absent from an older manager's answer, which is
+                            // the same as not verified.
+                            if m.email_verified.unwrap_or(false) {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                            .to_string(),
+                            m.role.to_string(),
+                            m.origin.as_ref().map(|o| o.to_string()).unwrap_or_default(),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize member list")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        MemberActions::Add {
+            subject,
+            role,
+            email,
+        } => {
+            debug!("Adding member {subject}");
+            let response = client
+                .add_tenant_user()
+                .body_map(|body| {
+                    body.subject(subject.clone())
+                        .role(role)
+                        .email(email.clone())
+                })
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to add tenant member",
+                    1,
+                ))
+                .unwrap();
+            println!(
+                "Added '{subject}' as {role} (user id {}).",
+                response.user_id.0
+            );
+        }
+        MemberActions::SetRole { user_id, role } => {
+            debug!("Setting role for {user_id}");
+            client
+                .put_tenant_user()
+                .user_id(user_id)
+                .body_map(|body| body.role(role))
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to set member role",
+                    1,
+                ))
+                .unwrap();
+            println!("User {user_id} is now {role}.");
+        }
+        MemberActions::Remove { user_id } => {
+            debug!("Removing member {user_id}");
+            client
+                .delete_tenant_user()
+                .user_id(user_id)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to remove tenant member",
+                    1,
+                ))
+                .unwrap();
+            println!("Removed user {user_id} from the tenant.");
+        }
+    }
+}
+
+async fn tenant_commands(format: OutputFormat, action: TenantActions, client: Client) {
+    match action {
+        TenantActions::List => {
+            debug!("Listing tenants");
+            let response = client
+                .list_tenants()
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to list tenants",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let mut rows = vec![[
+                        "name".to_string(),
+                        "id".to_string(),
+                        "initial provider".to_string(),
+                    ]];
+                    for tenant in response.iter() {
+                        rows.push([
+                            terminal_safe(&tenant.name),
+                            tenant.id.0.to_string(),
+                            terminal_safe(&tenant.initial_provider),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize tenant list")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        TenantActions::Get { tenant } => {
+            debug!("Retrieving tenant {tenant}");
+            let response = client
+                .get_tenant()
+                .tenant_id(&tenant)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to retrieve tenant",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    let rows = vec![
+                        [
+                            "name".to_string(),
+                            "id".to_string(),
+                            "initial provider".to_string(),
+                        ],
+                        [
+                            response.name.clone(),
+                            response.id.0.to_string(),
+                            response.initial_provider.clone(),
+                        ],
+                    ];
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize tenant")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        TenantActions::Create { name } => {
+            debug!("Creating tenant {name}");
+            let response = client
+                .create_tenant()
+                .body_map(|body| body.name(name.clone()))
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to create tenant",
+                    1,
+                ))
+                .unwrap();
+            // 201 is a fresh creation; 200 returns the pre-existing tenant.
+            let created = response.status() == reqwest::StatusCode::CREATED;
+            match format {
+                OutputFormat::Text => {
+                    if created {
+                        println!(
+                            "Created tenant '{}' ({}).",
+                            terminal_safe(&response.name),
+                            response.id.0
+                        );
+                    } else {
+                        println!(
+                            "Tenant '{}' already exists ({}).",
+                            response.name, response.id.0
+                        );
+                    }
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize tenant")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
+        TenantActions::Rename {
+            tenant_id,
+            name,
+            displace_existing,
+        } => {
+            debug!("Renaming tenant {tenant_id} to {name}");
+            let response = client
+                .patch_tenant()
+                .tenant_id(tenant_id)
+                .body_map(|body| body.name(name.clone()).displace_existing(displace_existing))
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to rename tenant",
+                    1,
+                ))
+                .unwrap();
+            // `displaced` is set when --displace-existing took the name from
+            // another tenant; that tenant was renamed and keeps its contents.
+            match &response.displaced {
+                Some(displaced) => println!(
+                    "Renamed tenant {tenant_id} to '{name}'. The tenant that held the name is now '{}' ({}).",
+                    displaced.name, displaced.id.0
+                ),
+                None => println!("Renamed tenant {tenant_id} to '{name}'."),
+            }
+        }
+        TenantActions::Delete { tenant_id } => {
+            debug!("Deleting tenant {tenant_id}");
+            client
+                .delete_tenant()
+                .tenant_id(tenant_id)
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to delete tenant",
+                    1,
+                ))
+                .unwrap();
+            println!("Tenant {tenant_id} deleted.");
+        }
+    }
+}
+
 async fn pipelines(format: OutputFormat, client: Client) {
     debug!("Listing pipelines");
     let response = client
@@ -385,7 +948,7 @@ async fn pipelines(format: OutputFormat, client: Client) {
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to list pipelines",
             1,
         ))
@@ -394,7 +957,7 @@ async fn pipelines(format: OutputFormat, client: Client) {
     rows.push(["name".to_string(), "status".to_string()]);
     for pipeline in response.iter() {
         rows.push([
-            pipeline.name.to_string(),
+            terminal_safe(&pipeline.name),
             pipeline.deployment_status.to_string(),
         ]);
     }
@@ -419,17 +982,58 @@ async fn pipelines(format: OutputFormat, client: Client) {
     }
 }
 
+/// The spelling of `key` that the user types on the command line.
+fn key_name(key: RuntimeConfigKey) -> String {
+    key.to_possible_value()
+        .map(|value| value.get_name().to_string())
+        .unwrap_or_else(|| format!("{key:?}"))
+}
+
+/// Parses `value` for `key`, keeping the reason a rejection happened.
+///
+/// The caller prints that reason, so a bad duration says which unit it wanted
+/// rather than only that the value was refused.
+fn parse_value<T>(key: RuntimeConfigKey, value: &str) -> Result<T, String>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    value.parse::<T>().map_err(|error| {
+        format!(
+            "`{value}` is not a valid value for `{}`: {error}",
+            key_name(key)
+        )
+    })
+}
+
+/// Parses a size for a key that once counted megabytes, refusing a bare
+/// number: `16000` meant sixteen gigabytes under the deprecated key, and as a
+/// size it would mean sixteen kilobytes, so the value must say its unit.
+fn parse_size_with_unit(key: RuntimeConfigKey, value: &str) -> Result<ConfigSize, String> {
+    match ConfigSize::from_str_with_unit(value) {
+        Ok((size, true)) => Ok(size),
+        Ok((_, false)) => Err(format!(
+            "`{value}` is not a valid value for `{}`: write a size with a unit, such as `{value}M`",
+            key_name(key)
+        )),
+        Err(error) => Err(format!(
+            "`{value}` is not a valid value for `{}`: {error}",
+            key_name(key)
+        )),
+    }
+}
+
 fn patch_runtime_config(
     rc: &mut RuntimeConfig,
     key: RuntimeConfigKey,
     value: &str,
-) -> Result<(), ()> {
+) -> Result<(), String> {
     match key {
         RuntimeConfigKey::Workers => {
-            rc.workers = value.parse().map_err(|_| ())?;
+            rc.workers = parse_value(key, value)?;
         }
         RuntimeConfigKey::Storage => {
-            let enable: bool = value.parse().map_err(|_| ())?;
+            let enable: bool = parse_value(key, value)?;
             if enable != rc.storage.is_some() {
                 rc.storage = enable.then(StorageOptions::default);
             }
@@ -438,67 +1042,136 @@ fn patch_runtime_config(
             rc.fault_tolerance.model = match value {
                 "false" | "none" => None,
                 "true" => Some(FtModel::default()),
-                _ => Some(value.parse().map_err(|_| ())?),
+                _ => Some(parse_value(key, value)?),
             }
         }
         RuntimeConfigKey::CheckpointInterval => {
-            rc.fault_tolerance.checkpoint_interval_secs = match value.parse().map_err(|_| ())? {
-                0 => None,
-                interval => Some(interval),
-            };
+            // The value of `--key checkpoint_interval` is text, so one key
+            // takes both a duration such as `5m` and the bare number of
+            // seconds the setting took before. `none` sends the explicit
+            // null that turns periodic checkpointing off.
+            rc.fault_tolerance.checkpoint_interval = Some(match value {
+                "none" | "null" => None,
+                _ => match value.parse::<u64>() {
+                    // A bare 0 disabled periodic checkpoints; `0s` would mean
+                    // the shortest interval instead, so tell the user to
+                    // write `none`.
+                    Ok(0) => {
+                        eprintln!(
+                            "a bare 0 is deprecated; write `none` to disable periodic checkpoints"
+                        );
+                        None
+                    }
+                    Ok(secs) => {
+                        eprintln!(
+                            "a bare number of seconds is deprecated; write `{secs}s`, \
+                             or `none` to disable periodic checkpoints"
+                        );
+                        Some(ConfigDuration::from_secs(secs))
+                    }
+                    Err(_) => Some(parse_value(key, value)?),
+                },
+            });
         }
         RuntimeConfigKey::CpuProfiler => {
-            rc.cpu_profiler = value.parse().map_err(|_| ())?;
+            rc.cpu_profiler = parse_value(key, value)?;
         }
         RuntimeConfigKey::Tracing => {
-            rc.tracing = value.parse().map_err(|_| ())?;
+            rc.tracing = parse_value(key, value)?;
         }
         RuntimeConfigKey::TracingEndpointJaeger => {
-            rc.tracing_endpoint_jaeger = value.parse().map_err(|_| ())?;
+            rc.tracing_endpoint_jaeger = parse_value(key, value)?;
         }
         RuntimeConfigKey::MinBatchSizeRecords => {
-            rc.min_batch_size_records = value.parse().map_err(|_| ())?;
+            rc.min_batch_size_records = parse_value(key, value)?;
         }
         RuntimeConfigKey::MaxBufferingDelayUsecs => {
-            rc.max_buffering_delay_usecs = value.parse().map_err(|_| ())?;
+            let legacy = parse_value(key, value)?;
+            eprintln!(
+                "`max_buffering_delay_usecs` is deprecated; use `max_buffering_delay` instead"
+            );
+            rc.max_buffering_delay = Some(ConfigDuration::from_micros(legacy));
+        }
+        RuntimeConfigKey::MaxBufferingDelay => {
+            rc.max_buffering_delay = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::CpuCoresMin => {
-            rc.resources.cpu_cores_min = Some(value.parse().map_err(|_| ())?);
+            rc.resources.cpu_cores_min = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::CpuCoresMax => {
-            rc.resources.cpu_cores_max = Some(value.parse().map_err(|_| ())?);
+            rc.resources.cpu_cores_max = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::MemoryMbMin => {
-            rc.resources.memory_mb_min = Some(value.parse().map_err(|_| ())?);
+            eprintln!("`memory_mb_min` is deprecated; use `memory_min` instead");
+            rc.resources.memory_min = Some(ConfigSize::from_mb(parse_value(key, value)?));
         }
         RuntimeConfigKey::MemoryMbMax => {
-            rc.resources.memory_mb_max = Some(value.parse().map_err(|_| ())?);
+            eprintln!("`memory_mb_max` is deprecated; use `memory_max` instead");
+            rc.resources.memory_max = Some(ConfigSize::from_mb(parse_value(key, value)?));
+        }
+        RuntimeConfigKey::MemoryMin => {
+            rc.resources.memory_min = Some(parse_size_with_unit(key, value)?);
+        }
+        RuntimeConfigKey::MemoryMax => {
+            rc.resources.memory_max = Some(parse_size_with_unit(key, value)?);
         }
         RuntimeConfigKey::StorageMbMax => {
-            rc.resources.storage_mb_max = Some(value.parse().map_err(|_| ())?);
+            eprintln!("`storage_mb_max` is deprecated; use `storage_max` instead");
+            rc.resources.storage_max = Some(ConfigSize::from_mb(parse_value(key, value)?));
+        }
+        RuntimeConfigKey::StorageMin => {
+            rc.resources.storage_min = Some(parse_size_with_unit(key, value)?);
+        }
+        RuntimeConfigKey::StorageMax => {
+            rc.resources.storage_max = Some(parse_size_with_unit(key, value)?);
+        }
+        RuntimeConfigKey::MaxRss => {
+            rc.max_rss = Some(parse_size_with_unit(key, value)?);
+        }
+        RuntimeConfigKey::DatafusionMemory => {
+            rc.datafusion_memory = Some(parse_size_with_unit(key, value)?);
         }
         RuntimeConfigKey::StorageClass => {
-            rc.resources.storage_class = Some(value.parse().map_err(|_| ())?);
+            rc.resources.storage_class = Some(parse_value(key, value)?);
+        }
+        RuntimeConfigKey::VolumeAttributesClass => {
+            rc.resources.volume_attributes_class = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::MinStorageBytes => {
+            eprintln!("`min_storage_bytes` is deprecated; use `min_spill_size` instead");
             if let Some(storage) = rc.storage.as_mut() {
-                storage.min_storage_bytes = Some(value.parse().map_err(|_| ())?);
+                storage.min_spill_size = Some(ConfigSize::from_bytes(parse_value(key, value)?));
+            }
+        }
+        RuntimeConfigKey::MinSpillSize => {
+            if let Some(storage) = rc.storage.as_mut() {
+                storage.min_spill_size = Some(parse_value(key, value)?);
             }
         }
         RuntimeConfigKey::ClockResolutionUsecs => {
-            rc.clock_resolution_usecs = Some(value.parse().map_err(|_| ())?);
+            let legacy = parse_value(key, value)?;
+            eprintln!("`clock_resolution_usecs` is deprecated; use `clock_resolution` instead");
+            rc.clock_resolution = Some(ConfigDuration::from_micros(legacy));
+        }
+        RuntimeConfigKey::ClockResolution => {
+            rc.clock_resolution = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::Logging => {
-            rc.logging = Some(value.parse().map_err(|_| ())?);
+            rc.logging = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::HttpWorkers => {
-            rc.http_workers = Some(value.parse().map_err(|_| ())?);
+            rc.http_workers = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::IoWorkers => {
-            rc.io_workers = Some(value.parse().map_err(|_| ())?);
+            rc.io_workers = Some(parse_value(key, value)?);
         }
         RuntimeConfigKey::DevTweaks => {
-            rc.dev_tweaks = serde_json::from_str(value).map_err(|_| ())?;
+            rc.dev_tweaks = serde_json::from_str(value).map_err(|error| {
+                format!(
+                    "`{value}` is not valid JSON for `{}`: {error}",
+                    key_name(key)
+                )
+            })?;
         }
     };
 
@@ -574,7 +1247,7 @@ async fn validate_program(
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to validate program",
             1,
         ))
@@ -607,10 +1280,11 @@ async fn wait_for_status_one_of(
         let pc = client
             .get_pipeline()
             .pipeline_name(name.clone())
+            .selector(PipelineFieldSelector::Status)
             .send()
             .await
             .map_err(handle_errors_fatal(
-                client.baseurl().clone(),
+                client.baseurl().to_string(),
                 "Failed to get program config",
                 1,
             ))
@@ -621,8 +1295,7 @@ async fn wait_for_status_one_of(
         if print_every_30_seconds.elapsed().as_secs() > 30 {
             info!(
                 "{} (current status: {})",
-                waiting_text,
-                pc.deployment_status.to_string()
+                waiting_text, pc.deployment_status
             );
             print_every_30_seconds = Instant::now();
         }
@@ -642,7 +1315,7 @@ async fn wait_for_status_one_of(
                         .unwrap_or_default()
                 );
             } else {
-                eprintln!("{}", deployment_error.message);
+                eprintln!("{}", terminal_safe(&deployment_error.message));
             }
             std::process::exit(1);
         }
@@ -662,10 +1335,11 @@ async fn wait_for_storage_status(
         let pc = client
             .get_pipeline()
             .pipeline_name(name.clone())
+            .selector(PipelineFieldSelector::Status)
             .send()
             .await
             .map_err(handle_errors_fatal(
-                client.baseurl().clone(),
+                client.baseurl().to_string(),
                 "Failed to get program config",
                 1,
             ))
@@ -679,31 +1353,66 @@ async fn wait_for_storage_status(
     }
 }
 
-async fn wait_for_checkpoint(client: &Client, name: String, seq_number: u64, waiting_text: &str) {
+/// Waits for `checkpoint` to complete, returning the checkpoint that actually
+/// completed. That is not necessarily the one passed in: if the pipeline
+/// restarts while we wait, the original request dies with it and this
+/// triggers a fresh checkpoint, which gets its own sequence number.
+async fn wait_for_checkpoint(
+    client: &Client,
+    name: String,
+    mut checkpoint: CheckpointResponse,
+    waiting_text: &str,
+) -> CheckpointResponse {
     let mut print_every_30_seconds = Instant::now();
     let mut is_waiting_for_checkpoint = true;
     while is_waiting_for_checkpoint {
-        let cs = client
-            .get_checkpoint_status()
-            .pipeline_name(name.clone())
-            .send()
-            .await
-            .map_err(handle_errors_fatal(
-                client.baseurl().clone(),
-                "Failed to get pipeline checkpoint status",
-                1,
-            ))
-            .unwrap();
+        let mut request = client.get_checkpoint_status().pipeline_name(name.clone());
+        if let Some(uuid) = checkpoint.incarnation_uuid {
+            request = request.incarnation_uuid(uuid);
+        }
+        let cs = match request.send().await {
+            Ok(cs) => cs,
+            Err(Error::ErrorResponse(e)) if e.error_code == "IncarnationUuidMismatch" => {
+                // The pipeline restarted since the checkpoint was requested;
+                // that request is gone, so start over. Sleep first so a
+                // crash-looping pipeline doesn't turn this into a tight
+                // retry loop.
+                sleep(Duration::from_millis(100)).await;
+                checkpoint = client
+                    .checkpoint_pipeline()
+                    .pipeline_name(name.clone())
+                    .send()
+                    .await
+                    .map_err(handle_errors_fatal(
+                        client.baseurl().to_string(),
+                        "Failed to initiate pipeline checkpoint",
+                        1,
+                    ))
+                    .unwrap()
+                    .into_inner();
+                continue;
+            }
+            Err(err) => Err(err)
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Failed to get pipeline checkpoint status",
+                    1,
+                ))
+                .unwrap(),
+        };
         debug!("Checkpoint status {:?}", cs);
 
-        is_waiting_for_checkpoint = cs.success.map(|c| c < seq_number).unwrap_or(true);
+        is_waiting_for_checkpoint = cs
+            .success
+            .map(|c| c < checkpoint.checkpoint_sequence_number)
+            .unwrap_or(true);
         if !is_waiting_for_checkpoint {
             // We have a checkpoint at least as recent as the requested sequence number
             break;
         }
 
         if let Some(failure) = &cs.failure {
-            if failure.sequence_number < seq_number {
+            if failure.sequence_number < checkpoint.checkpoint_sequence_number {
                 continue;
             }
             eprintln!(
@@ -722,6 +1431,7 @@ async fn wait_for_checkpoint(client: &Client, name: String, seq_number: u64, wai
 
         sleep(Duration::from_millis(500)).await;
     }
+    checkpoint
 }
 
 /// Fetch a pipeline's current tags.
@@ -729,10 +1439,11 @@ async fn get_pipeline_tags(client: &Client, name: &str) -> Vec<String> {
     client
         .get_pipeline()
         .pipeline_name(name)
+        .selector(PipelineFieldSelector::Status)
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to get pipeline tags",
             1,
         ))
@@ -752,7 +1463,7 @@ async fn get_known_tags(client: &Client) -> Vec<String> {
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to list pipeline tags",
             1,
         ))
@@ -777,11 +1488,12 @@ async fn set_pipeline_tags(client: &Client, name: &str, tags: Vec<String>) -> Ve
             udf_toml: None,
             program_config: None,
             runtime_config: None,
+            deployment_config: None,
         })
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to update pipeline tags",
             1,
         ))
@@ -858,11 +1570,12 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                             use_platform_compiler,
                         }),
                         runtime_config: None,
+                        deployment_config: None,
                     })
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
+                        client.baseurl().to_string(),
                         "Failed to create pipeline",
                         1,
                     ))
@@ -899,7 +1612,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get source pipeline",
                     1,
                 ))
@@ -939,11 +1652,12 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     udf_toml: source_pipeline.udf_toml,
                     program_config: Some(program_config),
                     runtime_config: Some(runtime_config),
+                    deployment_config: None,
                 })
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to copy pipeline",
                     1,
                 ))
@@ -1000,7 +1714,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get program config",
                     1,
                 ))
@@ -1035,11 +1749,12 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         udf_toml: None,
                         program_config: None,
                         runtime_config: None,
+                        deployment_config: None,
                     })
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
+                        client.baseurl().to_string(),
                         "Failed to recompile pipeline",
                         1,
                     ))
@@ -1059,7 +1774,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
+                        client.baseurl().to_string(),
                         "Failed to get program config",
                         1,
                     ))
@@ -1083,7 +1798,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
+                        client.baseurl().to_string(),
                         "Failed to dismiss pipeline deployment error",
                         1,
                     ))
@@ -1102,7 +1817,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to start pipeline",
                     1,
                 ))
@@ -1130,7 +1845,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         .send()
                         .await
                         .map_err(handle_errors_fatal(
-                            client.baseurl().clone(),
+                            client.baseurl().to_string(),
                             "Failed to get pipeline status",
                             1,
                         ))
@@ -1173,24 +1888,25 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to initiate pipeline checkpoint",
                     1,
                 ))
                 .unwrap();
             trace!("{:#?}", response);
-            let checkpoint_sequence_number = response.into_inner().checkpoint_sequence_number;
             if !no_wait {
-                wait_for_checkpoint(
+                // Report the checkpoint that completed, which differs from the
+                // one requested above if the pipeline restarted while waiting.
+                let completed = wait_for_checkpoint(
                     &client,
                     name.clone(),
-                    checkpoint_sequence_number,
+                    response.into_inner(),
                     "Taking a checkpoint...",
                 )
                 .await;
                 println!(
                     "Pipeline checkpoint (#{}) taken successfully.",
-                    checkpoint_sequence_number
+                    completed.checkpoint_sequence_number
                 );
             }
         }
@@ -1207,7 +1923,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to approve pipeline changes",
                     1,
                 ))
@@ -1222,7 +1938,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to pause pipeline",
                     1,
                 ))
@@ -1247,7 +1963,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to resume pipeline",
                     1,
                 ))
@@ -1283,7 +1999,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline status",
                     1,
                 ))
@@ -1296,7 +2012,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to stop pipeline",
                     1,
                 ))
@@ -1341,7 +2057,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to stop pipeline",
                     1,
                 ))
@@ -1367,7 +2083,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to clear pipeline",
                     1,
                 ))
@@ -1393,7 +2109,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline stats",
                     1,
                 ))
@@ -1440,7 +2156,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline metrics",
                     1,
                 ))
@@ -1526,7 +2242,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to delete the pipeline",
                     1,
                 ))
@@ -1538,10 +2254,11 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
             let response = client
                 .get_pipeline()
                 .pipeline_name(name)
+                .selector(PipelineFieldSelector::Status)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline status",
                     1,
                 ))
@@ -1583,7 +2300,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline config",
                     1,
                 ))
@@ -1614,7 +2331,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline config",
                     1,
                 ))
@@ -1622,11 +2339,8 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .unwrap()
                 .unwrap();
 
-            if patch_runtime_config(&mut rc, key, value.as_str()).is_err() {
-                eprintln!(
-                    "Failed to parse value '{}' for updating key {:?}",
-                    value, key
-                );
+            if let Err(error) = patch_runtime_config(&mut rc, key, value.as_str()) {
+                eprintln!("{error}");
                 std::process::exit(1);
             }
 
@@ -1642,11 +2356,12 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                     udf_toml: None,
                     program_config: None,
                     runtime_config: Some(rc),
+                    deployment_config: None,
                 })
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to set runtime config",
                     1,
                 ))
@@ -1694,7 +2409,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to update pipeline runtime",
                     1,
                 ))
@@ -1730,7 +2445,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to obtain heap profile",
                     1,
                 ))
@@ -1792,7 +2507,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to obtain circuit profile",
                     1,
                 ))
@@ -1891,7 +2606,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to obtain support bundle",
                     1,
                 ))
@@ -1979,7 +2694,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get completion status",
                     1,
                 ))
@@ -1987,7 +2702,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
 
             match format {
                 OutputFormat::Text => {
-                    println!("{}", &response.into_inner().token.to_string());
+                    println!("{}", response.into_inner().token);
                 }
                 OutputFormat::Json => {
                     println!(
@@ -2001,7 +2716,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         "Unsupported output format: {}, falling back to text",
                         format
                     );
-                    println!("{}", &response.into_inner().token.to_string());
+                    println!("{}", response.into_inner().token);
                     std::process::exit(1);
                 }
             }
@@ -2014,7 +2729,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get completion status",
                     1,
                 ))
@@ -2022,7 +2737,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
 
             match format {
                 OutputFormat::Text => {
-                    println!("{}", &response.into_inner().status.to_string());
+                    println!("{}", response.into_inner().status);
                 }
                 OutputFormat::Json => {
                     println!(
@@ -2036,7 +2751,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         "Unsupported output format, falling back to text: {}",
                         format
                     );
-                    println!("{}", &response.into_inner().status.to_string());
+                    println!("{}", response.into_inner().status);
                     std::process::exit(1);
                 }
             }
@@ -2048,7 +2763,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to start transaction",
                     1,
                 ))
@@ -2093,7 +2808,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get pipeline stats",
                     1,
                 ))
@@ -2127,7 +2842,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to commit transaction",
                     1,
                 ))
@@ -2142,7 +2857,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                         .send()
                         .await
                         .map_err(handle_errors_fatal(
-                            client.baseurl().clone(),
+                            client.baseurl().to_string(),
                             "Failed to get pipeline stats",
                             1,
                         ))
@@ -2195,7 +2910,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to compute pipeline diff",
                     1,
                 ))
@@ -2213,7 +2928,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to initiate rebalancing",
                     1,
                 ))
@@ -2228,7 +2943,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to advance clock",
                     1,
                 ))
@@ -2262,7 +2977,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to initiate compaction",
                     1,
                 ))
@@ -2277,7 +2992,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to dismiss pipeline deployment error",
                     1,
                 ))
@@ -2293,7 +3008,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Unable to retrieve pipeline events",
                     1,
                 ))
@@ -2432,7 +3147,7 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Unable to retrieve pipeline event",
                     1,
                 ))
@@ -2545,6 +3260,55 @@ async fn pipeline(format: OutputFormat, action: PipelineAction, client: Client) 
     }
 }
 
+/// Starts or pauses a connector, which is attached to a table when
+/// `relation_is_table` and to a view otherwise.
+///
+/// `action` is the action to request (`start` or `pause`), `past` its past
+/// tense, for the message printed on success.
+async fn connector_action(
+    client: &Client,
+    pipeline_name: String,
+    relation: &str,
+    connector: &str,
+    relation_is_table: bool,
+    action: &'static str,
+    past: &'static str,
+) {
+    if relation_is_table {
+        client
+            .post_pipeline_input_connector_action()
+            .pipeline_name(pipeline_name)
+            .table_name(relation)
+            .connector_name(connector)
+            .action(action)
+            .send()
+            .await
+            .map_err(handle_errors_fatal(
+                client.baseurl().to_string(),
+                "Failed to start or pause table connector",
+                1,
+            ))
+            .unwrap();
+        println!("Table {relation} connector {connector} {past} successfully.");
+    } else {
+        client
+            .post_pipeline_output_connector_action()
+            .pipeline_name(pipeline_name)
+            .view_name(relation)
+            .connector_name(connector)
+            .action(action)
+            .send()
+            .await
+            .map_err(handle_errors_fatal(
+                client.baseurl().to_string(),
+                "Failed to start or pause view connector",
+                1,
+            ))
+            .unwrap();
+        println!("View {relation} connector {connector} {past} successfully.");
+    }
+}
+
 async fn connector(
     format: OutputFormat,
     pipeline_name: String,
@@ -2559,7 +3323,7 @@ async fn connector(
         .send()
         .await
         .map_err(handle_errors_fatal(
-            client.baseurl().clone(),
+            client.baseurl().to_string(),
             "Failed to get pipeline config",
             1,
         ))
@@ -2585,50 +3349,28 @@ async fn connector(
 
     match action {
         ConnectorAction::Start => {
-            if !relation_is_table {
-                eprintln!(
-                    "Can not start the output connector '{connector}'. Only input connectors (connectors attached to a table) can be started."
-                );
-                std::process::exit(1);
-            }
-            client
-                .post_pipeline_input_connector_action()
-                .pipeline_name(pipeline_name)
-                .table_name(relation)
-                .connector_name(connector)
-                .action("start")
-                .send()
-                .await
-                .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
-                    "Failed to start table connector",
-                    1,
-                ))
-                .unwrap();
-            println!("Table {relation} connector {connector} started successfully.");
+            connector_action(
+                &client,
+                pipeline_name,
+                relation,
+                connector,
+                relation_is_table,
+                "start",
+                "started",
+            )
+            .await;
         }
         ConnectorAction::Pause => {
-            if !relation_is_table {
-                eprintln!(
-                    "Can not pause the output connector '{connector}'. Only input connectors (connectors attached to a table) can be paused."
-                );
-                std::process::exit(1);
-            }
-            client
-                .post_pipeline_input_connector_action()
-                .pipeline_name(pipeline_name)
-                .table_name(relation)
-                .connector_name(connector)
-                .action("pause")
-                .send()
-                .await
-                .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
-                    "Failed to pause table connector",
-                    1,
-                ))
-                .unwrap();
-            println!("Table {relation} connector {connector} paused successfully.");
+            connector_action(
+                &client,
+                pipeline_name,
+                relation,
+                connector,
+                relation_is_table,
+                "pause",
+                "paused",
+            )
+            .await;
         }
         ConnectorAction::Stats if relation_is_table => {
             let response = client
@@ -2639,7 +3381,7 @@ async fn connector(
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get table connector stats",
                     1,
                 ))
@@ -2677,7 +3419,7 @@ async fn connector(
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get view connector stats",
                     1,
                 ))
@@ -2803,7 +3545,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get program",
                     1,
                 ))
@@ -2838,10 +3580,11 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
             let response = client
                 .get_pipeline()
                 .pipeline_name(name)
+                .selector(PipelineFieldSelector::Status)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get program config",
                     1,
                 ))
@@ -2885,6 +3628,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                     use_platform_compiler,
                 }),
                 runtime_config: None,
+                deployment_config: None,
             };
             let response = client
                 .patch_pipeline()
@@ -2893,7 +3637,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to set program config",
                     1,
                 ))
@@ -2922,10 +3666,11 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
             let response = client
                 .get_pipeline()
                 .pipeline_name(name)
+                .selector(PipelineFieldSelector::Status)
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get program status",
                     1,
                 ))
@@ -2960,7 +3705,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Failed to get program compilation errors",
                     1,
                 ))
@@ -3012,6 +3757,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                     udf_toml,
                     program_config: None,
                     runtime_config: None,
+                    deployment_config: None,
                 };
                 let response = client
                     .patch_pipeline()
@@ -3020,7 +3766,7 @@ async fn program(format: OutputFormat, action: ProgramAction, client: Client) {
                     .send()
                     .await
                     .map_err(handle_errors_fatal(
-                        client.baseurl().clone(),
+                        client.baseurl().to_string(),
                         "Failed to set program code",
                         1,
                     ))
@@ -3058,7 +3804,7 @@ async fn cluster(format: OutputFormat, action: ClusterAction, client: Client) {
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Unable to retrieve cluster events",
                     1,
                 ))
@@ -3114,7 +3860,7 @@ async fn cluster(format: OutputFormat, action: ClusterAction, client: Client) {
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     "Unable to retrieve cluster event",
                     1,
                 ))
@@ -3132,6 +3878,9 @@ async fn cluster(format: OutputFormat, action: ClusterAction, client: Client) {
                             (Utc::now() - response.recorded_at).as_seconds_f64()
                         ),
                     ]);
+                    if let Some(stale) = response.stale {
+                        rows.push(["stale".to_string(), stale.to_string()]);
+                    }
                     rows.push(["all_healthy".to_string(), response.all_healthy.to_string()]);
                     rows.push(["api_status".to_string(), response.api_status.to_string()]);
                     if let Some(value) = &response.api_self_info {
@@ -3178,15 +3927,144 @@ async fn cluster(format: OutputFormat, action: ClusterAction, client: Client) {
                 }
             }
         }
+        ClusterAction::Health => {
+            // Both 200 (all healthy) and 503 (some service unhealthy) carry a
+            // `HealthStatus` body.
+            let health = match client.get_cluster_health().send().await {
+                Ok(response) => response.into_inner(),
+                Err(Error::ErrorResponse(response)) => response.into_inner(),
+                Err(e) => {
+                    eprintln!(
+                        "Unable to retrieve cluster health from {}: {e}",
+                        client.baseurl()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            match format {
+                OutputFormat::Text => {
+                    let now = Utc::now();
+                    if health.stale {
+                        // The runner is a separate process only in the enterprise edition,
+                        // hence the conditional phrasing rather than an edition lookup.
+                        eprintln!(
+                            "Warning: no cluster monitor event for over {} minutes, so the \
+                             statuses below are the last recorded ones, not current ones. On \
+                             Feldera Enterprise, the cluster monitor runs inside the Kubernetes \
+                             runner, which may be down.",
+                            health.stale_after_seconds / 60
+                        );
+                    }
+                    let mut rows = vec![];
+                    rows.push([
+                        "service".to_string(),
+                        "healthy".to_string(),
+                        "unchanged_since".to_string(),
+                        "checked_at".to_string(),
+                        "message".to_string(),
+                    ]);
+                    for (service, status) in [
+                        ("api", &health.api),
+                        ("compiler", &health.compiler),
+                        ("runner", &health.runner),
+                    ] {
+                        rows.push([
+                            service.to_string(),
+                            status.healthy.to_string(),
+                            format!(
+                                "{} ({:.0}s ago)",
+                                status.unchanged_since,
+                                (now - status.unchanged_since).as_seconds_f64()
+                            ),
+                            format!(
+                                "{} ({:.0}s ago)",
+                                status.checked_at,
+                                (now - status.checked_at).as_seconds_f64()
+                            ),
+                            status.message.clone(),
+                        ]);
+                    }
+                    println!(
+                        "{}",
+                        Builder::from_iter(rows).build().with(Style::rounded())
+                    );
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&health)
+                            .expect("Failed to serialize cluster health")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+            if !health.all_healthy {
+                // Exit 1 means the health could not be retrieved; 2 means unhealthy.
+                std::process::exit(2);
+            }
+        }
+        ClusterAction::Config => {
+            let response = client
+                .get_config()
+                .send()
+                .await
+                .map_err(handle_errors_fatal(
+                    client.baseurl().to_string(),
+                    "Unable to retrieve platform configuration",
+                    1,
+                ))
+                .unwrap();
+            match format {
+                OutputFormat::Text => {
+                    // A summary without `build_info.cargo_dependencies`, which lists
+                    // every crate and dwarfs the table. JSON output has all fields.
+                    let value = json!({
+                        "edition": response.edition,
+                        "version": response.version,
+                        "revision": response.revision,
+                        "runtime_revision": response.runtime_revision,
+                        "build_source": response.build_source,
+                        "build_timestamp": response.build_info.build_timestamp,
+                        "rustc_version": response.build_info.rustc_version,
+                        "cargo_target_triple": response.build_info.cargo_target_triple,
+                        "license_validity": response.license_validity,
+                        "update_info": response.update_info,
+                        "unstable_features": response.unstable_features,
+                        "changelog_url": response.changelog_url,
+                    });
+                    let table = json_to_table(&value).collapse().to_string();
+                    println!("{}", table);
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&response.into_inner())
+                            .expect("Failed to serialize platform configuration")
+                    );
+                }
+                _ => {
+                    eprintln!("Unsupported output format: {}", format);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
-fn main() {
-    let _guard = observability::init(
-        "https://18aa37ae23e7130b57b91aaad432bc18@o4510219052253184.ingest.us.sentry.io/4510298809827328",
-        "fda",
-        env!("CARGO_PKG_VERSION"),
+/// reqwest is built without a rustls provider, so the process default decides
+/// which one it uses.
+fn install_crypto_provider() {
+    // Err means a provider is already installed, which is the state wanted.
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
     );
+}
+
+fn main() {
+    install_crypto_provider();
     init_logging("warn");
 
     tokio::runtime::Builder::new_multi_thread()
@@ -3204,9 +4082,20 @@ fn main() {
             if cli.host.ends_with("/") {
                 cli.host = cli.host.trim_end_matches('/').to_string();
             }
+            // Releases before 0.340.0 read this variable; a shell that still
+            // exports it would otherwise send no credential and see a bare 401.
+            if cli.auth.is_none()
+                && cli.oidc_token_file.is_none()
+                && std::env::var_os("FELDERA_AUTH_TOKEN_COMMAND").is_some()
+            {
+                warn!(
+                    "FELDERA_AUTH_TOKEN_COMMAND is no longer read. Point FELDERA_OIDC_TOKEN_FILE at a file holding the token, or pass the command's output as --auth \"$(...)\"."
+                );
+            }
 
-            let client = || {
-                make_client(cli.host, cli.insecure, cli.tls_cert, cli.auth, cli.timeout)
+            let client_opts = ClientOpts::from_cli(&cli);
+            let client = move || {
+                make_client(client_opts)
                     .map_err(|e| {
                         eprintln!("Failed to create HTTP client: {}", e);
                         std::process::exit(1);
@@ -3216,6 +4105,11 @@ fn main() {
 
             match cli.command {
                 Commands::Apikey { action } => api_key_commands(cli.format, action, client()).await,
+                Commands::OidcTrust { action } => {
+                    oidc_trust_commands(cli.format, action, client()).await
+                }
+                Commands::Tenant { action } => tenant_commands(cli.format, action, client()).await,
+                Commands::Member { action } => member_commands(cli.format, action, client()).await,
                 Commands::Pipelines => pipelines(cli.format, client()).await,
                 Commands::Pipeline(action) => pipeline(cli.format, action, client()).await,
                 Commands::ValidateProgram {
@@ -3235,7 +4129,6 @@ fn init_logging(default_level: &str) {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     let _ = LogTracer::init();
     let _ = tracing_subscriber::registry()
-        .with(sentry::integrations::tracing::layer())
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
@@ -3248,11 +4141,155 @@ fn init_logging(default_level: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_program_errors, make_client};
+    use super::{
+        Client, ClientInfo, ClientOpts, RuntimeConfig, RuntimeConfigKey, format_program_errors,
+        install_crypto_provider, make_client, patch_runtime_config, read_oidc_token_file,
+    };
     use feldera_rest_api::types::{
         ProgramError, RustCompilationInfo, SqlCompilationInfo, SqlCompilerMessage,
     };
+    use feldera_types::duration::ConfigDuration;
+    use feldera_types::size::ConfigSize;
     use std::io::Write;
+    use std::time::Duration;
+
+    /// A duration key stores what the user typed as a duration. One field
+    /// holds the setting, so nothing is left behind under an older spelling.
+    #[test]
+    fn setting_a_duration_key_stores_a_duration() {
+        let mut config = RuntimeConfig::default();
+
+        patch_runtime_config(&mut config, RuntimeConfigKey::MaxBufferingDelay, "10ms").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::ClockResolution, "2s").unwrap();
+
+        assert_eq!(
+            config.max_buffering_delay,
+            Some(ConfigDuration::from_millis(10))
+        );
+        assert_eq!(config.clock_resolution, Some(ConfigDuration::from_secs(2)));
+    }
+
+    /// A size key stores what the user typed as a size, and the deprecated
+    /// megabyte and byte keys reach the same field.
+    #[test]
+    fn setting_a_size_key_stores_a_size() {
+        let mut config = RuntimeConfig::default();
+
+        patch_runtime_config(&mut config, RuntimeConfigKey::MemoryMax, "16Gi").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::MemoryMbMin, "4000").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::StorageMax, "400G").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::MaxRss, "12G").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::Storage, "true").unwrap();
+        patch_runtime_config(&mut config, RuntimeConfigKey::MinSpillSize, "10Mi").unwrap();
+
+        assert_eq!(config.resources.memory_max, Some(ConfigSize::from_gib(16)));
+        assert_eq!(config.resources.memory_min, Some(ConfigSize::from_mb(4000)));
+        assert_eq!(
+            config.resources.storage_max,
+            Some(ConfigSize::from_mb(400_000))
+        );
+        assert_eq!(config.max_rss, Some(ConfigSize::from_mb(12_000)));
+        assert_eq!(
+            config.storage.as_ref().unwrap().min_spill_size,
+            Some(ConfigSize::from_mib(10))
+        );
+
+        let error =
+            patch_runtime_config(&mut config, RuntimeConfigKey::MemoryMax, "16 GB").unwrap_err();
+        assert!(
+            error.contains("memory_max") && error.contains("unknown unit"),
+            "{error}"
+        );
+
+        // A bare number meant megabytes under the deprecated key and would mean
+        // bytes as a size, so a megabyte key asks for the unit; a byte key reads it.
+        let error =
+            patch_runtime_config(&mut config, RuntimeConfigKey::MemoryMax, "16000").unwrap_err();
+        assert!(error.contains("`16000M`"), "{error}");
+        patch_runtime_config(&mut config, RuntimeConfigKey::MinSpillSize, "4096").unwrap();
+        assert_eq!(
+            config.storage.as_ref().unwrap().min_spill_size,
+            Some(ConfigSize::from_bytes(4096))
+        );
+    }
+
+    /// `none` turns periodic checkpointing off. The bare number of seconds
+    /// expressed that by accepting 0, which a duration cannot mean.
+    #[test]
+    fn checkpoint_interval_can_disable_checkpointing() {
+        let mut config = RuntimeConfig::default();
+
+        patch_runtime_config(&mut config, RuntimeConfigKey::CheckpointInterval, "30s").unwrap();
+        assert_eq!(
+            config.fault_tolerance.checkpoint_interval,
+            Some(Some(ConfigDuration::from_secs(30)))
+        );
+
+        for disable in ["none", "null"] {
+            patch_runtime_config(&mut config, RuntimeConfigKey::CheckpointInterval, disable)
+                .unwrap();
+            assert_eq!(
+                config.fault_tolerance.checkpoint_interval,
+                Some(None),
+                "`{disable}` should disable periodic checkpoints"
+            );
+        }
+    }
+
+    /// One `checkpoint_interval` key serves both spellings: the command line
+    /// carries everything as text, so a bare number of seconds keeps working
+    /// where the field it writes now holds a duration.
+    #[test]
+    fn checkpoint_interval_still_accepts_a_bare_number_of_seconds() {
+        let mut config = RuntimeConfig::default();
+
+        patch_runtime_config(&mut config, RuntimeConfigKey::CheckpointInterval, "90").unwrap();
+        assert_eq!(
+            config.fault_tolerance.checkpoint_interval,
+            Some(Some(ConfigDuration::from_secs(90)))
+        );
+
+        // Zero was how the bare-number spelling turned checkpointing off.
+        patch_runtime_config(&mut config, RuntimeConfigKey::CheckpointInterval, "0").unwrap();
+        assert_eq!(config.fault_tolerance.checkpoint_interval, Some(None));
+
+        // A duration of zero is a length of time, not a disable token.
+        patch_runtime_config(&mut config, RuntimeConfigKey::CheckpointInterval, "0s").unwrap();
+        assert_eq!(
+            config.fault_tolerance.checkpoint_interval,
+            Some(Some(ConfigDuration::ZERO))
+        );
+    }
+
+    /// A rejected value reports what was wrong with it and names the key in the
+    /// spelling the user typed, not in Rust's debug spelling.
+    #[test]
+    fn a_rejected_value_explains_itself() {
+        let mut config = RuntimeConfig::default();
+
+        let error =
+            patch_runtime_config(&mut config, RuntimeConfigKey::MaxBufferingDelay, "10 sec")
+                .unwrap_err();
+        assert!(
+            error.contains("max_buffering_delay"),
+            "should name the key as typed, got: {error}"
+        );
+        assert!(
+            error.contains("10 sec"),
+            "should quote the offending value, got: {error}"
+        );
+        assert!(
+            error.contains("unit"),
+            "should say a unit was the problem, got: {error}"
+        );
+
+        let error =
+            patch_runtime_config(&mut config, RuntimeConfigKey::Workers, "many").unwrap_err();
+        assert!(
+            error.contains("workers") && error.contains("many"),
+            "should name the key and the value, got: {error}"
+        );
+    }
 
     // A single self-signed PEM-encoded certificate used only as test data. It
     // is never trusted by the system and never presented as a server
@@ -3270,17 +4307,26 @@ EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0gAMEUCIQDN\n\
 aC3Oy4iVrYGOq9v6uP9iblE=\n\
 -----END CERTIFICATE-----\n";
 
+    /// Options for a client that only exercises the TLS-certificate path.
+    fn tls_test_opts(tls_cert: std::path::PathBuf) -> ClientOpts {
+        ClientOpts {
+            host: "https://example.invalid".to_string(),
+            insecure: false,
+            tls_cert: Some(tls_cert),
+            auth: None,
+            oidc_token_file: None,
+            headers: Vec::new(),
+            timeout_secs: None,
+            tenant: None,
+            retries: 0,
+        }
+    }
+
     #[test]
     fn make_client_tls_cert_missing_file_returns_error() {
         let missing = std::path::PathBuf::from("/definitely/not/a/real/path-fda-test.pem");
-        let err = make_client(
-            "https://example.invalid".to_string(),
-            false,
-            Some(missing),
-            None,
-            None,
-        )
-        .expect_err("non-existent cert path must produce an error");
+        let err = make_client(tls_test_opts(missing))
+            .expect_err("non-existent cert path must produce an error");
         let msg = err.to_string();
         assert!(
             msg.contains("Failed to read TLS certificate file"),
@@ -3293,14 +4339,8 @@ aC3Oy4iVrYGOq9v6uP9iblE=\n\
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(b"this is not a PEM certificate")
             .expect("write temp file");
-        let err = make_client(
-            "https://example.invalid".to_string(),
-            false,
-            Some(file.path().to_path_buf()),
-            None,
-            None,
-        )
-        .expect_err("garbage cert contents must produce an error");
+        let err = make_client(tls_test_opts(file.path().to_path_buf()))
+            .expect_err("garbage cert contents must produce an error");
         let msg = err.to_string();
         // Either we fail the PEM parse or we parse to an empty bundle; both are
         // acceptable error paths.
@@ -3319,13 +4359,7 @@ aC3Oy4iVrYGOq9v6uP9iblE=\n\
         // The synthetic PEM above is syntactically valid for
         // `Certificate::from_pem_bundle`; we only care that the code path
         // wires the cert into the builder without surfacing an error.
-        let result = make_client(
-            "https://example.invalid".to_string(),
-            false,
-            Some(file.path().to_path_buf()),
-            None,
-            None,
-        );
+        let result = make_client(tls_test_opts(file.path().to_path_buf()));
         // Some rustls backends reject the synthetic cert at build time; accept
         // either a successful build or a cert-validation error, but never the
         // file-read / empty-bundle errors that would indicate our logic is
@@ -3341,6 +4375,86 @@ aC3Oy4iVrYGOq9v6uP9iblE=\n\
                 "unexpected empty-bundle error from valid PEM path: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn oidc_token_file_trims_contents() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(b"  tok-123\n").expect("write temp file");
+        let token = read_oidc_token_file(file.path()).expect("readable file");
+        assert_eq!(token, "tok-123");
+    }
+
+    #[test]
+    fn oidc_token_file_whitespace_only_is_error() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(b"\n\t \n").expect("write temp file");
+        let err = read_oidc_token_file(file.path()).expect_err("blank file must error");
+        assert!(err.to_string().contains("is empty"), "{err}");
+    }
+
+    #[test]
+    fn oidc_token_file_missing_is_error() {
+        let missing = std::path::Path::new("/definitely/not/a/real/path-fda-token");
+        let err = read_oidc_token_file(missing).expect_err("missing file must error");
+        let msg = err.to_string();
+        assert!(msg.contains("failed to read OIDC token file"), "{msg}");
+        assert!(
+            msg.contains("path-fda-token"),
+            "path should be named: {msg}"
+        );
+    }
+
+    #[test]
+    fn oidc_token_file_second_line_is_error() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        file.write_all(b"tok-1\ntok-2\n").expect("write temp file");
+        let err = read_oidc_token_file(file.path()).expect_err("two lines must error");
+        let msg = err.to_string();
+        assert!(msg.contains("does not hold a single-line token"), "{msg}");
+        assert!(msg.contains("a line break at byte 5"), "{msg}");
+    }
+
+    /// Options for a client whose only credential is a token file.
+    fn token_file_opts(host: &str, oidc_token_file: std::path::PathBuf) -> ClientOpts {
+        ClientOpts {
+            host: host.to_string(),
+            insecure: false,
+            tls_cert: None,
+            auth: None,
+            oidc_token_file: Some(oidc_token_file),
+            headers: Vec::new(),
+            timeout_secs: None,
+            tenant: None,
+            retries: 0,
+        }
+    }
+
+    #[test]
+    fn make_client_reads_token_file_for_https_only() {
+        install_crypto_provider();
+        let missing = std::path::PathBuf::from("/definitely/not/a/real/path-fda-token");
+        // Plain http sends no credential, so the file is never opened.
+        make_client(token_file_opts("http://example.invalid", missing.clone()))
+            .expect("http host must not read the token file");
+        let err = make_client(token_file_opts("https://example.invalid", missing))
+            .expect_err("https host must fail on a missing token file");
+        assert!(
+            err.to_string().contains("failed to read OIDC token file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn make_client_rejects_blank_token_file_for_https() {
+        install_crypto_provider();
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let err = make_client(token_file_opts(
+            "https://example.invalid",
+            file.path().to_path_buf(),
+        ))
+        .expect_err("blank token file must fail rather than send nothing");
+        assert!(err.to_string().contains("is empty"), "{err}");
     }
 
     #[test]
@@ -3392,6 +4506,7 @@ aC3Oy4iVrYGOq9v6uP9iblE=\n\
             sql_compilation: None,
             rust_compilation: Some(RustCompilationInfo {
                 exit_code: 101,
+                messages: Vec::new(),
                 stdout: "checking pipeline\n".to_string(),
                 stderr: "error: failed to compile".to_string(),
             }),
@@ -3419,5 +4534,181 @@ error: failed to compile\n"
         });
 
         assert_eq!(output, "System error:\ncompiler service unavailable\n");
+    }
+
+    /// A local HTTP server that records the head of every request it receives
+    /// and answers each with an empty pipeline list.
+    fn spawn_recording_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::BufRead;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().expect("test server address").port();
+        let (record, recorded) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone test connection"));
+                let mut head = String::new();
+                let mut line = String::new();
+                while matches!(reader.read_line(&mut line), Ok(bytes) if bytes > 2) {
+                    head.push_str(&line);
+                    line.clear();
+                }
+                if record.send(head).is_err() {
+                    break;
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/json\r\n\
+                      Content-Length: 2\r\n\
+                      Connection: close\r\n\r\n[]",
+                );
+                let _ = stream.flush();
+            }
+        });
+        (port, recorded)
+    }
+
+    /// Options for a client that talks to a local test server over http.
+    fn local_test_opts(port: u16, headers: &[&str]) -> ClientOpts {
+        ClientOpts {
+            host: format!("http://127.0.0.1:{port}"),
+            insecure: false,
+            tls_cert: None,
+            auth: None,
+            oidc_token_file: None,
+            headers: headers.iter().map(|header| header.to_string()).collect(),
+            timeout_secs: Some(10),
+            tenant: None,
+            retries: 0,
+        }
+    }
+
+    /// `main` installs the process-wide rustls provider before building a
+    /// client; a test that builds one has to do the same.
+    fn build_test_client(opts: ClientOpts) -> Client {
+        install_crypto_provider();
+        make_client(opts).expect("build client")
+    }
+
+    /// The head of the one request the server received, lowercased so that
+    /// header names can be matched whatever case the client chose.
+    async fn request_head(client: &Client, recorded: &std::sync::mpsc::Receiver<String>) -> String {
+        client
+            .list_pipelines()
+            .send()
+            .await
+            .expect("the test server answers with an empty list");
+        recorded
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server recorded the request")
+            .to_lowercase()
+    }
+
+    /// Every `--header` reaches the server: this is how a deployment behind an
+    /// authenticating proxy is reached, with the proxy's own session cookie.
+    #[tokio::test]
+    async fn custom_headers_are_sent_with_every_request() {
+        let (port, recorded) = spawn_recording_server();
+        let client = build_test_client(local_test_opts(
+            port,
+            &["Cookie: AWSELBAuthSessionCookie-0=abc", "X-Trace-Id: 42"],
+        ));
+        let head = request_head(&client, &recorded).await;
+        assert!(
+            head.contains("cookie: awselbauthsessioncookie-0=abc"),
+            "{head}"
+        );
+        assert!(head.contains("x-trace-id: 42"), "{head}");
+    }
+
+    /// A header named on the command line replaces the one the client would
+    /// otherwise send under that name, rather than arriving beside it.
+    #[tokio::test]
+    async fn custom_header_replaces_the_clients_own() {
+        let (port, recorded) = spawn_recording_server();
+        let mut opts = local_test_opts(port, &["Feldera-Tenant: chosen-by-header"]);
+        opts.tenant = Some("chosen-by-flag".to_string());
+        let client = build_test_client(opts);
+        let head = request_head(&client, &recorded).await;
+        assert_eq!(
+            head.matches("feldera-tenant:").count(),
+            1,
+            "the tenant must be named once: {head}"
+        );
+        assert!(head.contains("feldera-tenant: chosen-by-header"), "{head}");
+    }
+
+    /// A name carries one value: repeating it sends the later value alone,
+    /// rather than two headers the server would have to reconcile.
+    #[tokio::test]
+    async fn repeating_a_header_name_keeps_the_later_value() {
+        let (port, recorded) = spawn_recording_server();
+        let client = build_test_client(local_test_opts(
+            port,
+            &["X-Forwarded-For: 10.0.0.1", "X-Forwarded-For: 10.0.0.2"],
+        ));
+        let head = request_head(&client, &recorded).await;
+        assert_eq!(
+            head.matches("x-forwarded-for:").count(),
+            1,
+            "the header must be sent once: {head}"
+        );
+        assert!(head.contains("x-forwarded-for: 10.0.0.2"), "{head}");
+    }
+
+    /// The websocket path (`fda shell` and ad hoc queries) builds its request
+    /// by hand from the same client, so it has to carry `--header` too: a
+    /// session cookie that reaches every other request but not this one leaves
+    /// the shell unusable behind a proxy.
+    #[tokio::test]
+    async fn custom_headers_reach_the_websocket_upgrade() {
+        use reqwest_websocket::RequestBuilderExt;
+
+        let (port, recorded) = spawn_recording_server();
+        let client = build_test_client(local_test_opts(port, &["Cookie: session=abc"]));
+        // The test server answers 200 rather than completing the handshake, so
+        // the upgrade fails; the request it received is the point.
+        let _ = client
+            .client()
+            .get(format!("http://127.0.0.1:{port}/v0/pipelines/p/query"))
+            .upgrade()
+            .send()
+            .await;
+        let head = recorded
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server recorded the upgrade request")
+            .to_lowercase();
+        assert!(head.contains("upgrade: websocket"), "{head}");
+        assert!(head.contains("cookie: session=abc"), "{head}");
+    }
+
+    /// A credential from `--auth` is withheld from an `http://` host, but one
+    /// written as `--header` is the user's own decision and still travels:
+    /// that is the escape hatch for a proxy that speaks only plain http.
+    #[tokio::test]
+    async fn credential_header_travels_where_auth_is_withheld() {
+        let (port, recorded) = spawn_recording_server();
+        let mut opts = local_test_opts(port, &["Authorization: Bearer from-header"]);
+        opts.auth = Some("apikey:withheld".to_string());
+        let client = build_test_client(opts);
+        let head = request_head(&client, &recorded).await;
+        assert!(head.contains("authorization: bearer from-header"), "{head}");
+        assert!(
+            !head.contains("apikey:withheld"),
+            "`--auth` must stay off an unencrypted connection: {head}"
+        );
+    }
+
+    /// An argument that is not a header is reported when the client is built,
+    /// naming the argument, rather than dropped or sent malformed.
+    #[test]
+    fn unparsable_header_argument_fails_the_client() {
+        let err = make_client(local_test_opts(0, &["not-a-header"]))
+            .expect_err("a header without a colon must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not-a-header"), "{msg}");
+        assert!(msg.contains("Name: Value"), "{msg}");
     }
 }

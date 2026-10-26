@@ -47,7 +47,7 @@ as JSON `null` values or by simply omitting the columns whose value is `NULL`.
 For example, given the following table declaration
 
 ```sql
-create table json_test (
+CREATE TABLE json_test (
     b BOOLEAN,
     i INTEGER,
     d DOUBLE,
@@ -214,7 +214,7 @@ Full or partial updates are also supported if the table has a [primary key](/sql
 ```json
 {"update": {"vendor_id": 2, "vendor_address": "123 Feldera Place, San Francisco, CA"}}
 ```
-The `vendor_id` column must be a primary key. The vendors table may have more columns, but only the `vendor_address` column will be updated by the update event above. An `update` payload that contains all of the table columns is equivalent to an `insert`.
+The `vendor_id` column must be a primary key. The vendors table may have more columns, but only the `vendor_address` column will be updated by the update event above. An `update` payload that contains all of the table columns is equivalent to an `insert`.  In a program that sets [`FELDERA_LAZY_UPSERT`](/sql/grammar#experimental-options) to `ON`, a table with a primary key and no `LATENESS` column rejects `update` events; send an `insert` of the whole row instead, which replaces the row with the same key.
 
 ### The raw format
 
@@ -293,7 +293,7 @@ in use.  Specify `"json_flavor"` as one of the following:
   of SQL BINARY includes the `0x` prefix.
 
 [Debezium input connector]: /connectors/sources/debezium
-[Kafka Connect connector]: https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-data-types
+[Kafka Connect connector]: https://debezium.io/documentation/reference/connectors/mysql.html#mysql-data-types
 
 ## Configuring JSON event streams
 
@@ -303,10 +303,10 @@ When adding a new input or output connector on a table or view,
 the data format is specified in the `format` field of the connector configuration:
 
 ```sql
-create table PART (
-  id bigint not null primary key,
-  name varchar
-) with (
+CREATE TABLE part (
+  id BIGINT NOT NULL PRIMARY KEY,
+  name VARCHAR
+) WITH (
   'connectors' = '[{
     "transport": {
         "name": "url_input",

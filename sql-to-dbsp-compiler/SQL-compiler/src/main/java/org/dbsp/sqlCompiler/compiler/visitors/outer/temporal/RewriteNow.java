@@ -1,5 +1,6 @@
 package org.dbsp.sqlCompiler.compiler.visitors.outer.temporal;
 
+import org.dbsp.sqlCompiler.compiler.Documentation;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.annotation.AlwaysMonotone;
@@ -30,7 +31,7 @@ import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerRewriteVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.ReferenceMap;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.ResolveReferences;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitCloneVisitor;
-import org.dbsp.sqlCompiler.compiler.visitors.outer.ToJsonVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.FindSourcePositions;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity.InsertLimiters;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.IDBSPDeclaration;
@@ -69,6 +70,7 @@ import java.util.Objects;
  * ("temporal filters"), the others are compiled in a similar way with MAP operators.
  */
 public class RewriteNow extends CircuitCloneVisitor {
+    public static final Documentation.Link NOW_DOCUMENTATION = new Documentation.Link("sql/datetime", "now");
     // Holds the indexed version of the 'now' operator (indexed with an empty key).
     // (actually, it's the differentiator after the index)
     @Nullable
@@ -98,8 +100,8 @@ public class RewriteNow extends CircuitCloneVisitor {
         }
 
         @Override
-        public VisitDecision preorder(DBSPType type) {
-            return VisitDecision.STOP;
+        protected boolean rewritesTypes() {
+            return false;
         }
 
         @Override
@@ -125,7 +127,13 @@ public class RewriteNow extends CircuitCloneVisitor {
 
         @Override
         public VisitDecision preorder(DBSPClosureExpression closure) {
-            Utilities.enforce(this.context.isEmpty());
+            if (!this.context.isEmpty()) {
+                if (ContainsNow.find(this.compiler, closure.body))
+                    throw new CompilationError(
+                            "NOW() is not supported inside a lambda expression", closure.getNode());
+                this.map(closure, closure);
+                return VisitDecision.STOP;
+            }
             Utilities.enforce(closure.parameters.length == 1);
             DBSPParameter param = closure.parameters[0];
             DBSPTypeTuple paramType = param.getType().to(DBSPTypeRef.class).deref().to(DBSPTypeTuple.class);
@@ -167,8 +175,8 @@ public class RewriteNow extends CircuitCloneVisitor {
         }
 
         @Override
-        public VisitDecision preorder(DBSPType type) {
-            return VisitDecision.STOP;
+        protected boolean rewritesTypes() {
+            return false;
         }
     }
 
@@ -176,7 +184,10 @@ public class RewriteNow extends CircuitCloneVisitor {
         super(compiler, false);
     }
 
-    DBSPSimpleOperator createJoin(DBSPSimpleOperator input, DBSPUnaryOperator operator) {
+    /** Join {@code input} with the NOW stream; {@code operator} is the operator being rewritten,
+     * and {@code nowCall} the NOW() call that requires the join. */
+    DBSPSimpleOperator createJoin(DBSPSimpleOperator input, DBSPUnaryOperator operator,
+                                  DBSPExpression nowCall) {
         DBSPType inputType = input.getOutputZSetElementType();
         DBSPVariablePath var = inputType.ref().var();
         DBSPExpression indexFunction = new DBSPRawTupleExpression(
@@ -198,7 +209,10 @@ public class RewriteNow extends CircuitCloneVisitor {
         DBSPExpression joinFunction = new DBSPTupleExpression(fields, false)
                 .closure(key, left, right);
         Utilities.enforce(nowIndexed != null);
-        DBSPSimpleOperator result = new DBSPStreamJoinOperator(operator.getRelNode(), joinType,
+        // The join has no SQL counterpart; use the NOW() source code position
+        CalciteRelNode joinNode = operator.getRelNode().copy();
+        joinNode.addSourcePositions(List.of(nowCall.getSourcePosition()));
+        DBSPSimpleOperator result = new DBSPStreamJoinOperator(joinNode, joinType,
                 joinFunction, operator.isMultiset, index.outputPort(), nowIndexed.outputPort(), false);
         this.addOperator(result);
         return result;
@@ -208,7 +222,7 @@ public class RewriteNow extends CircuitCloneVisitor {
         this.compiler.reportWarning(
                 Objects.requireNonNull(expression).getSourcePosition(), "Inefficient pattern",
                 "NOW() expression is used in a pattern that could require expensive computations\n"
-                        + "See https://docs.feldera.com/sql/datetime/#now");
+                        + NOW_DOCUMENTATION.citation());
     }
 
     @Override
@@ -219,7 +233,8 @@ public class RewriteNow extends CircuitCloneVisitor {
         if (cn.found()) {
             OutputPort input = this.mapped(operator.input());
             this.warnExpensive(cn.nowExpression);
-            DBSPSimpleOperator join = this.createJoin(input.simpleNode(), operator);
+            DBSPSimpleOperator join = this.createJoin(
+                    input.simpleNode(), operator, Objects.requireNonNull(cn.nowExpression));
             RewriteNowClosure rn = new RewriteNowClosure(this.compiler());
             function = rn.apply(function).to(DBSPExpression.class);
             DBSPSimpleOperator result = new DBSPMapOperator(
@@ -244,12 +259,13 @@ public class RewriteNow extends CircuitCloneVisitor {
         return opcode == DBSPOpcode.GTE || opcode == DBSPOpcode.GT;
     }
 
-    static DBSPOpcode inverse(DBSPOpcode opcode) {
+    /** The opcode comparing the swapped operands: 'a OP b' iff 'b swappedOpcode(OP) a'. */
+    static DBSPOpcode swappedOpcode(DBSPOpcode opcode) {
         return switch (opcode) {
-            case LT -> DBSPOpcode.GTE;
-            case GTE -> DBSPOpcode.LT;
-            case LTE -> DBSPOpcode.GT;
-            case GT -> DBSPOpcode.LTE;
+            case LT -> DBSPOpcode.GT;
+            case GTE -> DBSPOpcode.LTE;
+            case LTE -> DBSPOpcode.GTE;
+            case GT -> DBSPOpcode.LT;
             case EQ -> DBSPOpcode.EQ;
             default -> throw new InternalCompilerError(opcode.toString());
         };
@@ -350,15 +366,27 @@ public class RewriteNow extends CircuitCloneVisitor {
             source = filter;
         }
 
-        // Index input by the temporal key.
+        // Index input by the temporal key.  When the key is a column, the value omits
+        // that column, and the map after the window puts it back from the key.
+        int keyColumn = bounds.keyColumn(param);
+        DBSPExpression value;
+        if (keyColumn < 0) {
+            value = param.asVariable().deref().applyClone();
+        } else {
+            List<DBSPExpression> valueFields = new ArrayList<>();
+            for (int i = 0; i < inputType.size(); i++)
+                if (i != keyColumn)
+                    valueFields.add(param.asVariable().deref().field(i).applyCloneIfNeeded());
+            value = new DBSPTupleExpression(valueFields, false);
+        }
         DBSPClosureExpression indexFunction =
                 new DBSPRawTupleExpression(
                         common.cast(common.getNode(), windowKeyType,
                                 DBSPCastExpression.CastType.SqlUnsafe),
-                        param.asVariable().deref().applyClone()).closure(param);
+                        value).closure(param);
         DBSPTypeIndexedZSet ix = new DBSPTypeIndexedZSet(operator.getRelNode(),
                 windowKeyType,
-                inputType);
+                value.getType());
         DBSPMapIndexOperator index = new DBSPMapIndexOperator(operator.getRelNode(),
                 indexFunction, ix, operator.isMultiset, source.outputPort());
         this.addOperator(index);
@@ -369,18 +397,39 @@ public class RewriteNow extends CircuitCloneVisitor {
         boolean lowerInclusive = bounds.lower() == null || bounds.lower().inclusive();
         boolean upperInclusive = bounds.upper() == null || bounds.upper().inclusive();
         CalciteRelNode windowNode = relNode.copy();
-        ToJsonVisitor.FindSourcePositions finder = new ToJsonVisitor.FindSourcePositions(this.compiler, false);
+        FindSourcePositions finder = new FindSourcePositions(this.compiler, false);
         finder.apply(makeWindow);
         windowNode.addSourcePositions(finder.positions);
         DBSPSimpleOperator window = new DBSPWindowOperator(
-                windowNode, lowerInclusive, upperInclusive, diffIndex.outputPort(), windowBounds.outputPort());
+                windowNode, lowerInclusive, upperInclusive,
+                // -infinity if not specified
+                bounds.lower() == null, diffIndex.outputPort(), windowBounds.outputPort());
         this.addOperator(window);
         DBSPSimpleOperator winInt = new DBSPIntegrateOperator(relNode, window.outputPort());
         this.addOperator(winInt);
 
-        // Deindex result of window
-        DBSPSimpleOperator deindex = new DBSPDeindexOperator(relNode, window.getFunctionNode(),
-                winInt.outputPort());
+        DBSPSimpleOperator deindex;
+        if (keyColumn < 0) {
+            // Deindex result of window
+            deindex = new DBSPDeindexOperator(relNode, window.getFunctionNode(), winInt.outputPort());
+        } else {
+            // Restore the columns and drop the key
+            DBSPVariablePath var = ix.getKVRefType().var();
+            DBSPExpression[] fields = new DBSPExpression[inputType.size()];
+            for (int i = 0; i < inputType.size(); i++) {
+                if (i == keyColumn) {
+                    // The key has the column's type, except that it cannot be NULL
+                    fields[i] = var.field(0).deref().applyCloneIfNeeded()
+                            .cast(common.getNode(), inputType.getFieldType(i),
+                                    DBSPCastExpression.CastType.SqlUnsafe);
+                } else {
+                    int valueField = i < keyColumn ? i : i - 1;
+                    fields[i] = var.field(1).deref().field(valueField).applyCloneIfNeeded();
+                }
+            }
+            DBSPClosureExpression rebuild = inputType.makeTuple(fields).closure(var);
+            deindex = new DBSPMapOperator(relNode, rebuild, new DBSPTypeZSet(inputType), winInt.outputPort());
+        }
         this.addOperator(deindex);
         return deindex;
     }
@@ -425,16 +474,14 @@ public class RewriteNow extends CircuitCloneVisitor {
 
     @Override
     public void postorder(DBSPFilterOperator operator) {
-        ContainsNow cn = new ContainsNow(this.compiler(), true);
         DBSPClosureExpression function = operator.getClosureFunction();
-        cn.apply(function);
-        if (!cn.found) {
+        if (!ContainsNow.find(this.compiler, function)) {
             // Filter does not involve 'now'
             super.postorder(operator);
             return;
         }
 
-        function = function.ensureTree(compiler).to(DBSPClosureExpression.class);
+        function = function.ensureTree(this.compiler).to(DBSPClosureExpression.class);
         List<BooleanExpression> filters = this.findTemporalFilters(operator, function);
         filters = combineExpressions(filters);
         Utilities.enforce(!filters.isEmpty());
@@ -444,9 +491,12 @@ public class RewriteNow extends CircuitCloneVisitor {
 
         if (leftOver.is(NonTemporalFilter.class)) {
             // Implement leftover as a join
-            DBSPSimpleOperator join = this.createJoin(result, operator);
-            RewriteNowClosure rn = new RewriteNowClosure(this.compiler());
             DBSPExpression filterBody = leftOver.to(NonTemporalFilter.class).expression().wrapBoolIfNeeded();
+            ContainsNow cn = new ContainsNow(this.compiler(), true);
+            cn.apply(filterBody);
+            DBSPSimpleOperator join = this.createJoin(
+                    result, operator, Objects.requireNonNull(cn.nowExpression));
+            RewriteNowClosure rn = new RewriteNowClosure(this.compiler());
             this.warnExpensive(filterBody);
             function = filterBody.closure(function.parameters);
             function = rn.apply(function).to(DBSPClosureExpression.class);

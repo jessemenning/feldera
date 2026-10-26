@@ -3,15 +3,22 @@ name: Platform Integration Tests
 
 on:
   workflow_call:
+    inputs:
+      image_tag:
+        description: "Image tag to test. Empty means this ref's own sha- tag."
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
-      run_id:
-        description: "ID of the workflow run that uploaded the artifact"
-        required: true
-
-env:
-  FELDERA_SENTRY_ENABLED: 1
-  SENTRY_ENVIRONMENT: ci
+      image_tag:
+        description: >-
+          Tag of an already-built image to test, e.g. sha-<40-char-sha> from an
+          earlier run. Leave empty to use this ref's own sha- tag, which only
+          exists if the image was built for exactly this commit. Pointing at a
+          previous run's image is what makes this workflow dispatchable on its
+          own, without waiting for a full rebuild.
+        required: false
+        type: string
 
 jobs:
   manager-no-network:
@@ -34,7 +41,7 @@ jobs:
             --health-interval=10s \
             --health-timeout=5s \
             --health-retries=5 \
-            ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ vars.FELDERA_IMAGE_NAME }}:${{ inputs.image_tag || format('sha-{0}', github.sha) }}
       - name: Wait for container to become healthy (max 50s)
         run: |
           for i in {1..50}; do
@@ -59,12 +66,11 @@ jobs:
           docker rm -f pipeline-manager-no-internet || true
           docker network rm no-internet-net || true
 
-  manager-https:
-    if: ${{ !contains(vars.CI_SKIP_JOBS, 'manager-https') }}
-    name: Make sure manager runs with HTTPS
+  manager-https-rbac:
+    if: ${{ !contains(vars.CI_SKIP_JOBS, 'manager-https-rbac') }}
+    name: HTTPS, RBAC and OIDC trust
     runs-on: ubuntu-latest-amd64
 
-    # Environment variables for OIDC authentication (if available)
     env:
       OIDC_TEST_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
       OIDC_TEST_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
@@ -81,7 +87,10 @@ jobs:
       - name: Login to GHCR with GITHUB_TOKEN
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Start pipeline-manager in background
+      # Phase 1: the HTTPS listener, against the external provider when one is
+      # configured. This manager is torn down before phase 2, which binds the
+      # same port.
+      - name: Start pipeline-manager with HTTPS
         run: |
           mkdir test-tls
           echo -e "[x509_v3]\nsubjectAltName = @alt_names\n\n[alt_names]\nDNS.1 = localhost\nIP.1 = 127.0.0.1\n" > test-tls/x509_v3_test.ext
@@ -103,7 +112,7 @@ jobs:
             -e RUST_LOG=info \
             -e RUST_BACKTRACE=1 \
             -e CARGO_BUILD_JOBS=${{ vars.CI_RUNNER_CORES || 20 }} \
-            ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }} \
+            ${{ vars.FELDERA_IMAGE_NAME }}:${{ inputs.image_tag || format('sha-{0}', github.sha) }} \
             --enable-https \
             --https-tls-cert-path /home/ubuntu/test-tls/tls_test.crt \
             --https-tls-key-path /home/ubuntu/test-tls/tls_test.key
@@ -123,7 +132,7 @@ jobs:
           done
           echo "Timed out waiting for pipeline-manager to become healthy"
           exit 1
-      - name: Run platform tests
+      - name: Pipeline CRUD over HTTPS
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/platform/test_pipeline_crud.py --timeout=3600 -vv
         working-directory: python
@@ -131,19 +140,45 @@ jobs:
           FELDERA_HTTPS_TLS_CERT: ../test-tls/tls_test.crt
           FELDERA_HOST: https://localhost:8080
           PYTHONPATH: ${{ github.workspace }}/python
-          # OIDC environment variables for authentication
           OIDC_TEST_ISSUER: ${{ vars.OIDC_TEST_ISSUER }}
           OIDC_TEST_CLIENT_ID: ${{ vars.OIDC_TEST_CLIENT_ID }}
           OIDC_TEST_CLIENT_SECRET: ${{ secrets.OIDC_TEST_CLIENT_SECRET }}
           OIDC_TEST_USERNAME: ${{ secrets.OIDC_TEST_USERNAME }}
           OIDC_TEST_PASSWORD: ${{ secrets.OIDC_TEST_PASSWORD }}
+
+      - name: Stop the HTTPS manager
+        run: docker rm -f pipeline-manager-https || true
+
+      # Phase 2: RBAC and OIDC trust. The suite owns the manager, restarting it
+      # through no-auth, single-tenant and multi-tenant configurations, and runs
+      # its own issuers: a login provider, a workload issuer that trusts are
+      # registered against, and a rogue issuer signing with an unknown key. It
+      # is stateful and ordered, so it runs serially rather than under -n.
+      - name: RBAC, OIDC trust and the route/role matrix
+        if: ${{ vars.CI_DRY_RUN != 'true' }}
+        run: uv run --locked pytest tests/platform_rbac --timeout=2400 --maxfail=1 -vv
+        working-directory: python
+        env:
+          FELDERA_TEST_IMAGE: ${{ vars.FELDERA_IMAGE_NAME }}:${{ inputs.image_tag || format('sha-{0}', github.sha) }}
+          PYTHONPATH: ${{ github.workspace }}/python
+
       - name: Logs & Cleanup
         if: always()
         run: |
           rm -rf test-tls
-          docker logs pipeline-manager-https || true
-          docker inspect pipeline-manager-https || true
-          docker rm -f pipeline-manager-https || true
+          # Only if it outlived the phase that normally removes it, which is
+          # what happens when that phase failed and its log is worth having.
+          if docker inspect pipeline-manager-https >/dev/null 2>&1; then
+            docker logs pipeline-manager-https || true
+            docker rm -f pipeline-manager-https || true
+          fi
+          for c in $(docker ps -aq --filter "name=feldera-rbac-"); do
+            echo "=== $c ==="; docker logs "$c" 2>&1 | tail -100 || true
+            docker rm -f "$c" || true
+          done
+          for v in $(docker volume ls -q --filter "name=feldera-rbac-state-"); do
+            docker volume rm -f "$v" || true
+          done
 
   oss-platform-tests:
     if: ${{ !contains(vars.CI_SKIP_JOBS, 'oss-platform-tests') }}
@@ -152,6 +187,7 @@ jobs:
       actions: read
       contents: read
       packages: read
+      id-token: write # exchanged for a Databricks token; see the Unity Catalog auth step below
     strategy:
       matrix:
         include:
@@ -176,10 +212,10 @@ jobs:
       FELDERA_HOST: https://pipeline-manager:8080
 
     container:
-      image: ghcr.io/feldera/feldera-dev:sha-a5ab793b8d261068867b9fdfad3f04157b2536fc
+      image: us-central1-docker.pkg.dev/feldera-ci/ghcr-remote/feldera/feldera-dev:sha-a112fd877176bba0f4e5f3475853f918b276d1ef
     services:
       pipeline-manager:
-        image: ${{ vars.FELDERA_IMAGE_NAME }}:sha-${{ github.sha }}
+        image: ${{ vars.FELDERA_IMAGE_NAME }}:${{ inputs.image_tag || format('sha-{0}', github.sha) }}
         env:
           # Configure OIDC authentication if available, otherwise use no auth
           AUTH_PROVIDER: ${{ vars.OIDC_TEST_ISSUER && 'generic-oidc' || 'none' }}
@@ -221,6 +257,18 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/python
 
+      # feldera-ci has no OAuth secret; the Unity Catalog deletion-vector
+      # test authenticates through Databricks workload identity federation
+      # instead, exchanging this job's own GitHub OIDC token for a
+      # Databricks one. unity_api.py does the exchange itself, lazily, the
+      # moment the test actually calls it and caches the result until
+      # Databricks' own reported expiry -- not here, up front: the full
+      # tests/platform suite runs under pytest-xdist for 30+ minutes, long
+      # enough to approach a federated token's lifetime, and which test
+      # draws a stale one would depend on xdist's scheduling. GitHub sets
+      # ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN on every step once id-token:
+      # write is granted, not just one that explicitly reads them, so no
+      # separate step is needed here.
       - name: Run platform tests
         if: ${{ vars.CI_DRY_RUN != 'true' }}
         run: uv run --locked pytest -n ${{ vars.PYTEST_WORKERS }} tests/platform --timeout=1500 -vv ${{ vars.PYTEST_EXTRA }}
@@ -228,18 +276,12 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/python
           IN_CI: 1 # We use this flag to skip some kafka tests in the python code base
-          # GCS test-bucket credentials, surfaced under the standard env
-          # names the Delta tests read (see python/tests/utils.py).
-          CI_K8S_MINIO_ACCESS_KEY_ID: ${{ secrets.CI_GCS_HMAC_ACCESS_KEY_ID }}
-          CI_K8S_MINIO_SECRET_ACCESS_KEY: ${{ secrets.CI_GCS_HMAC_SECRET_ACCESS_KEY }}
-          CI_MINIO_ENDPOINT: https://storage.googleapis.com
-          CI_MINIO_BUCKET: feldera-ci-test-feldera-ci
-          # rclone quirks for GCS S3-interop; MinIO provider signing gets 403.
-          CI_MINIO_PROVIDER: GCS
-          # GCS S3-interop lacks x-amz checksums; newer AWS SDKs (pyarrow's C++
-          # SDK) fail GetObject with "Response checksums mismatch" otherwise.
-          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
-          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+          CI_OBJECT_STORE_URI: gs://feldera-ci-test-feldera-ci
+          # Long-lived datasets tests only read.
+          CI_OBJECT_STORE_INPUTS_URI: gs://feldera-ci-inputs-feldera-ci
+          DELTA_TABLE_TEST_UNITY_HOST: ${{ vars.DATABRICKS_WORKSPACE_HOST }}
+          UNITY_CI_SERVICE_PRINCIPAL_APPLICATION_ID: ${{ vars.UNITY_CI_SERVICE_PRINCIPAL_APPLICATION_ID }}
+          DELTA_TABLE_TEST_UNITY_DV_TABLE: ${{ vars.DELTA_TABLE_TEST_UNITY_DV_TABLE }}
 
       - name: Download fda binary
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -291,3 +333,55 @@ jobs:
         working-directory: crates/fda
         env:
           FDA_BINARY: ${{ github.workspace }}/build/fda
+
+  # One cancel sentinel per job above, following the scheme ci.yml documents.
+  # ci.yml's cancel-if-tests-integration-platform-failed is not enough on its
+  # own: it watches the caller-side job, which reports failure only once every
+  # job here has finished, so a job that fails early leaves its siblings, and
+  # the rest of the run, going for hours. These watch a single job each and
+  # cancel the run as soon as it fails. `github.run_id` is the caller's run,
+  # so the whole run goes down, not just this workflow.
+  cancel-if-manager-no-network-failed:
+    name: Cancel if No-Network Manager Test Failed
+    needs: [manager-no-network]
+    if: failure()
+    runs-on: ubuntu-latest-amd64
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel workflow
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
+
+  cancel-if-manager-https-rbac-failed:
+    name: Cancel if HTTPS, RBAC and OIDC Trust Tests Failed
+    needs: [manager-https-rbac]
+    if: failure()
+    runs-on: ubuntu-latest-amd64
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel workflow
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"
+
+  cancel-if-oss-platform-tests-failed:
+    name: Cancel if OSS Platform Tests Failed
+    needs: [oss-platform-tests]
+    if: failure()
+    runs-on: ubuntu-latest-amd64
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel workflow
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel"

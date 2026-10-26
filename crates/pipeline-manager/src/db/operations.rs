@@ -1,5 +1,7 @@
 // Database operations that can be performed, grouped into categories.
 // Every operation is implemented to be part of a transaction.
+// A single read-only statement takes `&impl GenericClient` instead, so it can
+// run without a transaction.
 // These operations are building blocks and should be used accordingly as incorrect
 // usage may result in a panic.
 //
@@ -14,8 +16,10 @@
 pub mod api_key;
 pub mod cluster_monitor;
 pub mod connectivity;
+pub mod oidc_trust;
 pub mod pipeline;
 pub mod pipeline_monitor;
 mod pipeline_parsing;
 pub mod tenant;
+pub mod user;
 pub(crate) mod utils;

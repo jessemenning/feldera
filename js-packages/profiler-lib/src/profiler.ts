@@ -5,6 +5,7 @@ import { CircuitProfile, NodeAndMetric, PropertyValue } from "./profile.js";
 import { Cytograph, CytographRendering } from "./cytograph.js";
 import { CircuitSelector } from "./selection.js";
 import { MetadataSelector } from './metadataSelection.js';
+import type { DiagramTheme } from './diagramTheme.js';
 import { Option, shadeOfRed } from "./util.js";
 
 export { NodeAndMetric, shadeOfRed };
@@ -36,6 +37,10 @@ export interface TooltipRow {
     metric: string;
     isCurrentMetric: boolean;
     cells: TooltipCell[];
+    /** The cells added up, for metrics that add up: counts, byte sizes, durations.  Absent for
+     * ratios, minima, maxima, flags and settings, where a total states nothing.  Its
+     * `percentile` is the share of the largest total any node reports for the metric. */
+    total?: TooltipCell | undefined;
 }
 
 /** Tooltip data structure */
@@ -43,6 +48,9 @@ export interface NodeAttributes {
     /** The operator's graph node id, carried as a first-class field so consumers need not
      *  parse it back out of `title`. */
     nodeId: string;
+    /** True when the node contains other nodes, so its metrics and its consumer count describe
+     *  what is inside it rather than one operator. */
+    isRegion: boolean;
     title: string;
     /** Column headers */
     columns: string[];
@@ -94,6 +102,10 @@ export interface VisualizerConfig {
 
     /** Callbacks for UI updates */
     callbacks: ProfilerCallbacks;
+
+    /** Palette the diagram is drawn with; defaults to 'light'. Change it later with
+     *  `setTheme()` rather than by re-creating the visualizer. */
+    theme?: DiagramTheme;
 }
 
 /**
@@ -106,9 +118,18 @@ export class Visualizer {
     private rendering: CytographRendering | null = null;
     private profile: CircuitProfile | null = null;
     private onRefreshTooltip: (() => void) | null = null;
+    private theme: DiagramTheme;
 
     constructor(private readonly config: VisualizerConfig) {
         this.config = config;
+        this.theme = config.theme ?? 'light';
+    }
+
+    /** Switch the diagram palette. Cheap: the graph is restyled and repainted, not laid out
+     *  again, so nothing moves and no state is lost. */
+    setTheme(theme: DiagramTheme): void {
+        this.theme = theme;
+        this.rendering?.setTheme(theme);
     }
 
     /** Display an error message */
@@ -158,7 +179,8 @@ export class Visualizer {
                 MetadataSelector.getFullSelection(),
                 this.message.bind(this),
                 this.clearMessage.bind(this),
-                () => this.onRefreshTooltip = null
+                () => this.onRefreshTooltip = null,
+                this.theme
             );
             this.rendering.setEvents({
                 onNodeDoubleClick: (node, type) => {
@@ -166,7 +188,8 @@ export class Visualizer {
                         this.circuitSelector!.toggleExpand(node)
                     }
                     this.config.callbacks.onNodeDoubleClick?.(node, type)
-                }
+                },
+                onShowSource: (node) => this.config.callbacks.onNodeDoubleClick?.(node, 'leaf')
             });
 
             // Wire up event handlers

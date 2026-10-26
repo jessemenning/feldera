@@ -16,8 +16,11 @@ pub trait CmpFunc<T>: Send + Sync + 'static {
 
 /// Wrapper around type `T` that uses `F` instead of
 /// `Ord::cmp` to compare values.
+///
+/// Deliberately without the `#[archive(compare(PartialEq, PartialOrd))]`.
+/// A cross-form comparison for this type has to call `F`, and so
+/// has to be written by hand alongside the two below.
 #[derive(SizeOf, Archive, Serialize, Deserialize, IsNone)]
-#[archive(compare(PartialEq, PartialOrd))]
 pub struct WithCustomOrd<T, F> {
     pub val: T,
     phantom: PhantomData<F>,
@@ -163,6 +166,19 @@ where
         let real_self: T = self.val.deserialize(&mut Deserializer::default()).unwrap();
         let real_other: T = other.val.deserialize(&mut Deserializer::default()).unwrap();
         F::cmp(&real_self, &real_other)
+    }
+}
+
+impl<T, F> crate::dynamic::OrdRepr<WithCustomOrd<T, F>> for ArchivedWithCustomOrd<T, F>
+where
+    T: Archive + Deserializable,
+    F: CmpFunc<T>,
+{
+    fn ord_cmp(&self, other: &WithCustomOrd<T, F>) -> Ordering {
+        // `F` compares unarchived values, so this deserializes just as the
+        // archived `Ord` above does.
+        let real_self: T = self.val.deserialize(&mut Deserializer::default()).unwrap();
+        F::cmp(&real_self, &other.val)
     }
 }
 

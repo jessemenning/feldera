@@ -1,5 +1,5 @@
 use crate::compiler::sql_compiler::{attempt_end_to_end_sql_compilation, cleanup_sql_compilation};
-use crate::compiler::util::{encode_dir_as_string, read_file_content, DirectoryContent};
+use crate::compiler::util::{DirectoryContent, encode_dir_as_string, read_file_content};
 use crate::config::{CommonConfig, CompilerConfig};
 use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
@@ -66,6 +66,8 @@ impl CompilerTest {
             binary_upload_timeout_secs: 600,
             binary_upload_max_retries: 3,
             binary_upload_retry_delay_ms: 1000,
+            gen2_udf_sdk_path: None,
+            gen2_udf_sdk_version: None,
         };
 
         // Test in-memory database
@@ -123,6 +125,31 @@ impl CompilerTest {
         udf_rust: &str,
         udf_toml: &str,
     ) -> PipelineId {
+        self.create_pipeline_with_program_config(
+            tenant_id,
+            name,
+            platform_version,
+            program_code,
+            udf_rust,
+            udf_toml,
+            json!({}),
+        )
+        .await
+    }
+
+    /// Creates a pipeline in the database under the provided name with UDF and program
+    /// configuration specified.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_pipeline_with_program_config(
+        &self,
+        tenant_id: TenantId,
+        name: &str,
+        platform_version: &str,
+        program_code: &str,
+        udf_rust: &str,
+        udf_toml: &str,
+        program_config: serde_json::Value,
+    ) -> PipelineId {
         let pipeline_id = PipelineId(Uuid::now_v7());
         self.db
             .lock()
@@ -139,7 +166,7 @@ impl CompilerTest {
                     program_code: program_code.to_string(),
                     udf_rust: udf_rust.to_string(),
                     udf_toml: udf_toml.to_string(),
-                    program_config: json!({}),
+                    program_config,
                 },
             )
             .await
@@ -218,6 +245,7 @@ impl CompilerTest {
         tenant_id: TenantId,
         pipeline_id: PipelineId,
         program_code: &str,
+        warnings: bool,
     ) -> ExtendedPipelineDescr {
         // Retrieve pipeline descriptor
         let pipeline_descr = self.get_pipeline(tenant_id, pipeline_id).await;
@@ -271,7 +299,9 @@ impl CompilerTest {
         );
         assert_eq!(content_program_sql, program_code);
         assert_ne!(content_schema_json, "");
-        assert_eq!(content_stderr_log, "");
+        if !warnings {
+            assert_eq!(content_stderr_log, "");
+        }
         assert_eq!(content_stdout_log, "");
 
         // Return the pipeline descriptor

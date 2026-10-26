@@ -10,12 +10,16 @@
 //! thus fully applied (deleted rows are never emitted), and memory stays bounded
 //! to one batch.
 
+use crate::integrated::delta_table::ReadSchema;
 use anyhow::{Result as AnyResult, anyhow};
-use arrow::array::{Array, ArrayRef, StructArray, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, LargeListArray, ListArray, MapArray, StructArray, new_null_array,
+};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Fields, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_stream::try_stream;
+use bytes::Bytes;
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::DataFusionError;
@@ -26,17 +30,129 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use delta_kernel::actions::deletion_vector::{
     DeletionVectorDescriptor as KernelDvDescriptor, DeletionVectorStorageType,
 };
+use delta_kernel::object_store::{GetOptions, GetRange, ObjectStoreExt};
+use delta_kernel::{
+    DeltaResult as DeltaKernelResult, Error as DeltaKernelError, FileMeta, FileSlice,
+    StorageHandler,
+};
 use deltalake::kernel::{DeletionVectorDescriptor, StorageType};
 use deltalake::logstore::LogStore;
 use deltalake::{DeltaTable, ObjectStore, Path};
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, TryFutureExt};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
+};
+use parquet::arrow::async_reader::{
+    AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStreamBuilder,
+};
+use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use url::Url;
+
+/// Reads a Parquet file out of an object store for [`ParquetRecordBatchStreamBuilder`].
+/// parquet 59 deprecates `ParquetObjectReader` and says to implement this trait (arrow-rs #10308).
+#[derive(Clone)]
+pub(super) struct ObjectStoreReader {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: Option<u64>,
+    footer_size_hint: Option<usize>,
+}
+
+impl ObjectStoreReader {
+    pub(super) fn new(store: Arc<dyn ObjectStore>, path: Path) -> Self {
+        Self {
+            store,
+            path,
+            file_size: None,
+            footer_size_hint: None,
+        }
+    }
+
+    /// Read the footer at a known offset rather than with a suffix request.
+    pub(super) fn with_file_size(mut self, size: u64) -> Self {
+        self.file_size = Some(size);
+        self
+    }
+
+    /// Fetch this many trailing bytes at once, so one request can cover the whole footer.
+    pub(super) fn with_footer_size_hint(mut self, hint: usize) -> Self {
+        self.footer_size_hint = Some(hint);
+        self
+    }
+}
+
+fn to_parquet_err(e: delta_kernel::object_store::Error) -> ParquetError {
+    ParquetError::External(Box::new(e))
+}
+
+impl AsyncFileReader for ObjectStoreReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        self.store
+            .get_range(&self.path, range)
+            .map_err(to_parquet_err)
+            .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move {
+            self.store
+                .get_ranges(&self.path, &ranges)
+                .await
+                .map_err(to_parquet_err)
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let reader = ParquetMetaDataReader::new()
+                .with_arrow_reader_options(options)
+                .with_prefetch_hint(self.footer_size_hint);
+            let metadata = match self.file_size {
+                Some(size) => reader.load_and_finish(self, size).await?,
+                None => reader.load_via_suffix_and_finish(self).await?,
+            };
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
+/// Fetch the footer without knowing the file size, via a suffix range request.
+impl MetadataSuffixFetch for &mut ObjectStoreReader {
+    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let options = GetOptions {
+            range: Some(GetRange::Suffix(suffix as u64)),
+            ..Default::default()
+        };
+        async move {
+            let resp = self
+                .store
+                .get_opts(&self.path, options)
+                .await
+                .map_err(to_parquet_err)?;
+            resp.bytes().await.map_err(to_parquet_err)
+        }
+        .boxed()
+    }
+}
 
 /// Convert the delta-rs descriptor into its `delta_kernel` equivalent, which
 /// owns the decoding logic. The fields are identical; only the storage-type
@@ -55,17 +171,137 @@ fn to_kernel_descriptor(dv: &DeletionVectorDescriptor) -> KernelDvDescriptor {
     }
 }
 
+/// A [`StorageHandler`] that answers a repeated read from memory.
+///
+/// `delta_kernel` reads a whole sidecar object to decode one vector out of it, and a flush
+/// packs every vector it writes into one object.  The next flush therefore fetched that one
+/// object once per file it touched: O(files) requests and O(files^2) bytes for the same
+/// content.  Sharing one of these across a flush's reads makes it one request.
+///
+/// Reads are cached, so an instance must not outlive the snapshot it reads.  Every other
+/// operation passes straight through.
+/// What one `read_files` request names: the object, and the byte range if any.
+type ReadKey = (Url, Option<(u64, u64)>);
+
+pub(crate) struct CachedReads {
+    inner: Arc<dyn StorageHandler>,
+    /// Keyed by what `read_files` is asked for, which is the whole object here.
+    cache: Mutex<HashMap<ReadKey, Bytes>>,
+    /// Bytes held, against [`Self::MAX_CACHED_BYTES`].
+    held: AtomicU64,
+}
+
+impl CachedReads {
+    /// Ceiling on what one instance holds.  A packed object grows with the table's file
+    /// count, and caching is an optimization: past this the reads pass through rather than
+    /// let a large table turn a flush into a memory spike.
+    const MAX_CACHED_BYTES: u64 = 256 * 1024 * 1024;
+
+    pub(crate) fn new(inner: Arc<dyn StorageHandler>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+            held: AtomicU64::new(0),
+        })
+    }
+
+    fn key(slice: &FileSlice) -> ReadKey {
+        (slice.0.clone(), slice.1.as_ref().map(|r| (r.start, r.end)))
+    }
+}
+
+impl StorageHandler for CachedReads {
+    /// Serves what it has and asks `inner` only for the rest, preserving the requested order.
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaKernelResult<Box<dyn Iterator<Item = DeltaKernelResult<Bytes>>>> {
+        let mut answers: Vec<Option<Bytes>> = Vec::with_capacity(files.len());
+        let mut missing = Vec::new();
+        {
+            let cache = self.cache.lock().unwrap();
+            for slice in &files {
+                let hit = cache.get(&Self::key(slice)).cloned();
+                if hit.is_none() {
+                    missing.push(slice.clone());
+                }
+                answers.push(hit);
+            }
+        }
+
+        if !missing.is_empty() {
+            let fetched: Vec<Bytes> = self
+                .inner
+                .read_files(missing.clone())?
+                .collect::<DeltaKernelResult<Vec<_>>>()?;
+            {
+                let mut cache = self.cache.lock().unwrap();
+                for (slice, bytes) in missing.iter().zip(&fetched) {
+                    // Checked per entry, so one oversized object does not evict what fits.
+                    let held = self.held.load(Ordering::Relaxed);
+                    if held + bytes.len() as u64 <= Self::MAX_CACHED_BYTES {
+                        self.held
+                            .store(held + bytes.len() as u64, Ordering::Relaxed);
+                        cache.insert(Self::key(slice), bytes.clone());
+                    }
+                }
+            }
+
+            // Back in the order asked for: a miss takes the next fetched answer, and the
+            // fetches were made in the order the misses were found.
+            let mut fetched = fetched.into_iter();
+            for answer in answers.iter_mut() {
+                if answer.is_none() {
+                    *answer = fetched.next();
+                }
+            }
+        }
+
+        Ok(Box::new(answers.into_iter().map(|bytes| {
+            bytes.ok_or_else(|| {
+                DeltaKernelError::generic("storage returned fewer files than were requested")
+            })
+        })))
+    }
+
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaKernelResult<Box<dyn Iterator<Item = DeltaKernelResult<FileMeta>>>> {
+        self.inner.list_from(path)
+    }
+
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaKernelResult<()> {
+        self.inner.copy_atomic(src, dest)
+    }
+
+    fn put(&self, path: &Url, data: Bytes, overwrite: bool) -> DeltaKernelResult<()> {
+        self.inner.put(path, data, overwrite)
+    }
+
+    fn head(&self, path: &Url) -> DeltaKernelResult<FileMeta> {
+        self.inner.head(path)
+    }
+
+    fn delete(&self, path: &Url) -> DeltaKernelResult<()> {
+        self.inner.delete(path)
+    }
+}
+
 /// Decode a deletion vector into the bitmap of deleted row positions.
 ///
 /// `delta_kernel`'s `read` handles all three storage types ("i" inline,
 /// "u" relative sidecar, "p" absolute sidecar). It may block on I/O to fetch
 /// a sidecar file, so it runs on the blocking pool.
-pub(crate) async fn read_deletion_vector(
+///
+/// `storage` reads the sidecar. A caller decoding several vectors should hand the same
+/// [`CachedReads`] to each, or they will each fetch the object all of them share.
+pub(crate) async fn read_deletion_vector_with(
     dv: &DeletionVectorDescriptor,
     table: &DeltaTable,
+    storage: Arc<dyn StorageHandler>,
 ) -> AnyResult<RoaringTreemap> {
     let log_store = table.log_store();
-    let storage = log_store.engine(None).storage_handler();
 
     // Sidecar paths resolve via `Url::join`, which drops the last path
     // segment unless the base URL ends with '/'.
@@ -95,6 +331,15 @@ pub(crate) async fn read_deletion_vector(
         })
 }
 
+/// Decode one vector, fetching its sidecar afresh.
+pub(crate) async fn read_deletion_vector(
+    dv: &DeletionVectorDescriptor,
+    table: &DeltaTable,
+) -> AnyResult<RoaringTreemap> {
+    let storage = table.log_store().engine().storage_handler();
+    read_deletion_vector_with(dv, table, storage).await
+}
+
 /// Shorten `value` to at most 64 characters for use in error messages.
 fn abbreviate(value: &str) -> String {
     const MAX_CHARS: usize = 64;
@@ -104,13 +349,30 @@ fn abbreviate(value: &str) -> String {
     }
 }
 
-/// Build a [`TableProvider`] over the Parquet file at `path` that reads the rows
-/// `mode` picks out of `bitmap` (see [`ReadMode`]).
+/// One Parquet file to read, and the row positions a [`ReadMode`] picks out of
+/// it.
+pub(crate) struct MaskedFile {
+    pub path: Path,
+    /// A `RoaringTreemap` stays compact even for dense sets, and it is dropped
+    /// once the file has been streamed, so the footprint is short-lived.
+    pub bitmap: RoaringTreemap,
+}
+
+/// Build a [`TableProvider`] over `files`, reading from each the rows `mode`
+/// picks out of its bitmap (see [`ReadMode`]).
 ///
-/// The bitmap indexes rows by physical position, so the file is read in order
-/// through a single-partition [`StreamingTable`] (a `ListingTable` could split
-/// and reorder it). Row selection happens inside the Parquet decoder, so memory
-/// stays bounded to one batch.
+/// A bitmap indexes rows by physical position, so each file is read in order
+/// through a [`StreamingTable`] (a `ListingTable` could split and reorder it).
+/// Row selection happens inside the Parquet decoder, so a file costs one batch
+/// of memory while it streams.
+///
+/// The files are dealt into at most `max_partitions` partitions, and a partition
+/// opens its files one after another. That is what bounds the memory: a Parquet
+/// reader's own state is per column per open file and no batch size reaches it,
+/// so N files read at once cost N times that state. DataFusion drives every
+/// partition of a plan concurrently, so partitions are the only lever, and one
+/// provider over N files replaces the N single-file providers this used to be
+/// unioned from, whose count nothing bounded.
 ///
 /// `logical_schema` is the table's Arrow schema, restricted by the caller to the
 /// columns it wants read. Batches are projected to it by name (missing columns
@@ -119,21 +381,41 @@ fn abbreviate(value: &str) -> String {
 /// [`StreamingTable`] does not push projections down.
 pub(crate) async fn filtered_parquet_table(
     store: Arc<dyn ObjectStore>,
-    path: Path,
-    bitmap: RoaringTreemap,
-    logical_schema: SchemaRef,
+    files: Vec<MaskedFile>,
+    logical_schema: ReadSchema,
     mode: ReadMode,
+    max_partitions: usize,
 ) -> AnyResult<Arc<dyn TableProvider>> {
-    let partition = MaskedParquetPartition {
-        store,
-        path,
-        bitmap: Arc::new(bitmap),
-        schema: Arc::clone(&logical_schema),
-        mode,
-    };
-    let provider = StreamingTable::try_new(logical_schema, vec![Arc::new(partition)])
+    let schema = Arc::clone(logical_schema.schema());
+    let partitions: Vec<Arc<dyn PartitionStream>> = deal(files, max_partitions)
+        .into_iter()
+        .map(|files| {
+            Arc::new(MaskedParquetPartition {
+                store: Arc::clone(&store),
+                files: Arc::new(files),
+                schema: logical_schema.clone(),
+                mode,
+            }) as Arc<dyn PartitionStream>
+        })
+        .collect();
+    let provider = StreamingTable::try_new(schema, partitions)
         .map_err(|e| anyhow!("failed to build DV-filtered streaming table: {e}"))?;
     Ok(Arc::new(provider))
+}
+
+/// Deal `files` round-robin into at most `max_partitions` non-empty groups.
+///
+/// Round-robin rather than contiguous chunks so that a commit whose files vary
+/// in size spreads the large ones across partitions instead of loading one with
+/// all of them. An empty input yields one empty group, because a
+/// [`StreamingTable`] needs a partition to report the schema from.
+fn deal<T>(files: Vec<T>, max_partitions: usize) -> Vec<Vec<T>> {
+    let groups = max_partitions.clamp(1, files.len().max(1));
+    let mut dealt: Vec<Vec<T>> = (0..groups).map(|_| Vec::new()).collect();
+    for (index, file) in files.into_iter().enumerate() {
+        dealt[index % groups].push(file);
+    }
+    dealt
 }
 
 /// Which rows [`filtered_parquet_table`] reads, relative to its `bitmap`.
@@ -154,35 +436,36 @@ impl ReadMode {
     }
 }
 
-/// Single-partition [`PartitionStream`] that lazily opens a Parquet file and
-/// keeps or drops the rows flagged by `bitmap` (per `mode`) as batches flow
-/// through.
+/// [`PartitionStream`] that opens its files one at a time, keeping or dropping
+/// the rows each one's bitmap flags (per `mode`) as batches flow through.
+///
+/// One file is open at a time, so the partition's cost is one Parquet reader
+/// whatever it was given.
 struct MaskedParquetPartition {
     store: Arc<dyn ObjectStore>,
-    path: Path,
-    /// Row positions this partition acts on. A `RoaringTreemap` stays compact
-    /// even for dense sets, and it is dropped once the partition finishes
-    /// streaming, so the footprint is bounded and short-lived.
-    bitmap: Arc<RoaringTreemap>,
-    /// The Delta logical schema; may differ from the file's own schema under
+    files: Arc<Vec<MaskedFile>>,
+    /// The Delta logical schema; may differ from a file's own schema under
     /// schema evolution.
-    schema: SchemaRef,
-    /// Which rows to read, relative to `bitmap`.
+    schema: ReadSchema,
+    /// Which rows to read, relative to each file's bitmap.
     mode: ReadMode,
 }
 
 impl fmt::Debug for MaskedParquetPartition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MaskedParquetPartition")
-            .field("path", &self.path)
-            .field("bitmap_rows", &self.bitmap.len())
+            .field("files", &self.files.len())
+            .field(
+                "bitmap_rows",
+                &self.files.iter().map(|f| f.bitmap.len()).sum::<u64>(),
+            )
             .finish()
     }
 }
 
 /// A field's Parquet field id. The data file stamps `PARQUET:field_id`; the Delta
 /// read schema carries `delta.columnMapping.id`. Either identifies the same column.
-fn field_id(field: &Field) -> Option<&str> {
+pub(super) fn field_id(field: &Field) -> Option<&str> {
     field
         .metadata()
         .get("PARQUET:field_id")
@@ -191,7 +474,7 @@ fn field_id(field: &Field) -> Option<&str> {
 }
 
 /// Index a field list by field id, skipping fields without one.
-fn field_index_by_id(fields: &Fields) -> HashMap<&str, usize> {
+pub(super) fn field_index_by_id(fields: &Fields) -> HashMap<&str, usize> {
     fields
         .iter()
         .enumerate()
@@ -199,16 +482,58 @@ fn field_index_by_id(fields: &Fields) -> HashMap<&str, usize> {
         .collect()
 }
 
+/// Finds the field `want` among the fields of the schema `file`.
+///
+/// Matches by field id, then by name. A name match is accepted only against a
+/// file column carrying no id of its own, since one carrying a different id is
+/// a different column.
+///
+/// # Arguments
+///
+/// * `file` - the data file's schema, to search.
+/// * `by_id` - `file`'s fields indexed by field id, from [`field_index_by_id`].
+/// * `want` - the field to find.
+///
+/// # Returns
+///
+/// Its index into `file`'s fields, or `None` when the file has no such column.
+pub(super) fn source_index(
+    file: &Schema,
+    by_id: &HashMap<&str, usize>,
+    want: &Field,
+) -> Option<usize> {
+    match field_id(want) {
+        Some(id) => by_id.get(id).copied().or_else(|| {
+            file.fields()
+                .iter()
+                .position(|f| field_id(f).is_none() && f.name() == want.name())
+        }),
+        None => file.index_of(want.name()).ok(),
+    }
+}
+
+/// Builds the error for a file column that cannot be read as the type the Delta
+/// table's schema declares for it.
+///
+/// # Arguments
+///
+/// * `file` - the data file's path, when the caller knows it; a listing's
+///   reader does not.
+/// * `column` - the column's name, dotted for a nested child.
+/// * `from` - the type the file stores.
+/// * `to` - the type the table's schema declares.
+/// * `cause` - the failure underneath.
 fn conversion_error(
-    file: &str,
+    file: Option<&str>,
     column: &str,
     from: &DataType,
     to: &DataType,
     cause: impl fmt::Display,
 ) -> DataFusionError {
+    let of_file = file.map_or(String::new(), |f| format!(" of file '{f}'"));
     DataFusionError::External(
         format!(
-            "Delta file reader: cannot read column '{column}' of file '{file}': the file stores \
+            "Delta file reader: cannot read column '{column}'{of_file}: the file stores \
              it as {from:?}, which is not convertible to the {to:?} that the Delta table's \
              schema declares: {cause}"
         )
@@ -216,48 +541,155 @@ fn conversion_error(
     )
 }
 
-/// Convert a file column `array` to the `target` type the read schema expects.
-/// `file` and `column` (dotted for a nested child) locate it in errors.
+/// Returns the element field of a container type: a list's element, or a map's
+/// entries struct. `None` for any other type.
 ///
-/// Under column mapping a struct's field names differ between the file and the
-/// schema (a file may use logical names, the schema uses `col-<id>`), so a struct
-/// is rebuilt: each target child takes the source child with the same field id, or
-/// the child at the same position when neither side carries an id (unmapped). A
-/// target child the file lacks is null-filled, matching how [`project_to_logical`]
-/// handles a missing top-level column. Non-struct types (scalars, lists, maps)
-/// have no such names to match, so `cast` handles them, including type and
-/// container differences like `List` vs `LargeList`.
-fn realign_array(
+/// Delta has no fixed-size list, so that Arrow type never appears here.
+fn container_element(data_type: &DataType) -> Option<&FieldRef> {
+    match data_type {
+        DataType::List(element) | DataType::LargeList(element) | DataType::Map(element, _) => {
+            Some(element)
+        }
+        _ => None,
+    }
+}
+
+/// Rebuilds the list or map `array` around elements realigned to `target`'s
+/// element type, keeping the array's own container kind.
+///
+/// # Arguments
+///
+/// * `array` - the file's column.
+/// * `target` - the type the read schema declares for it.
+/// * `file` - the data file's path, for errors.
+/// * `column` - the column's name, for errors.
+///
+/// # Returns
+///
+/// The rebuilt array, or `None` when either side is not a container, which
+/// leaves the caller to handle it.
+fn realign_container(
     array: &ArrayRef,
     target: &DataType,
-    file: &str,
+    file: Option<&str>,
+    column: &str,
+) -> Result<Option<ArrayRef>, DataFusionError> {
+    let Some(element) = container_element(target) else {
+        return Ok(None);
+    };
+    let realigned = |values: &ArrayRef| realign_array(values, element.data_type(), file, column);
+    let rebuild_error =
+        |e: arrow::error::ArrowError| conversion_error(file, column, array.data_type(), target, e);
+
+    let rebuilt: ArrayRef = if let Some(source) = array.as_any().downcast_ref::<ListArray>() {
+        Arc::new(
+            ListArray::try_new(
+                Arc::clone(element),
+                source.offsets().clone(),
+                realigned(source.values())?,
+                source.nulls().cloned(),
+            )
+            .map_err(rebuild_error)?,
+        )
+    } else if let Some(source) = array.as_any().downcast_ref::<LargeListArray>() {
+        Arc::new(
+            LargeListArray::try_new(
+                Arc::clone(element),
+                source.offsets().clone(),
+                realigned(source.values())?,
+                source.nulls().cloned(),
+            )
+            .map_err(rebuild_error)?,
+        )
+    } else if let Some(source) = array.as_any().downcast_ref::<MapArray>() {
+        // A map's element is its entries struct, which holds the key and value.
+        let entries: ArrayRef = Arc::new(source.entries().clone());
+        let entries = realign_array(&entries, element.data_type(), file, column)?;
+        let Some(entries) = entries.as_any().downcast_ref::<StructArray>() else {
+            return Ok(None);
+        };
+        Arc::new(
+            MapArray::try_new(
+                Arc::clone(element),
+                source.offsets().clone(),
+                entries.clone(),
+                source.nulls().cloned(),
+                // Delta never marks a map sorted, so this matches the target.
+                matches!(target, DataType::Map(_, true)),
+            )
+            .map_err(rebuild_error)?,
+        )
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(rebuilt))
+}
+
+/// Converts the file column `array` to the `target` type the read schema
+/// declares.
+///
+/// Under column mapping the file and the schema name a struct's fields
+/// differently, so a struct is rebuilt child by child: each target child takes
+/// the source child of the same field id, or an id-less one of the same name,
+/// or, in an unmapped struct where no side carries ids, the child at the same
+/// position. A target child the file lacks is null-filled. A list or map is
+/// rebuilt around its realigned elements, since a struct inside one needs that
+/// same matching; `cast` handles the rest.
+///
+/// # Arguments
+///
+/// * `array` - the file's column.
+/// * `target` - the type the read schema declares for it.
+/// * `file` - the data file's path, for errors.
+/// * `column` - the column's name, dotted for a nested child, for errors.
+pub(super) fn realign_array(
+    array: &ArrayRef,
+    target: &DataType,
+    file: Option<&str>,
     column: &str,
 ) -> Result<ArrayRef, DataFusionError> {
-    let cast_to_target = || {
-        cast(array, target)
-            .map_err(|e| conversion_error(file, column, array.data_type(), target, e))
+    // Errors name the file's own type, not an intermediate one.
+    let cast_to_target = |from: &ArrayRef| {
+        cast(from, target).map_err(|e| conversion_error(file, column, array.data_type(), target, e))
     };
-    let DataType::Struct(target_fields) = target else {
-        return if array.data_type() == target {
-            Ok(Arc::clone(array))
+    if array.data_type() == target {
+        return Ok(Arc::clone(array));
+    }
+    if let Some(rebuilt) = realign_container(array, target, file, column)? {
+        // The rebuild keeps the file's container kind, so a target that spells
+        // it differently needs one more cast, of the offsets alone.
+        return if rebuilt.data_type() == target {
+            Ok(rebuilt)
         } else {
-            cast_to_target()
+            cast_to_target(&rebuilt)
         };
+    }
+    let DataType::Struct(target_fields) = target else {
+        return cast_to_target(array);
     };
     let Some(source) = array.as_any().downcast_ref::<StructArray>() else {
-        return cast_to_target();
+        return cast_to_target(array);
     };
     let src_idx_by_id = field_index_by_id(source.fields());
+    // Position is for an unmapped struct alone: once any target field carries an
+    // id, the source child at the same position may belong to another field.
+    let target_has_ids = target_fields.iter().any(|f| field_id(f).is_some());
     let children = target_fields
         .iter()
         .enumerate()
         .map(|(pos, tf)| {
-            // With an id, match by id only: falling back to position would risk
-            // grabbing an unrelated column. Without one (unmapped), use position.
-            let idx = match field_id(tf) {
-                Some(id) => src_idx_by_id.get(id).copied(),
-                None => Some(pos),
-            };
+            // Match by id, then by name, but only against a child that carries
+            // no id of its own: a child naming a different id means it, and
+            // taking it would read one column's values under another's name.
+            let idx = field_id(tf)
+                .and_then(|id| src_idx_by_id.get(id).copied())
+                .or_else(|| {
+                    source
+                        .fields()
+                        .iter()
+                        .position(|sf| field_id(sf).is_none() && sf.name() == tf.name())
+                })
+                .or_else(|| (!target_has_ids).then_some(pos));
             match idx.and_then(|i| source.columns().get(i)) {
                 Some(child) => realign_array(
                     child,
@@ -282,8 +714,8 @@ fn realign_array(
 /// columns the file lacks. Field-id matching handles `columnMapping.mode=id`
 /// tables, whose files name columns logically rather than by physical `col-<id>`.
 ///
-/// Partition columns come out NULL (Delta stores them in `partitionValues`, not
-/// in the file), a pre-existing limitation of the connector's Parquet reader.
+/// Partition columns are absent here (Delta stores them in `partitionValues`,
+/// not in the file); the caller adds them back as constants.
 fn project_to_logical(
     batch: &RecordBatch,
     logical_schema: &SchemaRef,
@@ -294,11 +726,13 @@ fn project_to_logical(
     let file_idx_by_id = field_index_by_id(file_schema.fields());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(logical_schema.fields().len());
     for field in logical_schema.fields().iter() {
-        let source = field_id(field)
-            .and_then(|id| file_idx_by_id.get(id).copied())
-            .or_else(|| file_schema.index_of(field.name()).ok());
-        let col = match source {
-            Some(idx) => realign_array(batch.column(idx), field.data_type(), file, field.name())?,
+        let col = match source_index(&file_schema, &file_idx_by_id, field) {
+            Some(idx) => realign_array(
+                batch.column(idx),
+                field.data_type(),
+                Some(file),
+                field.name(),
+            )?,
             None => new_null_array(field.data_type(), num_rows),
         };
         columns.push(col);
@@ -318,7 +752,7 @@ fn project_to_logical(
 /// Build the [`ProjectionMask`] selecting the root file columns `logical_schema`
 /// wants, matched by field id (falling back to name); the rest are never decoded.
 fn logical_projection_mask(
-    builder: &ParquetRecordBatchStreamBuilder<ParquetObjectReader>,
+    builder: &ParquetRecordBatchStreamBuilder<ObjectStoreReader>,
     logical_schema: &SchemaRef,
 ) -> ProjectionMask {
     let want_ids: HashSet<&str> = logical_schema
@@ -382,49 +816,69 @@ fn bitmap_to_selection(bitmap: &RoaringTreemap, total_rows: u64, mode: ReadMode)
 /// batch stream. Ours opens the Parquet file and masks deleted rows on the fly.
 impl PartitionStream for MaskedParquetPartition {
     fn schema(&self) -> &SchemaRef {
-        &self.schema
+        self.schema.schema()
     }
 
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let store = Arc::clone(&self.store);
-        let path = self.path.clone();
-        let bitmap = Arc::clone(&self.bitmap);
-        let logical_schema = Arc::clone(&self.schema);
+        let files = Arc::clone(&self.files);
+        let logical_schema = Arc::clone(self.schema.schema());
         let mode = self.mode;
 
         let stream = try_stream! {
-            let reader = ParquetObjectReader::new(store, path.clone());
-            let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                .await
-                .map_err(|e| DataFusionError::External(
-                    format!("failed to open Parquet file '{path}': {e}").into()))?;
-            // `num_rows()` is `i64` because Parquet's metadata is signed
-            // throughout; it is non-negative for any file whose footer parsed
-            // (which it did, just above).
-            let total_rows = builder.metadata().file_metadata().num_rows() as u64;
-            // Decode only the columns the logical schema names.
-            let mask = logical_projection_mask(&builder, &logical_schema);
-            // Pick rows inside the decoder: skip the flagged rows (apply a DV) or
-            // keep only them (read a DV delta).
-            let selection = bitmap_to_selection(&bitmap, total_rows, mode);
-            let mut parquet_stream = builder
-                .with_projection(mask)
-                .with_row_selection(selection)
-                .build()
-                .map_err(|e| DataFusionError::External(
-                    format!("failed to build Parquet stream for '{path}': {e}").into()))?;
+            // Sequentially: only one file's reader is alive at a time, which is
+            // what keeps a partition's memory independent of how many files it
+            // was given.
+            for file in files.iter() {
+                let path = &file.path;
+                let probe = ParquetRecordBatchStreamBuilder::new(
+                        ObjectStoreReader::new(Arc::clone(&store), path.clone()))
+                    .await
+                    .map_err(|e| DataFusionError::External(
+                        format!("failed to open Parquet file '{path}': {e}").into()))?;
+                // Decode string and binary columns straight into view arrays, the
+                // same types `physical_read_schema` declares. Without this the
+                // decoder builds 32-bit-offset arrays, which cap one batch at 2 GiB
+                // per column, and `project_to_logical` then pays to cast them.
+                // Rebuilding the reader metadata reuses the footer read above.
+                let metadata = ArrowReaderMetadata::try_new(
+                        Arc::clone(probe.metadata()),
+                        ArrowReaderOptions::new()
+                            .with_schema(Arc::clone(ReadSchema::new(probe.schema()).schema())))
+                    .map_err(|e| DataFusionError::External(
+                        format!("failed to read Parquet file '{path}' as view types: {e}").into()))?;
+                // `num_rows()` is `i64` because Parquet's metadata is signed
+                // throughout; it is non-negative for any file whose footer parsed
+                // (which it did, just above).
+                let total_rows = metadata.metadata().file_metadata().num_rows() as u64;
+                let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                    ObjectStoreReader::new(Arc::clone(&store), path.clone()),
+                    metadata,
+                );
+                // Decode only the columns the logical schema names.
+                let mask = logical_projection_mask(&builder, &logical_schema);
+                // Pick rows inside the decoder: skip the flagged rows (apply a DV) or
+                // keep only them (read a DV delta).
+                let selection = bitmap_to_selection(&file.bitmap, total_rows, mode);
+                let mut parquet_stream = builder
+                    .with_projection(mask)
+                    .with_row_selection(selection)
+                    .build()
+                    .map_err(|e| DataFusionError::External(
+                        format!("failed to build Parquet stream for '{path}': {e}").into()))?;
 
-            while let Some(batch) = parquet_stream.next().await {
-                let batch = batch.map_err(|e| DataFusionError::External(
-                    format!("error reading Parquet file '{path}': {e}").into()))?;
-                if batch.num_rows() > 0 {
-                    yield project_to_logical(&batch, &logical_schema, path.as_ref())?;
+                while let Some(batch) = parquet_stream.next().await {
+                    let batch = batch.map_err(|e| DataFusionError::External(
+                        format!("error reading Parquet file '{path}': {e}").into()))?;
+                    if batch.num_rows() > 0 {
+                        yield project_to_logical(&batch, &logical_schema, path.as_ref())?;
+                    }
                 }
             }
         };
 
         Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&self.schema),
+            Arc::clone(self.schema.schema()),
             stream,
         ))
     }
@@ -433,11 +887,12 @@ impl PartitionStream for MaskedParquetPartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int32Array, Int64Array, StringArray, StructArray};
+    use arrow::array::{Array, Int32Array, Int64Array, StringArray, StringViewArray, StructArray};
     use arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema,
     };
+    use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::prelude::SessionContext;
     use deltalake::{DeltaTableBuilder, ensure_table_uri};
     use proptest::prelude::*;
@@ -448,6 +903,116 @@ mod tests {
 
     fn with_id(field: ArrowField, key: &str, id: &str) -> ArrowField {
         field.with_metadata(HashMap::from([(key.to_string(), id.to_string())]))
+    }
+
+    /// Source `struct<alpha (id 5), beta (id 6)>` for a list element or map value,
+    /// paired with the target that lists the same two children in the opposite
+    /// order, so pairing by position swaps the values.
+    fn reordered_struct_pair() -> (StructArray, ArrowFields) {
+        let source = StructArray::from(vec![
+            (
+                Arc::new(with_id(
+                    ArrowField::new("alpha", ArrowDataType::Utf8, true),
+                    "PARQUET:field_id",
+                    "5",
+                )),
+                Arc::new(StringArray::from(vec!["A"])) as ArrayRef,
+            ),
+            (
+                Arc::new(with_id(
+                    ArrowField::new("beta", ArrowDataType::Utf8, true),
+                    "PARQUET:field_id",
+                    "6",
+                )),
+                Arc::new(StringArray::from(vec!["B"])) as ArrayRef,
+            ),
+        ]);
+        let target = ArrowFields::from(vec![
+            with_id(
+                ArrowField::new("col-6", ArrowDataType::Utf8, true),
+                "delta.columnMapping.id",
+                "6",
+            ),
+            with_id(
+                ArrowField::new("col-5", ArrowDataType::Utf8, true),
+                "delta.columnMapping.id",
+                "5",
+            ),
+        ]);
+        (source, target)
+    }
+
+    /// The value of `array`'s first child, as a string.
+    fn first_child_value(array: &ArrayRef) -> String {
+        array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    }
+
+    // A struct inside a container is column-mapped like any other, so realign
+    // must recurse by field id. The two sides share no child name here, so
+    // `cast` would pair them by position and swap the values. `LargeList` is
+    // Arrow's own spelling; `delta_table_follow_uniform_field_id_test` covers
+    // Delta's `List` and `Map` end to end.
+    #[test]
+    fn realign_array_matches_nested_struct_by_field_id() {
+        use arrow::buffer::OffsetBuffer;
+
+        let (value, target_fields) = reordered_struct_pair();
+        let element =
+            |element_type: ArrowDataType| Arc::new(ArrowField::new("element", element_type, true));
+        let list: ArrayRef = Arc::new(
+            LargeListArray::try_new(
+                element(value.data_type().clone()),
+                OffsetBuffer::new(vec![0i64, 1].into()),
+                Arc::new(value) as ArrayRef,
+                None,
+            )
+            .unwrap(),
+        );
+
+        // A `List` target over a `LargeList` file also exercises the coercion
+        // the rebuild leaves to `cast`.
+        let target = ArrowDataType::List(element(ArrowDataType::Struct(target_fields)));
+        let out = realign_array(&list, &target, Some(TEST_FILE), "history").unwrap();
+        assert_eq!(out.data_type(), &target);
+        let out = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            first_child_value(out.values()),
+            "B",
+            "the target's first child is id 6, so it must carry beta's value"
+        );
+    }
+
+    // The rebuild reports a rejected element with the column and file, which
+    // Arrow's own error lacks.
+    #[test]
+    fn realign_array_rejects_null_element_of_not_null_target() {
+        use arrow::array::{ListBuilder, StringBuilder};
+        let mut b = ListBuilder::new(StringBuilder::new());
+        b.values().append_value("a");
+        b.values().append_null();
+        b.append(true);
+        let source: ArrayRef = Arc::new(b.finish());
+
+        let target = ArrowDataType::List(Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Utf8,
+            false,
+        )));
+        let error = realign_array(&source, &target, Some(TEST_FILE), "items")
+            .expect_err("a null element must not pass into a NOT NULL element type")
+            .to_string();
+        assert!(error.contains("cannot read column 'items'"), "{error}");
+        assert!(error.contains(TEST_FILE), "{error}");
+        assert!(error.contains("cannot contain nulls"), "{error}");
     }
 
     // The read schema's list kind may differ from the file's (Delta `List` vs a
@@ -465,7 +1030,7 @@ mod tests {
 
         let target =
             ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true)));
-        let out = realign_array(&source, &target, TEST_FILE, "items").unwrap();
+        let out = realign_array(&source, &target, Some(TEST_FILE), "items").unwrap();
         assert_eq!(out.data_type(), &target);
         assert_eq!(out.len(), 2);
     }
@@ -575,7 +1140,7 @@ mod tests {
             ),
         ]));
 
-        let out = realign_array(&source, &target, TEST_FILE, "after").unwrap();
+        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
         let out = out.as_any().downcast_ref::<StructArray>().unwrap();
         let present = out
             .column(0)
@@ -590,6 +1155,127 @@ mod tests {
             .unwrap();
         assert_eq!(missing.len(), 2);
         assert!(missing.is_null(0) && missing.is_null(1));
+    }
+
+    // A file may name a struct's children physically and omit their Parquet
+    // field ids. `project_to_logical` falls back to the name at the top
+    // level, so the struct branch must too, or those children read as NULL.
+    #[test]
+    fn realign_array_matches_struct_child_by_name_without_an_id() {
+        let source: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("col-2", ArrowDataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["t1"])) as ArrayRef,
+        )]));
+        let target = ArrowDataType::Struct(ArrowFields::from(vec![with_id(
+            ArrowField::new("col-2", ArrowDataType::Utf8, true),
+            "delta.columnMapping.id",
+            "2",
+        )]));
+
+        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        assert_eq!(
+            first_child_value(&out),
+            "t1",
+            "an id-less child sharing the target's name must not be null-filled"
+        );
+    }
+
+    // A source child that names a different id is that other column, whatever
+    // it is called, so the name must not claim it.
+    #[test]
+    fn realign_array_ignores_a_name_match_carrying_another_id() {
+        let source: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(with_id(
+                ArrowField::new("col-5", ArrowDataType::Utf8, true),
+                "PARQUET:field_id",
+                "10",
+            )),
+            Arc::new(StringArray::from(vec!["ten"])) as ArrayRef,
+        )]));
+        let target = ArrowDataType::Struct(ArrowFields::from(vec![with_id(
+            ArrowField::new("col-5", ArrowDataType::Utf8, true),
+            "delta.columnMapping.id",
+            "5",
+        )]));
+
+        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = out.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(
+            out.column(0).is_null(0),
+            "id 10's values must not be read as id 5"
+        );
+    }
+
+    // Once a struct's fields carry ids, position says nothing: the id-carrying
+    // children match out of position, so a child left unmatched must read NULL
+    // rather than whatever sits at its index.
+    #[test]
+    fn realign_array_null_fills_an_unmatched_id_less_child() {
+        let source: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("gamma", ArrowDataType::Utf8, true)),
+                Arc::new(StringArray::from(vec!["G"])) as ArrayRef,
+            ),
+            (
+                Arc::new(with_id(
+                    ArrowField::new("alpha", ArrowDataType::Utf8, true),
+                    "PARQUET:field_id",
+                    "5",
+                )),
+                Arc::new(StringArray::from(vec!["A"])) as ArrayRef,
+            ),
+        ]));
+        let target = ArrowDataType::Struct(ArrowFields::from(vec![
+            with_id(
+                ArrowField::new("col-5", ArrowDataType::Utf8, true),
+                "delta.columnMapping.id",
+                "5",
+            ),
+            ArrowField::new("beta", ArrowDataType::Utf8, true),
+        ]));
+
+        let out = realign_array(&source, &target, Some(TEST_FILE), "after").unwrap();
+        let out = out.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "A",
+            "id 5 must come from the child naming it"
+        );
+        assert!(
+            out.column(1).is_null(0),
+            "an unmatched child must not take id 5's neighbor by position"
+        );
+    }
+
+    // The top-level match follows the same rule as the struct children: a file
+    // column naming another id is that column, whatever it is called.
+    #[test]
+    fn project_to_logical_ignores_a_name_match_carrying_another_id() {
+        let file_schema = Arc::new(ArrowSchema::new(vec![with_id(
+            ArrowField::new("col-5", ArrowDataType::Utf8, true),
+            "PARQUET:field_id",
+            "10",
+        )]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(StringArray::from(vec!["ten"])) as ArrayRef],
+        )
+        .unwrap();
+        let read_schema = Arc::new(ArrowSchema::new(vec![with_id(
+            ArrowField::new("col-5", ArrowDataType::Utf8, true),
+            "delta.columnMapping.id",
+            "5",
+        )]));
+
+        let out = project_to_logical(&batch, &read_schema, TEST_FILE).unwrap();
+        assert!(
+            out.column(0).is_null(0),
+            "id 10's values must not be read as id 5"
+        );
     }
 
     // A user hitting a type mismatch sees only the physical `col-<uuid>` name on
@@ -613,7 +1299,7 @@ mod tests {
             "2",
         )]));
 
-        let err = realign_array(&source, &target, TEST_FILE, "after")
+        let err = realign_array(&source, &target, Some(TEST_FILE), "after")
             .expect_err("Utf8 does not cast to FixedSizeBinary")
             .to_string();
 
@@ -799,6 +1485,250 @@ mod tests {
             .unwrap()
     }
 
+    /// The files are spread over at most `max_partitions` groups, and every
+    /// file lands in exactly one. The cap is the point: a plan runs all its
+    /// partitions at once, so it is the number of Parquet readers open
+    /// together.
+    #[test]
+    fn dealing_caps_the_groups_and_keeps_every_file() {
+        for (files, max_partitions, groups) in [
+            (212, 8, 8),
+            (212, 1, 1),
+            (3, 8, 3),
+            (1, 8, 1),
+            // A caller that asks for none still gets one, since a partition is
+            // what reports the schema.
+            (5, 0, 1),
+        ] {
+            let dealt = deal((0..files).collect::<Vec<_>>(), max_partitions);
+            assert_eq!(dealt.len(), groups, "{files} files over {max_partitions}");
+            assert!(
+                dealt.iter().all(|group| !group.is_empty()),
+                "no group may be empty; got {dealt:?}"
+            );
+            let mut seen: Vec<usize> = dealt.into_iter().flatten().collect();
+            seen.sort();
+            assert_eq!(
+                seen,
+                (0..files).collect::<Vec<_>>(),
+                "every file must be read exactly once"
+            );
+        }
+    }
+
+    /// An empty read still produces a partition, because a `StreamingTable`
+    /// takes its schema from one.
+    #[test]
+    fn dealing_nothing_yields_one_empty_group() {
+        assert_eq!(deal(Vec::<usize>::new(), 8), vec![Vec::<usize>::new()]);
+    }
+
+    /// Round-robin, so a commit whose files vary in size spreads the large ones
+    /// rather than loading one partition with all of them.
+    #[test]
+    fn dealing_is_round_robin() {
+        assert_eq!(
+            deal((0..7).collect::<Vec<_>>(), 3),
+            vec![vec![0, 3, 6], vec![1, 4], vec![2, 5]]
+        );
+    }
+
+    /// Many files through one provider: the partitions are capped, each file's
+    /// bitmap still applies to that file alone, and every kept row comes back.
+    ///
+    /// The cap is what bounds memory, since a plan drives all its partitions
+    /// concurrently and a Parquet reader's per-column state is per open file.
+    #[tokio::test]
+    async fn many_files_read_through_one_capped_provider() {
+        const FILES: usize = 7;
+        const ROWS_PER_FILE: i64 = 10;
+        const MAX_PARTITIONS: usize = 2;
+        let dir = TempDir::new().unwrap();
+
+        let file_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let mut files = Vec::new();
+        for file in 0..FILES {
+            let first = file as i64 * ROWS_PER_FILE;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![Arc::new(Int64Array::from_iter_values(
+                    first..first + ROWS_PER_FILE,
+                ))],
+            )
+            .unwrap();
+            let name = format!("part-{file}.parquet");
+            let handle = std::fs::File::create(dir.path().join(&name)).unwrap();
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(handle, Arc::clone(&file_schema), None)
+                    .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            // Drop the first row of every file, so a bitmap that leaked to
+            // another file would show up as a wrong row count.
+            files.push(MaskedFile {
+                path: Path::from(name),
+                bitmap: RoaringTreemap::from_iter([0u64]),
+            });
+        }
+
+        let declared = ReadSchema::new(&ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let store = unloaded_table(dir.path()).log_store().object_store();
+        let provider = filtered_parquet_table(
+            store,
+            files,
+            declared,
+            ReadMode::NotInBitmap,
+            MAX_PARTITIONS,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider
+                .scan(&SessionContext::new().state(), None, &[], None)
+                .await
+                .unwrap()
+                .output_partitioning()
+                .partition_count(),
+            MAX_PARTITIONS,
+            "{FILES} files must read through at most {MAX_PARTITIONS} readers"
+        );
+
+        let batches = SessionContext::new()
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut got: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(ids.iter().map(|v| v.unwrap()));
+        }
+        got.sort();
+        let expected: Vec<i64> = (0..FILES as i64)
+            .flat_map(|file| {
+                let first = file * ROWS_PER_FILE;
+                first + 1..first + ROWS_PER_FILE
+            })
+            .collect();
+        assert_eq!(
+            got, expected,
+            "every file must lose exactly its own first row"
+        );
+    }
+
+    /// One change data file read whole through the object store using [`filtered_parquet_table`]:
+    /// every row comes back, `_change_type` survives alongside the table's own columns, and
+    /// `__is_cdc`, which the declared schema leaves out, is dropped.
+    ///
+    /// This is the route a `uc://` change feed read takes. The bitmap is empty because a
+    /// change data file carries no deletion vector.
+    /// `__is_cdc` is a column Delta Spark writes and the table schema does not
+    /// declare.
+    #[tokio::test]
+    async fn change_data_file_reads_whole_through_object_store() {
+        let dir = TempDir::new().unwrap();
+
+        // As Delta Spark writes it: table columns, then the two it adds.
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, false),
+            ArrowField::new("_change_type", ArrowDataType::Utf8, false),
+            ArrowField::new("__is_cdc", ArrowDataType::Boolean, false),
+        ]));
+        let change_types = ["update_preimage", "update_postimage", "delete", "insert"];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..4i64)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..4).map(|i| format!("row_{i}")),
+                )),
+                Arc::new(StringArray::from_iter_values(change_types)),
+                Arc::new(arrow::array::BooleanArray::from(vec![true; 4])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join("cdc.parquet")).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, file_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // What `change_data_read_schema` builds: the table's columns plus
+        // `_change_type`, and nothing else.
+        let declared = ReadSchema::new(&ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, false),
+            ArrowField::new("_change_type", ArrowDataType::Utf8, true),
+        ]));
+
+        let store = unloaded_table(dir.path()).log_store().object_store();
+        let provider = filtered_parquet_table(
+            store,
+            vec![MaskedFile {
+                path: Path::from("cdc.parquet"),
+                bitmap: RoaringTreemap::new(),
+            }],
+            declared.clone(),
+            ReadMode::NotInBitmap,
+            1,
+        )
+        .await
+        .unwrap();
+        let batches = SessionContext::new()
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut got: Vec<(i64, String)> = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema().as_ref(),
+                declared.schema().as_ref(),
+                "`__is_cdc` must be pruned: the declared schema drives the read"
+            );
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let kinds = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                got.push((ids.value(row), kinds.value(row).to_string()));
+            }
+        }
+        got.sort();
+
+        let expected: Vec<(i64, String)> = change_types
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| (i as i64, (*kind).to_string()))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "an empty bitmap must read every row, with its change type intact"
+        );
+    }
+
     /// End-to-end check of [`filtered_parquet_table`] with [`ReadMode::NotInBitmap`]
     /// against a real Parquet file: DV-flagged rows are skipped inside the
     /// decoder, and the logical schema drives the read. A file column it omits is
@@ -827,19 +1757,22 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        let logical = Arc::new(ArrowSchema::new(vec![
+        let logical = ReadSchema::new(&ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int64, true),
             ArrowField::new("added_later", ArrowDataType::Utf8, true),
         ]));
         let deleted = RoaringTreemap::from_iter((0..TOTAL_ROWS as u64).filter(|i| i % 2 == 0));
 
-        let store = unloaded_table(dir.path()).log_store().object_store(None);
+        let store = unloaded_table(dir.path()).log_store().object_store();
         let provider = filtered_parquet_table(
             store,
-            Path::from("data.parquet"),
-            deleted,
-            Arc::clone(&logical),
+            vec![MaskedFile {
+                path: Path::from("data.parquet"),
+                bitmap: deleted,
+            }],
+            logical.clone(),
             ReadMode::NotInBitmap,
+            1,
         )
         .await
         .unwrap();
@@ -854,7 +1787,7 @@ mod tests {
         for batch in &batches {
             assert_eq!(
                 batch.schema().as_ref(),
-                logical.as_ref(),
+                logical.schema().as_ref(),
                 "batch schema must equal the declared logical schema"
             );
             let id = batch
@@ -872,6 +1805,95 @@ mod tests {
         got.sort();
         let expected: Vec<i64> = (0..TOTAL_ROWS as i64).filter(|i| i % 2 != 0).collect();
         assert_eq!(got, expected, "masked rows mismatch");
+    }
+
+    /// A deletion vector and `columnMapping.mode = 'id'` meet on the same file:
+    /// the bitmap picks the rows, the field ids pick the columns.
+    #[tokio::test]
+    async fn masked_reader_matches_columns_by_field_id() {
+        let dir = TempDir::new().unwrap();
+
+        // As a Uniform file has them: logical names, Parquet field ids.
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            with_id(
+                ArrowField::new("id", ArrowDataType::Int64, false),
+                "PARQUET:field_id",
+                "7",
+            ),
+            with_id(
+                ArrowField::new("label", ArrowDataType::Utf8, false),
+                "PARQUET:field_id",
+                "8",
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join("data.parquet")).unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, file_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // As the log has them: physical names, column mapping ids, and the
+        // columns in the opposite order.
+        let logical = ReadSchema::new(&ArrowSchema::new(vec![
+            with_id(
+                ArrowField::new("col-8", ArrowDataType::Utf8, true),
+                "delta.columnMapping.id",
+                "8",
+            ),
+            with_id(
+                ArrowField::new("col-7", ArrowDataType::Int64, true),
+                "delta.columnMapping.id",
+                "7",
+            ),
+        ]));
+
+        let store = unloaded_table(dir.path()).log_store().object_store();
+        let provider = filtered_parquet_table(
+            store,
+            vec![MaskedFile {
+                path: Path::from("data.parquet"),
+                bitmap: RoaringTreemap::from_iter([0u64, 2]),
+            }],
+            logical.clone(),
+            ReadMode::NotInBitmap,
+            1,
+        )
+        .await
+        .unwrap();
+        let batches = SessionContext::new()
+            .read_table(provider)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let mut rows: Vec<(String, i64)> = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.schema().as_ref(), logical.schema().as_ref());
+            let labels = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            rows.extend((0..batch.num_rows()).map(|i| (labels.value(i).to_string(), ids.value(i))));
+        }
+        assert_eq!(
+            rows,
+            vec![("b".to_string(), 1), ("d".to_string(), 3)],
+            "the deleted rows must be gone and each column read under its own id"
+        );
     }
 
     /// End-to-end check of [`filtered_parquet_table`] with [`ReadMode::InBitmap`]:
@@ -900,7 +1922,7 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        let logical = Arc::new(ArrowSchema::new(vec![
+        let logical = ReadSchema::new(&ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int64, true),
             ArrowField::new("added_later", ArrowDataType::Utf8, true),
         ]));
@@ -908,13 +1930,16 @@ mod tests {
         let wanted: Vec<u64> = [0u64, 1, 2, 50, 51, 199].into_iter().collect();
         let selected = RoaringTreemap::from_iter(wanted.iter().copied());
 
-        let store = unloaded_table(dir.path()).log_store().object_store(None);
+        let store = unloaded_table(dir.path()).log_store().object_store();
         let provider = filtered_parquet_table(
             store,
-            Path::from("data.parquet"),
-            selected,
-            Arc::clone(&logical),
+            vec![MaskedFile {
+                path: Path::from("data.parquet"),
+                bitmap: selected,
+            }],
+            logical.clone(),
             ReadMode::InBitmap,
+            1,
         )
         .await
         .unwrap();
@@ -927,7 +1952,7 @@ mod tests {
 
         let mut got: Vec<i64> = Vec::new();
         for batch in &batches {
-            assert_eq!(batch.schema().as_ref(), logical.as_ref());
+            assert_eq!(batch.schema().as_ref(), logical.schema().as_ref());
             let id = batch
                 .column(0)
                 .as_any()
@@ -943,5 +1968,133 @@ mod tests {
         got.sort();
         let expected: Vec<i64> = wanted.iter().map(|&r| r as i64).collect();
         assert_eq!(got, expected, "must read exactly the bitmap rows");
+    }
+}
+
+#[cfg(test)]
+mod cached_reads_test {
+    use super::*;
+
+    /// Answers each url with its own path as bytes, and records what it was asked for.
+    #[derive(Debug)]
+    struct Spy {
+        asked: Mutex<Vec<String>>,
+        /// Bytes to answer with, per url.
+        size: usize,
+    }
+
+    impl Spy {
+        fn new(size: usize) -> Arc<Self> {
+            Arc::new(Self {
+                asked: Mutex::new(Vec::new()),
+                size,
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl StorageHandler for Spy {
+        fn read_files(
+            &self,
+            files: Vec<FileSlice>,
+        ) -> DeltaKernelResult<Box<dyn Iterator<Item = DeltaKernelResult<Bytes>>>> {
+            let mut asked = self.asked.lock().unwrap();
+            let answers: Vec<Bytes> = files
+                .iter()
+                .map(|(url, _)| {
+                    asked.push(url.path().to_string());
+                    // Identifiable and of the requested size, so a mix-up is visible.
+                    let tag = url.path().bytes().last().unwrap_or(b'?');
+                    Bytes::from(vec![tag; self.size])
+                })
+                .collect();
+            Ok(Box::new(answers.into_iter().map(Ok)))
+        }
+
+        fn list_from(
+            &self,
+            _path: &Url,
+        ) -> DeltaKernelResult<Box<dyn Iterator<Item = DeltaKernelResult<FileMeta>>>> {
+            unimplemented!("not used by these tests")
+        }
+        fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaKernelResult<()> {
+            unimplemented!("not used by these tests")
+        }
+        fn put(&self, _path: &Url, _data: Bytes, _overwrite: bool) -> DeltaKernelResult<()> {
+            unimplemented!("not used by these tests")
+        }
+        fn head(&self, _path: &Url) -> DeltaKernelResult<FileMeta> {
+            unimplemented!("not used by these tests")
+        }
+        fn delete(&self, _path: &Url) -> DeltaKernelResult<()> {
+            unimplemented!("not used by these tests")
+        }
+    }
+
+    fn slice(name: &str) -> FileSlice {
+        (Url::parse(&format!("memory:///{name}")).unwrap(), None)
+    }
+
+    fn read(cache: &CachedReads, names: &[&str]) -> Vec<u8> {
+        cache
+            .read_files(names.iter().map(|n| slice(n)).collect())
+            .unwrap()
+            .map(|b| b.unwrap()[0])
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_read_is_answered_from_memory() {
+        let spy = Spy::new(8);
+        let cache = CachedReads::new(spy.clone());
+
+        assert_eq!(read(&cache, &["a"]), vec![b'a']);
+        assert_eq!(read(&cache, &["a"]), vec![b'a']);
+        assert_eq!(
+            spy.asked(),
+            vec!["/a"],
+            "the second read must not reach storage"
+        );
+    }
+
+    /// A batch of hits and misses must come back in the order it was asked for.
+    ///
+    /// Getting this wrong hands one file's bitmap to another file, which supersedes live rows
+    /// and resurrects dead ones -- silently, since the row count stays right.
+    #[test]
+    fn a_mixed_batch_keeps_its_order() {
+        let spy = Spy::new(8);
+        let cache = CachedReads::new(spy.clone());
+
+        // Warm 'b' and 'd' only.
+        read(&cache, &["b", "d"]);
+        spy.asked.lock().unwrap().clear();
+
+        assert_eq!(
+            read(&cache, &["a", "b", "c", "d", "e"]),
+            vec![b'a', b'b', b'c', b'd', b'e']
+        );
+        assert_eq!(
+            spy.asked(),
+            vec!["/a", "/c", "/e"],
+            "only the misses go to storage"
+        );
+    }
+
+    #[test]
+    fn an_oversized_object_is_not_held() {
+        let spy = Spy::new(CachedReads::MAX_CACHED_BYTES as usize + 1);
+        let cache = CachedReads::new(spy.clone());
+
+        read(&cache, &["a"]);
+        read(&cache, &["a"]);
+        assert_eq!(
+            spy.asked(),
+            vec!["/a", "/a"],
+            "an object past the cap must pass through rather than be held"
+        );
     }
 }

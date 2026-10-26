@@ -6,7 +6,7 @@
   import { useCodeEditorSettings } from '$lib/compositions/pipelines/useCodeEditorSettings.svelte'
   import { useDarkMode } from '$lib/compositions/useDarkMode.svelte'
   import { useSkeletonTheme } from '$lib/compositions/useSkeletonTheme.svelte'
-  import { isMonacoEditorDisabled } from '$lib/functions/common/monacoEditor'
+  import { isMonacoEditorDisabled } from '$lib/functions/monacoEditor'
 
   let {
     filePath,
@@ -17,7 +17,8 @@
     refreshOnChange = true
   }: {
     filePath: string
-    onSubmit: (json: string) => Promise<void>
+    // Absent for a read-only viewer; the Ctrl+S save shortcut then does nothing.
+    onSubmit?: (json: string) => Promise<void>
     value?: string
     readOnlyMessage?: { value: string }
     disabled?: boolean
@@ -72,7 +73,7 @@
       if (e.code === 'KeyS' && (e.ctrlKey || e.metaKey)) {
         const currentValue = currentModel.getValue()
         updateUpstream()
-        onSubmit(currentValue)
+        onSubmit?.(currentValue)
         e.preventDefault()
       }
     })

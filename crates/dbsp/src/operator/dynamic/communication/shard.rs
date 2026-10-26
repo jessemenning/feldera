@@ -6,7 +6,7 @@
 
 use feldera_storage::fbuf::{FBuf, FBufSerializer};
 use itertools::Itertools;
-use rkyv::{archived_root, ser::Serializer as _};
+use rkyv::archived_root;
 
 use crate::{
     Circuit, Runtime, Stream,
@@ -19,7 +19,8 @@ use crate::{
     operator::communication::{ExchangeActivity, Mailbox, new_exchange_operators},
     storage::file::SerializerInner,
     trace::{
-        Batch, BatchReader, Builder, IndexedWSetSerializer, deserialize_indexed_wset, merge_batches,
+        Batch, BatchReader, Builder, IndexedWSetSerializer, deserialize_indexed_wset,
+        merge_batches, serialize_offsets,
     },
 };
 
@@ -430,8 +431,8 @@ pub(crate) fn shard_batch<IB, OB>(
     // XXX If `shards == 1` and `OB` and `IB` are the same, then we could
     // implement this more efficiently, without copying.
     let shards = workers.len();
-    let keys_per_shard = batch.key_count() / shards;
-    let values_per_shard = batch.len() / shards;
+    let keys_per_shard = batch.key_count_upper_bound() / shards;
+    let values_per_shard = batch.len_upper_bound() / shards;
     for (worker, location) in WorkerLocations::new().enumerate() {
         let (estimated_keys, estimated_values) = if workers.contains(&worker) {
             (keys_per_shard, values_per_shard)
@@ -504,7 +505,7 @@ impl PairsSerializer {
     pub fn done(mut self, serializer: &mut SerializerInner) -> FBuf {
         serializer
             .with(FBufSerializer::new(&mut self.fbuf), |s| {
-                s.serialize_value(&self.offsets)
+                serialize_offsets(&self.offsets, s)
             })
             .unwrap();
         self.fbuf
@@ -730,7 +731,7 @@ mod tests {
                         if Runtime::worker_index() == 0 {
                             assert_eq!(batch, &test_data(0, 1))
                         } else {
-                            assert_eq!(batch.len(), 0);
+                            assert_eq!(batch.len_upper_bound(), 0);
                         }
                     });
                 Ok(())

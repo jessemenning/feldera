@@ -72,9 +72,9 @@ These options configure gRPC connection to the Pub/Sub service.
 
 * `pool_size` - gRPC channel pool size.
 
-* `timeout_seconds` - gRPC request timeout.
+* `timeout` - gRPC request timeout, for example `30s`. Replaces the deprecated `timeout_seconds`.
 
-* `connect_timeout_seconds` - gRPC connection timeout.
+* `connect_timeout` - gRPC connection timeout, for example `10s`. Replaces the deprecated `connect_timeout_seconds`.
 
 ### Emulator
 
@@ -120,7 +120,7 @@ Please ensure you have a Google Cloud account before proceeding.
 
   ```sql
   CREATE TABLE pub_sub_input (
-    id int
+    id INT
   ) WITH (
       'connectors' = '[
       {

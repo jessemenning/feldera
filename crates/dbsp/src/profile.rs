@@ -6,8 +6,9 @@ use crate::{
         GlobalNodeId,
         circuit_builder::{CircuitBase, Node},
         metadata::{
-            BACKGROUND_CACHE_OCCUPANCY, CIRCUIT_IDLE_TIME_SECONDS, CIRCUIT_METRICS,
-            CIRCUIT_RUNTIME_ELAPSED_SECONDS, CIRCUIT_RUNTIME_SECONDS, CIRCUIT_WAIT_TIME_SECONDS,
+            BACKGROUND_CACHE_OCCUPANCY, CIRCUIT_CPU_TIME_SECONDS, CIRCUIT_IDLE_TIME_SECONDS,
+            CIRCUIT_METRICS, CIRCUIT_NONBLOCKING_PERCENT, CIRCUIT_RUNTIME_ELAPSED_SECONDS,
+            CIRCUIT_RUNTIME_SECONDS, CIRCUIT_WAIT_BY_REASON_SECONDS, CIRCUIT_WAIT_TIME_SECONDS,
             CircuitMetric, FOREGROUND_CACHE_OCCUPANCY, INVOCATIONS_COUNT, MetaItem, MetricId,
             MetricReading, OperatorMeta, RUNTIME_NONBLOCKING_PERCENT, RUNTIME_PERCENT,
             RUNTIME_SECONDS, SPINE_STORAGE_SIZE_BYTES, STEPS_COUNT, USED_MEMORY_BYTES,
@@ -23,14 +24,16 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write,
     fs::{self, create_dir_all},
-    io::{Cursor as IoCursor, Error as IoError, Write as _},
+    io::{Error as IoError, Write as IoWrite},
     path::{Path, PathBuf},
     time::Duration,
 };
-use zip::{ZipWriter, write::SimpleFileOptions};
+use zip::{ZipWriter, result::ZipResult, write::SimpleFileOptions};
 
 mod cpu;
-pub use cpu::CPUProfiler;
+pub use cpu::{BlockingFor, CPUProfiler, ParkReason, ParkingFor, RuntimeIdle};
+#[cfg(test)]
+pub(crate) use cpu::{current_park_reason, current_runtime_idle};
 
 /// Rudimentary circuit profiler.
 ///
@@ -193,22 +196,23 @@ $(foreach format,$(FORMATS),$(eval $(call format_template,$(format))))
         Ok(dir_path)
     }
 
-    /// Returns a Zip archive containing all the profile `.dot` files.
-    pub fn as_zip(&self) -> Vec<u8> {
-        let mut zip = ZipWriter::new(IoCursor::new(Vec::with_capacity(65536)));
+    /// Writes a Zip archive containing all the profile `.dot` and `.txt` files
+    /// to `writer`.
+    ///
+    /// Each worker's text is rendered and compressed one worker at a time, so
+    /// the full archive is never held in memory.
+    pub fn write_zip<W: IoWrite>(&self, writer: W) -> ZipResult<W> {
+        let mut zip = ZipWriter::new_stream(writer);
         for (graph, worker) in self.worker_graphs.iter().zip(self.worker_offset..) {
-            zip.start_file(format!("{worker}.dot"), SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(graph.to_dot().as_bytes()).unwrap();
+            zip.start_file(format!("{worker}.dot"), SimpleFileOptions::default())?;
+            zip.write_all(graph.to_dot().as_bytes())?;
 
-            zip.start_file(format!("{worker}.txt"), SimpleFileOptions::default())
-                .unwrap();
-            zip.write_all(graph.to_string().as_bytes()).unwrap();
+            zip.start_file(format!("{worker}.txt"), SimpleFileOptions::default())?;
+            zip.write_all(graph.to_string().as_bytes())?;
         }
-        zip.start_file("Makefile", SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(Self::MAKEFILE.as_bytes()).unwrap();
-        zip.finish().unwrap().into_inner()
+        zip.start_file("Makefile", SimpleFileOptions::default())?;
+        zip.write_all(Self::MAKEFILE.as_bytes())?;
+        Ok(zip.finish()?.into_inner())
     }
 }
 
@@ -219,6 +223,51 @@ pub struct DbspProfile {
     pub metrics: &'static [CircuitMetric],
     pub worker_profiles: Vec<WorkerProfile>,
     pub graph: Option<Graph>,
+}
+
+/// Writes a [`DbspProfile`] document as JSON.
+/// (This abstraction is reused by the coordinator)
+pub struct ProfileJsonWriter<W: IoWrite> {
+    writer: W,
+    workers: usize,
+}
+
+impl<W: IoWrite> ProfileJsonWriter<W> {
+    /// Starts the document.
+    pub fn begin<M: Serialize + ?Sized>(
+        mut writer: W,
+        metrics: Option<&M>,
+    ) -> Result<Self, IoError> {
+        writer.write_all(b"{")?;
+        if let Some(metrics) = metrics {
+            writer.write_all(b"\"metrics\":")?;
+            serde_json::to_writer(&mut writer, metrics)?;
+            writer.write_all(b",")?;
+        }
+        writer.write_all(b"\"worker_profiles\":[")?;
+        Ok(Self { writer, workers: 0 })
+    }
+
+    pub fn worker<T: Serialize + ?Sized>(&mut self, worker: &T) -> Result<(), IoError> {
+        if self.workers > 0 {
+            self.writer.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut self.writer, worker)?;
+        self.workers += 1;
+        Ok(())
+    }
+
+    pub fn finish<G: Serialize + ?Sized>(mut self, graph: &G) -> Result<W, IoError> {
+        self.writer.write_all(b"],\"graph\":")?;
+        serde_json::to_writer(&mut self.writer, graph)?;
+        self.writer.write_all(b"}")?;
+        Ok(self.writer)
+    }
+
+    /// The underlying writer
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
 }
 
 impl DbspProfile {
@@ -308,8 +357,13 @@ impl Profiler {
     }
 
     /// Enable CPU profiling.
-    pub fn enable_cpu_profiler(&self) {
-        self.cpu_profiler.attach(&self.circuit, "cpu_profiler");
+    ///
+    /// `runtime_idle` comes from the [`CircuitHandle`](crate::circuit::CircuitHandle)
+    /// whose runtime evaluates this circuit; it is the source of the circuit's
+    /// wait time.
+    pub fn enable_cpu_profiler(&self, runtime_idle: RuntimeIdle) {
+        self.cpu_profiler
+            .attach(&self.circuit, "cpu_profiler", runtime_idle);
     }
 
     pub fn profile(&self, runtime_elapsed: Duration) -> WorkerProfile {
@@ -332,7 +386,7 @@ impl Profiler {
 
         // Compute total time
         let mut total_time: Duration = Duration::default();
-        for (node_id, _) in metadata.iter_mut() {
+        for node_id in metadata.keys() {
             if let Some(profile) = self.cpu_profiler.operator_profile(node_id) {
                 total_time += profile.real_time();
             }
@@ -364,7 +418,7 @@ impl Profiler {
                         RUNTIME_NONBLOCKING_PERCENT,
                         Vec::new(),
                         MetaItem::Percent {
-                            numerator: profile.cpu_time().as_micros() as u64,
+                            numerator: profile.cpu_time().as_micros() as i64,
                             denominator: profile.real_time().as_micros() as u64,
                         },
                     ),
@@ -372,7 +426,7 @@ impl Profiler {
                         RUNTIME_PERCENT,
                         Vec::new(),
                         MetaItem::Percent {
-                            numerator: profile.real_time().as_micros() as u64,
+                            numerator: profile.real_time().as_micros() as i64,
                             denominator: total_time.as_micros() as u64,
                         },
                     ),
@@ -387,11 +441,26 @@ impl Profiler {
                     CIRCUIT_WAIT_TIME_SECONDS => profile.wait_profile.real_time(),
                     STEPS_COUNT => profile.step_profile.invocations(),
                     CIRCUIT_RUNTIME_SECONDS => profile.step_profile.real_time(),
+                    CIRCUIT_CPU_TIME_SECONDS => profile.step_profile.cpu_time(),
+                    CIRCUIT_NONBLOCKING_PERCENT => MetaItem::Percent {
+                        numerator: profile.step_profile.cpu_time().as_micros() as i64,
+                        denominator: profile.step_profile.real_time().as_micros() as u64,
+                    },
                     CIRCUIT_IDLE_TIME_SECONDS => profile.idle_profile.real_time(),
                     CIRCUIT_RUNTIME_ELAPSED_SECONDS => runtime_elapsed,
                 ];
 
                 meta.extend(default_meta);
+
+                meta.extend(ParkReason::ALL.iter().zip(profile.wait_by_reason).map(
+                    |(reason, wait)| {
+                        MetricReading::new(
+                            CIRCUIT_WAIT_BY_REASON_SECONDS,
+                            vec![(Cow::Borrowed("reason"), Cow::Borrowed(reason.name()))],
+                            MetaItem::Duration(wait),
+                        )
+                    },
+                ));
 
                 fn cache_occupancy_metric(thread_type: ThreadType) -> MetricId {
                     match thread_type {
@@ -469,5 +538,302 @@ impl Profiler {
 
             (output, importance)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Runtime,
+        circuit::{
+            Circuit, CircuitConfig,
+            circuit_builder::{NodeId, Scope},
+            operator_traits::{Operator, UnaryOperator},
+        },
+        operator::Generator,
+        utils::Tup2,
+    };
+    use feldera_types::size::ConfigSize;
+    use std::io::Read;
+
+    /// Runs a circuit that keeps an integral spine busy and returns its profile.
+    ///
+    /// `shard` decides whether the workers have to exchange, which is the one
+    /// knob that changes which blocking site the step reaches.
+    fn profile_of_a_spine_under_load(workers: usize, shard: bool, steps: i32) -> DbspProfile {
+        const RECORDS_PER_STEP: i32 = 500;
+
+        let storage = tempfile::tempdir().unwrap();
+        let mut config =
+            CircuitConfig::with_workers(workers).with_temporary_storage(storage.path());
+        // Spill every batch, so the mergers fall behind the ingest and the spine
+        // reaches the batch count at which it applies backpressure.
+        config.storage.as_mut().unwrap().options.min_spill_size = Some(ConfigSize::ZERO);
+
+        let (mut dbsp, input) = Runtime::init_circuit(config, move |circuit| {
+            let (stream, input) = circuit.add_input_indexed_zset::<i32, i32>();
+            let stream = if shard { stream.shard() } else { stream };
+            stream.accumulate_integrate_trace();
+            Ok(input)
+        })
+        .unwrap();
+        dbsp.enable_cpu_profiler().unwrap();
+
+        for step in 0..steps {
+            let mut records = (0..RECORDS_PER_STEP)
+                .map(|record| Tup2(step * RECORDS_PER_STEP + record, Tup2(record, 1)))
+                .collect::<Vec<_>>();
+            input.append(&mut records);
+            dbsp.transaction().unwrap();
+        }
+
+        let profile = dbsp.retrieve_profile().unwrap();
+        dbsp.kill().unwrap();
+        profile
+    }
+
+    /// Every circuit's wait, split by reason, keyed by worker and circuit.
+    ///
+    /// Each reason is a reading of its own, told apart by its `reason` label.
+    fn wait_breakdowns(profile: &DbspProfile) -> Vec<(GlobalNodeId, BTreeMap<String, Duration>)> {
+        profile
+            .worker_profiles
+            .iter()
+            .flat_map(|worker| worker.metadata.iter())
+            .map(|(node_id, meta)| {
+                let breakdown = meta
+                    .readings(&CIRCUIT_WAIT_BY_REASON_SECONDS)
+                    .map(|(labels, parked)| {
+                        let [(name, reason)] = &labels[..] else {
+                            panic!("a breakdown reading carries one label: {labels:?}");
+                        };
+                        assert_eq!(name, "reason");
+                        match parked {
+                            MetaItem::Duration(parked) => (reason.to_string(), *parked),
+                            parked => panic!("a breakdown reading is a duration: {parked:?}"),
+                        }
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                (node_id.clone(), breakdown)
+            })
+            .filter(|(_, breakdown)| !breakdown.is_empty())
+            .collect()
+    }
+
+    fn parked_under(breakdown: &BTreeMap<String, Duration>, reason: ParkReason) -> Duration {
+        breakdown[reason.name()]
+    }
+
+    /// The breakdown names every reason and adds up to the wait it splits.
+    ///
+    /// Both come from the same per-step deltas, so any drift means a park was
+    /// counted in one and not the other.
+    #[test]
+    fn the_wait_breakdown_accounts_for_the_whole_wait() {
+        let profile = profile_of_a_spine_under_load(2, true, 100);
+        let mut waits = profile
+            .worker_profiles
+            .iter()
+            .flat_map(|worker| worker.attribute_profile(&CIRCUIT_WAIT_TIME_SECONDS))
+            .collect::<Vec<_>>();
+        assert!(!waits.is_empty(), "no circuit reported a wait time");
+
+        let mut expected_reasons = ParkReason::ALL.map(ParkReason::name).to_vec();
+        expected_reasons.sort();
+
+        for (node_id, breakdown) in wait_breakdowns(&profile) {
+            let named = breakdown.keys().cloned().collect::<Vec<_>>();
+            assert_eq!(named, expected_reasons);
+
+            let position = waits
+                .iter()
+                .position(|(waiting_node_id, _)| *waiting_node_id == node_id)
+                .unwrap_or_else(|| panic!("circuit {node_id} reports a breakdown but no wait"));
+            let (_, MetaItem::Duration(wait)) = waits.swap_remove(position) else {
+                panic!("circuit_wait_time_seconds must be a duration");
+            };
+
+            assert_eq!(
+                breakdown.values().sum::<Duration>(),
+                wait,
+                "circuit {node_id}"
+            );
+        }
+
+        assert!(
+            waits.is_empty(),
+            "circuits report a wait but no breakdown: {waits:?}"
+        );
+    }
+
+    /// Workers that shard their input wait on each other, and the breakdown
+    /// tells that apart from waiting on the mergers.
+    #[test]
+    fn sharded_workers_wait_for_their_peers() {
+        let breakdowns = wait_breakdowns(&profile_of_a_spine_under_load(2, true, 100));
+        assert!(!breakdowns.is_empty());
+
+        for (node_id, breakdown) in breakdowns {
+            assert!(
+                parked_under(&breakdown, ParkReason::Peers) > Duration::ZERO,
+                "circuit {node_id} never waited for its peers: {breakdown:?}"
+            );
+        }
+    }
+
+    /// An operator that hands the runtime nothing else to do while it sleeps.
+    ///
+    /// A worker's runtime has no timer, so the sleep happens on a plain thread
+    /// and the operator awaits word that it finished.
+    struct Sleeper;
+
+    impl Sleeper {
+        const NAP: Duration = Duration::from_millis(1);
+    }
+
+    impl Operator for Sleeper {
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed("Sleeper")
+        }
+
+        fn clock_start(&mut self, _scope: Scope) {}
+        fn clock_end(&mut self, _scope: Scope) {}
+
+        fn fixedpoint(&self, _scope: Scope) -> bool {
+            true
+        }
+    }
+
+    impl UnaryOperator<i32, i32> for Sleeper {
+        async fn eval(&mut self, input: &i32) -> i32 {
+            let (slept, wake) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(Self::NAP);
+                let _ = slept.send(());
+            });
+            wake.await.unwrap();
+            *input
+        }
+    }
+
+    /// An operator awaiting something the instrumentation does not model still
+    /// lands in a bucket of its own, rather than looking like idle time.
+    #[test]
+    fn a_pending_operator_is_told_apart_from_an_idle_runtime() {
+        const STEPS: u32 = 20;
+
+        let (mut dbsp, ()) = Runtime::init_circuit(CircuitConfig::with_workers(1), |circuit| {
+            let source = circuit.add_source(Generator::new(|| 1i32));
+            circuit.add_unary_operator(Sleeper, &source);
+            Ok(())
+        })
+        .unwrap();
+        dbsp.enable_cpu_profiler().unwrap();
+        for _ in 0..STEPS {
+            dbsp.transaction().unwrap();
+        }
+        let profile = dbsp.retrieve_profile().unwrap();
+        dbsp.kill().unwrap();
+
+        let breakdowns = wait_breakdowns(&profile);
+        assert!(!breakdowns.is_empty());
+        for (node_id, breakdown) in breakdowns {
+            assert!(
+                parked_under(&breakdown, ParkReason::OperatorPending) >= Sleeper::NAP * STEPS,
+                "circuit {node_id} did not charge the sleeps to the operator: {breakdown:?}"
+            );
+        }
+    }
+
+    /// Every park inside a step happens under some declaration, if only the
+    /// scheduler's own.  Time landing in `unattributed` means the step blocked
+    /// somewhere this instrumentation does not know about.
+    #[test]
+    fn a_step_never_waits_without_saying_why() {
+        for (workers, shard, steps) in [(1, false, 400), (2, true, 100)] {
+            for (node_id, breakdown) in
+                wait_breakdowns(&profile_of_a_spine_under_load(workers, shard, steps))
+            {
+                assert_eq!(
+                    parked_under(&breakdown, ParkReason::Unattributed),
+                    Duration::ZERO,
+                    "circuit {node_id} waited without declaring why: {breakdown:?}"
+                );
+            }
+        }
+    }
+
+    /// A worker profile with three operators carrying two metrics each.
+    fn worker_profile(seed: u64) -> WorkerProfile {
+        let mut metadata = HashMap::new();
+        for node in 0..3 {
+            let mut meta = OperatorMeta::new();
+            meta.extend([
+                MetricReading::new(
+                    USED_MEMORY_BYTES,
+                    Vec::new(),
+                    MetaItem::Bytes(HumanBytes::new(seed * 100 + node as u64)),
+                ),
+                MetricReading::new(INVOCATIONS_COUNT, Vec::new(), MetaItem::Count(node)),
+            ]);
+            metadata.insert(GlobalNodeId::from_path(&[NodeId::new(node)]), meta);
+        }
+        WorkerProfile::new(metadata)
+    }
+
+    fn profile(workers: u64, graph: Option<Graph>) -> DbspProfile {
+        DbspProfile::new((0..workers).map(worker_profile).collect(), graph)
+    }
+
+    #[test]
+    fn profile_json_writer_phases() {
+        let mut json = ProfileJsonWriter::begin(Vec::new(), None::<&str>).unwrap();
+        assert_eq!(json.writer_mut().as_slice(), b"{\"worker_profiles\":[");
+        json.worker(&1).unwrap();
+        json.worker(&2).unwrap();
+        let so_far = std::mem::take(json.writer_mut());
+        assert_eq!(so_far, b"{\"worker_profiles\":[1,2");
+        let rest = json.finish(&"g").unwrap();
+        assert_eq!(rest, b"],\"graph\":\"g\"}");
+    }
+
+    /// The phased writer produces the same bytes as `as_json`.
+    #[test]
+    fn profile_json_writer_matches_as_json() {
+        for (workers, graph) in [(0, None), (1, None), (3, Some(Graph::default()))] {
+            let profile = profile(workers, graph);
+            let expected = profile.as_json();
+            let mut json = ProfileJsonWriter::begin(Vec::new(), Some(profile.metrics)).unwrap();
+            for worker in &profile.worker_profiles {
+                json.worker(worker).unwrap();
+            }
+            let streamed = json.finish(&profile.graph).unwrap();
+            assert_eq!(String::from_utf8(streamed).unwrap(), expected);
+        }
+    }
+
+    /// The streamed archive is a valid zip naming one `.dot` and one `.txt`
+    /// per worker, plus the Makefile.
+    #[test]
+    fn write_zip_lists_every_worker() {
+        let profile = GraphProfile {
+            elapsed_time: Duration::from_secs(1),
+            worker_offset: 4,
+            worker_graphs: vec![Graph::default(); 2],
+        };
+        let streamed = profile.write_zip(Vec::new()).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(streamed)).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["4.dot", "4.txt", "5.dot", "5.txt", "Makefile"]);
+        let mut makefile = String::new();
+        archive
+            .by_name("Makefile")
+            .unwrap()
+            .read_to_string(&mut makefile)
+            .unwrap();
+        assert_eq!(makefile, GraphProfile::MAKEFILE);
     }
 }

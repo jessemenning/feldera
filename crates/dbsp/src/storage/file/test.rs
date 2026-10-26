@@ -1,8 +1,15 @@
-use std::{io::Cursor, marker::PhantomData, sync::Arc};
+use std::{
+    io::Cursor,
+    marker::PhantomData,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use crate::{
     DBWeight, Runtime,
-    circuit::CircuitConfig,
+    circuit::{CircuitConfig, CircuitStorageConfig},
     dynamic::{DataTrait, DowncastTrait, DynWeight, Factory, LeanVec, Vector, WithFactory},
     storage::{
         backend::{BlockLocation, StorageBackend},
@@ -11,9 +18,13 @@ use crate::{
             TouchedWindowCount,
             format::{
                 BLOOM_FILTER_BLOCK_MAGIC, BatchMetadata, Compression, FileTrailer,
-                ROARING_BITMAP_FILTER_BLOCK_MAGIC,
+                INCOMPATIBLE_FEATURE_MODULAR_FILTERS, INCOMPATIBLE_FEATURE_ROARING_FILTERS,
+                MODULAR_BLOOM_FILTER_BLOCK_MAGIC, ROARING_BITMAP_FILTER_BLOCK_MAGIC,
             },
-            reader::{BulkRows, FilteredKeys, Reader},
+            reader::{
+                BulkRows, CorruptionError, Error as ReaderError, FilteredKeys, Reader,
+                read_metadata,
+            },
         },
     },
     trace::{
@@ -25,16 +36,22 @@ use crate::{
 };
 
 use super::{
-    Factories, FilterPlan,
+    BatchKeyFilter, Factories, FilterPlan,
     reader::{ColumnSpec, RowGroup},
     writer::{Parameters, Writer1, Writer2},
 };
 
+use crate::storage::file::FilterKind;
+use crate::storage::file::format::{INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN, ValueStampFlag};
+use crate::storage::{backend::StorageError, buffer_cache::FBuf};
 use crate::{
     DBData,
     dynamic::{DynData, Erase},
 };
-use binrw::BinRead;
+use binrw::{BinRead, BinWrite};
+use crc32c::crc32c;
+use feldera_storage::file::FileId;
+use feldera_storage::{FileCommitter, FileReader, FileRw, StoragePath};
 use feldera_types::config::{StorageConfig, StorageOptions};
 use rand::{Rng, seq::SliceRandom, thread_rng};
 use tempfile::tempdir;
@@ -218,11 +235,48 @@ where
     handle.kill().unwrap();
 }
 
+/// Runs `f` inside a circuit configured with `rate`, which is what both the
+/// writer and the filter loader consult.
+///
+/// The rate goes through the storage options rather than the deprecated dev
+/// tweak, so the tests drive the same path production does. The circuit's own
+/// storage is unused: `f` reaches its batch files through its own backend.
+fn with_false_positive_rate<F>(rate: f64, f: F)
+where
+    F: FnOnce() + Clone + Send + 'static,
+{
+    let tempdir = tempdir().unwrap();
+    let config = CircuitConfig::default().with_storage(Some(
+        CircuitStorageConfig::for_config(
+            StorageConfig {
+                path: tempdir.path().to_string_lossy().into_owned(),
+                cache: Default::default(),
+            },
+            StorageOptions {
+                bloom_false_positive_rate: Some(rate),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap(),
+    ));
+    let (handle, ()) = Runtime::init_circuit(config, move |_| {
+        f();
+        Ok(())
+    })
+    .unwrap();
+    handle.kill().unwrap();
+}
+
 fn for_each_compression_type<F>(parameters: Parameters, f: F)
 where
     F: Fn(Parameters),
 {
-    for compression in [None, Some(Compression::Snappy)] {
+    for compression in [
+        None,
+        Some(Compression::Snappy),
+        Some(Compression::Lz4),
+        Some(Compression::Zstd),
+    ] {
         print!("\n# testing with compression={compression:?}\n\n");
         f(parameters.clone().with_compression(compression));
     }
@@ -401,6 +455,114 @@ fn test_find<K, A, N, T>(
     assert_eq!(cursor.key(), Some(key.erase()));
 }
 
+/// Seeks one cursor again and again, rather than starting each seek from a
+/// fresh cursor as [`test_find`] does.
+///
+/// A cursor that has already moved resumes its search from the path it holds:
+/// it compares the row it is on, then the last row of its data block, and
+/// only then climbs out through its index blocks and descends again.  A seek
+/// from row 0 reaches those comparisons in one order and with one path; a
+/// sequence of seeks walks a cursor whose path is partly consumed, which is
+/// how a merge uses one.  The targets below are spaced so that consecutive
+/// seeks land in the same data block, in the next one, and several blocks
+/// further on.
+///
+/// A target the cursor has already passed must leave it where it is.  That is
+/// the promise every one of these four makes, and the comparison against the
+/// current row is what keeps it.
+fn test_repeated_seeks<K, A, N, T>(
+    rows: &RowGroup<DynData, DynData, N, T>,
+    offset: u64,
+    n: usize,
+    expected: impl Fn(usize) -> (K, K, K, A),
+) where
+    K: DBData,
+    A: DBData,
+    T: ColumnSpec,
+{
+    if n == 0 {
+        return;
+    }
+    let mut tmp_key = K::default();
+    let mut tmp_aux = A::default();
+    let (tmp_key, tmp_aux): (&mut DynData, &mut DynData) =
+        (tmp_key.erase_mut(), tmp_aux.erase_mut());
+
+    let targets: Vec<usize> = [
+        0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987,
+    ]
+    .into_iter()
+    .filter(|&row| row < n)
+    .chain([n - 1])
+    .collect();
+
+    // Forward, by key and by predicate, each on a cursor of its own.
+    for by_predicate in [false, true] {
+        let mut cursor = unsafe { rows.first().unwrap() };
+        let mut landed = 0;
+        for &row in &targets {
+            let (_before, mut key, _after, mut aux) = expected(row);
+            if by_predicate {
+                let target = key.clone();
+                unsafe { cursor.seek_forward_until(|k| k >= target.erase()) }.unwrap();
+            } else {
+                unsafe { cursor.advance_to_value_or_larger(key.erase()) }.unwrap();
+            }
+            assert_eq!(cursor.absolute_position(), offset + row as u64);
+            assert_eq!(
+                unsafe { cursor.item((tmp_key, tmp_aux)) },
+                Some((key.erase_mut(), aux.erase_mut()))
+            );
+            assert_eq!(cursor.key(), Some(key.erase()));
+
+            // Seeking back to where it came from leaves it here.
+            let (_before, mut behind, _after, _aux) = expected(landed);
+            if by_predicate {
+                let target = behind.clone();
+                unsafe { cursor.seek_forward_until(|k| k >= target.erase()) }.unwrap();
+            } else {
+                unsafe { cursor.advance_to_value_or_larger(behind.erase_mut()) }.unwrap();
+            }
+            assert_eq!(cursor.absolute_position(), offset + row as u64);
+            assert_eq!(cursor.key(), Some(key.erase()));
+            landed = row;
+        }
+    }
+
+    // Backward, the same way.
+    for by_predicate in [false, true] {
+        let mut cursor = unsafe { rows.last().unwrap() };
+        let mut landed = n - 1;
+        for &row in targets.iter().rev() {
+            let (_before, mut key, _after, mut aux) = expected(row);
+            if by_predicate {
+                let target = key.clone();
+                unsafe { cursor.seek_backward_until(|k| k <= target.erase()) }.unwrap();
+            } else {
+                unsafe { cursor.rewind_to_value_or_smaller(key.erase()) }.unwrap();
+            }
+            assert_eq!(cursor.absolute_position(), offset + row as u64);
+            assert_eq!(
+                unsafe { cursor.item((tmp_key, tmp_aux)) },
+                Some((key.erase_mut(), aux.erase_mut()))
+            );
+            assert_eq!(cursor.key(), Some(key.erase()));
+
+            // And a target ahead of it leaves it here.
+            let (_before, mut ahead, _after, _aux) = expected(landed);
+            if by_predicate {
+                let target = ahead.clone();
+                unsafe { cursor.seek_backward_until(|k| k <= target.erase()) }.unwrap();
+            } else {
+                unsafe { cursor.rewind_to_value_or_smaller(ahead.erase_mut()) }.unwrap();
+            }
+            assert_eq!(cursor.absolute_position(), offset + row as u64);
+            assert_eq!(cursor.key(), Some(key.erase()));
+            landed = row;
+        }
+    }
+}
+
 fn test_out_of_range<K, A, N, T>(
     row_group: &RowGroup<DynData, DynData, N, T>,
     before: &K,
@@ -528,6 +690,8 @@ fn test_cursor_helper<K, A, N, T>(
         test_find(rows, &before, &key, &after, aux.clone());
     }
 
+    test_repeated_seeks(rows, offset, n, &expected);
+
     let mut random = unsafe { rows.before() };
     let mut order: Vec<_> = (0..n + 10).collect();
     order.shuffle(&mut thread_rng());
@@ -615,8 +779,15 @@ fn test_multifetch_zset<K, A>(
 
     let mut keys = keys_factory.default_box();
     for i in 0..n {
+        // `before` sorts between this key and the one before it, so it is in
+        // the file's range and in the block a search would look in, and it is
+        // not in the file.  Asking for it says that a key the file does not
+        // hold is reported as missing rather than as its neighbour.
+        let (before, key, _after, diff) = (expected_fn)(i);
         if rand::random() {
-            let (_before, key, _after, diff) = (expected_fn)(i);
+            keys.push_ref(&before);
+        }
+        if rand::random() {
             keys.push_ref(&key);
             expected.push_val_diff(().erase(), diff.erase());
             expected.push_key(key.erase());
@@ -946,6 +1117,50 @@ fn two_columns_snappy() {
 }
 
 #[test]
+fn two_columns_lz4() {
+    init_test_logger();
+    test_2_columns_helper(Parameters::default().with_compression(Some(Compression::Lz4)));
+}
+
+#[test]
+fn two_columns_zstd() {
+    init_test_logger();
+    test_2_columns_helper(Parameters::default().with_compression(Some(Compression::Zstd)));
+}
+
+/// Zstd levels are a writer-side choice that must not change what reads back.
+#[test]
+fn two_columns_zstd_levels() {
+    init_test_logger();
+    for level in [1, 3, 9] {
+        test_2_columns_helper(
+            Parameters::default()
+                .with_compression(Some(Compression::Zstd))
+                .with_compression_level(Some(level)),
+        );
+    }
+}
+
+/// The level reaches us from user configuration, so an absurd one must still
+/// produce a readable file.
+///
+/// Note this passes with or without the explicit clamp in `BlockWriter::new`,
+/// because zstd also clamps the level itself. The clamp is kept so the
+/// behaviour does not depend on that, but this test does not prove it is
+/// there; it pins the observable property that any configured level works.
+#[test]
+fn two_columns_zstd_level_out_of_range() {
+    init_test_logger();
+    for level in [i32::MIN, -1000000, 1000000, i32::MAX] {
+        test_2_columns_helper(
+            Parameters::default()
+                .with_compression(Some(Compression::Zstd))
+                .with_compression_level(Some(level)),
+        );
+    }
+}
+
+#[test]
 fn two_columns_max_branch_2_uncompressed() {
     init_test_logger();
     test_2_columns_helper(
@@ -1259,8 +1474,16 @@ fn bloom_filter_roundtrip_and_block_kind() {
         for key in [1i64, 3, 7] {
             assert!(filters.maybe_contains_key(key.erase(), None));
         }
-        assert_eq!(filter_block_magic(&reader), Some(BLOOM_FILTER_BLOCK_MAGIC));
-        assert_eq!(incompatible_features(&reader), 0);
+        assert_eq!(
+            filter_block_magic(&reader),
+            Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)
+        );
+        // A file carrying more than one module is deliberately unreadable by
+        // binaries that predate them, so they fail loudly rather than mis-parse.
+        assert_eq!(
+            incompatible_features(&reader),
+            INCOMPATIBLE_FEATURE_MODULAR_FILTERS
+        );
     }
 }
 
@@ -1419,7 +1642,10 @@ fn writer_without_filter_plan_uses_bloom_filter() {
         }
 
         let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
-        assert_eq!(filter_block_magic(&reader), Some(BLOOM_FILTER_BLOCK_MAGIC));
+        assert_eq!(
+            filter_block_magic(&reader),
+            Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)
+        );
     });
 }
 
@@ -1532,6 +1758,150 @@ fn roaring_u64_filter_roundtrip_uses_batch_min_offset() {
     });
 }
 
+/// A roaring filter planned around a key smaller than the file's first key
+/// answers the same straight from the writer and after the file is reopened.
+///
+/// A merge plans its filter around the smallest key of its inputs, and that
+/// key can cancel out of the merged file. The keys here sit at odd offsets from
+/// the planned minimum, so a reader that took the first key for the filter's
+/// base would probe only clear bits.
+#[test]
+fn roaring_filter_planned_below_the_first_key_survives_reopen() {
+    init_test_logger();
+
+    with_roaring_enabled(|| {
+        for reopen in [false, true] {
+            let factories = Factories::<DynData, DynData>::new::<i64, ()>();
+            let tempdir = tempdir().unwrap();
+            let storage_backend = <dyn StorageBackend>::new(
+                &StorageConfig {
+                    path: tempdir.path().to_string_lossy().to_string(),
+                    cache: Default::default(),
+                },
+                &StorageOptions::default(),
+            )
+            .unwrap();
+
+            let planned_min = -1_000i64;
+            let keys: Vec<i64> = (0..64).map(|i| planned_min + 1 + 2 * i).collect();
+            let filter_plan =
+                FilterPlan::from_bounds((&planned_min) as &DynData, keys.last().unwrap());
+            let mut writer = Writer1::new(
+                &factories,
+                test_buffer_cache,
+                &*storage_backend,
+                Parameters::default(),
+                FilterPlan::decide_filter(Some(&filter_plan), keys.len()),
+            )
+            .unwrap();
+            for key in &keys {
+                writer.write0((key, &())).unwrap();
+            }
+
+            let (reader, filters) = if reopen {
+                let path = writer.path().clone();
+                let (_file_handle, _key_filter, _key_bounds) =
+                    writer.close(BatchMetadata::default()).unwrap();
+                let (reader, membership_filter) = Reader::open_with_filter(
+                    &[&factories.any_factories()],
+                    test_buffer_cache,
+                    &*storage_backend,
+                    &path,
+                )
+                .unwrap();
+                let key_range = reader.key_range().unwrap().map(Into::into);
+                let filters = BatchFilters::from_file(key_range, membership_filter);
+                (reader, filters)
+            } else {
+                writer.into_reader(BatchMetadata::default()).unwrap()
+            };
+
+            for key in &keys {
+                assert!(
+                    filters.maybe_contains_key(key as &DynData, None),
+                    "reopen={reopen}: key {key} not found"
+                );
+            }
+            for key in keys.iter().map(|key| key + 1).take(keys.len() - 1) {
+                assert!(
+                    !filters.maybe_contains_key((&key) as &DynData, None),
+                    "reopen={reopen}: absent key {key} found"
+                );
+            }
+            assert_eq!(
+                filter_block_magic(&reader),
+                Some(ROARING_BITMAP_FILTER_BLOCK_MAGIC)
+            );
+        }
+    });
+}
+
+/// A writer that receives no rows writes no filter, whichever filter it was
+/// created with.
+///
+/// A merge picks its output's filter before it knows whether any key survives,
+/// so a writer can hold a filter and receive no rows. The finished file must
+/// then be byte for byte the file that a writer without a filter produces,
+/// which every binary that reads this format version can read. Both the
+/// writer's own reader and a reader that reopens the file must report no
+/// filter.
+#[test]
+fn empty_file_gets_no_filter() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let storage_backend = backend_at(&tempdir.path().to_string_lossy());
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let write_empty_file = |key_filter| {
+        let writer = Writer1::new(
+            &factories,
+            test_buffer_cache,
+            &*storage_backend,
+            Parameters::default(),
+            key_filter,
+        )
+        .unwrap();
+        let path = writer.path().clone();
+        let (reader, filters) = writer.into_reader(BatchMetadata::default()).unwrap();
+        let contents = storage_backend.read(&path).unwrap().as_slice().to_vec();
+        (reader, filters, contents)
+    };
+
+    let (_, _, unfiltered_contents) = write_empty_file(None);
+    for (label, key_filter) in [
+        ("Bloom", BatchKeyFilter::new_bloom(100, 1e-4)),
+        (
+            "roaring",
+            Some(BatchKeyFilter::new_roaring_u32((&0u32) as &DynData)),
+        ),
+    ] {
+        assert!(key_filter.is_some(), "{label}: the writer needs a filter");
+        let (reader, filters, contents) = write_empty_file(key_filter);
+        assert_eq!(
+            filters.membership_filter_kind(),
+            FilterKind::None,
+            "{label}: the writer kept its filter"
+        );
+        assert!(
+            contents == unfiltered_contents,
+            "{label}: the file differs from one written without a filter"
+        );
+
+        let (_reopened, membership_filter): (Reader<(&'static DynData, &'static DynData, ())>, _) =
+            Reader::open_with_filter(
+                &[&factories.any_factories()],
+                test_buffer_cache,
+                &*storage_backend,
+                reader.path(),
+            )
+            .unwrap();
+        assert!(
+            membership_filter.is_none(),
+            "{label}: the reopened file has a filter"
+        );
+    }
+}
+
 #[test]
 fn i64_keys_fallback_to_bloom_when_span_exceeds_u32() {
     init_test_logger();
@@ -1563,7 +1933,10 @@ fn i64_keys_fallback_to_bloom_when_span_exceeds_u32() {
         }
 
         let (reader, _filters) = writer.into_reader(BatchMetadata::default()).unwrap();
-        assert_eq!(filter_block_magic(&reader), Some(BLOOM_FILTER_BLOCK_MAGIC));
+        assert_eq!(
+            filter_block_magic(&reader),
+            Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)
+        );
     });
 }
 
@@ -1686,4 +2059,1194 @@ fn test_big_values() {
             parameters,
         )
     });
+}
+
+/// Builds a storage backend rooted at `dir`.
+fn backend_at(dir: &str) -> Arc<dyn StorageBackend> {
+    <dyn StorageBackend>::new(
+        &StorageConfig {
+            path: dir.to_string(),
+            cache: Default::default(),
+        },
+        &StorageOptions::default(),
+    )
+    .unwrap()
+}
+
+/// Writes `keys` into a batch file under `dir`.
+///
+/// # Arguments
+///
+/// - `dir`: directory to write the batch into.
+/// - `keys`: keys to write, in order.
+///
+/// # Returns
+///
+/// The path of the finished file, which the tests reopen through a fresh
+/// backend.
+fn write_u32_batch(dir: &str, keys: &[u32]) -> StoragePath {
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let storage_backend = backend_at(dir);
+    let mut writer = Writer1::new(
+        &factories,
+        test_buffer_cache,
+        &*storage_backend,
+        Parameters::default(),
+        FilterPlan::<DynData>::decide_filter(None, keys.len()),
+    )
+    .unwrap();
+    for key in keys {
+        writer.write0((key, &())).unwrap();
+    }
+    let tmp_path = writer.path().clone();
+    // The handle must outlive the copy: dropping it removes the file.
+    let (_file_handle, _filter, _bounds) = writer.close(BatchMetadata::default()).unwrap();
+
+    // The writer picks its own file name, which a later backend instance has
+    // no way to learn, so the batch is renamed to something the tests can ask
+    // for by name.
+    let stable_path = StoragePath::from("batch.feldera".to_string());
+    let content = storage_backend.read(&tmp_path).unwrap();
+    storage_backend
+        .write(&stable_path, (*content).clone())
+        .unwrap();
+    storage_backend.delete(&tmp_path).unwrap();
+    stable_path
+}
+
+/// Opens a batch file written by [`write_u32_batch`].
+///
+/// # Arguments
+///
+/// - `dir`: directory holding the batch.
+/// - `path`: the batch's path, as returned by [`write_u32_batch`].
+///
+/// # Returns
+///
+/// - the batch's filter chain;
+/// - the magic of the filter block on disk, or `None` when it has no filter;
+/// - the file's incompatible feature bits.
+fn open_u32_batch(dir: &str, path: &StoragePath) -> (BatchFilters<DynData>, Option<[u8; 4]>, u64) {
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let storage_backend = backend_at(dir);
+    let (reader, membership_filter): (Reader<(&'static DynData, &'static DynData, ())>, _) =
+        Reader::open_with_filter(
+            &[&factories.any_factories()],
+            test_buffer_cache,
+            &*storage_backend,
+            path,
+        )
+        .unwrap();
+    let magic = filter_block_magic(&reader);
+    let features = incompatible_features(&reader);
+    let key_range = reader.key_range().unwrap().map(Into::into);
+    (
+        BatchFilters::from_file(key_range, membership_filter),
+        magic,
+        features,
+    )
+}
+
+/// The configured rate selects the module count, and a one-module filter is
+/// written in the original encoding so older binaries can still read the file.
+#[test]
+fn rate_selects_the_module_count_and_the_block_encoding() {
+    init_test_logger();
+
+    for (rate, expected_magic) in [
+        (1e-4, Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)),
+        (1e-3, Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)),
+        (1e-2, Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC)),
+        (1e-1, Some(BLOOM_FILTER_BLOCK_MAGIC)),
+        (1.0, None),
+    ] {
+        let tempdir = tempdir().unwrap();
+        let dir = tempdir.path().to_string_lossy().to_string();
+        let keys: Vec<u32> = (0..2_000u32).map(|k| k * 2).collect();
+
+        with_false_positive_rate(rate, move || {
+            let path = write_u32_batch(&dir, &keys);
+            let (filters, magic, features) = open_u32_batch(&dir, &path);
+            assert_eq!(magic, expected_magic, "rate {rate:e} wrote the wrong block");
+
+            for key in &keys {
+                assert!(
+                    filters.maybe_contains_key(key as &DynData, None),
+                    "rate {rate:e}: filter rejected stored key {key}"
+                );
+            }
+
+            // Only a multi-module file is closed to older binaries. A file with
+            // one module, or none, stays readable by them.
+            let expected_features = if rate < 0.05 {
+                INCOMPATIBLE_FEATURE_MODULAR_FILTERS
+            } else {
+                0
+            };
+            assert_eq!(
+                features, expected_features,
+                "rate {rate:e} set the wrong incompatible features"
+            );
+
+            let kind = filters.membership_filter_kind();
+            if expected_magic.is_none() {
+                assert_eq!(
+                    kind,
+                    FilterKind::None,
+                    "rate {rate:e} should write no filter"
+                );
+            } else {
+                assert_eq!(kind, FilterKind::Bloom, "rate {rate:e} should write Bloom");
+            }
+        });
+    }
+}
+
+/// Lowering the rate sheds modules when the file is loaded, without rewriting
+/// it and without ever losing a key.
+#[test]
+fn lowering_the_rate_evicts_modules_on_load() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    let keys: Vec<u32> = (0..4_000u32).map(|k| k * 2).collect();
+    let path = Arc::new(Mutex::new(None));
+
+    // Write at the most accurate rate, so the file holds four modules.
+    {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        with_false_positive_rate(1e-4, move || {
+            *path.lock().unwrap() = Some(write_u32_batch(&dir, &keys));
+        });
+    }
+    let path = path.lock().unwrap().clone().unwrap();
+
+    // Reload it under progressively coarser rates. Each one keeps fewer bytes
+    // resident, and none of them may lose a key.
+    let mut previous_bytes = usize::MAX;
+    for rate in [1e-4, 1e-3, 1e-2, 1e-1] {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        let bytes = Arc::new(Mutex::new(0));
+        {
+            let bytes = bytes.clone();
+            with_false_positive_rate(rate, move || {
+                let (filters, magic, _features) = open_u32_batch(&dir, &path);
+                assert_eq!(
+                    magic,
+                    Some(MODULAR_BLOOM_FILTER_BLOCK_MAGIC),
+                    "the file on disk is unchanged by loading it"
+                );
+                assert_eq!(filters.membership_filter_kind(), FilterKind::Bloom);
+                for key in &keys {
+                    assert!(
+                        filters.maybe_contains_key(key as &DynData, None),
+                        "rate {rate:e}: eviction lost key {key}"
+                    );
+                }
+                *bytes.lock().unwrap() = filters.stats().membership_filter.size_byte;
+            });
+        }
+        let bytes = *bytes.lock().unwrap();
+        assert!(
+            bytes < previous_bytes,
+            "rate {rate:e} kept {bytes} bytes resident, no less than the {previous_bytes} before it"
+        );
+        previous_bytes = bytes;
+    }
+}
+
+/// A rate of one drops the filter entirely at load time, even for a file that
+/// was written with modules.
+#[test]
+fn a_rate_of_one_drops_an_existing_filter_on_load() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    let keys: Vec<u32> = (0..1_000u32).collect();
+    let path = Arc::new(Mutex::new(None));
+
+    {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        with_false_positive_rate(1e-4, move || {
+            *path.lock().unwrap() = Some(write_u32_batch(&dir, &keys));
+        });
+    }
+    let path = path.lock().unwrap().clone().unwrap();
+
+    with_false_positive_rate(1.0, move || {
+        let (filters, _magic, _features) = open_u32_batch(&dir, &path);
+        assert_eq!(filters.membership_filter_kind(), FilterKind::None);
+        assert_eq!(filters.stats().membership_filter.size_byte, 0);
+        // Without a membership filter every in-range key must still be accepted.
+        for key in &keys {
+            assert!(filters.maybe_contains_key(key as &DynData, None));
+        }
+    });
+}
+
+/// A [`FileReader`] that tallies the bytes the reads it forwards ask for.
+#[derive(Debug)]
+struct CountingFileReader {
+    inner: Arc<dyn FileReader>,
+    bytes: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl FileRw for CountingFileReader {
+    fn file_id(&self) -> FileId {
+        self.inner.file_id()
+    }
+
+    fn path(&self) -> &StoragePath {
+        self.inner.path()
+    }
+}
+
+impl FileCommitter for CountingFileReader {
+    fn commit(&self) -> Result<(), StorageError> {
+        self.inner.commit()
+    }
+}
+
+impl FileReader for CountingFileReader {
+    fn mark_for_checkpoint(&self) {
+        self.inner.mark_for_checkpoint();
+    }
+
+    fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
+        self.bytes.fetch_add(location.size, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_block(location)
+    }
+
+    fn get_size(&self) -> Result<u64, StorageError> {
+        self.inner.get_size()
+    }
+}
+
+/// Opens a batch file, counting what loading its membership filter reads.
+///
+/// The filter block is read on demand, so counting around that one call leaves
+/// out the trailer and index reads and measures the filter alone.
+///
+/// # Arguments
+///
+/// - `dir`: directory holding the batch.
+/// - `path`: the batch's path, as returned by [`write_u32_batch`].
+///
+/// # Returns
+///
+/// - the batch's filter chain;
+/// - bytes the reads asked for, filter block only;
+/// - number of reads issued.
+fn open_u32_batch_counting(dir: &str, path: &StoragePath) -> (BatchFilters<DynData>, usize, usize) {
+    let factories = Factories::<DynData, DynData>::new::<u32, ()>();
+    let storage_backend = backend_at(dir);
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::new(CountingFileReader {
+        inner: storage_backend.open(path).unwrap(),
+        bytes: bytes.clone(),
+        calls: calls.clone(),
+    });
+    let reader: Reader<(&'static DynData, &'static DynData, ())> =
+        Reader::new(&[&factories.any_factories()], test_buffer_cache, counting).unwrap();
+    let key_range = reader.key_range().unwrap().map(Into::into);
+
+    let before = (bytes.load(Ordering::Relaxed), calls.load(Ordering::Relaxed));
+    let membership_filter = reader.membership_filter().unwrap();
+    let filter_bytes = bytes.load(Ordering::Relaxed) - before.0;
+    let filter_calls = calls.load(Ordering::Relaxed) - before.1;
+
+    (
+        BatchFilters::from_file(key_range, membership_filter),
+        filter_bytes,
+        filter_calls,
+    )
+}
+
+/// A coarse rate reads only the modules it needs, not the whole filter block.
+///
+/// This is what the recorded per-module bit counts buy. Without them a reader
+/// would have to read every module to learn what a prefix of them is worth, and
+/// dropping modules would save memory but no I/O.
+#[test]
+fn a_coarse_rate_reads_only_the_modules_it_keeps() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    // Enough keys that a module spans many sectors, so the saving cannot hide
+    // in the rounding up to the 512-byte read granularity.
+    let keys: Vec<u32> = (0..20_000u32).map(|k| k * 3).collect();
+    let path = Arc::new(Mutex::new(None));
+
+    {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        with_false_positive_rate(1e-4, move || {
+            *path.lock().unwrap() = Some(write_u32_batch(&dir, &keys));
+        });
+    }
+    let path = path.lock().unwrap().clone().unwrap();
+
+    // Coarse first: a shared cache could only make the later, finer open
+    // cheaper, so it cannot manufacture the difference asserted below.
+    let measure = |rate: f64| {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        let result = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        {
+            let result = result.clone();
+            with_false_positive_rate(rate, move || {
+                let (filters, bytes, calls) = open_u32_batch_counting(&dir, &path);
+                for key in &keys {
+                    assert!(
+                        filters.maybe_contains_key(key as &DynData, None),
+                        "rate {rate:e}: a prefix read lost key {key}"
+                    );
+                }
+                *result.lock().unwrap() =
+                    (bytes, filters.stats().membership_filter.size_byte, calls);
+            });
+        }
+        *result.lock().unwrap()
+    };
+
+    let (coarse_read, coarse_resident, _coarse_calls) = measure(1e-1);
+    let (fine_read, fine_resident, fine_calls) = measure(1e-4);
+
+    // The finest rate cannot shed a module, so it must not pay to find that
+    // out: one read of the block, as before any of this existed.
+    assert_eq!(
+        fine_calls, 1,
+        "1e-4 read the filter block in {fine_calls} calls, not the one it needs"
+    );
+
+    assert!(
+        coarse_resident < fine_resident,
+        "1e-1 kept {coarse_resident} bytes resident, 1e-4 kept {fine_resident}"
+    );
+    assert!(
+        coarse_read < fine_read,
+        "1e-1 read {coarse_read} bytes of filter, no fewer than the {fine_read} that 1e-4 read"
+    );
+
+    // Reads are issued in 512-byte sectors, so a module dropped is a module not
+    // read, give or take the sector the header shares with the first of them.
+    let unread = fine_read - coarse_read;
+    let evicted = fine_resident - coarse_resident;
+    assert!(
+        unread + 512 >= evicted,
+        "evicting {evicted} bytes of modules only avoided reading {unread}"
+    );
+}
+
+/// A filter written in the original encoding loads whole whatever the rate.
+///
+/// One module is written as `LFFB`, the encoding that predates modular filters,
+/// and such a filter has no ladder to descend: the rate can drop it entirely or
+/// leave it alone, and nothing in between. The modular path has its own tests
+/// for shedding; this pins that the legacy path does not try to.
+#[test]
+fn a_legacy_filter_has_no_ladder_to_descend() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    let keys: Vec<u32> = (0..4_000u32).map(|k| k * 2).collect();
+    let path = Arc::new(Mutex::new(None));
+
+    // 1e-1 is one module, so the writer uses the original encoding.
+    {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        with_false_positive_rate(1e-1, move || {
+            *path.lock().unwrap() = Some(write_u32_batch(&dir, &keys));
+        });
+    }
+    let path = path.lock().unwrap().clone().unwrap();
+
+    // Loading it at any rate that wants a filter gives back all of it, whether
+    // the rate is coarser or finer than the one it was written at.
+    let mut sizes = Vec::new();
+    for rate in [1e-1, 1e-2, 1e-4] {
+        let (dir, keys, path) = (dir.clone(), keys.clone(), path.clone());
+        let size = Arc::new(Mutex::new(0));
+        {
+            let size = size.clone();
+            with_false_positive_rate(rate, move || {
+                let (filters, magic, _features) = open_u32_batch(&dir, &path);
+                assert_eq!(
+                    magic,
+                    Some(BLOOM_FILTER_BLOCK_MAGIC),
+                    "rate {rate:e}: the file on disk is unchanged by loading it"
+                );
+                assert_eq!(filters.membership_filter_kind(), FilterKind::Bloom);
+                for key in &keys {
+                    assert!(
+                        filters.maybe_contains_key(key as &DynData, None),
+                        "rate {rate:e}: a legacy filter lost key {key}"
+                    );
+                }
+                *size.lock().unwrap() = filters.stats().membership_filter.size_byte;
+            });
+        }
+        sizes.push(*size.lock().unwrap());
+    }
+    assert!(sizes[0] > 0, "the legacy filter measured zero bytes");
+    assert!(
+        sizes.iter().all(|size| *size == sizes[0]),
+        "a legacy filter changed size with the rate: {sizes:?}"
+    );
+
+    // A rate of one drops it outright, the one thing the rate can do to it.
+    with_false_positive_rate(1.0, move || {
+        let (filters, _magic, _features) = open_u32_batch(&dir, &path);
+        assert_eq!(filters.membership_filter_kind(), FilterKind::None);
+        assert_eq!(filters.stats().membership_filter.size_byte, 0);
+        for key in &keys {
+            assert!(filters.maybe_contains_key(key as &DynData, None));
+        }
+    });
+}
+
+/// A stamped value column survives a write/reopen cycle.
+///
+/// A successful reopen also proves the writer set
+/// [`INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN`]: the reader rejects a trailer
+/// whose feature bit and stamp disagree, so a stamped file that opens at all
+/// must carry the bit.
+#[test]
+fn value_stamp_roundtrip() {
+    init_test_logger();
+
+    for stamp in [ValueStampFlag::NO_STAMP, ValueStampFlag::UPSERT_INDEX] {
+        let factories = Factories::<DynData, DynData>::new::<i64, ()>();
+        let tempdir = tempdir().unwrap();
+        let storage_backend = <dyn StorageBackend>::new(
+            &StorageConfig {
+                path: tempdir.path().to_string_lossy().to_string(),
+                cache: Default::default(),
+            },
+            &StorageOptions::default(),
+        )
+        .unwrap();
+
+        let mut writer = Writer1::new(
+            &factories,
+            test_buffer_cache,
+            &*storage_backend,
+            Parameters::default(),
+            FilterPlan::<DynData>::decide_filter(None, 3),
+        )
+        .unwrap();
+        for key in [1i64, 3, 7] {
+            writer.write0((&key, &())).unwrap();
+        }
+
+        let path = writer.path().clone();
+        // Hold the handle: the file is removed when the last one drops.
+        let (_file_handle, _key_filter, _key_bounds) = writer
+            .close(BatchMetadata {
+                value_stamp: stamp,
+                ..BatchMetadata::default()
+            })
+            .unwrap();
+
+        let (reader, _membership_filter) =
+            Reader::<(&'static DynData, &'static DynData, ())>::open_with_filter(
+                &[&factories.any_factories()],
+                test_buffer_cache,
+                &*storage_backend,
+                &path,
+            )
+            .unwrap();
+        assert_eq!(reader.metadata().value_stamp, stamp);
+        assert_eq!(
+            reader.metadata().value_stamp.is_stamped(),
+            stamp != ValueStampFlag::NO_STAMP
+        );
+    }
+}
+
+/// Negative control for the downgrade guarantee.
+///
+/// A binary that predates the stamp must REFUSE a stamped file rather than read
+/// `Tup2<V, u32>` bytes as `V`.  It refuses because the stamp is advertised in
+/// the incompatible bitmap and its bit is absent from that binary's known set,
+/// which this reproduces.  Once every reader in the tree knows the bit, this
+/// test is the only thing left holding the guarantee: moving the stamp to the
+/// compatible bitmap, or folding it into the older mask, breaks it here.
+#[test]
+fn old_reader_refuses_stamped_file() {
+    const KNOWN_BEFORE_STAMP: u64 =
+        INCOMPATIBLE_FEATURE_ROARING_FILTERS | INCOMPATIBLE_FEATURE_MODULAR_FILTERS;
+
+    assert_ne!(
+        INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN & !KNOWN_BEFORE_STAMP,
+        0,
+        "a reader predating the stamp must see the bit as unknown and refuse the file"
+    );
+}
+
+/// Copies a layer file, changing its trailer on the way.
+///
+/// # Arguments
+///
+/// * `storage_backend` - where both files live.
+/// * `path` - the file to copy.
+/// * `copy` - where to write the copy.
+/// * `patch` - the change to make to the copy's trailer.
+fn copy_with_patched_trailer(
+    storage_backend: &dyn StorageBackend,
+    path: &StoragePath,
+    copy: &StoragePath,
+    patch: impl FnOnce(&mut FileTrailer),
+) {
+    let mut content = (*storage_backend.read(path).unwrap()).clone();
+    let trailer_offset = content.len() - 512;
+    let mut trailer = FileTrailer::read_le(&mut Cursor::new(&content[trailer_offset..])).unwrap();
+    patch(&mut trailer);
+    trailer
+        .write_le(&mut Cursor::new(&mut content[trailer_offset..]))
+        .unwrap();
+    let checksum = crc32c(&content[trailer_offset + 4..]).to_le_bytes();
+    content[trailer_offset..trailer_offset + 4].copy_from_slice(&checksum);
+    storage_backend.write(copy, content).unwrap();
+}
+
+/// A trailer whose hidden-value-column feature bit and value stamp disagree is
+/// corrupted, and reading it fails whichever way they disagree.
+#[test]
+fn inconsistent_value_stamp_is_corruption() {
+    init_test_logger();
+
+    let tempdir = tempdir().unwrap();
+    let dir = tempdir.path().to_string_lossy().to_string();
+    let path = write_u32_batch(&dir, &[1, 3, 7]);
+    let storage_backend = backend_at(&dir);
+
+    for (n, (bit, stamp)) in [
+        (true, ValueStampFlag::UPSERT_INDEX),
+        (true, ValueStampFlag::NO_STAMP),
+        (false, ValueStampFlag::UPSERT_INDEX),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let copy = StoragePath::from(format!("patched{n}.feldera"));
+        copy_with_patched_trailer(&*storage_backend, &path, &copy, |trailer| {
+            if bit {
+                trailer.incompatible_features |= INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN;
+            } else {
+                trailer.incompatible_features &= !INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN;
+            }
+            trailer.metadata.value_stamp = stamp;
+        });
+
+        let result = read_metadata(test_buffer_cache, &*storage_backend, &copy);
+        if bit == stamp.is_stamped() {
+            // A consistent trailer, rewritten the same way, still reads.
+            assert_eq!(result.unwrap().value_stamp, stamp);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(ReaderError::Corruption(CorruptionError::InconsistentValueStamp {
+                        bit: found_bit,
+                        stamp: found_stamp,
+                    })) if found_bit == bit && found_stamp == stamp.is_stamped()
+                ),
+                "bit {bit}, stamp {stamp:?}: expected an inconsistent stamp, got {result:?}"
+            );
+        }
+    }
+}
+
+/// Read-ahead on a cursor that declared a sequential walk.
+///
+/// The counters these tests read are recorded per thread type, and a thread
+/// outside a circuit has none, so each test runs on a worker.  A file is
+/// written, then opened again under a new file id, which is what makes every
+/// block a cache miss on the first visit.
+mod read_ahead {
+    use super::{BatchMetadata, Parameters, Reader, Writer1, Writer2};
+    use crate::{
+        Runtime,
+        circuit::{
+            CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
+        },
+        dynamic::{DynData, Erase},
+        storage::{
+            buffer_cache::{CacheAccess, CacheStats},
+            file::{Factories, FilterPlan},
+        },
+        trace::{cursor::AccessHint, test::run_in_circuit_with_storage_config},
+    };
+    use feldera_buffer_cache::ThreadType;
+    use feldera_storage::{FileReader, StoragePath};
+    use feldera_types::size::ConfigSize;
+    use feldera_types::{
+        config::{FileBackendConfig, StorageBackendConfig},
+        duration::ConfigDuration,
+    };
+    use std::{path::Path, sync::Arc};
+    use tempfile::tempdir;
+
+    type Column = (&'static DynData, &'static DynData, ());
+    type TwoColumns = (&'static DynData, &'static DynData, Column);
+
+    pub(super) fn config(
+        dir: &Path,
+        read_ahead: Option<u64>,
+        ioop_delay_ms: Option<u64>,
+    ) -> CircuitConfig {
+        let mut config = CircuitConfig::with_workers(1).with_storage(Some(
+            CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: dir.to_string_lossy().into_owned(),
+                    cache: StorageCacheConfig::default(),
+                },
+                StorageOptions {
+                    min_spill_size: Some(ConfigSize::ZERO),
+                    backend: StorageBackendConfig::File(Box::new(FileBackendConfig {
+                        async_threads: Some(true),
+                        ioop_latency: ioop_delay_ms.map(ConfigDuration::from_millis),
+                        sync: None,
+                        sync_mode: None,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ));
+        config.dev_tweaks.layer_file_read_ahead_blocks = read_ahead;
+        config
+    }
+
+    pub(super) fn foreground(stats: &CacheStats, access: CacheAccess) -> u64 {
+        stats.0[ThreadType::Foreground][access].count
+    }
+
+    /// A one-column file of `keys` ascending keys.  The handle keeps the file
+    /// alive: the writer's file is deleted when its last handle drops.
+    ///
+    /// # Arguments
+    ///
+    /// * `keys` - how many keys to write.
+    ///
+    /// # Returns
+    ///
+    /// A handle on the written file, its path, and the factories that read it.
+    fn write_keys(
+        keys: u64,
+    ) -> (
+        Arc<dyn FileReader>,
+        StoragePath,
+        Factories<DynData, DynData>,
+    ) {
+        write_keys_with(keys, Parameters::default())
+    }
+
+    pub(super) fn write_keys_with(
+        keys: u64,
+        parameters: Parameters,
+    ) -> (
+        Arc<dyn FileReader>,
+        StoragePath,
+        Factories<DynData, DynData>,
+    ) {
+        let factories = Factories::<DynData, DynData>::new::<i64, ()>();
+        let backend = Runtime::storage_backend().unwrap();
+        let mut writer = Writer1::new(
+            &factories,
+            Runtime::buffer_cache,
+            &*backend,
+            parameters,
+            FilterPlan::<DynData>::decide_filter(None, keys as usize),
+        )
+        .unwrap();
+        for key in 0..keys as i64 {
+            writer.write0((key.erase(), ().erase())).unwrap();
+        }
+        let path = writer.path().clone();
+        let (handle, _filter, _bounds) = writer.close(BatchMetadata::default()).unwrap();
+        (handle, path, factories)
+    }
+
+    pub(super) fn reopen(
+        path: &StoragePath,
+        factories: &Factories<DynData, DynData>,
+    ) -> Reader<Column> {
+        Reader::open(
+            &[&factories.any_factories()],
+            Runtime::buffer_cache,
+            &*Runtime::storage_backend().unwrap(),
+            path,
+        )
+        .unwrap()
+    }
+
+    /// Walks every key with a cursor made under `hint` and returns how many it
+    /// saw together with the file's cache statistics.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - the file to walk.
+    /// * `hint` - how to tell the cursor it will be moved.
+    ///
+    /// # Returns
+    ///
+    /// How many keys the walk saw, and the cache statistics it left.
+    pub(super) fn walk(reader: &Reader<Column>, hint: AccessHint) -> (u64, CacheStats) {
+        let rows = reader.rows().with_hint(hint);
+        let mut cursor = unsafe { rows.first() }.unwrap();
+        let mut seen = 0;
+        while cursor.has_value() {
+            seen += 1;
+            unsafe { cursor.move_next() }.unwrap();
+        }
+        (seen, reader.cache_stats())
+    }
+
+    /// About a thousand keys fit a data block, so this is a few hundred
+    /// blocks: enough for the read-ahead to matter and to outrun.
+    const KEYS: u64 = 300_000;
+
+    /// With the walk declared, all but the first data block (and the trailer
+    /// and index block read to reach it) arrive through read-ahead.  Without
+    /// the declaration every block is a synchronous miss and nothing is asked
+    /// for ahead.
+    #[test]
+    fn a_declared_walk_reads_ahead_and_an_undeclared_one_does_not() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), None, None), || {
+            let (_handle, path, factories) = write_keys(KEYS);
+
+            let hinted = reopen(&path, &factories);
+            let (seen, stats) = walk(&hinted, AccessHint::Sequential);
+            assert_eq!(seen, KEYS);
+            let misses = foreground(&stats, CacheAccess::Miss);
+            let prefetches = foreground(&stats, CacheAccess::Prefetch);
+            let served =
+                foreground(&stats, CacheAccess::Hit) + foreground(&stats, CacheAccess::Wait);
+            // The trailer on open, the root index block, and the first data
+            // block: everything after that arrives through read-ahead.
+            assert!(
+                misses <= 3,
+                "a declared walk read {misses} blocks synchronously"
+            );
+            assert!(
+                prefetches >= 100,
+                "a declared walk asked for only {prefetches} blocks ahead"
+            );
+            assert!(
+                served <= prefetches,
+                "{served} blocks were served from the cache but only {prefetches} were read ahead"
+            );
+
+            let plain = reopen(&path, &factories);
+            let (seen, stats) = walk(&plain, AccessHint::Unknown);
+            assert_eq!(seen, KEYS);
+            assert_eq!(foreground(&stats, CacheAccess::Prefetch), 0);
+            assert_eq!(foreground(&stats, CacheAccess::Wait), 0);
+            assert!(foreground(&stats, CacheAccess::Miss) >= 100);
+        });
+    }
+
+    /// A depth of zero switches the read-ahead off, whatever the hint.
+    #[test]
+    fn a_zero_depth_disables_read_ahead() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), Some(0), None), || {
+            let (_handle, path, factories) = write_keys(KEYS);
+            let reader = reopen(&path, &factories);
+            let (seen, stats) = walk(&reader, AccessHint::Sequential);
+            assert_eq!(seen, KEYS);
+            assert_eq!(foreground(&stats, CacheAccess::Prefetch), 0);
+            assert!(foreground(&stats, CacheAccess::Miss) >= 100);
+        });
+    }
+
+    /// With every read taking 20 ms, the walk reaches the next block long
+    /// before its read-ahead lands.  It must wait for that read rather than
+    /// issue its own: each block crosses the device once, so the blocks read
+    /// ahead account for every block the cache served.
+    #[test]
+    fn a_walk_that_overtakes_its_read_ahead_waits_rather_than_reading_twice() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), None, Some(20)), || {
+            let (_handle, path, factories) = write_keys(40_000);
+            let reader = reopen(&path, &factories);
+            let (seen, stats) = walk(&reader, AccessHint::Sequential);
+            assert_eq!(seen, 40_000);
+            let misses = foreground(&stats, CacheAccess::Miss);
+            let prefetches = foreground(&stats, CacheAccess::Prefetch);
+            let waits = foreground(&stats, CacheAccess::Wait);
+            let served = foreground(&stats, CacheAccess::Hit) + waits;
+            assert!(waits > 0, "the walk never caught up with its read-ahead");
+            assert!(
+                misses <= 3,
+                "the walk read {misses} blocks itself instead of waiting"
+            );
+            assert_eq!(
+                prefetches, served,
+                "{prefetches} blocks read ahead but {served} served: a block crossed the device twice"
+            );
+        });
+    }
+
+    /// A cursor made from a declared row group's next column walks its values
+    /// with the same read-ahead.
+    #[test]
+    fn the_value_column_inherits_the_declaration() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), None, None), || {
+            const VALUES: i64 = 100_000;
+            let factories0 = Factories::<DynData, DynData>::new::<i64, ()>();
+            let factories1 = Factories::<DynData, DynData>::new::<i64, ()>();
+            let backend = Runtime::storage_backend().unwrap();
+            let mut writer = Writer2::new(
+                &factories0,
+                &factories1,
+                Runtime::buffer_cache,
+                &*backend,
+                Parameters::default(),
+                FilterPlan::<DynData>::decide_filter(None, 1),
+            )
+            .unwrap();
+            for value in 0..VALUES {
+                writer.write1((value.erase(), ().erase())).unwrap();
+            }
+            writer.write0((1i64.erase(), ().erase())).unwrap();
+            let path = writer.path().clone();
+            let (_handle, _filter, _bounds) = writer.close(BatchMetadata::default()).unwrap();
+
+            let reader: Reader<TwoColumns> = Reader::open(
+                &[&factories0.any_factories(), &factories1.any_factories()],
+                Runtime::buffer_cache,
+                &*backend,
+                &path,
+            )
+            .unwrap();
+            let keys = reader.rows().with_hint(AccessHint::Sequential);
+            let key = unsafe { keys.first() }.unwrap();
+            let values = key.next_column().unwrap();
+            let mut cursor = unsafe { values.first() }.unwrap();
+            let mut seen = 0;
+            while cursor.has_value() {
+                seen += 1;
+                unsafe { cursor.move_next() }.unwrap();
+            }
+            assert_eq!(seen, VALUES);
+            let stats = reader.cache_stats();
+            assert!(
+                foreground(&stats, CacheAccess::Prefetch) >= 50,
+                "the value column was not read ahead: {stats:?}"
+            );
+            assert!(foreground(&stats, CacheAccess::Miss) <= 4);
+        });
+    }
+}
+
+/// A data block size of its own for the key column.
+mod key_block_size {
+    use super::read_ahead::{config, foreground, reopen, walk, write_keys_with};
+    use super::{BatchMetadata, Parameters, Reader, Writer2};
+    use crate::{
+        DynZWeight, Runtime, ZWeight,
+        circuit::runtime::tests::with_mock_process_rss,
+        dynamic::{DynData, DynUnit, Erase},
+        storage::{
+            buffer_cache::CacheAccess,
+            file::{Factories, FilterPlan},
+        },
+        trace::{
+            Batch, BatchLayout, BatchReader, BatchReaderFactories, Builder, FallbackIndexedWSet,
+            FallbackIndexedWSetFactories, Spine, Trace, TraceRole, cursor::AccessHint,
+            spine_async::MIN_LEVEL0_MERGE_BATCHES, test::run_in_circuit_with_storage_config,
+        },
+    };
+    use feldera_storage::StoragePath;
+    use feldera_types::memory_pressure::MemoryPressure;
+    use futures::executor::block_on;
+    use std::{
+        sync::Arc,
+        thread::sleep,
+        time::{Duration, Instant},
+    };
+    use tempfile::tempdir;
+
+    type TwoColumns = (
+        &'static DynData,
+        &'static DynData,
+        (&'static DynData, &'static DynData, ()),
+    );
+
+    /// Every block a cold, undeclared walk reads is a miss, so the misses
+    /// count the key blocks: four times the block, about a quarter of them.
+    #[test]
+    fn a_larger_key_block_means_fewer_key_blocks() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), Some(0), None), || {
+            let key_blocks = |parameters: Parameters| {
+                let (_handle, path, factories) = write_keys_with(300_000, parameters);
+                let (seen, stats) = walk(&reopen(&path, &factories), AccessHint::Unknown);
+                assert_eq!(seen, 300_000);
+                foreground(&stats, CacheAccess::Miss)
+            };
+            let small = key_blocks(Parameters::default());
+            let large = key_blocks(Parameters::default().with_min_key_data_block(32 * 1024));
+            assert!(small >= 100, "{small} key blocks at 8 KiB");
+            assert!(
+                large * 3 <= small,
+                "32 KiB key blocks gave {large} misses against {small} at 8 KiB"
+            );
+        });
+    }
+
+    /// The value column keeps its own size: a two-column file with one key
+    /// and many values has as many value blocks whatever the key block.
+    #[test]
+    fn value_blocks_keep_their_size_when_key_blocks_grow() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), Some(0), None), || {
+            let value_blocks = |parameters: Parameters| {
+                const VALUES: i64 = 100_000;
+                let factories0 = Factories::<DynData, DynData>::new::<i64, ()>();
+                let factories1 = Factories::<DynData, DynData>::new::<i64, ()>();
+                let backend = Runtime::storage_backend().unwrap();
+                let mut writer = Writer2::new(
+                    &factories0,
+                    &factories1,
+                    Runtime::buffer_cache,
+                    &*backend,
+                    parameters,
+                    FilterPlan::<DynData>::decide_filter(None, 1),
+                )
+                .unwrap();
+                for value in 0..VALUES {
+                    writer.write1((value.erase(), ().erase())).unwrap();
+                }
+                writer.write0((1i64.erase(), ().erase())).unwrap();
+                let path = writer.path().clone();
+                let (_handle, _filter, _bounds) = writer.close(BatchMetadata::default()).unwrap();
+                let reader: Reader<TwoColumns> = Reader::open(
+                    &[&factories0.any_factories(), &factories1.any_factories()],
+                    Runtime::buffer_cache,
+                    &*backend,
+                    &path,
+                )
+                .unwrap();
+                let key = unsafe { reader.rows().first() }.unwrap();
+                let mut cursor = unsafe { key.next_column().unwrap().first() }.unwrap();
+                let mut seen = 0;
+                while cursor.has_value() {
+                    seen += 1;
+                    unsafe { cursor.move_next() }.unwrap();
+                }
+                assert_eq!(seen, VALUES);
+                foreground(&reader.cache_stats(), CacheAccess::Miss)
+            };
+            let small = value_blocks(Parameters::default());
+            let large = value_blocks(Parameters::default().with_min_key_data_block(32 * 1024));
+            assert!(small >= 50, "{small} value blocks");
+            assert!(
+                small.abs_diff(large) <= 2,
+                "value blocks changed with the key block: {small} against {large}"
+            );
+        });
+    }
+
+    type IndexedWSet = FallbackIndexedWSet<DynData, DynData, DynZWeight>;
+    type IndexedWSetFactories = FallbackIndexedWSetFactories<DynData, DynData, DynZWeight>;
+    type KeyValueColumns = (
+        &'static DynData,
+        &'static DynUnit,
+        (&'static DynData, &'static DynZWeight, ()),
+    );
+
+    fn indexed_wset_factories() -> IndexedWSetFactories {
+        <IndexedWSetFactories>::new::<i64, i64, ZWeight>()
+    }
+
+    /// An in-memory batch of `keys` keys starting at `first`, each with one value.
+    ///
+    /// # Arguments
+    ///
+    /// * `factories` - factories for the batch.
+    /// * `first` - the first key.
+    /// * `keys` - how many keys to write.
+    ///
+    /// # Returns
+    ///
+    /// The batch, held in memory.
+    fn memory_batch(factories: &IndexedWSetFactories, first: i64, keys: i64) -> IndexedWSet {
+        let mut builder =
+            <IndexedWSet as Batch>::Builder::with_capacity(factories, keys as usize, keys as usize);
+        for key in first..first + keys {
+            builder.push_val_diff(0i64.erase(), 1i64.erase());
+            builder.push_key(key.erase());
+        }
+        builder.done()
+    }
+
+    /// Key blocks per 100k keys of the file at `path`, from a cold walk over
+    /// its key column: every block such a walk reads is a miss, less the
+    /// trailer and the index blocks, which are a handful.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - the file to measure.
+    ///
+    /// # Returns
+    ///
+    /// Key blocks per 100k keys, which compares files of different sizes.
+    fn key_blocks_per_100k(path: &StoragePath) -> u64 {
+        let column0 = Factories::<DynData, DynUnit>::new::<i64, ()>();
+        let column1 = Factories::<DynData, DynZWeight>::new::<i64, ZWeight>();
+        let reader: Reader<KeyValueColumns> = Reader::open(
+            &[&column0.any_factories(), &column1.any_factories()],
+            Runtime::buffer_cache,
+            &*Runtime::storage_backend().unwrap(),
+            path,
+        )
+        .unwrap();
+        let mut cursor = unsafe { reader.rows().first() }.unwrap();
+        let mut rows = 0u64;
+        while cursor.has_value() {
+            rows += 1;
+            unsafe { cursor.move_next() }.unwrap();
+        }
+        assert!(rows > 0, "an empty file at {path}");
+        foreground(&reader.cache_stats(), CacheAccess::Miss) * 100_000 / rows
+    }
+
+    /// The batches a spine's merger writes take the spine's layout: 32 KiB
+    /// key blocks hold about four times the keys of the default 8 KiB.
+    #[test]
+    fn a_spine_merges_in_its_layout() {
+        let dir = tempdir().unwrap();
+        run_in_circuit_with_storage_config(config(dir.path(), Some(0), None), || {
+            let small = merged_key_blocks_per_100k(BatchLayout::default());
+            let large = merged_key_blocks_per_100k(BatchLayout {
+                key_block_bytes: Some(32 * 1024),
+            });
+            assert!(
+                small >= 80,
+                "{small} key blocks per 100k keys in the default layout"
+            );
+            assert!(
+                large * 3 <= small,
+                "32 KiB key blocks gave {large} key blocks per 100k keys against {small}"
+            );
+        });
+    }
+
+    /// Fills a spine laid out as `layout` with more in-memory batches than a
+    /// level-0 merge waits for, and measures the file the merger wrote.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout` - the layout to give the spine.
+    ///
+    /// # Returns
+    ///
+    /// Key blocks per 100k keys of the merger's output.
+    fn merged_key_blocks_per_100k(layout: BatchLayout) -> u64 {
+        let factories = indexed_wset_factories();
+        let mut spine = Spine::<IndexedWSet>::new(
+            &factories,
+            Arc::new("merged".to_string()),
+            TraceRole::Integral,
+        )
+        .with_layout(layout);
+        const KEYS: i64 = 30_000;
+        for batch in 0..(MIN_LEVEL0_MERGE_BATCHES + 2) as i64 {
+            block_on(spine.insert(memory_batch(&factories, batch * KEYS, KEYS)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            // A merge under a zero storage threshold writes a file; the inputs
+            // stay in memory, so the largest file is the merge that landed.
+            let merged = spine
+                .get_batches()
+                .into_iter()
+                .filter(|batch| batch.file_path().is_some())
+                .max_by_key(|batch| batch.len_upper_bound());
+            if let Some(merged) = merged {
+                return key_blocks_per_100k(merged.file_path().unwrap());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the merger wrote no file in a minute"
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A batch a spine spills as it is inserted, which it does from High
+    /// memory pressure up, takes the spine's layout too.
+    #[test]
+    fn a_spine_spills_in_its_layout_under_pressure() {
+        const GIB: u64 = 1 << 30;
+        // 9.2 GiB against a 10 GiB ceiling reads as High: a spine spills what
+        // it is handed, while a builder still builds in memory (that takes
+        // Critical), so the file measured below is the spine's.
+        with_mock_process_rss(GIB * 92 / 10, || {
+            let dir = tempdir().unwrap();
+            let config = config(dir.path(), Some(0), None).with_max_rss_bytes(Some(10 * GIB));
+            run_in_circuit_with_storage_config(config, || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while Runtime::memory_pressure().unwrap() < MemoryPressure::High {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the runtime never saw the pinned RSS"
+                    );
+                    sleep(Duration::from_millis(50));
+                }
+                let small = spilled_key_blocks_per_100k(BatchLayout::default());
+                let large = spilled_key_blocks_per_100k(BatchLayout {
+                    key_block_bytes: Some(32 * 1024),
+                });
+                assert!(
+                    small >= 80,
+                    "{small} key blocks per 100k keys in the default layout"
+                );
+                assert!(
+                    large * 3 <= small,
+                    "32 KiB key blocks gave {large} key blocks per 100k keys against {small}"
+                );
+            });
+        });
+    }
+
+    /// Inserts one in-memory batch into a spine laid out as `layout` and
+    /// measures the file the insert spilled it to.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout` - the layout to give the spine.
+    ///
+    /// # Returns
+    ///
+    /// Key blocks per 100k keys of the spilled file.
+    fn spilled_key_blocks_per_100k(layout: BatchLayout) -> u64 {
+        let factories = indexed_wset_factories();
+        let mut spine = Spine::<IndexedWSet>::new(
+            &factories,
+            Arc::new("spilled".to_string()),
+            TraceRole::Integral,
+        )
+        .with_layout(layout);
+        block_on(spine.insert(memory_batch(&factories, 0, 300_000)));
+        let batches = spine.get_batches();
+        let [batch] = batches.as_slice() else {
+            panic!("{} batches after one insert", batches.len());
+        };
+        let path = batch
+            .file_path()
+            .expect("a batch inserted under High memory pressure is spilled to storage");
+        key_blocks_per_100k(path)
+    }
 }

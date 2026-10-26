@@ -20,6 +20,7 @@ from .helper import (
     wait_for_condition,
     gen_pipeline_name,
     patch_json,
+    wait_for_pipeline_reachable,
 )
 
 
@@ -42,9 +43,10 @@ def _max_rss_bytes_metric(pipeline_name: str) -> int | None:
     assert r.status_code == HTTPStatus.OK, r.text
     for metric in json.loads(r.text):
         if metric.get("key") == "max_rss_bytes":
-            values = metric.get("values", [])
+            # A multihost pipeline reports one value per host.
+            values = {v.get("value") for v in metric.get("values", [])}
             assert len(values) == 1, metric
-            return values[0].get("value")
+            return values.pop()
     return None
 
 
@@ -76,6 +78,7 @@ def test_checkpoint_enterprise(pipeline_name):
     sql = "CREATE TABLE t1(x int) WITH ('materialized'='true');"
     create_pipeline(pipeline_name, sql)
     start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
 
     for _ in range(5):
         resp = post_no_body(api_url(f"/pipelines/{pipeline_name}/checkpoint"))
@@ -136,8 +139,15 @@ def test_suspend_enterprise(pipeline_name):
       5. Start c2 -> c2 runs, triggers start_after dependency for c3 -> data from both.
       6. Suspend/resume again -> all connectors in EOI, verify no new data arrives.
     """
-    before_max_rss_mb = 64_000
-    after_max_rss_mb = 65_000
+    # The circuit's memory limit is the smaller of `max_rss_mb` and the memory
+    # available to the process, so keep `max_rss_mb` well below any realistic
+    # host or container memory limit for it to be the binding one.
+    before_max_rss_mb = 2_000
+    after_max_rss_mb = 2_100
+    # The pipeline carves the DataFusion pool out of `max_rss_mb` before sizing
+    # the circuit (`Controller::circuit_config` in crates/adapters); pinning the
+    # pool makes the expected circuit RSS exact.
+    datafusion_memory_mb = 500
 
     def runtime_config(max_rss_mb: int) -> dict:
         return {
@@ -145,7 +155,11 @@ def test_suspend_enterprise(pipeline_name):
             "hosts": FELDERA_TEST_NUM_HOSTS,
             "logging": "debug",
             "max_rss_mb": max_rss_mb,
+            "datafusion_memory_mb": datafusion_memory_mb,
         }
+
+    def expected_circuit_rss_bytes(max_rss_mb: int) -> int:
+        return (max_rss_mb - datafusion_memory_mb) * 1_000_000
 
     sql = r"""
     CREATE TABLE t1 (
@@ -205,7 +219,10 @@ def test_suspend_enterprise(pipeline_name):
 
     # Start pipeline (all connectors remain paused)
     start_pipeline(pipeline_name)
-    assert _max_rss_bytes_metric(pipeline_name) == before_max_rss_mb * 1_000_000
+    wait_for_pipeline_reachable(pipeline_name)
+    assert _max_rss_bytes_metric(pipeline_name) == expected_circuit_rss_bytes(
+        before_max_rss_mb
+    )
     assert connector_paused(pipeline_name, "t1", "c1")
     assert connector_paused(pipeline_name, "t1", "c2")
     assert connector_paused(pipeline_name, "t1", "c3")
@@ -230,7 +247,10 @@ def test_suspend_enterprise(pipeline_name):
     )
     assert resp.status_code == HTTPStatus.OK, resp.text
     start_pipeline(pipeline_name)
-    assert _max_rss_bytes_metric(pipeline_name) == after_max_rss_mb * 1_000_000
+    wait_for_pipeline_reachable(pipeline_name)
+    assert _max_rss_bytes_metric(pipeline_name) == expected_circuit_rss_bytes(
+        after_max_rss_mb
+    )
     # After resume: c1 running (EOI), c2,c3 still paused
     assert not connector_paused(pipeline_name, "t1", "c1")
     assert connector_paused(pipeline_name, "t1", "c2")
@@ -249,6 +269,7 @@ def test_suspend_enterprise(pipeline_name):
     # Suspend/resume again
     stop_pipeline(pipeline_name, force=False)
     start_pipeline(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
 
     # All connectors should now be running (EOI)
     assert not connector_paused(pipeline_name, "t1", "c1")
@@ -289,7 +310,7 @@ def test_suspend_failure_enterprise(pipeline_name):
 
     This is the failure counterpart to `test_suspend_enterprise` (which covers
     the happy path). It needs its own pipeline because the trigger is a
-    storage-disabled config: with storage off, `can_suspend` fails permanently
+    storage-disabled config: with storage off, `can_checkpoint` fails permanently
     with `StorageRequired`, so the suspend checkpoint cannot succeed. The
     manager forwards `/suspend` to the pipeline without pre-checking
     suspendability, the checkpoint fails, and the pipeline must be forcefully

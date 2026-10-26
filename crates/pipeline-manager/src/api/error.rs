@@ -1,6 +1,4 @@
-use actix_web::{
-    body::BoxBody, http::StatusCode, HttpResponse, HttpResponseBuilder, ResponseError,
-};
+use actix_web::{HttpResponse, ResponseError, body::BoxBody, http::StatusCode};
 use feldera_types::error::{DetailedError, ErrorResponse};
 use serde::Serialize;
 use std::time::Duration;
@@ -16,9 +14,9 @@ pub enum ApiError {
     // very likely already not be matched if it misses a URL-encoded parameter.
     MissingUrlEncodedParam { param: &'static str },
     InvalidUuidParam { value: String, error: String },
-    InvalidNameParam { value: String, error: String },
     InvalidChecksumParam { value: String, error: String },
     InvalidVersionParam { value: String, error: String },
+    InvalidLogCursorParam { value: String, error: String },
     UnsupportedPipelineAction { action: String, reason: String },
     InvalidBootstrapConfig { reason: String },
     InvalidConnectorAction { action: String },
@@ -43,9 +41,9 @@ impl DetailedError for ApiError {
         match self {
             Self::MissingUrlEncodedParam { .. } => Cow::from("MissingUrlEncodedParam"),
             Self::InvalidUuidParam { .. } => Cow::from("InvalidUuidParam"),
-            Self::InvalidNameParam { .. } => Cow::from("InvalidNameParam"),
             Self::InvalidChecksumParam { .. } => Cow::from("InvalidChecksumParam"),
             Self::InvalidVersionParam { .. } => Cow::from("InvalidVersionParam"),
+            Self::InvalidLogCursorParam { .. } => Cow::from("InvalidLogCursorParam"),
             Self::UnsupportedPipelineAction { .. } => Cow::from("UnsupportedPipelineAction"),
             Self::InvalidBootstrapConfig { .. } => Cow::from("InvalidBootstrapConfig"),
             Self::InvalidConnectorAction { .. } => Cow::from("InvalidConnectorAction"),
@@ -78,14 +76,14 @@ impl Display for ApiError {
             Self::InvalidUuidParam { value, error } => {
                 write!(f, "Invalid UUID string '{value}': {error}")
             }
-            Self::InvalidNameParam { value, error } => {
-                write!(f, "Invalid name string '{value}': {error}")
-            }
             Self::InvalidChecksumParam { value, error } => {
                 write!(f, "Invalid checksum string '{value}': {error}")
             }
             Self::InvalidVersionParam { value, error } => {
                 write!(f, "Invalid version string '{value}': {error}")
+            }
+            Self::InvalidLogCursorParam { value, error } => {
+                write!(f, "Invalid log cursor '{value}': {error}")
             }
             Self::UnsupportedPipelineAction { action, reason } => {
                 write!(f, "Unsupported pipeline action '{action}': {reason}")
@@ -177,9 +175,9 @@ impl ResponseError for ApiError {
         match self {
             Self::MissingUrlEncodedParam { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUuidParam { .. } => StatusCode::BAD_REQUEST,
-            Self::InvalidNameParam { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidChecksumParam { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidVersionParam { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidLogCursorParam { .. } => StatusCode::BAD_REQUEST,
             Self::UnsupportedPipelineAction { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::InvalidBootstrapConfig { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidConnectorAction { .. } => StatusCode::BAD_REQUEST,
@@ -201,6 +199,6 @@ impl ResponseError for ApiError {
     }
 
     fn error_response(&self) -> HttpResponse<BoxBody> {
-        HttpResponseBuilder::new(self.status_code()).json(ErrorResponse::from_error(self))
+        crate::error::json_error_response(self)
     }
 }

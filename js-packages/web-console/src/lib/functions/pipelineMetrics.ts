@@ -1,40 +1,19 @@
+import {
+  type AggregatedInputEndpointMetrics,
+  type AggregatedOutputEndpointMetrics,
+  aggregateConnectorMetrics
+} from 'common-lib/connectorMetrics'
+import { discreteDerivative } from 'common-lib/math'
+import { tuple } from 'common-lib/tuple'
 import { ServerDate } from '$lib/compositions/serverTime'
-import { groupBy } from '$lib/functions/common/array'
-import { nonNull } from '$lib/functions/common/function'
-import { discreteDerivative } from '$lib/functions/common/math'
-import { tuple } from '$lib/functions/common/tuple'
-import { normalizeCaseIndependentName } from '$lib/functions/felderaRelation'
 import type {
   CheckpointActivity,
   ControllerStatus,
-  InputEndpointMetrics,
   InputEndpointStatus,
-  OutputEndpointMetrics,
   OutputEndpointStatus,
   PermanentSuspendError
 } from '$lib/services/manager'
 import type { GlobalMetricsTimestamp, TimeSeriesEntry } from '$lib/types/pipelineManager'
-
-export type AggregatedMetrics<M, EndpointStatus = {}> = {
-  aggregate: { metrics: M }
-  connectors: ({
-    endpointName: string
-    metrics: M
-  } & EndpointStatus)[]
-}
-
-export type AggregatedInputEndpointMetrics = AggregatedMetrics<
-  InputEndpointMetrics,
-  Pick<InputEndpointStatus, 'paused' | 'barrier' | 'health' | 'fatal_error'> & {
-    io_active: boolean
-    transaction_phase?: 'started' | 'committed'
-  }
->
-
-export type AggregatedOutputEndpointMetrics = AggregatedMetrics<
-  OutputEndpointMetrics,
-  Pick<OutputEndpointStatus, 'health' | 'fatal_error'> & { io_active: boolean }
->
 
 export const emptyPipelineMetrics = {
   tables: new Map<string, AggregatedInputEndpointMetrics>(),
@@ -70,130 +49,11 @@ export const accumulatePipelineMetrics =
       ...newData.global_metrics,
       timeMs: newTimestamp
     }
-    const initiatedByConnectors =
-      newData.global_metrics.transaction_initiators.initiated_by_connectors
     return {
       lastTimestamp: oldData?.lastTimestamp,
       inputs: newData.inputs,
       outputs: newData.outputs,
-      tables: new Map(
-        groupBy(newData.inputs, (i) => normalizeCaseIndependentName({ name: i.config.stream })).map(
-          ([relationName, endpoints]) => {
-            const oldRelation = oldData?.tables.get(relationName)
-            const connectors = endpoints.map((cur) => {
-              const prev = oldRelation?.connectors.find((c) => c.endpointName === cur.endpoint_name)
-              const connectorPhase = ((phase) =>
-                phase && (phase === ('started' as const) || phase === ('committed' as const))
-                  ? phase
-                  : undefined)(initiatedByConnectors[cur.endpoint_name]?.phase?.toLowerCase())
-              return {
-                endpointName: cur.endpoint_name,
-                metrics: cur.metrics,
-                paused: cur.paused,
-                barrier: cur.barrier,
-                io_active:
-                  prev !== undefined && cur.metrics.total_records > prev.metrics.total_records,
-                transaction_phase: connectorPhase,
-                health: cur.health,
-                fatal_error: cur.fatal_error
-              }
-            })
-            const metrics: AggregatedInputEndpointMetrics = {
-              connectors,
-              aggregate: {
-                metrics: endpoints.reduce(
-                  (acc: InputEndpointMetrics, cur) => {
-                    const metrics = cur.metrics
-                    return {
-                      total_bytes: acc.total_bytes + metrics.total_bytes,
-                      total_records: acc.total_records + metrics.total_records,
-                      buffered_records: acc.buffered_records + metrics.buffered_records,
-                      num_transport_errors: acc.num_transport_errors + metrics.num_transport_errors,
-                      num_parse_errors: acc.num_parse_errors + metrics.num_parse_errors,
-                      end_of_input: acc.end_of_input && metrics.end_of_input,
-                      buffered_bytes: acc.buffered_bytes + metrics.buffered_bytes
-                    }
-                  },
-                  {
-                    total_bytes: 0,
-                    total_records: 0,
-                    buffered_bytes: 0,
-                    buffered_records: 0,
-                    num_transport_errors: 0,
-                    num_parse_errors: 0,
-                    end_of_input: true
-                  }
-                )
-              }
-            }
-            return tuple(relationName, metrics)
-          }
-        )
-      ),
-      views: new Map(
-        groupBy(newData.outputs, (i) =>
-          normalizeCaseIndependentName({ name: i.config.stream })
-        ).map(([relationName, endpoints]) => {
-          const oldRelation = oldData?.views.get(relationName)
-          const metrics: AggregatedOutputEndpointMetrics = {
-            connectors: endpoints.map((cur) => {
-              const prev = oldRelation?.connectors.find((c) => c.endpointName === cur.endpoint_name)
-              return {
-                endpointName: cur.endpoint_name,
-                metrics: cur.metrics,
-                io_active:
-                  prev !== undefined &&
-                  (cur.metrics.transmitted_records > prev.metrics.transmitted_records ||
-                    (nonNull(cur.metrics.batch_records_written) &&
-                      (!nonNull(prev.metrics.batch_records_written) ||
-                        cur.metrics.batch_records_written !== prev.metrics.batch_records_written))),
-                health: cur.health,
-                fatal_error: cur.fatal_error
-              }
-            }),
-            aggregate: {
-              metrics: endpoints.reduce(
-                (acc: OutputEndpointMetrics, cur) => {
-                  const metrics = cur.metrics
-                  return {
-                    buffered_batches: acc.buffered_batches + metrics.buffered_batches,
-                    buffered_records: acc.buffered_records + metrics.buffered_records,
-                    num_encode_errors: acc.num_encode_errors + metrics.num_encode_errors,
-                    num_transport_errors: acc.num_transport_errors + metrics.num_transport_errors,
-                    total_processed_input_records:
-                      acc.total_processed_input_records + metrics.total_processed_input_records,
-                    transmitted_bytes: acc.transmitted_bytes + metrics.transmitted_bytes,
-                    transmitted_records: acc.transmitted_records + metrics.transmitted_records,
-                    total_processed_steps:
-                      acc.total_processed_steps + metrics.total_processed_steps,
-                    queued_batches: acc.queued_batches + metrics.queued_batches,
-                    queued_records: acc.queued_records + metrics.queued_records,
-                    memory: acc.memory + metrics.memory,
-                    batch_records_written: !nonNull(metrics.batch_records_written)
-                      ? acc.batch_records_written
-                      : (acc.batch_records_written ?? 0) + metrics.batch_records_written
-                  }
-                },
-                {
-                  buffered_batches: 0,
-                  buffered_records: 0,
-                  num_encode_errors: 0,
-                  num_transport_errors: 0,
-                  total_processed_input_records: 0,
-                  transmitted_bytes: 0,
-                  transmitted_records: 0,
-                  total_processed_steps: 0,
-                  queued_batches: 0,
-                  queued_records: 0,
-                  memory: 0,
-                  batch_records_written: null
-                }
-              )
-            }
-          }
-          return tuple(relationName, metrics)
-        })
-      ),
+      ...aggregateConnectorMetrics(newData, oldData),
       global: globalWithTimestamp,
       checkpoint_activity: newData.checkpoint_activity ?? { status: 'idle' as const },
       permanent_checkpoint_errors: newData.permanent_checkpoint_errors
@@ -215,23 +75,147 @@ export const timeSeriesAxisMax = (metrics: TimeSeriesEntry[], now: () => number 
   metrics.at(-1)?.t ?? now()
 
 /**
- * Memory limit on a multi-host deployment, in MB.
+ * Number of oldest samples to drop to keep the series within its bounds.
  *
- * `memory_mb_max` is the individual host's limit, but the reported memory metric
+ * Every sample within `windowMs` of the newest one is kept, and so is the
+ * newest sample that falls outside it. That one extra sample is what lets a
+ * rate series, which needs a pair of samples per point, cover the whole window:
+ * keeping its age rather than a fixed cushion holds at any sample interval.
+ *
+ * `maxSamples` bounds the series should the timestamps stop advancing, which
+ * leaves every sample inside the window; set it well above the sample rate any
+ * deployment reports.
+ *
+ * @param samples - Series ordered oldest first.
+ * @param windowMs - How far back from the newest sample to retain.
+ * @param maxSamples - Ceiling on the retained sample count.
+ */
+export const staleSampleCount = (
+  samples: TimeSeriesEntry[],
+  windowMs: number,
+  maxSamples: number
+): number => {
+  const newest = samples.at(-1)?.t
+  if (newest === undefined) {
+    return 0
+  }
+  const oldestKept = newest - windowMs
+  let stale = 0
+  for (let i = samples.length - 1; i >= 0; i--) {
+    if (samples[i].t < oldestKept) {
+      // Sample `i` is the newest one outside the window: it anchors the first
+      // rate that the window can plot, so only samples older than it are stale.
+      stale = i
+      break
+    }
+  }
+  return Math.max(stale, samples.length - maxSamples)
+}
+
+const bytesPerUnit: Record<string, number> = {
+  '': 1,
+  k: 1e3,
+  K: 1e3,
+  M: 1e6,
+  G: 1e9,
+  T: 1e12,
+  P: 1e15,
+  E: 1e18,
+  Ki: 2 ** 10,
+  Mi: 2 ** 20,
+  Gi: 2 ** 30,
+  Ti: 2 ** 40,
+  Pi: 2 ** 50,
+  Ei: 2 ** 60
+}
+
+/**
+ * Bytes of a configuration size such as `"16G"`, `"4Gi"` or `"4096"`.
+ *
+ * The syntax is the one the pipeline reads: a number and a decimal or binary
+ * unit, with an optional trailing `B`. A number stands for the setting's
+ * deprecated spelling, which counted `legacyUnit`s, so a stored
+ * `memory_mb_max: 16000` reads as 16 GB.
+ *
+ * @param size - The size as configured, in either spelling.
+ * @param legacyUnit - The unit a bare number counts, such as `'M'`.
+ * @returns The size in bytes, or undefined when it is unset or malformed.
+ */
+export const configSizeBytes = (
+  size: string | number | null | undefined,
+  legacyUnit: keyof typeof bytesPerUnit = ''
+): number | undefined => {
+  if (size === null || size === undefined) {
+    return undefined
+  }
+  if (typeof size === 'number') {
+    return Number.isFinite(size) && size >= 0 ? size * bytesPerUnit[legacyUnit] : undefined
+  }
+  const match = /^\+?(\d*)(?:\.(\d*))?([A-Za-z]*)$/.exec(size)
+  if (!match) {
+    return undefined
+  }
+  const [, whole, fraction, unit] = match
+  const unitName = unit.endsWith('B') ? unit.slice(0, -1) : unit
+  const unitBytes = Object.hasOwn(bytesPerUnit, unitName) ? bytesPerUnit[unitName] : undefined
+  if (unitBytes === undefined || (whole === '' && (fraction ?? '') === '')) {
+    return undefined
+  }
+  return Math.round(Number(`${whole || '0'}.${fraction || '0'}`) * unitBytes)
+}
+
+/**
+ * A size setting of `resources`, read from the current name or from the
+ * deprecated megabyte count a configuration stored before the size rename
+ * still carries.
+ *
+ * @param resources - `runtimeConfig.resources`, in whichever spelling it holds.
+ * @param name - The current name of the setting, such as `'memory_max'`.
+ * @param legacyName - The deprecated name, such as `'memory_mb_max'`.
+ * @returns The size in bytes, or undefined when it is unset or malformed.
+ */
+export const resourceSizeBytes = (
+  resources: Record<string, unknown> | null | undefined,
+  name: string,
+  legacyName: string
+): number | undefined => {
+  // A bare number under either name is read in megabytes, as the pipeline
+  // reads it.
+  const current = resources?.[name]
+  if (current !== null && current !== undefined) {
+    return configSizeBytes(current as string | number, 'M')
+  }
+  return configSizeBytes(resources?.[legacyName] as string | number | null | undefined, 'M')
+}
+
+/**
+ * Memory limit on a multi-host deployment, in bytes.
+ *
+ * `memory_max` is the individual host's limit, but the reported memory metric
  * is the sum of resident memory across all hosts in a multihost deployment.
  * To keep the limit line meaningful, multiply the per-host limit by the number of hosts.
  *
- * @param perHostMemoryMb - Per-host limit `runtimeConfig.resources.memory_mb_max`, in MB.
+ * @param perHostMemoryBytes - Per-host limit `runtimeConfig.resources.memory_max`, in bytes.
  * @param hosts - Number of hosts `runtimeConfig.hosts`; treated as at least 1.
- * @returns The aggregate limit in MB, or undefined when no limit is configured.
+ * @returns The aggregate limit in bytes, or undefined when no limit is configured.
  */
-export const multihostMemoryLimitMb = (
-  perHostMemoryMb: number | null | undefined,
+export const multihostMemoryLimitBytes = (
+  perHostMemoryBytes: number | null | undefined,
   hosts: number | null | undefined
-): number | undefined => (perHostMemoryMb ? perHostMemoryMb * Math.max(hosts ?? 1, 1) : undefined)
+): number | undefined =>
+  perHostMemoryBytes ? perHostMemoryBytes * Math.max(hosts ?? 1, 1) : undefined
 
 /**
- * @returns Time series of throughput with smoothing window over 3 data intervals
+ * Throughput time series: records added between consecutive samples, stamped
+ * with the newer sample of each pair.
+ *
+ * A rate needs two samples, so the series holds one point fewer than `metrics`
+ * and starts at the second-oldest sample. Retaining one sample older than the
+ * plotted window is therefore what makes the rate cover that window; see
+ * `staleSampleCount`.
+ *
+ * @returns Series of `[timestamp, records]`, plus the latest and mean rate and
+ * the y-axis bounds.
  */
 export const calcPipelineThroughput = (metrics: TimeSeriesEntry[]) => {
   const series = discreteDerivative(metrics, (n1, n0) => ({

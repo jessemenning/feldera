@@ -1,20 +1,40 @@
+# librdkafka, built against AWS-LC rather than the system OpenSSL.
+#
+# This is a separate stage because building AWS-LC needs Go and cmake, and
+# neither belongs in the shipped image. Only the installed library crosses over.
+FROM ubuntu:24.04 AS librdkafka
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update --fix-missing && apt-get install -y \
+  git cmake build-essential pkg-config golang-go \
+  libsasl2-dev zlib1g-dev libzstd-dev
+COPY scripts/install-librdkafka.sh /tmp/install-librdkafka.sh
+# The script reads the librdkafka version from the lockfile, so the library and
+# the crate expecting it cannot drift apart. A stale image fails loudly at the
+# pkg-config probe rather than building against the wrong version.
+COPY Cargo.lock /tmp/Cargo.lock
+RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
+
 # The base image contains tools to build the code given that
 # we need a Java and Rust compiler to run alongside the pipeline manager
 # as of now. This will change later.
 FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
-# These two environment variables are used to make openssl-sys pick
-# up libssl-dev and statically link it. Without it, our build defaults
-# to building a vendored version of OpenSSL.
+# Source URL for the Solace C SDK tarball (solace-rs-sys). Empty on amd64, where
+# solace-rs falls back to the official C_API_LINUX64 download. Required on arm64,
+# which has no official download URL — the arm64 build passes the hosted
+# solclient_Linux-aarch64 tarball here so --precompile (and runtime pipeline
+# compiles) can link solclient. Inherited by the `release` stage.
+ARG SOLCLIENT_TARBALL_URL=""
+ENV SOLCLIENT_TARBALL_URL=${SOLCLIENT_TARBALL_URL}
+
 RUN apt update --fix-missing && apt -y dist-upgrade && apt install \
-  # bindgen needs this (at least the dec crate uses bindgen)
-  libclang-dev \
-  # pkg-config is required for cargo to find libssl
-  libssl-dev pkg-config \
-  cmake \
-  # rdkafka dependency needs libsasl2-dev zlib and a CXX compiler
-  libsasl2-dev zlib1g-dev build-essential \
+  # pkg-config is how rdkafka-sys locates the librdkafka copied in below
+  pkg-config \
+  # librdkafka links these; it is built in the stage above, but pipelines are
+  # compiled in this image and the linker resolves them here. aws-lc-sys
+  # compiles through its cc builder, so neither cmake nor libclang is needed.
+  libsasl2-dev zlib1g-dev libzstd-dev build-essential \
   # To install rust
   curl  \
   # For running the SQL compiler
@@ -39,11 +59,25 @@ RUN update-ca-certificates
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
   locale-gen
 
+# librdkafka from the stage above. rdkafka-sys links it dynamically, so it has
+# to be here both to build pipelines and to run them.
+COPY --from=librdkafka /usr/local/lib/librdkafka* /usr/local/lib/
+COPY --from=librdkafka /usr/local/include/librdkafka /usr/local/include/librdkafka
+COPY --from=librdkafka /usr/local/lib/pkgconfig/rdkafka*.pc /usr/local/lib/pkgconfig/
+RUN ldconfig \
+  # A NEEDED entry for libssl or libcrypto means librdkafka found a system
+  # OpenSSL and preferred it over AWS-LC, which is the failure this whole
+  # arrangement exists to prevent and is invisible at run time.
+  && if readelf -d /usr/local/lib/librdkafka.so.1 | grep -qE 'Shared library: \[lib(ssl|crypto)\.so'; then \
+       echo "error: librdkafka links a shared OpenSSL" >&2; exit 1; \
+     fi \
+  # rdkafka-sys probes for librdkafka this way; failing here beats failing
+  # partway through a pipeline compilation.
+  && pkg-config --exists rdkafka
+
 USER ubuntu
 WORKDIR /home/ubuntu
 
-ENV OPENSSL_NO_VENDOR=1
-ENV OPENSSL_STATIC=1
 ENV LC_ALL=en_US.UTF-8
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
@@ -67,7 +101,8 @@ RUN mkdir -p feldera/demos/sql
 COPY --chown=ubuntu crates/pipeline-manager/demos/sql feldera/demos/sql
 
 # Install cargo and rust for this non-root user
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+COPY --chown=ubuntu rust-toolchain.toml feldera/rust-toolchain.toml
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $(sed -n 's/^channel *= *"\(.*\)"/\1/p' feldera/rust-toolchain.toml)
 # The download URL for mold uses x86_64/aarch64 whereas dpkg --print-architecture says amd64/arm64
 RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86_64/g"`; \
   curl -LO https://github.com/rui314/mold/releases/download/v2.40.4/mold-2.40.4-$arch-linux.tar.gz \
@@ -76,17 +111,6 @@ RUN arch=`dpkg --print-architecture | sed "s/arm64/aarch64/g" | sed "s/amd64/x86
   && rm mold-2.40.4-$arch-linux.tar.gz
 ENV PATH="$PATH:/home/ubuntu/.cargo/bin:/home/ubuntu/mold/bin"
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold -C link-arg=-Wl,--compress-debug-sections=zlib"
-
-# Go is required to build aws-lc-fips-sys when rustls is built with FIPS.
-# Installed from upstream rather than Ubuntu's golang-go package because the
-# 24.04 package is stuck at 1.22.2 and ships many unfixed CVEs that fail our
-# image scan. Revert to apt's golang-go once Ubuntu ships a patched version.
-RUN arch=`dpkg --print-architecture`; \
-  curl -LO https://go.dev/dl/go1.26.4.linux-$arch.tar.gz \
-  && tar -xzf go1.26.4.linux-$arch.tar.gz \
-  && mv go goroot \
-  && rm go1.26.4.linux-$arch.tar.gz
-ENV PATH="$PATH:/home/ubuntu/goroot/bin"
 
 # Install Samply for profiling
 RUN curl --proto '=https' --tlsv1.2 -LsSf https://github.com/feldera/samply/releases/download/v0.13.2/samply-installer.sh | sh

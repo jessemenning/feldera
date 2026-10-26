@@ -117,6 +117,13 @@ pub const BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFFB";
 /// Magic number for roaring bitmap filter blocks.
 pub const ROARING_BITMAP_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFFR";
 
+/// Magic number for modular Bloom filter blocks.
+///
+/// A filter with a single module is written with
+/// [`BLOOM_FILTER_BLOCK_MAGIC`] instead, so files that carry no ladder stay
+/// readable by binaries that predate modular filters.
+pub const MODULAR_BLOOM_FILTER_BLOCK_MAGIC: [u8; 4] = *b"LFMB";
+
 /// 8-byte header at the beginning of each block.
 ///
 /// A block does not identify its own size, so any reference to a block must
@@ -176,6 +183,35 @@ impl TouchedWindowCount {
     }
 }
 
+/// Whether a file's value column carries a trailing column that the reader hides.
+///
+/// Use `u32` instead of an enum, so we can still parse a trailer containing an
+/// unknown code.
+#[binrw]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ValueStampFlag {
+    stamp: u32,
+}
+
+impl ValueStampFlag {
+    /// An ordinary file: values are exactly the declared value type.
+    pub const NO_STAMP: Self = Self { stamp: 0 };
+
+    /// Values are `Tup2<V, u32>`, where the `u32` is an arrival index that the
+    /// reader projects away.  Written by the lazy input upsert operator.
+    pub const UPSERT_INDEX: Self = Self { stamp: 1 };
+
+    /// True if the value column carries a hidden trailing column.
+    ///
+    /// # Returns
+    ///
+    /// True for any code but [`Self::NO_STAMP`], so an unknown code reads as stamped
+    /// and the incompatible feature check is what refuses the file.
+    pub fn is_stamped(self) -> bool {
+        self.stamp != Self::NO_STAMP.stamp
+    }
+}
+
 /// Additional metadata added to the file by the writer.
 #[binrw]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -190,6 +226,13 @@ pub struct BatchMetadata {
     /// e.g. because its key type is not roaring-compatible or its span exceeds
     /// `u32`.
     pub touched_window_count: TouchedWindowCount,
+
+    /// Whether the value column carries a trailing column the reader hides.
+    ///
+    /// Appended after `touched_window_count`.  The trailer block is zero-padded
+    /// to 4 kB, so a trailer written before this field existed reads back as
+    /// [`ValueStampFlag::NO_STAMP`], exactly as `negative_weight_count` was added.
+    pub value_stamp: ValueStampFlag,
 }
 
 /// File trailer block.
@@ -225,6 +268,11 @@ pub struct FileTrailer {
     ///
     /// This is 0 if there is no filter block, or if the filter block size is
     /// bigger than `i32::MAX`.
+    ///
+    /// The writer never puts a filter block at offset 0: it writes the block
+    /// after the data, and it writes none for a file with no rows. Older
+    /// writers did put one at offset 0 in a file with no rows, with a nonzero
+    /// `filter_size`, and readers must ignore it.
     pub filter_offset: u64,
 
     /// Size in bytes of the filter block.
@@ -293,10 +341,26 @@ impl FileTrailer {
         (self.compatible_features & feature) != 0
     }
 
+    /// Returns true if `feature` is set in the incompatible feature bitmap.
+    ///
+    /// # Arguments
+    ///
+    /// * `feature` - the bit to test.
+    ///
+    /// # Returns
+    ///
+    /// True if the file needs that feature to be read correctly, so a reader without it
+    /// must refuse the file.
+    pub fn has_incompatible_feature(&self, feature: u64) -> bool {
+        (self.incompatible_features & feature) != 0
+    }
+
     /// Returns the unknown incompatible features, if any.
     pub fn unknown_incompatible_features(&self) -> Option<u64> {
-        let unknown_incompatible_features =
-            self.incompatible_features & !INCOMPATIBLE_FEATURE_ROARING_FILTERS;
+        let unknown_incompatible_features = self.incompatible_features
+            & !INCOMPATIBLE_FEATURE_ROARING_FILTERS
+            & !INCOMPATIBLE_FEATURE_MODULAR_FILTERS
+            & !INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN;
         if unknown_incompatible_features != 0 {
             Some(unknown_incompatible_features)
         } else {
@@ -325,6 +389,15 @@ pub const COMPATIBLE_FEATURE_NEGATIVE_WEIGHT_COUNT: u64 = 1 << 1;
 /// Bit set to 1 in [FileTrailer::incompatible_features] if the file contains
 /// roaring bitmap membership filter blocks.
 pub const INCOMPATIBLE_FEATURE_ROARING_FILTERS: u64 = 1 << 0;
+
+/// Bit set to 1 in [FileTrailer::incompatible_features] if the file contains a
+/// Bloom filter with more than one module.
+pub const INCOMPATIBLE_FEATURE_MODULAR_FILTERS: u64 = 1 << 1;
+
+/// Bit set to 1 in [FileTrailer::incompatible_features] if the file's value
+/// column carries a trailing column that only a reader which knows to hide it
+/// can interpret.
+pub const INCOMPATIBLE_FEATURE_HIDDEN_VALUE_COLUMN: u64 = 1 << 2;
 
 /// Information about a column.
 ///
@@ -593,7 +666,23 @@ fn next_multiple_of_pow2(offset: usize, alignment: usize) -> usize {
 #[brw(repr(u8))]
 pub enum Compression {
     /// [Snappy](https://en.wikipedia.org/wiki/Snappy_(compression)).
+    ///
+    /// The payload is a Snappy raw block, which carries its own decompressed
+    /// length.
     Snappy = 1,
+
+    /// [LZ4](https://en.wikipedia.org/wiki/LZ4_(compression_algorithm)) raw
+    /// block.
+    ///
+    /// The payload is the decompressed length as a 32-bit little-endian
+    /// integer, followed by the LZ4 block.
+    Lz4 = 2,
+
+    /// [Zstandard](https://en.wikipedia.org/wiki/Zstd).
+    ///
+    /// The compression level is not recorded, since decompression does not need
+    /// it.  The payload is framed the same way as [`Compression::Lz4`].
+    Zstd = 3,
 }
 
 impl Compression {
@@ -663,6 +752,77 @@ pub struct BloomFilterBlockRef<'a> {
     pub data: &'a [u64],
 }
 
+/// The fixed-size front of a modular Bloom filter block.
+///
+/// Kept separate from the module contents so a reader can parse it from the
+/// first sector of the block and learn, before reading any modules, both their
+/// layout and how accurate any prefix of them would be.
+///
+/// The modules follow, equally sized and stored back to back starting at module
+/// 0, so a reader can take any prefix of them and get a valid filter at reduced
+/// accuracy.
+#[binrw]
+#[derive(Clone, Debug)]
+pub struct ModularBloomFilterHeader {
+    /// Block header with "LFMB" magic.
+    #[brw(assert(
+        header.magic == MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
+        "modular bloom filter block has bad magic"
+    ))]
+    pub header: BlockHeader,
+
+    /// Number of modules the filter was written with.
+    pub total_modules: u32,
+
+    /// Number of hashes each module uses per key.
+    pub hashes_per_module: u32,
+
+    /// Number of `u64` elements in each module.
+    pub words_per_module: u64,
+
+    /// Bits set in each module, one entry per module.
+    ///
+    /// A reader needs these to work out how many modules a target false
+    /// positive rate requires. Measuring instead would mean reading the modules
+    /// first, which is the read this is meant to size.
+    #[br(count = total_modules)]
+    pub set_bits: Vec<u64>,
+}
+
+impl ModularBloomFilterHeader {
+    /// Serialized length of the header, given `total_modules`.
+    pub fn len_for(total_modules: u32) -> usize {
+        // Block header, three scalars, then one count per module.
+        8 + 4 + 4 + 8 + total_modules as usize * 8
+    }
+}
+
+/// A block representing a modular Bloom filter (with data by reference).
+#[binwrite]
+pub struct ModularBloomFilterBlockRef<'a> {
+    /// Block header with "LFMB" magic.
+    #[bw(assert(
+        header.magic == MODULAR_BLOOM_FILTER_BLOCK_MAGIC,
+        "modular bloom filter block has bad magic"
+    ))]
+    pub header: BlockHeader,
+
+    /// Number of modules the filter was written with.
+    pub total_modules: u32,
+
+    /// Number of hashes each module uses per key.
+    pub hashes_per_module: u32,
+
+    /// Number of `u64` elements in each module.
+    pub words_per_module: u64,
+
+    /// Bits set in each module, one entry per module.
+    pub set_bits: &'a [u64],
+
+    /// Module contents, `total_modules * words_per_module` elements.
+    pub data: &'a [u64],
+}
+
 /// A block representing a roaring bitmap filter.
 #[binrw]
 pub struct RoaringBitmapFilterBlock {
@@ -678,6 +838,10 @@ pub struct RoaringBitmapFilterBlock {
     pub len: u64,
 
     /// Serialized roaring bitmap contents.
+    ///
+    /// The bitmap holds each key's offset from a base no larger than the
+    /// file's first key. The base is not stored: readers locate the first key
+    /// at the bitmap's lowest set bit.
     #[br(count = len)]
     pub data: Vec<u8>,
 }
@@ -696,6 +860,6 @@ pub struct RoaringBitmapFilterBlockRef<'a> {
     #[bw(try_calc(u64::try_from(data.len())))]
     pub len: u64,
 
-    /// Serialized roaring bitmap contents.
+    /// Serialized roaring bitmap contents, as in [`RoaringBitmapFilterBlock`].
     pub data: &'a [u8],
 }

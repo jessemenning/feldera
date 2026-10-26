@@ -1,7 +1,8 @@
 use crate::transport::kafka::{
-    MemoryUseReporter, build_headers, generate_oauthbearer_token, kafka_send,
-    validate_aws_msk_region,
+    OauthbearerAuth, buffered_bytes, build_headers, generate_oauthbearer_token, kafka_send,
+    resolve_oauthbearer_auth,
 };
+use crate::util::MemoryUseReporter;
 use crate::{AsyncErrorCallback, OutputEndpoint, transport::kafka::DeferredLogging};
 use anyhow::{Context, Error as AnyError, Result as AnyResult, anyhow, bail};
 use feldera_adapterlib::transport::OutputBatchType;
@@ -9,7 +10,7 @@ use feldera_types::transport::kafka::KafkaOutputConfig;
 use rdkafka::client::OAuthToken;
 use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::ConsumerContext;
-use rdkafka::message::OwnedHeaders;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::{
     ClientConfig, ClientContext, Message,
     config::FromClientConfigAndContext,
@@ -19,10 +20,10 @@ use rdkafka::{
     types::RDKafkaErrorCode,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Mutex;
 use std::{cmp::max, sync::RwLock, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::span::EnteredSpan;
 use tracing::{debug, info, info_span, warn};
 
@@ -95,6 +96,9 @@ pub struct KafkaOutputEndpoint {
     max_message_size: usize,
     next_transaction: u64,
     state: State,
+    /// `ControllerInner::shutdown_token`, which ends a wait on a full
+    /// producer queue.  See [kafka_send].
+    shutdown: CancellationToken,
 }
 
 pub fn span(topic: &str) -> EnteredSpan {
@@ -102,7 +106,7 @@ pub fn span(topic: &str) -> EnteredSpan {
 }
 
 impl KafkaOutputEndpoint {
-    pub fn new(config: KafkaOutputConfig) -> AnyResult<Self> {
+    pub fn new(config: KafkaOutputConfig, shutdown: CancellationToken) -> AnyResult<Self> {
         let _guard = span(&config.topic);
         let ft = config.clone().fault_tolerance.unwrap_or_default();
         let mut common = CommonConfig::new(
@@ -143,14 +147,13 @@ impl KafkaOutputEndpoint {
         // producers cooperating with us by using the same `transactional.id`.
         let context = DataProducerContext::new(&config)?;
         let kafka_producer =
-            ThreadedProducer::from_config_and_context(&common.producer_config, context)?;
+            ThreadedProducer::from_config_and_context(&common.producer_config, context)
+                .map_err(|e| anyhow!("error creating Kafka producer: {e}"))?;
         kafka_producer
             .context()
             .deferred_logging
             .with_deferred_logging(|| {
-                kafka_producer.init_transactions(Duration::from_secs(
-                    config.initialization_timeout_secs.into(),
-                ))
+                kafka_producer.init_transactions(Duration::from(config.initialization_timeout()))
             })?;
 
         // Read the number of partitions and the next step number.  We do this
@@ -167,6 +170,7 @@ impl KafkaOutputEndpoint {
             max_message_size,
             next_transaction,
             state: State::New,
+            shutdown,
         })
     }
 
@@ -184,7 +188,9 @@ impl KafkaOutputEndpoint {
         let mut next_transaction = 0;
         for partition in 0..n_partitions {
             let ctp = Ctp::new(&consumer, topic, partition as i32);
-            let watermarks = ctp.fetch_watermarks(None)?;
+            let watermarks = ctp
+                .fetch_watermarks(None)
+                .map_err(|e| anyhow!("error retrieving watermarks for topic '{topic}': {e}",))?;
             if !watermarks.is_empty() {
                 if let Some(msg) = ctp.read_last_message(&watermarks)? {
                     let key = OutputPosition::from_message(&msg).with_context(|| {
@@ -237,6 +243,21 @@ impl OutputEndpoint for KafkaOutputEndpoint {
     }
 
     fn push_buffer(&mut self, buffer: &[u8]) -> AnyResult<()> {
+        self.push_key(None, Some(buffer), &[])
+    }
+
+    fn push_key(
+        &mut self,
+        provided_key: Option<&[u8]>,
+        val: Option<&[u8]>,
+        headers: &[(&str, Option<&[u8]>)],
+    ) -> AnyResult<()> {
+        if provided_key.is_some() {
+            bail!(
+                "Kafka output transport does not support key-value pairs when configured in exactly once fault-tolerant mode."
+            );
+        }
+
         let _guard = span(&self.topic);
         let State::BatchOpen(OutputPosition {
             transaction,
@@ -254,17 +275,24 @@ impl OutputEndpoint for KafkaOutputEndpoint {
         });
 
         if transaction >= self.next_transaction {
+            let mut all_headers = self.headers.clone();
+            for (key, value) in headers {
+                all_headers = all_headers.insert(Header { key, value: *value });
+            }
+
             let key = OutputPosition {
                 transaction,
                 substep,
             };
             let key = serde_json::to_string(&key).unwrap();
-            let record = BaseRecord::to(&self.topic)
+            let mut record = BaseRecord::to(&self.topic)
                 .key(&key)
                 .partition(self.next_partition as i32)
-                .payload(buffer)
-                .headers(self.headers.clone());
-            kafka_send(&self.kafka_producer, &self.topic, record)?;
+                .headers(all_headers);
+            if let Some(val) = val {
+                record = record.payload(val);
+            }
+            kafka_send(&self.kafka_producer, &self.topic, record, &self.shutdown)?;
 
             self.next_partition += 1;
             if self.next_partition >= self.n_partitions {
@@ -272,15 +300,6 @@ impl OutputEndpoint for KafkaOutputEndpoint {
             }
         }
         Ok(())
-    }
-
-    fn push_key(
-        &mut self,
-        _key: Option<&[u8]>,
-        _val: Option<&[u8]>,
-        _headers: &[(&str, Option<&[u8]>)],
-    ) -> AnyResult<()> {
-        todo!()
     }
 
     fn batch_end(&mut self) -> AnyResult<()> {
@@ -325,7 +344,7 @@ impl OutputEndpoint for KafkaOutputEndpoint {
 
         if transaction >= self.next_transaction {
             if transaction > self.next_transaction {
-                warn!(
+                debug!(
                     "skipping from transaction {} to {transaction}",
                     self.next_transaction
                 );
@@ -364,7 +383,7 @@ struct DataProducerContext {
 
     deferred_logging: DeferredLogging,
 
-    oauthbearer_config: HashMap<String, String>,
+    oauthbearer_config: OauthbearerAuth,
 
     memory_use_reporter: Mutex<MemoryUseReporter>,
 
@@ -373,19 +392,18 @@ struct DataProducerContext {
 
 impl DataProducerContext {
     fn new(kafka_config: &KafkaOutputConfig) -> AnyResult<Self> {
-        let mut oauthbearer_config = HashMap::new();
-        if let Some(region) =
-            validate_aws_msk_region(&kafka_config.kafka_options, kafka_config.region.clone())?
-        {
-            oauthbearer_config.insert("region".to_owned(), region);
-        };
+        let oauthbearer_config = resolve_oauthbearer_auth(
+            &kafka_config.kafka_options,
+            kafka_config.oauth_provider,
+            kafka_config.region.clone(),
+        )?;
 
         Ok(Self {
             async_error_callback: RwLock::new(None),
             deferred_logging: DeferredLogging::new(),
             oauthbearer_config,
             topic: kafka_config.topic.clone(),
-            memory_use_reporter: Mutex::new(MemoryUseReporter::new()),
+            memory_use_reporter: Mutex::new(MemoryUseReporter::new("buffers", 1024 * 1024)),
         })
     }
 }
@@ -402,7 +420,11 @@ impl ClientContext for DataProducerContext {
             let fatal = error
                 .rdkafka_error_code()
                 .is_some_and(|code| code == RDKafkaErrorCode::Fatal);
-            cb(fatal, anyhow!(reason.to_string()), Some("kakfa_ft_err"));
+            cb(
+                fatal,
+                anyhow!("Kafka producer error: {error}; Reason: {reason}"),
+                Some("kafka_ft_err"),
+            );
         } else {
             warn!("{error}");
         }
@@ -414,7 +436,10 @@ impl ClientContext for DataProducerContext {
 
     fn stats(&self, statistics: rdkafka::Statistics) {
         let _guard = span(&self.topic);
-        self.memory_use_reporter.lock().unwrap().update(&statistics);
+        self.memory_use_reporter
+            .lock()
+            .unwrap()
+            .update(buffered_bytes(&statistics));
     }
 }
 
@@ -444,7 +469,7 @@ where
 {
     error_cb: F,
     deferred_logging: DeferredLogging,
-    oauthbearer_config: HashMap<String, String>,
+    oauthbearer_config: OauthbearerAuth,
     memory_use_reporter: Mutex<MemoryUseReporter>,
     topic: String,
 }
@@ -454,19 +479,18 @@ where
     F: Fn(AnyError) + Send + Sync,
 {
     fn new(error_cb: F, kafka_config: &KafkaOutputConfig) -> AnyResult<Self> {
-        let mut oauthbearer_config = HashMap::new();
-        if let Some(region) =
-            validate_aws_msk_region(&kafka_config.kafka_options, kafka_config.region.clone())?
-        {
-            oauthbearer_config.insert("region".to_owned(), region);
-        };
+        let oauthbearer_config = resolve_oauthbearer_auth(
+            &kafka_config.kafka_options,
+            kafka_config.oauth_provider,
+            kafka_config.region.clone(),
+        )?;
 
         Ok(Self {
             error_cb,
             deferred_logging: DeferredLogging::new(),
             oauthbearer_config,
             topic: kafka_config.topic.clone(),
-            memory_use_reporter: Mutex::new(MemoryUseReporter::new()),
+            memory_use_reporter: Mutex::new(MemoryUseReporter::new("buffers", 1024 * 1024)),
         })
     }
 }
@@ -499,7 +523,10 @@ where
 
     fn stats(&self, statistics: rdkafka::Statistics) {
         let _guard = span(&self.topic);
-        self.memory_use_reporter.lock().unwrap().update(&statistics);
+        self.memory_use_reporter
+            .lock()
+            .unwrap()
+            .update(buffered_bytes(&statistics));
     }
 }
 

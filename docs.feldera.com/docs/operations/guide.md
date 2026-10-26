@@ -13,7 +13,7 @@ Unfortunately this makes it impossible to run simple SQL testing
 code such as:
 
 ```sql
-CREATE MATERIALIZED VIEW V AS SELECT 1 + 2;
+CREATE MATERIALIZED VIEW v AS SELECT 1 + 2;
 ```
 
 The workaround this limitation is to have at least one table in each
@@ -22,7 +22,7 @@ of an output.  You can use the [datagen
 connector](/connectors/sources/datagen.md) to populate this table:
 
 ```sql
-CREATE TABLE T(c BOOLEAN) WITH (
+CREATE TABLE t(c BOOLEAN) WITH (
   'connectors' = '[{
     "name": "dummy",
     "transport": {
@@ -36,7 +36,7 @@ CREATE TABLE T(c BOOLEAN) WITH (
   }]'
 );
 
-CREATE MATERIALIZED VIEW V AS SELECT 1 + 2 FROM T;
+CREATE MATERIALIZED VIEW v AS SELECT 1 + 2 FROM t;
 ```
 
 ## Diagnosing Performance Issues
@@ -53,6 +53,11 @@ the following methods:
 * the `support_bundle` [function in the Python SDK](https://docs.feldera.com/python/examples.html#retrieve-a-support-bundle-for-a-pipeline).
 * the web-console has a button to download the bundle for a pipeline
 * or the `support_bundle` [endpoint in the REST API](/api/download-support-bundle).
+
+A downloaded bundle can be read back in the web console: press the "Open support bundle"
+button on the home page to upload and vie the bundle in the profile viewer, which shows the
+pipeline's logs, metrics and circuit profile. The same button lists the bundles opened
+before, so that a bundle can be reopened without picking the file again.
 
 The support bundle has the following content:
 
@@ -84,7 +89,7 @@ The support bundle has the following content:
 **Solution**: This usually happens when the Delta Table uses features unsupported by `delta-rs`, such as liquid clustering. Check the table properties and set the checkpoint policy to "classic":
 
 ```sql
-ALTER TABLE my_table SET TBLPROPERTIES (
+ALTER TABLE my_table SET tblproperties (
   'checkpointPolicy' = 'classic'
 )
 ```
@@ -115,9 +120,33 @@ explicitly request larger volumes for each pipeline:
 
    ```json
    "resources": {
-       "storage_mb_max": 128000
+       "storage_max": "128G"
    }
    ```
+
+#### Compiler binary store
+
+**Error**: a pipeline fails to compile with:
+```
+Unable to write to the binary store: the storage volume is full; an operator
+must grow it or delete unused pipelines to reclaim space
+```
+
+The compiler stores every compiled pipeline binary on its own volume, separate
+from the pipeline storage above. Compilation fails immediately rather than
+retrying, because only an operator can resolve it.
+
+**Solution**: grow the compiler volume or reclaim space. Budget at least 200 to
+300 MB per compiled program version. Deleting unused pipelines lets the
+compiler's garbage collector reclaim their binaries. The compiler health check
+reports this condition through `/cluster_healthz` once the volume is 95% full,
+before uploads start failing.
+
+If the message instead says the volume is read-only, the kernel remounted the
+filesystem after a disk failure; repair or replace the underlying disk.
+
+After resolving the cause, recompile affected pipelines by editing or re-saving
+their program.
 
 ### Kubernetes evictions
 
@@ -150,7 +179,7 @@ making them eviction candidates. To raise their priority:
    ```json
    "resources": {
        "cpu_cores_min": 16,
-       "memory_mb_min": 32000,
+       "memory_min": "32G",
    }
    ```
 
@@ -160,8 +189,8 @@ making them eviction candidates. To raise their priority:
    "resources": {
        "cpu_cores_min": 16,
        "cpu_cores_max": 16,
-       "memory_mb_min": 32000,
-       "memory_mb_max": 32000,
+       "memory_min": "32G",
+       "memory_max": "32G",
    }
    ```
 
@@ -225,14 +254,14 @@ written with only single-host pipelines in mind.
 
 Choosing a larger storage without preserving existing state can be done
 by clearing the storage, followed by increasing the runtime configuration's
-`resources.storage_mb_max`. However, this field cannot be edited with uncleared
+`resources.storage_max`. However, this field cannot be edited with uncleared
 storage (i.e., while preserving existing state). Currently, Feldera does not
 have the feature to expand existing storage. It is however possible to do it
 out-of-band by directly interacting with the underlying Kubernetes PVC.
 This is only possible if its storage class allows volume expansion.
 
 This out-of-band action will result in a discrepancy between what the runtime
-configuration `resources.storage_mb_max` states and the actual size of the
+configuration `resources.storage_max` states and the actual size of the
 storage. Be aware that clearing storage afterward will delete the PVC that
 was changed out-of-band, thereby undoing the storage expansion.
 
@@ -253,7 +282,7 @@ was changed out-of-band, thereby undoing the storage expansion.
    kubectl get pvc -n $NAMESPACE $PIPELINE_PVC
    ```
 
-   ... which for example outputs (`resources.storage_mb_max` is set to 25000 in this example):
+   ... which for example outputs (`resources.storage_max` is set to `"25G"` in this example):
    ```
    NAME            STATUS   VOLUME    CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
    pipeline-....   Bound    pvc-...   24Gi       RWO            gp3            <unset>                 21s

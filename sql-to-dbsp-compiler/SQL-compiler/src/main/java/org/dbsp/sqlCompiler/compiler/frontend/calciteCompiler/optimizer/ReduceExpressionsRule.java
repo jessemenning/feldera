@@ -80,6 +80,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -130,7 +131,7 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
             final RelMetadataQuery mq = call.getMetadataQuery();
             final RelOptPredicateList predicates =
                     mq.getPulledUpPredicates(filter.getInput());
-            if (reduceExpressions(filter, expList, predicates, true,
+            if (ReduceExpressionsRule.reduceExpressions(filter, expList, predicates, true,
                     config.matchNullability(), config.treatDynamicCallsAsConstant())) {
                 assert expList.size() == 1;
                 newConditionExp = expList.get(0);
@@ -292,7 +293,7 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
             final RelOptPredicateList predicates =
                     leftPredicates.union(rexBuilder,
                             rightPredicates.shift(rexBuilder, fieldCount));
-            if (!reduceExpressions(join, expList, predicates, true,
+            if (!ReduceExpressionsRule.reduceExpressions(join, expList, predicates, true,
                     config.matchNullability(), config.treatDynamicCallsAsConstant())) {
                 return;
             }
@@ -343,7 +344,7 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
                 expandedExprList.add(expr.accept(shuttle));
             }
             final RelOptPredicateList predicates = RelOptPredicateList.EMPTY;
-            if (reduceExpressions(calc, expandedExprList, predicates, false,
+            if (ReduceExpressionsRule.reduceExpressions(calc, expandedExprList, predicates, false,
                     config.matchNullability(), config.treatDynamicCallsAsConstant())) {
                 final RexProgramBuilder builder =
                         new RexProgramBuilder(
@@ -431,7 +432,8 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
                 List<Window.RexWinAggCall> aggCalls = new ArrayList<>();
                 for (Window.RexWinAggCall aggCall : group.aggCalls) {
                     final List<RexNode> expList = new ArrayList<>(aggCall.getOperands());
-                    if (reduceExpressions(window, expList, predicates)) {
+                    if (ReduceExpressionsRule.reduceExpressions(window, expList, predicates,
+                            false, true, false)) {
                         aggCall =
                                 new Window.RexWinAggCall(aggCall.getParserPosition(),
                                         (SqlAggFunction) aggCall.getOperator(),
@@ -488,6 +490,10 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
 
     //~ Methods ----------------------------------------------------------------
 
+    /** An executor that returns each expression unchanged */
+    private static final RexExecutor NO_EVALUATION =
+            (rexBuilder, constExps, reducedValues) -> reducedValues.addAll(constExps);
+
     /**
      * Reduces a list of expressions.
      *
@@ -538,18 +544,28 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
                         expList, predicates, treatDynamicCallsAsConstant);
 
         boolean simplified = false;
-        /*
-        Some Calcite simplifications are wrong, in particular the ones producing TIMESTAMP results.
+        // Some Calcite simplifications are wrong, in particular the ones producing TIMESTAMP results.
+        // for (int i = 0; i < expList.size(); i++) {
+        //     final RexNode expr2 =
+        //             simplify.simplifyPreservingType(expList.get(i), unknownAs,
+        //                     matchNullability);
+        //     if (!expr2.equals(expList.get(i))) {
+        //         expList.set(i, expr2);
+        //         simplified = true;
+        //     }
+        // }
+        // Calcite normalizes expressions, e.g., it flattens ANDs, as the temporal filter
+        // analysis requires; this RexSimplify evaluates no constants
+        final RexSimplify normalize = new RexSimplify(rexBuilder, predicates, NO_EVALUATION);
         for (int i = 0; i < expList.size(); i++) {
             final RexNode expr2 =
-                    simplify.simplifyPreservingType(expList.get(i), unknownAs,
+                    normalize.simplifyPreservingType(expList.get(i), unknownAs,
                             matchNullability);
             if (!expr2.equals(expList.get(i))) {
                 expList.set(i, expr2);
                 simplified = true;
             }
         }
-         */
 
         if (reduced && simplified) {
             return !originExpList.equals(expList);
@@ -618,9 +634,13 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
             addCasts = Collections.nCopies(reducedValues.size(), true);
         }
 
+        // RexReplacer casts a reduced value back to the type of the original
+        // expression, which can rebuild a CAST of a literal unchanged
+        final List<RexNode> beforeReplacement = new ArrayList<>(expList);
         new RexReplacer(simplify, unknownAs, constExps, reducedValues, addCasts)
                 .mutate(expList);
-        return true;
+        // return true;
+        return changed || !beforeReplacement.equals(expList);
     }
 
     /**
@@ -788,6 +808,45 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
             NON_CONSTANT, REDUCIBLE_CONSTANT, IRREDUCIBLE_CONSTANT
         }
 
+        // Expressions with types from the following list (or with operands from
+        // this list) are not constant-folded.
+        // Calcite's evaluation of TIME and TIMESTAMP values is broken: it does not support
+        // TIMESTAMP with precisions above 3, and it converts a TIMESTAMP WITH TIME ZONE to a
+        // string as epoch milliseconds.
+        // The evaluation rules of VARIANT values are different.
+        // Calcite drops the fractional seconds when converting an INTERVAL to a string.
+        private static final EnumSet<SqlTypeName> NOT_EVALUATED = EnumSet.of(
+                SqlTypeName.TIME,
+                SqlTypeName.TIME_WITH_LOCAL_TIME_ZONE,
+                SqlTypeName.TIME_TZ,
+                SqlTypeName.TIMESTAMP,
+                SqlTypeName.TIMESTAMP_WITH_LOCAL_TIME_ZONE,
+                SqlTypeName.TIMESTAMP_TZ,
+                SqlTypeName.VARIANT);
+
+        /** True for the types whose values the Calcite executor does not compute as Feldera does */
+        private static boolean notEvaluated(SqlTypeName type) {
+            return NOT_EVALUATED.contains(type) || SqlTypeName.INTERVAL_TYPES.contains(type);
+        }
+
+        /** True for the casts that Calcite evaluates differently from Feldera:
+         * <ul>
+         *   <li>a cast of a DECIMAL or floating point value to a string: Calcite and Feldera
+         *       format these numbers differently, e.g., 1.50 and 1.5, or 1.0E-7 and 1e-7</li>
+         *   <li>a cast of a string to DECIMAL: Calcite truncates, e.g., '1.239' to the
+         *       DECIMAL(5, 2) 1.23, where Feldera rounds to 1.24</li>
+         * </ul> */
+        private static boolean castNotEvaluated(RexCall call) {
+            if (call.getKind() != SqlKind.CAST && call.getKind() != SqlKind.SAFE_CAST)
+                return false;
+            SqlTypeName from = call.getOperands().get(0).getType().getSqlTypeName();
+            SqlTypeName to = call.getType().getSqlTypeName();
+            if (to == SqlTypeName.DECIMAL && SqlTypeName.CHAR_TYPES.contains(from))
+                return true;
+            return SqlTypeName.CHAR_TYPES.contains(to)
+                    && (from == SqlTypeName.DECIMAL || SqlTypeName.APPROX_TYPES.contains(from));
+        }
+
         private final boolean treatDynamicCallsAsConstant;
 
         private final List<ReducibleExprLocator.Constancy> stack = new ArrayList<>();
@@ -833,14 +892,16 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
         }
 
         private void addResult(RexNode exp) {
-            // Cast of literal can't be reduced, so skip those (otherwise we'd
-            // go into an infinite loop as we add them back).
             if (exp.getKind() == SqlKind.CAST) {
                 RexCall cast = (RexCall) exp;
                 RexNode operand = cast.getOperands().get(0);
-                if (operand instanceof RexLiteral) {
-                    return;
-                }
+                // Feldera reduces casts of literals; reduceExpressionsInternal detects a reduction
+                //   that does not change the expression.
+                // Cast of literal can't be reduced, so skip those (otherwise we'd
+                // go into an infinite loop as we add them back).
+                // if (operand instanceof RexLiteral) {
+                //    return;
+                // }
                 if (operand instanceof RexCall) {
                     RexCall opCall = (RexCall) operand;
                     if (opCall.getKind() == SqlKind.ARRAY_VALUE_CONSTRUCTOR) {
@@ -961,25 +1022,20 @@ public abstract class ReduceExpressionsRule<C extends org.apache.calcite.rel.rul
                     && (call.getOperator() instanceof SqlRowOperator)) {
                 callConstancy = ReducibleExprLocator.Constancy.NON_CONSTANT;
             }
-            // https://github.com/feldera/feldera/issues/4700:
-            // Disable all expression evaluations for TIME and TIMESTAMP values, since they are broken in Calcite:
-            // Calcite does not support TIMESTAMP with precisions above 3
-            // Disable optimizations for VARIANT values, the evaluation rules are different
-            SqlTypeName resultType = call.getType().getSqlTypeName();
-            if (resultType == SqlTypeName.TIMESTAMP ||
-                    resultType == SqlTypeName.TIME ||
-                    resultType == SqlTypeName.VARIANT ||
-                    SqlTypeName.INTERVAL_TYPES.contains(resultType))
+            if (notEvaluated(call.getType().getSqlTypeName()))
                 callConstancy = Constancy.NON_CONSTANT;
-            for (int iOperand = 0; iOperand < operandCount; ++iOperand) {
-                RexNode operand = call.getOperands().get(iOperand);
+            for (RexNode operand : call.getOperands()) {
                 SqlTypeName operandType = operand.getType().getSqlTypeName();
-                if (operandType == SqlTypeName.TIMESTAMP
-                        || operandType == SqlTypeName.TIME
-                        || operandType == SqlTypeName.VARIANT) {
+                if (notEvaluated(operandType))
                     callConstancy = Constancy.NON_CONSTANT;
-                }
+                // Calcite computes on REAL and DOUBLE operands with the IEEE 754 rules,
+                // and Feldera stores -0 as +0 and treats all NaNs as equal: e.g., Calcite
+                // evaluates 1e0 / -0e0 to -Infinity, and Feldera to Infinity
+                if (SqlTypeName.APPROX_TYPES.contains(operandType))
+                    callConstancy = Constancy.NON_CONSTANT;
             }
+            if (castNotEvaluated(call))
+                callConstancy = Constancy.NON_CONSTANT;
 
             if (callConstancy == ReducibleExprLocator.Constancy.NON_CONSTANT) {
                 // any REDUCIBLE_CONSTANT children are now known to be maximal

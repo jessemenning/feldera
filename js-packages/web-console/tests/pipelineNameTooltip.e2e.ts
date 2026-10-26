@@ -1,15 +1,21 @@
 import { expect, test } from '@playwright/test'
-import { deletePipeline, putPipeline } from '$lib/services/pipelineManager'
+import { putPipeline } from '$lib/services/pipelineManager'
 import {
   cleanupPipeline,
+  clearAndDeletePipeline,
   configureTestClient,
   killPipelineAndWaitForStopped,
   startPipelineAndWaitForRunning,
+  TEST_COMPILATION_PROFILE,
   waitForCompilation,
   waitForPipeline
 } from '$lib/services/testPipelineHelpers'
 
 configureTestClient()
+
+// The status chip follows `usePipelineList`, which polls every 2 s, so the DOM
+// trails the API by up to one poll plus request latency.
+const STATUS_CHIP_TIMEOUT_MS = 6_000
 
 const PREFIX = `test-name-tooltip-${Date.now()}`
 const PIPELINE_NAME = `${PREFIX}`
@@ -23,7 +29,7 @@ test.describe('Pipeline name edit tooltip', () => {
       name: PIPELINE_NAME,
       description: 'E2E test pipeline for name-edit tooltip',
       program_code: 'create view v as (select 1)',
-      program_config: { profile: 'unoptimized' }
+      program_config: { profile: TEST_COMPILATION_PROFILE }
     })
     await waitForPipeline(PIPELINE_NAME, (p) => p.status === 'Stopped', 60_000)
   })
@@ -35,7 +41,6 @@ test.describe('Pipeline name edit tooltip', () => {
   test('shows no tooltip when stopped, running tooltip when running, deleted tooltip after out-of-band delete', async ({
     page
   }) => {
-    test.skip()
     await page.goto(`/pipelines/${PIPELINE_NAME}`)
 
     const editButton = page.getByRole('button', { name: 'Edit pipeline name', exact: true })
@@ -45,9 +50,15 @@ test.describe('Pipeline name edit tooltip', () => {
       .locator('span[role="button"]')
       .filter({ hasText: PIPELINE_NAME })
 
+    // Move the pointer away and then on the target element to trigger `mouseenter` event.
+    const hoverPipelineName = async () => {
+      await page.mouse.move(0, 0)
+      await pipelineNameTrigger.hover()
+    }
+
     // Stopped: edit is enabled, no tooltip on hover.
     await expect(editButton).not.toBeDisabled()
-    await pipelineNameTrigger.hover()
+    await hoverPipelineName()
     await expect(
       page.getByText("Cannot edit the pipeline's name while it's running")
     ).not.toBeVisible()
@@ -55,29 +66,30 @@ test.describe('Pipeline name edit tooltip', () => {
 
     // Start the pipeline and wait for Running.
     await waitForCompilation(PIPELINE_NAME, 60_000)
-    await startPipelineAndWaitForRunning(PIPELINE_NAME, 20_000)
-    await expect(statusChip).toHaveText(/running/i, { timeout: 2_000 })
+    await startPipelineAndWaitForRunning(PIPELINE_NAME, 60_000)
+    await expect(statusChip).toHaveText(/running/i, { timeout: STATUS_CHIP_TIMEOUT_MS })
 
     // Running: edit is disabled, "running" tooltip appears on hover.
     await expect(editButton).toBeDisabled()
-    await pipelineNameTrigger.hover()
+    await hoverPipelineName()
     await expect(page.getByText("Cannot edit the pipeline's name while it's running")).toBeVisible({
       timeout: 5_000
     })
 
     // Kill the pipeline and wait for Stopped.
     await killPipelineAndWaitForStopped(PIPELINE_NAME)
-    await expect(statusChip).not.toHaveText(/running/i, { timeout: 2_000 })
+    await expect(statusChip).not.toHaveText(/running/i, { timeout: STATUS_CHIP_TIMEOUT_MS })
 
     // Delete the pipeline out-of-band (simulates another tab / API client).
-    await deletePipeline(PIPELINE_NAME)
+    // The server refuses a delete until storage is cleared, so clear it first.
+    await clearAndDeletePipeline(PIPELINE_NAME)
 
     // Wait for the page to enter the frozen "Deleted" state.
     await expect(statusChip).toHaveText(/deleted/i, { timeout: 10_000 })
 
     // Deleted: edit is disabled, "deleted" tooltip appears on hover.
     await expect(editButton).toBeDisabled()
-    await pipelineNameTrigger.hover()
+    await hoverPipelineName()
     await expect(page.getByText("Cannot edit the deleted pipeline's name")).toBeVisible({
       timeout: 5_000
     })

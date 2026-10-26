@@ -1,42 +1,58 @@
 use crate::catalog::{ArrowStream, InputCollectionHandle};
 use crate::format::InputBuffer;
+use crate::integrated::DistributedInput;
 use crate::integrated::delta_table::deletion_vector::{
-    ReadMode, filtered_parquet_table, read_deletion_vector,
+    MaskedFile, ReadMode, filtered_parquet_table, read_deletion_vector,
 };
-use crate::integrated::delta_table::{delta_input_serde_config, register_storage_handlers};
+use crate::integrated::delta_table::field_id_adapter::FieldIdAdapterFactory;
+use crate::integrated::delta_table::{
+    ReadSchema, delta_input_serde_config, register_storage_handlers,
+};
 use crate::transport::{InputEndpoint, InputQueue, InputReaderCommand, IntegratedInputEndpoint};
 use crate::{ControllerError, InputConsumer, InputReader, PipelineState};
 use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
-use arrow::array::{Array, ArrayData, ArrayRef, BooleanArray, make_array};
+use arrow::array::{Array, ArrayData, ArrayRef, AsArray, BooleanArray, make_array};
+use arrow::compute::kernels::cmp::eq;
+use arrow::compute::{filter_record_batch, is_null, not, prep_null_mask_filter};
 use arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
 };
 use chrono::{DateTime, Utc};
 use datafusion::catalog::TableProvider;
-use datafusion::common::DataFusionError;
 use datafusion::common::arrow::array::RecordBatch;
+use datafusion::common::tree_node::{TransformedResult, TreeNode};
+use datafusion::common::{DFSchema, DataFusionError, ScalarValue};
+use datafusion::config::ConfigNonZeroUsize;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::execution::memory_pool::MemoryLimit;
-use datafusion::physical_plan::{PhysicalExpr, displayable};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, SendableRecordBatchStream,
+    StatisticsArgs, StatisticsContext, displayable, execute_stream,
+};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use dbsp::circuit::tokio::TOKIO;
 use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+use delta_kernel::table_features::ColumnMappingMode;
 use deltalake::datafusion::dataframe::DataFrame;
 use deltalake::datafusion::execution::context::SQLOptions;
-use deltalake::datafusion::logical_expr::SortExpr;
-use deltalake::datafusion::prelude::{Expr, SessionContext, col};
+use deltalake::datafusion::logical_expr::{ExprSchemable, SortExpr};
+use deltalake::datafusion::prelude::{Expr, SessionConfig, SessionContext, cast, ident, lit};
 use deltalake::datafusion::sql::sqlparser::dialect::GenericDialect;
 use deltalake::datafusion::sql::sqlparser::parser::Parser;
 use deltalake::datafusion::sql::sqlparser::tokenizer::Token;
 use deltalake::kernel::{
-    Action, Add as AddAction, DeletionVectorDescriptor, Remove as RemoveAction,
+    Action, Add as AddAction, AddCDCFile as AddCdcAction, DeletionVectorDescriptor,
+    Remove as RemoveAction,
 };
 use deltalake::logstore::{self, IORuntime};
 use deltalake::table::builder::ensure_table_uri;
-use deltalake::{DeltaTable, DeltaTableBuilder, Path, datafusion};
+use deltalake::table::config::TablePropertiesExt;
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, Path, datafusion};
 use feldera_adapterlib::format::{ParseError, StagedInputBuffer};
 use feldera_adapterlib::metrics::{ConnectorMetrics, ValueType};
 use feldera_adapterlib::transport::{InputQueueEntry, Resume, Watermark, parse_resume_info};
@@ -51,8 +67,11 @@ use feldera_adapterlib::utils::job_queue::JobQueue;
 use feldera_storage::tokio::TOKIO_DEDICATED_IO;
 use feldera_types::adapter_stats::ConnectorHealth;
 use feldera_types::config::{FtModel, PipelineConfig};
+use feldera_types::coordination::InputShard;
 use feldera_types::program_schema::{Field, Relation};
-use feldera_types::transport::delta_table::{DeltaTableReaderConfig, DeltaTableTransactionMode};
+use feldera_types::transport::delta_table::{
+    DeltaTableIngestMode, DeltaTableReaderConfig, DeltaTableTransactionMode,
+};
 use futures_util::StreamExt;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
@@ -61,7 +80,7 @@ use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Display;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -89,10 +108,11 @@ const REPORT_ERROR: &str =
 static DELTA_READER_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(DEFAULT_MAX_CONCURRENT_READERS));
 
-/// Default cap for concurrent Delta object-store reads, used both as the
-/// initial token count for `DELTA_READER_SEMAPHORE` and as the fallback
-/// for DataFusion's `target_partitions` when neither
-/// `DELTA_DF_TARGET_PARTITIONS` nor `max_concurrent_readers` is set.
+/// Default cap for concurrent Delta object-store reads: the initial token count
+/// for `DELTA_READER_SEMAPHORE`, which bounds how many connector queries read at
+/// once. It does not bound the scan parallelism *within* one query; that is
+/// DataFusion's `target_partitions`, which `create_session_context_with` derives
+/// from `io_workers` / `workers` unless `DELTA_DF_TARGET_PARTITIONS` overrides it.
 const DEFAULT_MAX_CONCURRENT_READERS: usize = 6;
 
 /// Configured `max_concurrent_readers` value (0 = not set by any connector).
@@ -122,13 +142,252 @@ fn format_datafusion_error(
         format!(
             "{base}\n\
              DataFusion memory pool is exhausted. Current datafusion memory pool limit: {current_pool_limit}. \
-             Consider setting or increasing 'datafusion_memory_mb' in the pipeline runtime config. \
-             If raising the budget is not an option, reduce 'io_workers' / 'workers' or \
-             set the env var 'DELTA_DF_TARGET_PARTITIONS=1' to lower per-scan parallelism.\n"
+             The query needs more memory than the pool holds; consider setting or increasing \
+             'datafusion_memory' (a size such as \"4Gi\") in the pipeline runtime config. If raising the budget is not \
+             an option, reduce 'io_workers' / 'workers' or set the env var \
+             'DELTA_DF_TARGET_PARTITIONS=1' to scan fewer files at a time, which lowers how much \
+             of the scan is held in memory at once.\n"
         )
     } else {
         base
     }
+}
+
+/// A positive integer from the environment variable `name`, or `None` when it
+/// is unset or does not hold one.
+///
+/// These are process-wide overrides, so they apply to every Delta Lake
+/// connector in the pipeline. A connector setting of the same meaning takes
+/// precedence.
+fn env_override(endpoint_name: &str, name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    match value.parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            warn!(
+                "delta_table {endpoint_name}: ignoring {name}={value:?}; expected a positive integer"
+            );
+            None
+        }
+    }
+}
+
+/// Total decoded bytes a single read may hold across all the files it decodes
+/// at once.
+///
+/// Parquet decode buffers are invisible to the DataFusion memory pool, so
+/// `datafusion_memory` does not bound them. What does is the batch size,
+/// which DataFusion states in *rows* (8192 by default), leaving the byte total
+/// unbounded: a wide row makes one batch arbitrarily large, and up to
+/// `target_partitions` files decode at once.
+///
+/// This is a ceiling, not a target. 1 GiB is chosen so that ordinary tables keep
+/// the full 8192-row batch and only unusually wide rows shrink it: across 32
+/// scan partitions it takes more than 1 KiB of compressed data per row before
+/// the batch gets smaller.
+const DECODE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Smallest batch the budget may ask for, unless the configured batch size is
+/// smaller still. A read whose rows are wide enough to hit this floor exceeds
+/// `DECODE_BUDGET_BYTES`, which is deliberate: shrinking batches without limit
+/// costs more in per-batch overhead than it saves.
+const MIN_BATCH_ROWS: usize = 64;
+
+/// Assumed ratio of decoded bytes to the byte counts the Delta log reports,
+/// which are compressed file sizes.
+const COMPRESSED_EXPANSION: u64 = 4;
+
+/// How big the Delta log says a read is: bytes on disk and the number of
+/// records those bytes hold.
+///
+/// Both come from the log, so they cost no I/O. `Add.size` is the compressed
+/// file size and `Add.stats.numRecords` its row count.
+/// [`ReadSize::batch_rows`] divides one by the other, so a read whose files
+/// record no row count has no ratio to work from and falls back to the
+/// configured batch size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReadSize {
+    bytes: u64,
+    records: u64,
+}
+
+impl ReadSize {
+    fn add(&mut self, bytes: u64, records: u64) {
+        self.bytes += bytes;
+        self.records += records;
+    }
+
+    /// Rows per decoded batch, so that `partitions` readers together stay near
+    /// [`DECODE_BUDGET_BYTES`]. `default_rows` is both the starting point and
+    /// the ceiling: the budget only ever shrinks a batch.
+    ///
+    /// `partitions` is how many readers the plan runs at once, which
+    /// [`scan_partitions`] reads off the plan rather than assuming.
+    fn batch_rows(&self, partitions: usize, default_rows: usize) -> Option<usize> {
+        if self.bytes == 0 || self.records == 0 {
+            return None;
+        }
+        let partitions = partitions.max(1) as u64;
+        let bytes_per_row = (self.bytes * COMPRESSED_EXPANSION)
+            .div_ceil(self.records)
+            .max(1);
+        let rows = (DECODE_BUDGET_BYTES / partitions / bytes_per_row) as usize;
+        // A configured batch size below the floor is what the connector was
+        // asked for, so it wins: `clamp` requires `min <= max` and would panic
+        // otherwise.
+        Some(rows.clamp(MIN_BATCH_ROWS.min(default_rows), default_rows))
+    }
+}
+
+/// The row count the log records for `add`, or 0 when the writer omitted the
+/// `numRecords` statistic or wrote one this cannot parse.
+fn add_records(add: &AddAction) -> u64 {
+    add.get_stats()
+        .ok()
+        .flatten()
+        .map_or(0, |stats| stats.num_records)
+        .max(0) as u64
+}
+
+/// How big the log says one `Add` action's file is, or `None` when it records no
+/// row count and so leaves no bytes-per-row ratio.
+///
+/// `Remove` and `cdc` actions carry a size but never a row count, so a read of
+/// one is unmeasured and falls back to the configured batch size.
+fn add_read_size(add: &AddAction) -> Option<ReadSize> {
+    let mut size = ReadSize::default();
+    size.add(add.size.max(0) as u64, add_records(add));
+    (size.records > 0).then_some(size)
+}
+
+/// How many readers `plan` runs at once: the partitions of its leaves, which
+/// are its scans, summed because a plan with several scans drives them
+/// together.
+fn scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let children = plan.children();
+    if children.is_empty() {
+        return plan.output_partitioning().partition_count();
+    }
+    children.iter().map(|child| scan_partitions(child)).sum()
+}
+
+/// The read size DataFusion derived for `plan`, or `None` unless it reports
+/// both a byte total and a row count. `Statistics` states each independently
+/// and either may be absent, and one without the other gives no bytes-per-row
+/// ratio.
+///
+/// The Delta snapshot's table provider states the log's own totals here, so a
+/// snapshot read is sized without the connector passing anything. The listing
+/// tables the connector builds for follow and CDC reads are planned with
+/// `collect_statistics` off, so their callers supply a [`ReadSize`] instead.
+fn plan_read_size(plan: &dyn ExecutionPlan) -> Option<ReadSize> {
+    let statistics = StatisticsContext::new()
+        .compute(plan, &StatisticsArgs::new())
+        .ok()?;
+    Some(ReadSize {
+        bytes: *statistics.total_byte_size.get_value()? as u64,
+        records: *statistics.num_rows.get_value()? as u64,
+    })
+}
+
+/// The suffix a read error carries to say which table version produced the data
+/// being read, or nothing when the read is not tied to one commit (the initial
+/// snapshot spans many).
+fn version_suffix(version: Option<i64>) -> String {
+    match version {
+        Some(version) => format!(" (table version: {version})"),
+        None => String::new(),
+    }
+}
+
+/// Render up to [`DESCRIBED_PATHS`] of `paths` for a log message, followed by a
+/// count of the rest.
+///
+/// A commit can add hundreds of files, and the description it produces is
+/// repeated on every retry of the read. Spelling out every path there once
+/// cost a customer a 7.5 KB log line every 44 seconds, which pushed everything
+/// else out of the pipeline's log buffer.
+fn describe_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
+    let mut paths = paths.into_iter();
+    let shown: Vec<&str> = paths.by_ref().take(DESCRIBED_PATHS).collect();
+    let rest = paths.count();
+    let mut description = format!("{shown:?}");
+    if rest > 0 {
+        description.push_str(&format!(" and {rest} more"));
+    }
+    description
+}
+
+/// How many file paths a read description names before summarizing the rest.
+const DESCRIBED_PATHS: usize = 3;
+
+/// A listing table must be planned without statistics. DataFusion matches them to fields by
+/// position against the table schema, which under `mode = 'id'` holds physical `col-<id>` names
+/// no file need use, then folds a column it reads as constant into a literal before
+/// `PhysicalExprAdapter` runs, and the read returns NULL; a NaN, which parquet-rs leaves out of
+/// min/max, folds to another value the same way. Reading every footer to plan costs a round trip
+/// per file as well. Only a listing table consults this; the Delta table provider states the
+/// log's own statistics either way, so batch sizing keeps them.
+fn plan_listing_without_statistics(cfg: SessionConfig) -> SessionConfig {
+    cfg.set_bool("datafusion.execution.collect_statistics", false)
+}
+
+/// Refuse a table that may shred VARIANT values: delta-rs reads only the unshredded part and drops
+/// the shredded fields without an error.
+fn check_no_variant_shredding(
+    endpoint_name: &str,
+    table: &DeltaTable,
+) -> Result<(), ControllerError> {
+    let snapshot = table.snapshot().map_err(|e| {
+        ControllerError::invalid_transport_configuration(
+            endpoint_name,
+            &format!("error reading the Delta table protocol: {e}"),
+        )
+    })?;
+    refuse_variant_shredding(endpoint_name, snapshot.protocol())
+}
+
+/// [`check_no_variant_shredding`] for one protocol, also checked on each followed commit.
+fn refuse_variant_shredding(
+    endpoint_name: &str,
+    protocol: &deltalake::kernel::Protocol,
+) -> Result<(), ControllerError> {
+    let shredding = [protocol.reader_features(), protocol.writer_features()]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|f| matches!(f.as_ref(), "variantShredding" | "variantShredding-preview"));
+    match shredding {
+        Some(feature) => Err(ControllerError::invalid_transport_configuration(
+            endpoint_name,
+            &format!(
+                "the Delta table enables '{}', which this connector cannot read: shredded \
+                 VARIANT fields would be lost. Read a table without VARIANT shredding.",
+                feature.as_ref()
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Whether a `table_builder.load()` failure is transient and worth retrying.
+///
+/// There is no strongly-typed way to identify these across the transitive
+/// dependencies involved, so this checks substrings in a debug-formatted
+/// representation of the error:
+///
+/// - "timeout": the load can get stuck forever in S3 authentication for some
+///   configurations (see <https://github.com/delta-io/delta-rs/issues/3768>),
+///   surfacing as a timeout on our end.
+///
+/// - "No files in log segment": S3-interop layers (observed against GCS)
+///   occasionally answer the delta kernel's version-scoped `start-after`
+///   listing of `_delta_log` with zero files even though the commits are
+///   actually present -- a real but wrong response to that one request, not
+///   a genuinely missing or corrupted table.
+fn is_retryable_delta_load_error(e: &DeltaTableError) -> bool {
+    let debug = format!("{:?}", e);
+    debug.to_ascii_lowercase().contains("timeout") || debug.contains("No files in log segment")
 }
 
 /// A deletion vector is only in effect when it flags at least one row.
@@ -136,23 +395,30 @@ fn is_active_dv(dv: &DeletionVectorDescriptor) -> bool {
     dv.cardinality > 0
 }
 
-/// A `uc://` location is path-less, so a `ListingTable` built from `root_url() +
-/// Add.path` reads empty. Such tables must read through the object store directly.
-fn requires_direct_object_store_read(table: &DeltaTable) -> bool {
+/// Reports whether this table's files must be read through the object store
+/// instead of a [`ListingTable`].
+///
+/// A `uc://` location carries no path, so a listing built from `root_url() +
+/// Add.path` resolves to nothing and reads empty.
+fn location_is_unlistable(table: &DeltaTable) -> bool {
     table.log_store().root_url().scheme() == "uc"
 }
 
-/// The table root as a base URL guaranteed to end in `/`, so string-joining a
-/// relative `Add.path` yields a well-formed URL. delta-rs normalizes the location
-/// to a trailing slash only when it has a path, so a root with none (`uc://cat.db.tbl`,
-/// or a table at a bucket root) would otherwise collapse into the joined file name.
-fn table_root_base(table: &DeltaTable) -> String {
-    let root = table.log_store().root_url().to_string();
-    if root.ends_with('/') {
-        root
-    } else {
-        format!("{root}/")
-    }
+/// A [`ListingTableUrl`] for one data file of `table`.
+///
+/// delta-rs percent-decodes an action's path when it reads the log, so `path` is
+/// already the object-store key. Appending it as URL segments re-encodes it, which
+/// [`ListingTableUrl::try_new`] then undoes exactly once; string-joining it and
+/// calling [`ListingTableUrl::parse`] instead would decode a second time (and read
+/// a `*` or `[` in a partition value as a glob), silently listing no file at all.
+fn file_listing_url(table: &DeltaTable, path: &str) -> AnyResult<ListingTableUrl> {
+    let mut url = table.log_store().root_url().clone();
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("Delta table root cannot be extended with a file path"))?
+        .pop_if_empty()
+        .extend(path.split('/'));
+    ListingTableUrl::try_new(url, None)
+        .map_err(|e| anyhow!("invalid file path '{path}' in Delta log action: {e}"))
 }
 
 /// A field's physical (on-disk) name under column mapping, or its logical name
@@ -307,6 +573,29 @@ fn relabel_nested_columns(
     .map_err(|e| anyhow!("relabeling column-mapped field names failed: {e}"))
 }
 
+/// Apply the connector's optional `filter` to `df`, or return `df` unchanged.
+/// The expression parses against `df`'s own schema, so `df` must still carry
+/// every column the filter names. `relation` names the frame when a caller has
+/// more than one (the two CDC sides); pass `None` when `description` already
+/// identifies it.
+pub(super) fn apply_filter(
+    df: DataFrame,
+    filter: Option<&str>,
+    description: &str,
+    relation: Option<&str>,
+) -> AnyResult<DataFrame> {
+    let Some(filter) = filter else {
+        return Ok(df);
+    };
+    let expr = df
+        .parse_sql_expr(filter)
+        .map_err(|e| anyhow!("invalid 'filter' expression '{filter}': {e}"))?;
+    let frame = relation.map_or(String::new(), |r| format!(" to '{r}'"));
+    df.filter(expr).map_err(|e| {
+        anyhow!("internal error processing {description}; {REPORT_ERROR}; error applying 'filter'{frame}: {e}")
+    })
+}
+
 /// Build the `DataFrame` that streams a CDC transaction to the circuit.
 ///
 /// Equivalent (in SQL) to:
@@ -334,21 +623,13 @@ fn relabel_nested_columns(
 /// would have been ingested anyway. This also shrinks the inputs to
 /// `EXCEPT ALL`, which sorts both relations.
 ///
-/// The filter is parsed against each `DataFrame`'s own schema, so
-/// column references resolve against the correct relation. The two
-/// sides cannot share a single parsed `Expr` because column
-/// references would otherwise point at the wrong relation after
-/// `except`. (`cdc_adds` and `cdc_removes` are labels for the two
-/// sides, not registered tables.)
+/// Each side is filtered separately (see [`apply_filter`]): the two
+/// cannot share one parsed `Expr`, because its column references
+/// would point at the wrong relation after `except`. (`cdc_adds` and
+/// `cdc_removes` are labels for the two sides, not registered tables.)
 ///
-/// Caveat: `EXCEPT ALL` relies on `arrow_row::RowConverter`, which in
-/// the currently pinned `arrow-row` does not support `Map` columns.
-/// Pure-append transactions on tables with `Map` columns are
-/// unaffected (the `EXCEPT ALL` branch isn't taken when `removes_df`
-/// is `None`); transactions that do produce Removes fail here with
-/// `NotImplemented`. See issue:
-///   - https://github.com/apache/datafusion/issues/15428
-///   - https://github.com/apache/arrow-rs/issues/7879
+/// `EXCEPT ALL` plans as an anti join on every column;
+/// `except_all_cancels_a_rewrite_across_all_types` checks it over every Delta type.
 ///
 /// Free function (not a method on the connector) so a unit test can
 /// inspect the resulting logical plan without standing up the full
@@ -360,26 +641,14 @@ pub(super) fn build_cdc_dataframe(
     order_by: &str,
     description: &str,
 ) -> AnyResult<DataFrame> {
-    let apply_filter = |df: DataFrame, side: &'static str| -> AnyResult<DataFrame> {
-        let Some(filter) = filter else {
-            return Ok(df);
-        };
-        let expr = df
-            .parse_sql_expr(filter)
-            .map_err(|e| anyhow!("invalid 'filter' expression '{filter}': {e}"))?;
-        df.filter(expr).map_err(|e| {
-            anyhow!("internal error processing {description}; {REPORT_ERROR}; error applying 'filter' to '{side}': {e}")
-        })
-    };
-
-    let adds_df = apply_filter(adds_df, "cdc_adds")?;
+    let adds_df = apply_filter(adds_df, filter, description, Some("cdc_adds"))?;
 
     let result_df = match removes_df {
         None => adds_df,
         Some(removes_df) => {
-            let removes_df = apply_filter(removes_df, "cdc_removes")?;
+            let removes_df = apply_filter(removes_df, filter, description, Some("cdc_removes"))?;
             adds_df.except(removes_df).map_err(|e| {
-                anyhow!("failed to build the CDC set difference for {description}: {e}. This typically means the Delta table contains a `Map` column, which the CDC deduplication step (`EXCEPT ALL`) does not yet support.")
+                anyhow!("failed to build the CDC set difference for {description}: {e}. This can happen if the table uses a column type the CDC deduplication step (`EXCEPT ALL`) cannot compare.")
             })?
         }
     };
@@ -433,6 +702,7 @@ pub struct DeltaTableInputEndpoint {
     config: DeltaTableReaderConfig,
     datafusion: SessionContext,
     consumer: Box<dyn InputConsumer>,
+    distributed: Option<DistributedInput>,
 }
 
 impl DeltaTableInputEndpoint {
@@ -442,66 +712,49 @@ impl DeltaTableInputEndpoint {
         pipeline_config: &PipelineConfig,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
         consumer: Box<dyn InputConsumer>,
+        distributed: Option<DistributedInput>,
     ) -> Self {
         register_storage_handlers();
 
-        // if `DELTA_DF_TARGET_PARTITIONS` env var (process-wide override) is set,
-        // override default target partitions with that value. Target partitions
-        // controls the number of parallel tasks DataFusion uses for scanning during the
-        // snapshot phase.
-        let env_target_partitions = match std::env::var("DELTA_DF_TARGET_PARTITIONS").ok() {
-            None => None,
-            Some(s) => match s.parse::<usize>() {
-                Ok(n) if n > 0 => Some(n),
-                _ => {
-                    warn!(
-                        "delta_table {endpoint_name}: ignoring DELTA_DF_TARGET_PARTITIONS={s:?}; expected a positive integer"
-                    );
-                    None
-                }
-            },
-        };
-        if let Some(n) = env_target_partitions {
-            info!("delta_table {endpoint_name}: DELTA_DF_TARGET_PARTITIONS={n} overriding default");
+        // `scan_parallelism` controls how many files DataFusion decodes at once;
+        // `batch_size` how many rows each decoded batch holds. Both are
+        // per-connector settings, each falling back to a process-wide env var
+        // for the case where a running pipeline needs the knob without a
+        // config change.
+        let target_partitions = config
+            .scan_parallelism
+            .map(|n| n as usize)
+            .or_else(|| env_override(endpoint_name, "DELTA_DF_TARGET_PARTITIONS"));
+        if let Some(n) = target_partitions {
+            info!("delta_table {endpoint_name}: scanning {n} files at a time");
         }
 
-        let env_batch_size = match std::env::var("DELTA_DF_BATCH_SIZE").ok() {
-            None => None,
-            Some(s) => match s.parse::<usize>() {
-                Ok(n) if n > 0 => {
-                    info!("delta_table {endpoint_name}: applying DELTA_DF_BATCH_SIZE={n}");
-                    Some(n)
-                }
-                _ => {
-                    warn!(
-                        "delta_table {endpoint_name}: ignoring DELTA_DF_BATCH_SIZE={s:?}; expected a positive integer"
-                    );
-                    None
-                }
-            },
-        };
+        let batch_size = config
+            .batch_size
+            .map(|n| n as usize)
+            .or_else(|| env_override(endpoint_name, "DELTA_DF_BATCH_SIZE"));
+        if let Some(n) = batch_size {
+            info!("delta_table {endpoint_name}: decoding {n} rows per batch");
+        }
 
-        // Configure datafusion not to generate Utf8View arrow types, which are
-        // not yet supported by the `serde_arrow` crate. The `SessionContext`
-        // shares the pipeline-wide `RuntimeEnv` so that the CDC-mode ORDER BY
-        // query spills to the same bounded memory pool and on-disk scratch
-        // dir as every other datafusion user in the pipeline.
+        // The `SessionContext` shares the pipeline-wide `RuntimeEnv` so that the
+        // CDC-mode ORDER BY query spills to the same bounded memory pool and
+        // on-disk scratch dir as every other datafusion user in the pipeline.
+        // Its object store registry is private; see
+        // `create_integrated_input_endpoint`.
         //
         // `target_partitions` inherits `create_session_context_with`'s
-        // worker-derived default; only override if `DELTA_DF_TARGET_PARTITIONS`
-        // was set explicitly. Same for `batch_size`.
+        // worker-derived default, and `batch_size` DataFusion's, unless the
+        // connector configured them above.
         let datafusion = create_session_context_with(pipeline_config, runtime_env, |cfg| {
-            let mut cfg = cfg.set_bool(
-                "datafusion.execution.parquet.schema_force_view_types",
-                false,
-            );
-            if let Some(n) = env_target_partitions {
+            let mut cfg = cfg;
+            if let Some(n) = target_partitions {
                 cfg = cfg.set_usize("datafusion.execution.target_partitions", n);
             }
-            if let Some(n) = env_batch_size {
+            if let Some(n) = batch_size {
                 cfg = cfg.set_usize("datafusion.execution.batch_size", n);
             }
-            cfg
+            plan_listing_without_statistics(cfg)
         });
 
         Self {
@@ -509,6 +762,7 @@ impl DeltaTableInputEndpoint {
             config: config.clone(),
             datafusion,
             consumer,
+            distributed,
         }
     }
 }
@@ -531,13 +785,79 @@ impl IntegratedInputEndpoint for DeltaTableInputEndpoint {
             self.consumer,
             input_handle,
             resume_info,
+            self.distributed,
         )?))
     }
 }
 
-struct DeltaTableInputReader {
+pub(super) struct DeltaTableInputReader {
     sender: Sender<PipelineState>,
     inner: Arc<DeltaTableInputEndpointInner>,
+}
+
+#[cfg(test)]
+impl DeltaTableInputReader {
+    /// The state last sent to the connector's worker.
+    pub(super) fn state(&self) -> PipelineState {
+        *self.sender.borrow()
+    }
+}
+
+/// Whether the table records a change feed after `actions`, or `None` if the
+/// commit says nothing about it.
+///
+/// A `metaData` action carries the whole table configuration, so a key absent
+/// from one is off, not unchanged: that is what `ALTER TABLE ... UNSET
+/// TBLPROPERTIES` writes. A commit with no `metaData` leaves the state alone.
+fn change_data_feed_state(actions: &[Action]) -> Option<bool> {
+    actions.iter().rev().find_map(|action| match action {
+        Action::Metadata(metadata) => Some(
+            metadata
+                .configuration()
+                .get(ENABLE_CHANGE_DATA_FEED)
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        ),
+        _ => None,
+    })
+}
+
+/// For testing only: if this environment variable is set, a distributed
+/// connector does not request its snapshot transaction on every host (see
+/// `DeltaTableInputEndpointInner::start_distributed_snapshot_transaction`).
+/// Instead, each host requests an ordinary transaction when it reads its first
+/// records, so that several hosts request one connector's transaction
+/// separately, which exercises how the coordinator handles that.
+const PER_HOST_SNAPSHOT_TRANSACTIONS_ENV: &str = "FELDERA_TEST_PER_HOST_SNAPSHOT_TRANSACTIONS";
+
+/// Returns an error if a distributed connector cannot honor `config`.
+fn validate_distributed(config: &DeltaTableReaderConfig) -> AnyResult<()> {
+    // A distributed connector divides the snapshot's files among the hosts,
+    // which read their parts independently.  Reading the snapshot in
+    // timestamp order, or a change data feed's rows in `cdc_order_by`
+    // order, needs a single reader.
+    if config.timestamp_column.is_some() {
+        bail!(
+            "a distributed DeltaLake connector does not support 'timestamp_column', because each host reads its part of the snapshot in its own order"
+        );
+    }
+    if config.is_cdc() {
+        bail!(
+            "a distributed DeltaLake connector does not support 'cdc' mode, because 'cdc_order_by' requires a single reader"
+        );
+    }
+    // Only the home host follows the table, and it starts as soon as it has
+    // read its own part of the snapshot.  The changes that it reads could then
+    // reach the pipeline before the rows that they change, which other hosts
+    // are still reading, unless the snapshot's transaction across the hosts
+    // holds them back.
+    if matches!(config.mode, DeltaTableIngestMode::SnapshotAndFollow)
+        && config.transaction_mode == DeltaTableTransactionMode::None
+    {
+        bail!(
+            "a distributed DeltaLake connector in 'snapshot_and_follow' mode requires a 'transaction_mode' other than 'none', so that the host that follows the table does not read changes to rows before the other hosts read those rows from the snapshot"
+        );
+    }
+    Ok(())
 }
 
 impl DeltaTableInputReader {
@@ -548,9 +868,9 @@ impl DeltaTableInputReader {
         consumer: Box<dyn InputConsumer>,
         input_handle: &InputCollectionHandle,
         resume_info: Option<JsonValue>,
+        distributed: Option<DistributedInput>,
     ) -> AnyResult<Self> {
         let (sender, receiver) = channel(PipelineState::Paused);
-        let receiver_clone = receiver.clone();
 
         let resume_info = if let Some(resume_info) = resume_info {
             let resume_info = parse_resume_info::<DeltaResumeInfo>(&resume_info)?;
@@ -567,6 +887,15 @@ impl DeltaTableInputReader {
                 } => {
                     info!(
                         "delta_table {endpoint_name}: resuming to ingest the initial snapshot from table version {version} at timestamp {snapshot_timestamp}"
+                    );
+                }
+                DeltaResumeInfo {
+                    version: Some(version),
+                    snapshot_pending: true,
+                    ..
+                } => {
+                    info!(
+                        "delta_table {endpoint_name}: resuming to ingest the initial snapshot from table version {version}"
                     );
                 }
                 DeltaResumeInfo {
@@ -597,13 +926,32 @@ impl DeltaTableInputReader {
         let (init_status_sender, mut init_status_receiver) =
             mpsc::channel::<Result<(), ControllerError>>(1);
 
+        config.validate().map_err(|e| anyhow!("{e}"))?;
+
         if config.num_parsers == 0 {
             bail!("invalid 'num_parsers' value: 'num_parsers' must be greater than 0");
+        }
+
+        if distributed.is_some() {
+            validate_distributed(&config)?;
         }
 
         if config.end_version.is_some() && !config.follow() {
             bail!(
                 "the 'end_version' property is not valid in '{}' mode; it can only be used when the DeltaLake connector is configured with 'follow', 'snapshot_and_follow', or 'cdc' mode",
+                config.mode
+            )
+        }
+
+        // Rejected rather than ignored: `require` exists to fail loudly when a
+        // table records no change data, so silently dropping it in a mode that
+        // never reads one is the worst of both. Tested on the configured field
+        // and not on `change_feed()`, whose default the environment can set
+        // for the whole process: that must not fail every snapshot connector.
+        let change_feed_mode = config.follow() && !config.is_cdc();
+        if config.change_feed.is_some() && !change_feed_mode {
+            bail!(
+                "the 'change_feed' property is not valid in '{}' mode; it can only be used when the DeltaLake connector is configured with 'follow' or 'snapshot_and_follow' mode",
                 config.mode
             )
         }
@@ -681,6 +1029,7 @@ impl DeltaTableInputReader {
             consumer,
             schema,
             resume_info.clone(),
+            distributed,
         ));
 
         // This is needed to initialize completed_frontier for the connector. It's not ideal, as the completion
@@ -707,7 +1056,7 @@ impl DeltaTableInputReader {
                 .spawn(move || {
                     TOKIO.block_on(async {
                         let _ = endpoint_clone
-                            .worker_task(input_stream, receiver_clone, init_status_sender)
+                            .worker_task(input_stream, receiver, init_status_sender)
                             .await;
                     })
                 })
@@ -724,7 +1073,7 @@ impl DeltaTableInputReader {
 
         Ok(Self {
             sender,
-            inner: endpoint.clone(),
+            inner: endpoint,
         })
     }
 
@@ -747,6 +1096,10 @@ impl InputReader for DeltaTableInputReader {
         self
     }
 
+    fn startup_choice(&self) -> Option<JsonValue> {
+        self.inner.startup_choice.lock().unwrap().clone()
+    }
+
     fn request(&self, command: InputReaderCommand) {
         match command {
             InputReaderCommand::Replay { .. } => panic!(
@@ -761,56 +1114,7 @@ impl InputReader for DeltaTableInputReader {
             InputReaderCommand::Queue {
                 checkpoint_requested,
             } => {
-                // When initiating a checkpoint, try to stop at a delta table transaction boundary.
-                let stop_at: &dyn Fn(&QueueEntry) -> bool = if checkpoint_requested {
-                    &|entry: &QueueEntry| {
-                        matches!(
-                            entry,
-                            QueueEntry::ResumeInfo(Some(_)) | QueueEntry::Rollback
-                        )
-                    }
-                } else {
-                    &|_: &QueueEntry| false
-                };
-
-                let (total, _, resume_info) = self.inner.queue.flush_with_aux_until(stop_at);
-                let resume_status = match resume_info.last() {
-                    None => self.inner.last_resume_status.lock().unwrap().clone(),
-                    Some((_ts, QueueEntry::ResumeInfo(resume_info))) => resume_info.clone(),
-                    Some((_ts, QueueEntry::Rollback)) => Some(
-                        self.inner
-                            .last_checkpointable_status
-                            .lock()
-                            .unwrap()
-                            .clone(),
-                    ),
-                };
-
-                *self.inner.last_resume_status.lock().unwrap() = resume_status.clone();
-                if let Some(resume_status) = &resume_status {
-                    *self.inner.last_checkpointable_status.lock().unwrap() = resume_status.clone();
-                }
-
-                let resume = match resume_status {
-                    None => Resume::Barrier,
-                    Some(delta_resume_info) => delta_resume_info.to_resume(),
-                };
-
-                // We use the same format (DeltaResumeInfo) for resume info and watermark metadata.
-                self.inner.consumer.extended(
-                    total,
-                    Some(resume),
-                    resume_info
-                        .into_iter()
-                        .filter_map(|(timestamp, metadata)| match metadata {
-                            QueueEntry::ResumeInfo(resume_info) => Some(Watermark::new(
-                                timestamp,
-                                resume_info.map(|m| serde_json::to_value(m).unwrap()),
-                            )),
-                            QueueEntry::Rollback => None,
-                        })
-                        .collect(),
-                );
+                self.inner.queue(checkpoint_requested);
             }
             InputReaderCommand::Disconnect => {
                 let _ = self.sender.send_replace(PipelineState::Terminated);
@@ -819,6 +1123,12 @@ impl InputReader for DeltaTableInputReader {
     }
 
     fn is_closed(&self) -> bool {
+        // This reports the reader as closed once its worker exits, which also
+        // happens after the end of input.  [InputReader::is_closed] does not
+        // allow that, but here it does no harm: [Self::request] answers
+        // [InputReaderCommand::Queue] itself, without the worker, so the
+        // controller never finds the reader closed without an answer, and so
+        // never removes it.
         self.inner.queue.is_empty() && self.sender.is_closed()
     }
 }
@@ -827,6 +1137,18 @@ impl Drop for DeltaTableInputReader {
     fn drop(&mut self) {
         self.disconnect();
     }
+}
+
+/// Strips the `timestamp '...'` or `date '...'` that older checkpoints stored.
+fn raw_resume_timestamp(stored: &str) -> &str {
+    for prefix in ["timestamp '", "date '"] {
+        if let Some(rest) = stored.strip_prefix(prefix)
+            && let Some(raw) = rest.strip_suffix('\'')
+        {
+            return raw;
+        }
+    }
+    stored
 }
 
 /// Resume info stored in each checkpoint for the DeltaTableInputEndpoint.
@@ -844,11 +1166,31 @@ struct DeltaResumeInfo {
     /// and if `timestamp_column` is set in the configuration.
     ///
     /// The connector will resume loading the snapshot from this timestamp after
-    /// resuming from a checkpoint.
+    /// resuming from a checkpoint. Stored raw, as `cast(<ts> as string)` returns it.
     snapshot_timestamp: Option<String>,
 
     /// True if the connector reached the end-of-input state.
     eoi: bool,
+
+    /// True if a distributed connector opened the table at `version` to read
+    /// its share of the initial snapshot, but has not read any of it yet.  On
+    /// resume, the host reads its share at `version`, so that every host reads
+    /// the same version even if they stopped at different points.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    snapshot_pending: bool,
+
+    /// True if a distributed connector with `snapshot_pending` had already
+    /// requested the transaction for its share of the snapshot, which every
+    /// host joins (see
+    /// [`DeltaTableInputEndpointInner::start_distributed_snapshot_transaction`]).
+    ///
+    /// A host saves this state only if that transaction committed without its
+    /// share, for example because the host failed or the pipeline suspended.
+    /// The other hosts may then have finished their shares, and they will not
+    /// join a new such transaction, so on resume this host reads its share in
+    /// a transaction of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    snapshot_started: bool,
 }
 
 impl DeltaResumeInfo {
@@ -858,6 +1200,8 @@ impl DeltaResumeInfo {
             version: None,
             snapshot_timestamp: None,
             eoi: false,
+            snapshot_pending: false,
+            snapshot_started: false,
         }
     }
 
@@ -867,6 +1211,8 @@ impl DeltaResumeInfo {
             version: None,
             snapshot_timestamp: None,
             eoi: true,
+            snapshot_pending: false,
+            snapshot_started: false,
         }
     }
 
@@ -882,18 +1228,34 @@ impl DeltaResumeInfo {
             version: Some(version),
             snapshot_timestamp: None,
             eoi,
+            snapshot_pending: false,
+            snapshot_started: false,
         }
     }
 
     /// Checkpoint taken while the connector is ingesting the initial snapshot.
     ///
     /// * `version` is the version of the table being snapshotted.
-    /// * `timestamp` is the timestamp of the last record ingested as part of the initial snapshot.
+    /// * `timestamp` is the raw start of the next slice to ingest.
     fn snapshot_mode(version: i64, timestamp: &str) -> Self {
         Self {
             version: Some(version),
             snapshot_timestamp: Some(timestamp.to_string()),
             eoi: false,
+            snapshot_pending: false,
+            snapshot_started: false,
+        }
+    }
+
+    /// Checkpoint taken after a distributed connector opened the table at
+    /// `version` to read the initial snapshot, before it read any of it.
+    fn snapshot_pending(version: i64) -> Self {
+        Self {
+            version: Some(version),
+            snapshot_timestamp: None,
+            eoi: false,
+            snapshot_pending: true,
+            snapshot_started: false,
         }
     }
 
@@ -931,6 +1293,11 @@ struct DeltaTableMetrics {
     /// Target Delta table version for the in-flight catchup window;
     /// [`VERSION_METRIC_UNSET`] when no catchup window is active.
     catchup_target_version: AtomicU64,
+    /// Commits read from the change data files they recorded.
+    commits_from_change_data: AtomicU64,
+    /// Commits that recorded no change data and were read from the files they
+    /// added and removed instead.
+    commits_from_file_actions: AtomicU64,
 }
 
 /// Sentinel stored in version gauges before a value is available.
@@ -946,6 +1313,8 @@ impl DeltaTableMetrics {
             snapshot_transaction_starts: AtomicU64::new(0),
             last_ingested_version: AtomicU64::new(VERSION_METRIC_UNSET),
             catchup_target_version: AtomicU64::new(VERSION_METRIC_UNSET),
+            commits_from_change_data: AtomicU64::new(0),
+            commits_from_file_actions: AtomicU64::new(0),
         }
     }
 
@@ -1027,6 +1396,19 @@ impl ConnectorMetrics for DeltaTableMetrics {
                 ValueType::Gauge,
                 self.catchup_target_version_metric(),
             ),
+            (
+                "input_connector_delta_commits_from_change_data",
+                "Commits read from the change data files they recorded.",
+                ValueType::Counter,
+                self.commits_from_change_data.load(Ordering::Relaxed) as f64,
+            ),
+            (
+                "input_connector_delta_commits_from_file_actions",
+                "Commits that recorded no change data and were read from the files they added \
+                 and removed.",
+                ValueType::Counter,
+                self.commits_from_file_actions.load(Ordering::Relaxed) as f64,
+            ),
         ]
     }
 }
@@ -1045,6 +1427,149 @@ struct CatchupFollowState {
     target: Option<i64>,
     /// Label for the current Feldera transaction, if one has been started.
     transaction: Option<Option<String>>,
+}
+
+/// A CDC file read straight from the object store rather than through a
+/// listing: one carrying an active deletion vector, or any file of a location
+/// with no directory to list.
+type DirectCdcFile<'a> = (&'a CdcFile<'a>, Option<&'a DeletionVectorDescriptor>);
+
+/// A file's partition values in `partition_value_keys` order, as the key that
+/// groups files reading together.
+///
+/// The outer `Option` is load-bearing: a log that omits a partition column is
+/// not a log that records it as NULL, and grouping the two together would let
+/// whichever file the log listed first decide the value for both.
+type PartitionKey = Vec<Option<Option<String>>>;
+
+/// One data file of a CDC transaction or a snapshot, as the log describes it.
+struct CdcFile<'a> {
+    path: &'a str,
+    partition_values: Option<&'a HashMap<String, Option<String>>>,
+    deletion_vector: Option<&'a DeletionVectorDescriptor>,
+}
+
+/// The column Delta Lake's change data files carry alongside the table's own
+/// columns, naming the change each row represents.
+const CHANGE_TYPE_COLUMN: &str = "_change_type";
+
+/// The change types a change feed read applies as retractions, and its
+/// complement. Written as a predicate and its negation rather than two lists,
+/// so that every row falls in exactly one pass whatever its `_change_type`.
+const RETRACTED_CHANGE_TYPES: &str = "_change_type IN ('update_preimage', 'delete')";
+const INSERTED_CHANGE_TYPES: &str =
+    "_change_type IS NULL OR _change_type NOT IN ('update_preimage', 'delete')";
+
+/// Table property that makes a writer record change data files.
+const ENABLE_CHANGE_DATA_FEED: &str = "delta.enableChangeDataFeed";
+
+/// The column a table declares that collides with the change feed's
+/// [`CHANGE_TYPE_COLUMN`], if it declares one.
+///
+/// Delta schemas carry no case-sensitivity information, so the name is matched
+/// ignoring case, the way the rest of the connector matches column names (see
+/// [`ColumnNameSet`]). Returns the name the table uses, which need not be the
+/// spelling the feed uses.
+fn reserved_change_type_column(schema: &ArrowSchema) -> Option<&str> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .find(|name| name.eq_ignore_ascii_case(CHANGE_TYPE_COLUMN))
+}
+
+/// Iterate a string column as `Option<&str>`, whichever width of string array
+/// the read produced.
+///
+/// A read schema asks for view types ([`ReadSchema`]), so a string column
+/// arrives as `Utf8View`; a reader that binds `Utf8` cannot read it. `None`
+/// means the column is not a string at all.
+fn string_column_iter(column: &ArrayRef) -> Option<Box<dyn Iterator<Item = Option<&str>> + '_>> {
+    match column.data_type() {
+        ArrowDataType::Utf8 => Some(Box::new(column.as_string::<i32>().iter())),
+        ArrowDataType::LargeUtf8 => Some(Box::new(column.as_string::<i64>().iter())),
+        ArrowDataType::Utf8View => Some(Box::new(column.as_string_view().iter())),
+        _ => None,
+    }
+}
+
+/// Split `batch` into its table columns and one polarity per row, taken from the
+/// change feed's [`CHANGE_TYPE_COLUMN`].
+///
+/// The column is removed rather than left in place: it is not part of the SQL
+/// table, and the record deserializer would otherwise carry a string it discards
+/// for every row.
+fn take_change_type_polarities(mut batch: RecordBatch) -> AnyResult<(RecordBatch, Vec<bool>)> {
+    let index = batch.schema().index_of(CHANGE_TYPE_COLUMN).map_err(|_| {
+        anyhow!(
+            "internal error reading the Delta change data feed; {REPORT_ERROR}: column '{CHANGE_TYPE_COLUMN}' is missing from the batch"
+        )
+    })?;
+    let column = batch.remove_column(index);
+    let change_types = string_column_iter(&column).ok_or_else(|| {
+        anyhow!(
+            "internal error reading the Delta change data feed; {REPORT_ERROR}: column '{CHANGE_TYPE_COLUMN}' has type {:?}, expected a string column",
+            column.data_type()
+        )
+    })?;
+
+    let polarities = change_types
+        .map(|change_type| match change_type {
+            Some("insert") | Some("update_postimage") => Ok(true),
+            Some("delete") | Some("update_preimage") => Ok(false),
+            other => Err(anyhow!(
+                "unexpected value {} in the '{CHANGE_TYPE_COLUMN}' column of a Delta change data file; expected one of 'insert', 'update_postimage', 'update_preimage', 'delete'",
+                other.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"))
+            )),
+        })
+        .collect::<AnyResult<Vec<bool>>>()?;
+
+    Ok((batch, polarities))
+}
+
+/// How a read decides the polarity of each row it ingests.
+#[derive(Clone)]
+enum Polarity {
+    /// Every row in the frame shares one polarity: `true` inserts, `false` retracts
+    Fixed(bool),
+
+    /// `cdc` mode: a predicate over the row decides, `true` meaning delete.
+    /// The expression binds columns by index, so it is compiled against the
+    /// frame it evaluates (see [`DeltaTableInputEndpointInner::compile_delete_filter`]).
+    DeleteFilter(Arc<dyn PhysicalExpr>),
+
+    /// A change feed read: the `_change_type` column decides.
+    ChangeType,
+}
+
+/// Evaluate a compiled `cdc_delete_filter` against `batch`; returns one polarity
+/// per row.
+fn eval_delete_filter(expr: &dyn PhysicalExpr, batch: &RecordBatch) -> AnyResult<Vec<bool>> {
+    let deletions = expr.evaluate(batch).map_err(|e| {
+        anyhow!("internal error evaluating the delete filter expression; {REPORT_ERROR}: {e}")
+    })?;
+
+    let array = deletions
+        .into_array(batch.num_rows())
+        .map_err(|e| {
+            anyhow!(
+                "internal error converting the result of the delete filter expressions to array; {REPORT_ERROR}: {e}"
+            )
+        })?;
+    let bitmask = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            anyhow!(
+                "internal error converting the result of the delete filter expression to BooleanArray; {REPORT_ERROR}: expected Boolean, found {:?}", array.data_type()
+            )
+        })?;
+
+    Ok(bitmask
+        .into_iter()
+        // treat NULLs as inserts.
+        .map(|b| !b.unwrap_or(false))
+        .collect())
 }
 
 struct DeltaTableInputEndpointInner {
@@ -1076,8 +1601,9 @@ struct DeltaTableInputEndpointInner {
     catchup_follow_state: Mutex<CatchupFollowState>,
 
     /// SQL columns the connector actually reads (skippable unused columns
-    /// removed when `skip_unused_columns` is set). A delta column is kept iff it
-    /// is a member. Derived once from the immutable SQL schema.
+    /// removed when `skip_unused_columns` is set). One input to which Delta
+    /// columns are kept; see [`needs_column`](DeltaTableInputEndpointInner::needs_column).
+    /// Derived once from the immutable SQL schema.
     used_sql_columns: OnceLock<ColumnNameSet>,
 
     /// SQL columns named by the connector's own expressions -- `filter`,
@@ -1099,6 +1625,28 @@ struct DeltaTableInputEndpointInner {
     ///   later null-fills for earlier commits, and a dropped column is ignored
     ///   once gone.
     schema_table: Mutex<Option<Arc<DeltaTable>>>,
+
+    /// Whether the table records a change feed, as of the last `metaData`
+    /// action the connector read.
+    ///
+    /// Seeded at startup by [`validate_change_data_feed`](Self::validate_change_data_feed),
+    /// so the warning below fires on the transition rather than on every commit
+    /// of a table that never recorded one.
+    change_data_feed_enabled: AtomicBool,
+
+    /// For a distributed connector, this host's part of the input and the
+    /// table version that host 0 chose.
+    distributed: Option<DistributedInput>,
+
+    /// On host 0 of a distributed connector, the table version that it opened,
+    /// for the other hosts to read the snapshot at (see
+    /// [`InputReader::startup_choice`]).
+    startup_choice: Mutex<Option<JsonValue>>,
+
+    /// The label of the snapshot transaction that
+    /// [`Self::start_distributed_snapshot_transaction`] requested, until the
+    /// snapshot query takes it.
+    started_snapshot_transaction: Mutex<Option<Option<Option<String>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1111,7 +1659,8 @@ enum QueueEntry {
     /// between retries.
     ///
     /// Note: this is not the actual transaction rollback: the current transaction,
-    /// if any, will be committed.
+    /// if any, will be committed, except for a distributed snapshot's
+    /// transaction, which stays open.
     Rollback,
 }
 
@@ -1123,6 +1672,7 @@ impl DeltaTableInputEndpointInner {
         consumer: Box<dyn InputConsumer>,
         schema: Relation,
         resume_info: Option<DeltaResumeInfo>,
+        distributed: Option<DistributedInput>,
     ) -> Self {
         let queue = Arc::new(InputQueue::new(consumer.clone()));
 
@@ -1149,7 +1699,112 @@ impl DeltaTableInputEndpointInner {
             used_sql_columns: OnceLock::new(),
             config_referenced_columns: OnceLock::new(),
             schema_table: Mutex::new(None),
+            change_data_feed_enabled: AtomicBool::new(false),
+            distributed,
+            startup_choice: Mutex::new(None),
+            started_snapshot_transaction: Mutex::new(None),
         }
+    }
+
+    /// Flushes queued input to the circuit, for [InputReaderCommand::Queue].
+    fn queue(&self, checkpoint_requested: bool) {
+        // When initiating a checkpoint, try to stop at a delta table transaction boundary.
+        let stop_at: &dyn Fn(&QueueEntry) -> bool = if checkpoint_requested {
+            &|entry: &QueueEntry| {
+                matches!(
+                    entry,
+                    QueueEntry::ResumeInfo(Some(_)) | QueueEntry::Rollback
+                )
+            }
+        } else {
+            &|_: &QueueEntry| false
+        };
+
+        let (total, _, resume_info) = self.queue.flush_with_aux_until(stop_at);
+        let resume_status = match resume_info.last() {
+            None => self.last_resume_status.lock().unwrap().clone(),
+            Some((_ts, QueueEntry::ResumeInfo(resume_info))) => resume_info.clone(),
+            Some((_ts, QueueEntry::Rollback)) => {
+                Some(self.last_checkpointable_status.lock().unwrap().clone())
+            }
+        };
+
+        self.last_resume_status
+            .lock()
+            .unwrap()
+            .clone_from(&resume_status);
+        if let Some(resume_status) = &resume_status {
+            self.last_checkpointable_status
+                .lock()
+                .unwrap()
+                .clone_from(resume_status);
+        }
+
+        let resume = match resume_status {
+            None => Resume::Barrier,
+            Some(delta_resume_info) => delta_resume_info.to_resume(),
+        };
+
+        // We use the same format (DeltaResumeInfo) for resume info and watermark metadata.
+        self.consumer.extended(
+            total,
+            Some(resume),
+            resume_info
+                .into_iter()
+                .filter_map(|(timestamp, metadata)| match metadata {
+                    QueueEntry::ResumeInfo(resume_info) => Some(Watermark::new(
+                        timestamp,
+                        resume_info.map(|m| serde_json::to_value(m).unwrap()),
+                    )),
+                    QueueEntry::Rollback => None,
+                })
+                .collect(),
+        );
+    }
+
+    /// Returns true if this host follows the table's log after the snapshot.
+    ///
+    /// The log is a single sequence of commits, so only one host of a
+    /// distributed connector follows it: the home host.  The other hosts stop
+    /// after their part of the snapshot.
+    fn follows(&self) -> bool {
+        self.config.follow()
+            && self
+                .distributed
+                .as_ref()
+                .is_none_or(|distributed| distributed.shard.is_home())
+    }
+
+    /// On a host other than host 0 of a distributed connector, returns the
+    /// table version that host 0 chose, which this host must read the snapshot
+    /// at.  Returns `None` on host 0 and for a connector that is not
+    /// distributed.
+    ///
+    /// Only a host that has no version to resume from may call this: a host
+    /// that resumes uses its own version, and host 0 may then have chosen none.
+    fn chosen_version(&self) -> Result<Option<u64>, ControllerError> {
+        let Some(distributed) = &self.distributed else {
+            return Ok(None);
+        };
+        if distributed.shard.is_leader() {
+            return Ok(None);
+        }
+        let Some(choice) = &distributed.choice else {
+            return Err(ControllerError::invalid_transport_configuration(
+                &self.endpoint_name,
+                "the coordinator did not provide the table version that host 0 chose for this distributed connector",
+            ));
+        };
+        serde_json::from_value::<u64>(choice.clone())
+            .map(Some)
+            .map_err(|e| {
+                ControllerError::invalid_transport_configuration(
+                    &self.endpoint_name,
+                    &format!(
+                        "invalid table version {choice} from host 0 for this distributed connector: {e}"
+                    ),
+                )
+            })
     }
 
     fn catchup_target(&self) -> Option<i64> {
@@ -1269,6 +1924,127 @@ impl DeltaTableInputEndpointInner {
             Some(end_version) => min(latest, end_version),
             None => latest,
         })
+    }
+
+    /// Returns true if we haven't completed a snapshot before the checkpoint
+    /// that `resume_status` came from was taken, that is, if:
+    /// - there is no checkpoint,
+    /// - the checkpoint was taken in the initial state,
+    /// - the checkpoint was taken mid-snapshot (`snapshot_timestamp` is set), or
+    /// - the checkpoint was taken before the snapshot started
+    ///   (`snapshot_pending` is set).
+    fn snapshot_incomplete(resume_status: &Option<DeltaResumeInfo>) -> bool {
+        matches!(
+            resume_status,
+            None | Some(DeltaResumeInfo { version: None, .. })
+                | Some(DeltaResumeInfo {
+                    snapshot_timestamp: Some(_),
+                    ..
+                })
+                | Some(DeltaResumeInfo {
+                    snapshot_pending: true,
+                    ..
+                })
+        )
+    }
+
+    /// For a distributed connector that has not started its snapshot, records
+    /// that it opened `table` for the snapshot, so that a checkpoint taken
+    /// before it reads anything holds the version.
+    ///
+    /// Without this, such a checkpoint would hold no version.  On resume, the
+    /// host would then need host 0's choice, which a host 0 at end of input
+    /// does not make, or which names a newer version than the one that the
+    /// hosts that finished their shares read.
+    fn record_snapshot_version(&self, table: &DeltaTable) {
+        let mut last_resume_status = self.last_resume_status.lock().unwrap();
+        if self.distributed.is_some()
+            && self.config.snapshot()
+            && matches!(
+                *last_resume_status,
+                Some(DeltaResumeInfo {
+                    version: None,
+                    eoi: false,
+                    ..
+                })
+            )
+        {
+            // We verified that the table version is not None in `open_table`.
+            let pending = DeltaResumeInfo::snapshot_pending(table.version().unwrap() as i64);
+            *last_resume_status = Some(pending.clone());
+            *self.last_checkpointable_status.lock().unwrap() = pending;
+        }
+    }
+
+    /// For a distributed connector that reads its snapshot in a transaction,
+    /// waits until the connector runs, through `receiver`, and then requests
+    /// the transaction, before this host reads.  A paused connector does not
+    /// request it, because the transaction would stay open, holding back
+    /// output and checkpoints, until the connector reads its part.
+    ///
+    /// For testing only, setting [PER_HOST_SNAPSHOT_TRANSACTIONS_ENV] in the
+    /// environment skips this, so that each host requests an ordinary
+    /// transaction when it reads its first records.
+    ///
+    /// Otherwise, a host requests the transaction only when it reads its first
+    /// records, and a host whose part of the snapshot has no files never
+    /// requests it.  The request marks the transaction as one that every host
+    /// requests, so the coordinator commits it only after every host has
+    /// committed its part of the snapshot.  The snapshot query reuses the label (see
+    /// [`Self::snapshot_transaction_label`]), and the snapshot's final queue
+    /// entry commits the transaction as usual.
+    async fn start_distributed_snapshot_transaction(&self, receiver: &mut Receiver<PipelineState>) {
+        if self.distributed.is_none()
+            || std::env::var_os(PER_HOST_SNAPSHOT_TRANSACTIONS_ENV).is_some()
+            || !self.config.snapshot()
+            || !Self::snapshot_incomplete(&self.last_resume_status.lock().unwrap())
+            || self
+                .last_resume_status
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|status| status.snapshot_started)
+        {
+            return;
+        }
+        wait_running(receiver).await;
+        let Some(label) = self.allocate_snapshot_transaction_label() else {
+            return;
+        };
+        // A checkpoint taken after the transaction commits without this
+        // host's share records that this host started it.  Both copies of the
+        // status get the flag: a flush that consumes nothing, because the
+        // queue holds this request until the host joins the transaction,
+        // copies the last status over the checkpointable one.
+        let mark_started = |status: &mut DeltaResumeInfo| {
+            if status.snapshot_pending {
+                status.snapshot_started = true;
+            }
+        };
+        mark_started(&mut self.last_checkpointable_status.lock().unwrap());
+        if let Some(status) = self.last_resume_status.lock().unwrap().as_mut() {
+            mark_started(status);
+        }
+        // Every host makes this request, so the coordinator keeps the
+        // transaction open until every host has committed its part.  During a
+        // snapshot, every queue entry's resume info is `None`.
+        self.queue.push_entry(
+            InputQueueEntry::new_with_aux(Utc::now(), QueueEntry::ResumeInfo(None))
+                .with_start_transaction_on_all_hosts(label.clone()),
+            Vec::new(),
+        );
+        *self.started_snapshot_transaction.lock().unwrap() = Some(Some(label));
+    }
+
+    /// Returns the label of the transaction for the snapshot query: the one
+    /// that [`Self::start_distributed_snapshot_transaction`] requested, if any,
+    /// or a new one.
+    fn snapshot_transaction_label(&self) -> Option<Option<String>> {
+        self.started_snapshot_transaction
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.allocate_snapshot_transaction_label())
     }
 
     fn allocate_snapshot_transaction_label(&self) -> Option<Option<String>> {
@@ -1401,9 +2177,8 @@ impl DeltaTableInputEndpointInner {
     /// `snapshot_filter`, `cdc_delete_filter`, `cdc_order_by`), case-folded for
     /// matching. Derived once and cached.
     ///
-    /// These strings are validated during configuration, so they parse here; a
-    /// parse error is therefore unreachable and contributes no columns rather
-    /// than failing the connector a second time.
+    /// Endpoint initialization parses these strings first, in every mode, so a
+    /// parse error is unreachable here.
     fn config_referenced_columns(&self) -> &ColumnNameSet {
         self.config_referenced_columns.get_or_init(|| {
             let mut columns = BTreeSet::new();
@@ -1424,6 +2199,15 @@ impl DeltaTableInputEndpointInner {
         })
     }
 
+    /// Validate the filter expressions that apply in every mode: 'filter' and
+    /// 'snapshot_filter'. The CDC expressions are validated by
+    /// [`validate_cdc_config`](Self::validate_cdc_config) and
+    /// [`validate_cdc_delete_filter`](Self::validate_cdc_delete_filter).
+    fn validate_config_expressions(&self) -> Result<(), ControllerError> {
+        self.validate_snapshot_filter()?;
+        self.validate_filter()
+    }
+
     /// True if a column may actually be skipped: its shape permits omitting it
     /// ([`is_unused_and_omittable`](Self::is_unused_and_omittable)) *and* no
     /// connector expression references it. A referenced column must be read and
@@ -1436,53 +2220,27 @@ impl DeltaTableInputEndpointInner {
                 .contains(&field.name.name())
     }
 
-    /// True if CDC keeps the column named `name`. When `skip_unused_columns`
-    /// is off, keep everything. When on, keep a column only if the circuit
-    /// reads it (`used_sql_columns`) or a connector expression names it
-    /// (`config_referenced_columns`, which also covers Delta metadata columns
-    /// like `__feldera_op` that the SQL schema omits).
-    ///
-    /// The plain and DV-masked CDC sides must apply this same rule, or their
-    /// columns differ and the `UNION ALL` no longer lines up by position. The
-    /// off case needs the explicit `!skip_unused_columns()`: `used_sql_columns`
-    /// holds only SQL columns, but the unprojected frame also carries Delta
-    /// physical columns the SQL table never maps.
-    fn keeps_cdc_column(&self, name: &str) -> bool {
-        !self.skip_unused_columns()
-            || self.used_sql_columns().contains(name)
-            || self.config_referenced_columns().contains(name)
+    /// True if the connector reads the column `name`: the circuit uses it, or a
+    /// connector expression names it -- including Delta columns the SQL table
+    /// never declares (`__feldera_op`, a filter-only column), which the
+    /// projection then drops.
+    fn needs_column(&self, name: &str) -> bool {
+        self.used_sql_columns().contains(name) || self.config_referenced_columns().contains(name)
     }
 
-    /// Project `df` to the columns the connector needs when `skip_unused_columns`
-    /// is set, mirroring the snapshot path's `SELECT <used_columns>`: keep a
-    /// column iff the circuit reads it (`used_sql_columns`) or a connector
-    /// expression names it (`config_referenced_columns`). The latter covers Delta
-    /// metadata columns absent from the SQL schema, e.g. `__feldera_op` /
-    /// `__feldera_ts`, which `cdc_delete_filter` / `cdc_order_by` test, so those
-    /// expressions can resolve. A Delta table may carry far more physical columns
-    /// than the SQL table maps; this keeps the connector from reading the rest
-    /// off disk.
-    ///
-    /// The plain `ListingTable` side and the DV-masked side of a CDC transaction
-    /// both project through [`keeps_cdc_column`](Self::keeps_cdc_column), so the
-    /// two relations expose the same columns and their `UNION ALL` lines up.
+    /// Project `df` to [`needs_column`](Self::needs_column), like the snapshot
+    /// path's `SELECT <used_columns>`. Both CDC read sides use this predicate,
+    /// so their `UNION ALL` lines up by position.
     fn project_cdc_columns(&self, df: DataFrame) -> AnyResult<DataFrame> {
-        if !self.skip_unused_columns() {
-            return Ok(df);
-        }
-
         // Filter `df`'s own field list (not the SQL schema) so the projection
         // tracks the read schema if column mapping ever varies it across
-        // versions, and preserves on-disk column order: the order the
-        // `cdc_delete_filter` `PhysicalExpr` binds by index in
-        // `extract_delete_filter_expr`. Own the kept names before consuming `df`;
-        // `select_columns` takes `df` by value, so the `df.schema()` borrow must
-        // end first.
+        // versions. Own the kept names before consuming `df`; `select_columns`
+        // takes `df` by value, so the `df.schema()` borrow must end first.
         let kept: Vec<String> = df
             .schema()
             .fields()
             .iter()
-            .filter(|f| self.keeps_cdc_column(f.name()))
+            .filter(|f| self.needs_column(f.name()))
             .map(|f| f.name().to_string())
             .collect();
         let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
@@ -1494,9 +2252,9 @@ impl DeltaTableInputEndpointInner {
     /// Load the entire table snapshot as a single "select * where <filter>" query.
     /// Returns the total number of records processed.
     ///
-    /// Fails with an error if the function fails to read the snapshot.  This function
-    /// doesn't retry (the idea being that the snapshot can be large, and it's better to
-    /// fail fast and give the user a chance to restart the pipeline).
+    /// Fails with an error if the function fails to read the snapshot after
+    /// [`DeltaTableReaderConfig::max_retries`] retries.  Each retry reads the
+    /// whole snapshot again.
     async fn read_unordered_snapshot(
         &self,
         table: &DeltaTable,
@@ -1540,7 +2298,7 @@ impl DeltaTableInputEndpointInner {
                 QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(
                     // We verified that the table version is not None in the open_table method.
                     table.version().unwrap() as i64,
-                    !self.config.follow(),
+                    !self.follows(),
                 ))),
             )
             // If we started a transaction while processing the snapshot, commit it now.
@@ -1586,7 +2344,7 @@ impl DeltaTableInputEndpointInner {
                 QueueEntry::ResumeInfo(Some(DeltaResumeInfo::follow_mode(
                     // We verified that the table version is not None in the open_table method.
                     table.version().unwrap() as i64,
-                    !self.config.follow(),
+                    !self.follows(),
                 ))),
             )
             // If we started a transaction while processing the snapshot, commit it now.
@@ -1626,12 +2384,32 @@ impl DeltaTableInputEndpointInner {
             }
         );
 
-        let bounds = execute_query_collect(&self.datafusion, &bounds_query).await?;
-
-        info!(
-            "delta_table {}: querying the table for min and max timestamp values",
-            &self.endpoint_name,
-        );
+        // The log only saves a scan, so an error reading it falls back to the query.
+        let from_log = self
+            .timestamp_bounds_from_log(table, timestamp_field)
+            .unwrap_or_else(|e| {
+                warn!(
+                    "delta_table {}: cannot read the timestamp bounds from the Delta log, so querying the table instead: {e}",
+                    &self.endpoint_name
+                );
+                None
+            });
+        let bounds = match from_log {
+            Some(bounds) => {
+                info!(
+                    "delta_table {}: reading the min and max timestamp values from the Delta log",
+                    &self.endpoint_name,
+                );
+                bounds.collect().await?
+            }
+            None => {
+                info!(
+                    "delta_table {}: querying the table for the min and max timestamp values",
+                    &self.endpoint_name,
+                );
+                execute_query_collect(&self.datafusion, &bounds_query).await?
+            }
+        };
 
         if bounds.len() != 1 || bounds[0].num_rows() != 1 {
             info!(
@@ -1661,7 +2439,7 @@ impl DeltaTableInputEndpointInner {
             snapshot_timestamp: Some(snapshot_timestamp),
             ..
         }) => {
-            snapshot_timestamp.clone()
+            raw_resume_timestamp(snapshot_timestamp).to_string()
         } _ => {
             array_to_string(bounds[0].column(0))
             .ok_or_else(|| anyhow!("internal error: cannot retrieve the first column in the output of query '{bounds_query}' as a string"))?
@@ -1693,12 +2471,12 @@ impl DeltaTableInputEndpointInner {
 
         loop {
             // Evaluate SQL expression for the new end of the interval.
-            let end = execute_singleton_query(
+            let end_raw = execute_singleton_query(
                 &self.datafusion,
                 &format!("select cast(({start} + {lateness}) as string)"),
             )
             .await?;
-            let end = timestamp_to_sql_expression(&timestamp_field.columntype, &end);
+            let end = timestamp_to_sql_expression(&timestamp_field.columntype, &end_raw);
 
             // Query the table for the range.
             let mut range_query = format!(
@@ -1740,7 +2518,7 @@ impl DeltaTableInputEndpointInner {
                     QueueEntry::ResumeInfo(Some(DeltaResumeInfo::snapshot_mode(
                         // We verified that the table version is not None in the open_table method.
                         table.version().unwrap() as i64,
-                        &start,
+                        &end_raw,
                     ))),
                 )
                 // If we started a transaction while processing the range query, commit it now.
@@ -1752,6 +2530,117 @@ impl DeltaTableInputEndpointInner {
         }
 
         Ok(total_records)
+    }
+
+    /// The min and max of the timestamp column, as `start_ts` and `end_ts`, from the Delta log's
+    /// per-file statistics, so that no data file is read. No rows when no file has a non-NULL
+    /// value. `None` when a filter is set or a file has no statistics for the column.
+    fn timestamp_bounds_from_log(
+        &self,
+        table: &DeltaTable,
+        timestamp_field: &Field,
+    ) -> AnyResult<Option<DataFrame>> {
+        // With a filter, the bounds of all files can be much wider than those of the rows it keeps,
+        // and each extra range is one more query, so let the query find them.
+        if self.effective_snapshot_filter().is_some() {
+            return Ok(None);
+        }
+        let snapshot = table.snapshot()?;
+        let name = ColumnNameSet::from_names([timestamp_field.name.name()]);
+        let schema = snapshot.schema();
+        let Some(field) = schema.fields().find(|f| name.contains(f.name())) else {
+            return Ok(None);
+        };
+        // The add actions name a partition column's value by its logical name, and its statistics
+        // by its physical name.
+        let physical = match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+            Some(MetadataValue::String(physical)) => physical.clone(),
+            _ => field.name().to_string(),
+        };
+        let partitioned = snapshot
+            .metadata()
+            .partition_columns()
+            .contains(field.name());
+        let (lo, hi) = if partitioned {
+            let partition = format!("partition.{}", field.name());
+            (partition.clone(), partition)
+        } else {
+            (format!("min.{physical}"), format!("max.{physical}"))
+        };
+
+        let mut stats = Vec::new();
+        for batch in snapshot.add_actions_batches(true)? {
+            let (Some(lo), Some(hi)) = (batch.column_by_name(&lo), batch.column_by_name(&hi))
+            else {
+                return Ok(self.warn_no_statistics(field.name()));
+            };
+            // A file whose column is all NULL has a NULL min and max, and no range reads it.
+            let all_null = match (
+                batch.column_by_name(&format!("null_count.{physical}")),
+                batch.column_by_name("num_records"),
+            ) {
+                _ if partitioned => is_null(lo)?,
+                (Some(nulls), Some(records)) => {
+                    // An unknown count keeps the file; `prep_null_mask_filter` needs a NULL.
+                    let all_null = eq(nulls, records)?;
+                    match all_null.null_count() {
+                        0 => all_null,
+                        _ => prep_null_mask_filter(&all_null),
+                    }
+                }
+                _ => BooleanArray::from(vec![false; batch.num_rows()]),
+            };
+            let file_stats = filter_record_batch(
+                &RecordBatch::try_from_iter([("lo", lo.clone()), ("hi", hi.clone())])?,
+                &not(&all_null)?,
+            )?;
+            if file_stats.column(0).null_count() + file_stats.column(1).null_count() > 0 {
+                return Ok(self.warn_no_statistics(field.name()));
+            }
+            stats.push(file_stats);
+        }
+        // No file has a non-NULL value, so the snapshot is empty.
+        if stats.iter().all(|b| b.num_rows() == 0) {
+            let schema = ArrowSchema::new(vec![
+                ArrowField::new("start_ts", ArrowDataType::Utf8, true),
+                ArrowField::new("end_ts", ArrowDataType::Utf8, true),
+            ]);
+            let empty = RecordBatch::new_empty(Arc::new(schema));
+            return Ok(Some(self.datafusion.read_batch(empty)?));
+        }
+
+        // The log truncates a timestamp's max to milliseconds; round it up so that the ranges, each
+        // as wide as the column's `LATENESS`, reach past the true max.
+        let hi = match stats[0].schema().field(1).data_type() {
+            ArrowDataType::Timestamp(..) => {
+                ident("hi") + lit(ScalarValue::new_interval_mdn(0, 0, 1_000_000))
+            }
+            _ => ident("hi"),
+        };
+        let bounds = self
+            .datafusion
+            .read_batches(stats)?
+            .aggregate(
+                vec![],
+                vec![
+                    datafusion::functions_aggregate::expr_fn::min(ident("lo")).alias("lo"),
+                    datafusion::functions_aggregate::expr_fn::max(ident("hi")).alias("hi"),
+                ],
+            )?
+            .select(vec![
+                cast(ident("lo"), ArrowDataType::Utf8).alias("start_ts"),
+                cast(hi, ArrowDataType::Utf8).alias("end_ts"),
+            ])?;
+        Ok(Some(bounds))
+    }
+
+    /// Warns that some files have no statistics for `column`, and returns `None`.
+    fn warn_no_statistics(&self, column: &str) -> Option<DataFrame> {
+        warn!(
+            "delta_table {}: the Delta log has no statistics for column '{column}' in some data files, so the connector cannot skip those files when it finds the column's range or reads one range of it; to read faster, collect statistics for the column (table property 'delta.dataSkippingStatsColumns') and recompute them for the existing files",
+            &self.endpoint_name,
+        );
+        None
     }
 
     /// Runs `operation` until it succeeds or [`DeltaTableReaderConfig::max_retries`] is exhausted.
@@ -1809,6 +2698,14 @@ impl DeltaTableInputEndpointInner {
         mut receiver: Receiver<PipelineState>,
         init_status_sender: mpsc::Sender<Result<(), ControllerError>>,
     ) {
+        // Validate before opening the table: 'filter' applies to follow reads
+        // too, so an invalid expression must fail startup rather than the first
+        // commit.
+        if let Err(e) = self.validate_config_expressions() {
+            let _ = init_status_sender.send(Err(e)).await;
+            return;
+        }
+
         let table = match self.open_table().await {
             Err(e) => {
                 let _ = init_status_sender.send(Err(e)).await;
@@ -1818,28 +2715,41 @@ impl DeltaTableInputEndpointInner {
         };
 
         let table = Arc::new(table);
+        self.record_snapshot_version(&table);
+
+        if let Some(distributed) = &self.distributed
+            && distributed.shard.is_leader()
+        {
+            // We verified that the table version is not None in `open_table`.
+            *self.startup_choice.lock().unwrap() = Some(JsonValue::from(table.version().unwrap()));
+        }
 
         // The opened table is the schema source until following pins it to the
         // latest version; this makes it available to the snapshot reads below.
         *self.schema_table.lock().unwrap() = Some(Arc::clone(&table));
+
+        if let Err(e) = self.validate_change_data_feed(&table) {
+            let _ = init_status_sender.send(Err(e)).await;
+            return;
+        }
 
         if let Err(e) = self.prepare_snapshot_query(&table).await {
             let _ = init_status_sender.send(Err(e)).await;
             return;
         };
 
-        let cdc_delete_filter = match self.prepare_cdc().await {
-            Err(e) => {
-                let _ = init_status_sender.send(Err(e)).await;
-                return;
-            }
-            Ok(cdc_delete_filter) => cdc_delete_filter,
-        };
+        if let Err(e) = self.prepare_cdc().await {
+            let _ = init_status_sender.send(Err(e)).await;
+            return;
+        }
 
         // Code before this point is part of endpoint initialization.
         // After this point, the thread should continue running until it receives a
         // shutdown command from the controller.
         let _ = init_status_sender.send(Ok(())).await;
+
+        self.start_distributed_snapshot_transaction(&mut receiver)
+            .await;
 
         // Wait for the pipeline to start before reading.
         wait_running(&mut receiver).await;
@@ -1848,6 +2758,7 @@ impl DeltaTableInputEndpointInner {
 
         if let Some(DeltaResumeInfo {
             version: Some(version),
+            snapshot_pending: false,
             ..
         }) = &last_resume_status
         {
@@ -1857,18 +2768,7 @@ impl DeltaTableInputEndpointInner {
         // We verified that the table version is not None in the open_table method.
         let mut version = table.version().unwrap() as i64;
 
-        // We haven't completed a snapshot before the checkpoint was taken if
-        // - there is no checkpoint
-        // - the checkpoint was taken in the initial state
-        // - the checkpoint was taken mid-snapshot (snapshot_timestamp is set)
-        let snapshot_incomplete = matches!(
-            last_resume_status,
-            None | Some(DeltaResumeInfo { version: None, .. })
-                | Some(DeltaResumeInfo {
-                    snapshot_timestamp: Some(_),
-                    ..
-                })
-        );
+        let snapshot_incomplete = Self::snapshot_incomplete(&last_resume_status);
 
         let snapshot_record_count = if snapshot_incomplete
             && self.config.snapshot()
@@ -1894,7 +2794,7 @@ impl DeltaTableInputEndpointInner {
         };
 
         // Start following the table if required by the configuration.
-        if self.config.follow() {
+        if self.follows() {
             // The schema source stays at the version we opened at; each commit's
             // schema change advances it as the loop reaches that commit (see
             // `advance_schema`), so every commit's data is read against the
@@ -1910,17 +2810,17 @@ impl DeltaTableInputEndpointInner {
                     .phase
                     .store(DeltaPhase::Follow as u64, Ordering::Relaxed);
                 info!(
-                    "delta_table {}: snapshot phase completed, switching to follow mode (records: {}, version: {})",
-                    &self.endpoint_name, snapshot_record_count, version
+                    "delta_table {}: snapshot phase completed, switching to '{}' mode (records: {}, version: {})",
+                    &self.endpoint_name, self.config.mode, snapshot_record_count, version
                 );
             } else if !self.config.snapshot() {
-                // Pure CDC follow mode (no snapshot configured)
+                // Following the log without an initial snapshot.
                 self.metrics
                     .phase
                     .store(DeltaPhase::Follow as u64, Ordering::Relaxed);
                 info!(
-                    "delta_table {}: CDC follow started (from version: {})",
-                    &self.endpoint_name, version
+                    "delta_table {}: '{}' mode started (from version: {})",
+                    &self.endpoint_name, self.config.mode, version
                 );
             }
             // Note: If self.config.snapshot() && !snapshot_incomplete, we're resuming from a checkpoint
@@ -1993,12 +2893,20 @@ impl DeltaTableInputEndpointInner {
                             }
                             DeltaTableTransactionMode::Catchup => {
                                 if self.catchup_target().is_none() {
+                                    // A catchup window batches every commit up to the table's latest version into a transaction, so open
+                                    // it only while the connector is running; otherwise it can latch the table version from before it was paused.
+                                    wait_running(&mut receiver).await;
+
                                     let target =
                                         match self.catchup_target_version(Arc::clone(&table)).await
                                         {
                                             Ok(target) => target,
                                             Err(_) => break,
                                         };
+                                    // A pause during the listing makes `target` stale: commits written while paused belong in this window too.
+                                    if *receiver.borrow() != PipelineState::Running {
+                                        continue;
+                                    }
                                     debug!(
                                         "delta_table {}: starting catchup transaction (current version: {version}, target version: {target})",
                                         &self.endpoint_name,
@@ -2021,7 +2929,6 @@ impl DeltaTableInputEndpointInner {
                                 new_version,
                                 &actions,
                                 &table,
-                                cdc_delete_filter.clone(),
                                 input_stream.as_mut(),
                                 &mut receiver,
                                 start_transaction,
@@ -2103,7 +3010,7 @@ impl DeltaTableInputEndpointInner {
         let url = ensure_table_uri(&self.config.uri).map_err(|e| {
             ControllerError::invalid_transport_configuration(
                 &self.endpoint_name,
-                &format!("invalid Delta table uri '{}': {e}", &self.config.uri),
+                &format!("invalid Delta table uri '{}': {e}", self.config.uri),
             )
         })?;
 
@@ -2140,6 +3047,10 @@ impl DeltaTableInputEndpointInner {
                 {
                     // If we are resuming from a checkpoint, use the version specified in the checkpoint.
                     table_builder.with_version(version as u64)
+                } else if let Some(version) = self.chosen_version()? {
+                    // Read the snapshot at the version that host 0 chose, so
+                    // that the hosts together read one version's files.
+                    table_builder.with_version(version)
                 } else {
                     match &self.config {
                         DeltaTableReaderConfig {
@@ -2180,14 +3091,7 @@ impl DeltaTableInputEndpointInner {
                 match tokio::time::timeout(operation_timeout, table_builder.load()).await {
                     Ok(Ok(table)) => break table,
                     Ok(Err(e)) => {
-                        // Timeout errors can originate from multiple transitive dependencies. There is no easy
-                        // way to identify them in a strongly-typed fashion. Instead, we check for the "timeout"
-                        // substring in a formatter representation of the error.
-                        //
-                        // Debug-format `e` as the timeout error is often found toward the end of the error chain.
-                        let is_timeout = format!("{:?}", e).to_lowercase().contains("timeout");
-
-                        if is_timeout && retry_count < MAX_RETRIES {
+                        if is_retryable_delta_load_error(&e) && retry_count < MAX_RETRIES {
                             retry_count += 1;
                             let backoff_ms = min(1000 * (1 << (retry_count - 1)), 10_000);
                             warn!(
@@ -2199,7 +3103,7 @@ impl DeltaTableInputEndpointInner {
                         } else {
                             return Err(ControllerError::invalid_transport_configuration(
                                 &self.endpoint_name,
-                                &format!("error opening delta table '{}': {e:?}", &self.config.uri),
+                                &format!("error opening delta table '{}': {e:?}", self.config.uri),
                             ));
                         }
                     }
@@ -2209,7 +3113,7 @@ impl DeltaTableInputEndpointInner {
                                 &self.endpoint_name,
                                 &format!(
                                     "timeout loading delta table '{}' after {retry_count} attempts",
-                                    &self.config.uri,
+                                    self.config.uri,
                                 ),
                             ));
                         } else {
@@ -2234,6 +3138,8 @@ impl DeltaTableInputEndpointInner {
             )
         })? as i64;
 
+        check_no_variant_shredding(&self.endpoint_name, &delta_table)?;
+
         // If we are about to follow the table, set resume state to the current table version, otherwise
         // the connector will remain in the barrier state until at least one transaction is added to the log.
         if !self.config.snapshot() {
@@ -2246,11 +3152,11 @@ impl DeltaTableInputEndpointInner {
         // Our snapshot scans and CDC listing tables both address files by the
         // table's `root_url()`, so register that store with datafusion.
         // Without it, `select ... from snapshot` fails with "No suitable object
-        // store found for <root>". (delta-rs 0.32.x no longer uses the old
+        // store found for <root>". (delta-rs no longer uses the old
         // synthetic `delta-rs://` URL, so we don't register it anymore.)
         let log_store = delta_table.log_store();
         let runtime_env = self.datafusion.runtime_env();
-        runtime_env.register_object_store(log_store.root_url(), log_store.root_object_store(None));
+        runtime_env.register_object_store(log_store.root_url(), log_store.root_object_store());
 
         // if let Some(schema) = delta_table.schema() {
         //     info!("Delta table schema: {schema:?}");
@@ -2285,6 +3191,15 @@ impl DeltaTableInputEndpointInner {
                 anyhow!("failed to obtain Delta table provider for snapshot: {e}"),
             )
         })?;
+        let provider = match &self.distributed {
+            Some(distributed) => self
+                .snapshot_share(table, provider, &distributed.shard)
+                .await
+                .map_err(|e| {
+                    ControllerError::input_transport_error(&self.endpoint_name, true, e)
+                })?,
+            None => provider,
+        };
         self.datafusion
             .register_table("snapshot", provider)
             .map_err(|e| {
@@ -2296,6 +3211,66 @@ impl DeltaTableInputEndpointInner {
             })?;
 
         Ok(())
+    }
+
+    /// Returns a table of this host's part of the snapshot of `table`, given
+    /// the `whole` table.
+    ///
+    /// The hosts of a distributed connector divide the snapshot's data files:
+    /// in order by path, the `i`th file goes to the host that `shard` says owns
+    /// unit `i`.  Every host opened the same table version, so every host sees
+    /// the same files in the same order, and each file goes to exactly one
+    /// host.
+    async fn snapshot_share(
+        &self,
+        table: &DeltaTable,
+        whole: Arc<dyn TableProvider>,
+        shard: &InputShard,
+    ) -> AnyResult<Arc<dyn TableProvider>> {
+        let snapshot = table
+            .snapshot()
+            .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?;
+        // `Add` supplies each file's partition values as the log's strings,
+        // which `add_partition_columns` needs.
+        #[allow(deprecated)]
+        let mut adds = snapshot
+            .log_data()
+            .iter()
+            .map(|file| file.add_action())
+            .collect::<Vec<_>>();
+        adds.sort_by(|a, b| a.path.cmp(&b.path));
+        let n_files = adds.len();
+        let files = adds
+            .iter()
+            .enumerate()
+            .filter(|(index, _add)| shard.contains(*index as u64))
+            .map(|(_index, add)| CdcFile {
+                path: &add.path,
+                partition_values: Some(&add.partition_values),
+                deletion_vector: add.deletion_vector.as_ref(),
+            })
+            .collect::<Vec<_>>();
+        info!(
+            "delta_table {}: host {} reads {} of the snapshot's {n_files} files",
+            &self.endpoint_name,
+            shard.host(),
+            files.len(),
+        );
+
+        let df = match self.files_dataframe(table, &files, "snapshot").await? {
+            Some(df) => df,
+            // No files: an empty table with the columns that the snapshot query
+            // reads.
+            None => self
+                .project_cdc_columns(
+                    self.datafusion
+                        .read_table(whole)
+                        .map_err(|e| anyhow!("error reading Delta table: {e}"))?,
+                )?
+                .limit(0, Some(0))
+                .map_err(|e| anyhow!("error creating an empty snapshot: {e}"))?,
+        };
+        Ok(df.into_view())
     }
 
     /// Validate the filter expression specified in the 'snapshot_filter' parameter.
@@ -2354,115 +3329,81 @@ impl DeltaTableInputEndpointInner {
 
     /// Convert the delete filter SQL expression into a Datafusion PhysicalExpr.
     ///
-    /// Parses `cdc_delete_filter` directly against the snapshot schema and
-    /// lowers the resulting logical expression to a physical expression.
-    async fn extract_delete_filter_expr(
-        &self,
-    ) -> Result<Option<Arc<dyn PhysicalExpr>>, ControllerError> {
-        let Some(delete_filter) = &self.config.cdc_delete_filter else {
+    /// Compile `cdc_delete_filter`, if configured, against `schema`: the schema of
+    /// the frame the filter will evaluate.
+    fn compile_delete_filter(&self, schema: &DFSchema) -> AnyResult<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(delete_filter) = self.config.cdc_delete_filter.as_deref() else {
             return Ok(None);
         };
 
-        let snapshot_df = self
-            .datafusion
-            .table("snapshot")
-            .await
-            .map_err(|_e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!(
-                        "internal error compiling 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: table 'snapshot' not found"
-                    ),
-                )
-            })?;
-
-        // The compiled `PhysicalExpr` binds columns by index, so it must see the
-        // same schema as the batches it will evaluate. When `skip_unused_columns`
-        // is set, `process_cdc_transaction` projects those batches to the CDC
-        // read set via `project_cdc_columns`, so project here through the same
-        // helper. Both derive the read set from the same Delta snapshot (this
-        // `snapshot` table is registered from it), so the column order matches.
-        let snapshot_df = self.project_cdc_columns(snapshot_df).map_err(|e| {
-            ControllerError::invalid_transport_configuration(
-                &self.endpoint_name,
-                &format!(
-                    "internal error compiling 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: {e}"
-                ),
-            )
-        })?;
-
-        let schema = snapshot_df.schema().clone();
-
         let filter_expr = self
             .datafusion
-            .parse_sql_expr(delete_filter, &schema)
+            .parse_sql_expr(delete_filter, schema)
             .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!("invalid 'cdc_delete_filter' expression '{delete_filter}': {e}"),
-                )
+                anyhow!("invalid 'cdc_delete_filter' expression '{delete_filter}': {e}")
+            })?;
+
+        // Coerce the expression's types the way the logical analyzer does for a
+        // planned predicate. Compiling a physical expression directly skips that
+        // pass, and then a literal keeps whatever type the parser gave it: a
+        // `Utf8` literal compared against a `Utf8View` column reaches the Arrow
+        // kernel as "Invalid comparison operation: Utf8View == Utf8".
+        let filter_expr = filter_expr
+            .rewrite(&mut TypeCoercionRewriter::new(schema))
+            .data()
+            .map_err(|e| {
+                anyhow!("cannot compile 'cdc_delete_filter' expression '{delete_filter}': {e}")
             })?;
 
         let physical_expr = DefaultPhysicalPlanner::default()
-            .create_physical_expr(&filter_expr, &schema, &self.datafusion.state())
+            .create_physical_expr(
+                &filter_expr,
+                schema,
+                &self.datafusion.state(),
+                &PhysicalPlanningContext::default(),
+            )
             .map_err(|e| {
-                ControllerError::invalid_transport_configuration(
-                    &self.endpoint_name,
-                    &format!(
-                        "internal error compiling 'cdc_delete_filter' expression '{delete_filter}'; {REPORT_ERROR}: {e}"
-                    ),
-                )
+                anyhow!("cannot compile 'cdc_delete_filter' expression '{delete_filter}': {e}")
             })?;
 
         Ok(Some(physical_expr))
     }
 
-    /// Evaluate delete filter expression against a batch of updates; returns a vector of polarities.
-    async fn eval_delete_filter(
-        delete_filter: &dyn PhysicalExpr,
-        batch: &RecordBatch,
-    ) -> AnyResult<Vec<bool>> {
-        let deletions = delete_filter.evaluate(batch).map_err(|e| {
-            anyhow!("internal error evaluating the delete filter expression; {REPORT_ERROR}: {e}")
+    /// Validate the filter expression specified in the 'cdc_delete_filter'
+    /// parameter by compiling it against the snapshot schema. Each transaction
+    /// compiles the expression again, against the frame it reads.
+    async fn validate_cdc_delete_filter(&self) -> Result<(), ControllerError> {
+        if self.config.cdc_delete_filter.is_none() {
+            return Ok(());
+        }
+
+        let invalid_config =
+            |e: String| ControllerError::invalid_transport_configuration(&self.endpoint_name, &e);
+
+        let snapshot_df = self.datafusion.table("snapshot").await.map_err(|_e| {
+            invalid_config(format!(
+                "internal error validating 'cdc_delete_filter'; {REPORT_ERROR}: table 'snapshot' not found"
+            ))
         })?;
+        let snapshot_df = self
+            .project_cdc_columns(snapshot_df)
+            .map_err(|e| invalid_config(e.to_string()))?;
 
-        let array = deletions
-            .into_array(batch.num_rows())
-            .map_err(|e| {
-                anyhow!(
-                    "internal error converting the result of the delete filter expressions to array; {REPORT_ERROR}: {e}"
-                )
-            })?;
-        let bitmask = array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| {
-                anyhow!(
-                    "internal error converting the result of the delete filter expression to BooleanArray; {REPORT_ERROR}: expected Boolean, found {:?}", array.data_type()
-                )
-            })?;
-
-        let polarities = bitmask
-            .into_iter()
-            // treat NULLs as inserts.
-            .map(|b| !b.unwrap_or(false))
-            .collect::<Vec<bool>>();
-
-        Ok(polarities)
+        self.compile_delete_filter(snapshot_df.schema())
+            .map(|_| ())
+            .map_err(|e| invalid_config(e.to_string()))
     }
 
     /// Prepare to read initial snapshot, if required by endpoint configuration.
     ///
     /// * register snapshot as a datafusion table
-    /// * validate snapshot config: filter condition and timestamp column
+    /// * validate the timestamp column against the registered snapshot
     async fn prepare_snapshot_query(&self, table: &Arc<DeltaTable>) -> Result<(), ControllerError> {
         if !self.config.snapshot() && !self.config.is_cdc() {
             return Ok(());
         }
 
         self.register_snapshot_table(table).await?;
-        self.validate_snapshot_filter()?;
-        self.validate_filter()?;
 
         if let Some(timestamp_column) = &self.config.timestamp_column {
             validate_timestamp_column(
@@ -2478,12 +3419,64 @@ impl DeltaTableInputEndpointInner {
         Ok(())
     }
 
+    /// Check at startup what a change feed read needs from the table.
+    ///
+    /// `change_feed = require` fails unless the table has `delta.enableChangeDataFeed` set.
+    /// `auto` accepts either.
+    fn validate_change_data_feed(&self, table: &DeltaTable) -> Result<(), ControllerError> {
+        if !self.config.reads_change_feed() {
+            return Ok(());
+        }
+
+        let invalid = |message: String| {
+            ControllerError::invalid_transport_configuration(&self.endpoint_name, &message)
+        };
+
+        let enabled = table
+            .snapshot()
+            .map_err(|e| invalid(format!("error accessing Delta table snapshot: {e}")))?
+            .snapshot()
+            .table_properties()
+            .enable_change_data_feed();
+        self.change_data_feed_enabled
+            .store(enabled, Ordering::Relaxed);
+
+        if !enabled {
+            // `auto` is content either way: the fallback is what it is for.
+            return if self.config.requires_change_feed() {
+                Err(invalid(format!(
+                    "'change_feed' is set to 'require', but the Delta table '{}' does not have \
+                     the '{ENABLE_CHANGE_DATA_FEED}' property set to 'true', so it records no \
+                     change data. Set the property on the table (changes committed before it is set \
+                     are not recorded), or set 'change_feed' to 'auto'.",
+                    self.config.uri,
+                )))
+            } else {
+                Ok(())
+            };
+        }
+
+        // Delta reserves the name for the change feed, so a table recording one
+        // cannot also declare it as a column.
+        let schema = self.logical_schema().map_err(|e| invalid(e.to_string()))?;
+        if let Some(column) = reserved_change_type_column(&schema) {
+            return Err(invalid(format!(
+                "the Delta table '{}' records a change data feed and also has a column named \
+                 '{column}', which the feed reserves under the name \
+                 '{CHANGE_TYPE_COLUMN}'; set 'change_feed' to 'off' to read this table from its \
+                 file actions instead.",
+                self.config.uri,
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Prepare to process CDC stream.
-    async fn prepare_cdc(&self) -> Result<Option<Arc<dyn PhysicalExpr>>, ControllerError> {
+    async fn prepare_cdc(&self) -> Result<(), ControllerError> {
         self.validate_cdc_config()?;
 
-        let delete_expr = self.extract_delete_filter_expr().await?;
-        Ok(delete_expr)
+        self.validate_cdc_delete_filter().await
     }
 
     /// Execute a SQL query to load a complete or partial snapshot of the DeltaTable.
@@ -2542,13 +3535,16 @@ impl DeltaTableInputEndpointInner {
 
         self.execute_df(
             df,
-            true,
-            None,
+            Polarity::Fixed(true),
             &descr,
             input_stream,
             receiver,
-            self.allocate_snapshot_transaction_label(),
+            self.snapshot_transaction_label(),
             num_retries,
+            None,
+            // The snapshot reads through delta-rs's table provider, which
+            // states the log's totals in the plan, so the batch size is
+            // derived from there.
             None,
         )
         .await
@@ -2569,6 +3565,13 @@ impl DeltaTableInputEndpointInner {
     ///
     /// * `max_retries` - the maximum number of retries to attempt if the function fails to read the log entry.
     ///
+    /// * `version` - the table version whose data is being read, named in the
+    ///   error message. `None` for the initial snapshot, which spans many.
+    ///
+    /// * `read_size` - how big the Delta log says this read is, used to bound
+    ///   the decoded batch size. `None` falls back to what DataFusion derived
+    ///   for the plan, and then to the configured batch size.
+    ///
     /// Returns the total number of records processed.
     ///
     /// Returns an error if the function fails to read the log entry after performing the configured
@@ -2584,25 +3587,25 @@ impl DeltaTableInputEndpointInner {
     async fn execute_df(
         &self,
         dataframe: DataFrame,
-        polarity: bool,
-        cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
+        polarity: Polarity,
         descr: &str,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
         transaction: Option<Option<String>>,
         max_retries: u32,
-        current_table_version: Option<i64>,
+        version: Option<i64>,
+        read_size: Option<ReadSize>,
     ) -> Result<usize, AnyError> {
         let mut retry_count = 0;
         loop {
             match self
                 .execute_df_inner(
                     dataframe.clone(),
-                    polarity,
-                    cdc_delete_filter.clone(),
+                    polarity.clone(),
                     input_stream,
                     receiver,
                     &transaction,
+                    read_size,
                 )
                 .await
             {
@@ -2616,11 +3619,7 @@ impl DeltaTableInputEndpointInner {
                     if retry_count - 1 == max_retries {
                         let message = format!(
                             "error retrieving {descr} after {retry_count} attempts{}: {e}",
-                            if let Some(version) = current_table_version {
-                                format!(" (current table version: {version})")
-                            } else {
-                                String::new()
-                            }
+                            version_suffix(version)
                         );
                         self.consumer
                             .update_connector_health(ConnectorHealth::unhealthy(&message));
@@ -2630,11 +3629,7 @@ impl DeltaTableInputEndpointInner {
 
                     let message = format!(
                         "error retrieving {descr} after {retry_count} attempts{}: {e}; retrying in {backoff_delay:?}",
-                        if let Some(version) = current_table_version {
-                            format!(" (current table version: {version})")
-                        } else {
-                            String::new()
-                        }
+                        version_suffix(version)
                     );
                     self.consumer
                         .update_connector_health(ConnectorHealth::unhealthy(&message));
@@ -2645,24 +3640,81 @@ impl DeltaTableInputEndpointInner {
         }
     }
 
+    /// Execute `dataframe`, with the decoded batch bounded in bytes rather than
+    /// only in rows.
+    ///
+    /// The plan is built to derive the batch size from, since that needs the
+    /// scan's statistics and its partition count, and then built again once the
+    /// size is known. Setting the size on the task context alone is not enough:
+    /// `FilterExec` takes its batch size when it is planned
+    /// (`physical_planner.rs` hands it `session_state.config().batch_size()`)
+    /// and feeds that frozen value to a coalescer, so it would buffer the
+    /// smaller batches back up to the size the first plan was built with. One
+    /// is in the plan whenever `filter` or `snapshot_filter` is set, and it
+    /// survives planning because `parquet.pushdown_filters` is off by default.
+    ///
+    /// Planning twice is why the second pass is conditional: a read that keeps
+    /// the configured size, which is the common one, is planned once.
+    async fn execute_stream(
+        &self,
+        dataframe: DataFrame,
+        read_size: Option<ReadSize>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let (mut state, logical) = dataframe.into_parts();
+
+        let plan = state.create_physical_plan(&logical).await?;
+        let partitions = scan_partitions(&plan);
+        let default_rows = state.config().batch_size();
+        let rows = read_size
+            .or_else(|| plan_read_size(plan.as_ref()))
+            .and_then(|size| size.batch_rows(partitions, default_rows))
+            .filter(|rows| *rows < default_rows);
+
+        if let Some(rows) = rows {
+            debug!(
+                "delta_table {}: reading {rows} rows per batch instead of {default_rows}, to \
+                 keep {partitions} concurrent readers within {} MB of decoded data",
+                &self.endpoint_name,
+                DECODE_BUDGET_BYTES / 1024 / 1024,
+            );
+            state.config_mut().options_mut().execution.batch_size =
+                ConfigNonZeroUsize::try_new(rows)?;
+        }
+        let plan = if rows.is_some() {
+            state.create_physical_plan(&logical).await?
+        } else {
+            plan
+        };
+
+        execute_stream(plan, state.task_ctx())
+    }
+
     // A single attempt of the `execute_df` retry loop.
     #[allow(clippy::too_many_arguments)]
     async fn execute_df_inner(
         &self,
         dataframe: DataFrame,
-        polarity: bool,
-        cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
+        polarity: Polarity,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
         transaction: &Option<Option<String>>,
+        read_size: Option<ReadSize>,
     ) -> Result<usize, String> {
         wait_running(receiver).await;
         let transaction = self.follow_start_transaction(transaction);
 
+        // A distributed snapshot's transaction must contain every host's whole
+        // part of the snapshot, so that the home host's changes to the table
+        // cannot reach the circuit before rows that this host reads again
+        // after an error.  So an error keeps the transaction open, and the
+        // retry reads into it again.
+        let commit_on_error =
+            !(self.distributed.is_some() && Self::is_snapshot_transaction_label(&transaction));
+
         // Limit the number of connectors simultaneously reading from Delta Lake.
         let _token = DELTA_READER_SEMAPHORE.acquire().await.unwrap();
 
-        let mut stream = match dataframe.execute_stream().await {
+        let mut stream = match self.execute_stream(dataframe, read_size).await {
             Err(e) => {
                 return Err(format!("{e:?}"));
             }
@@ -2699,23 +3751,18 @@ impl DeltaTableInputEndpointInner {
         >::new(
             num_parsers,
             move || {
-                let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> = cdc_delete_filter.clone();
+                let polarity = polarity.clone();
                 let input_stream = input_stream.fork();
 
                 Box::new(move |(batch, timestamp)| {
                     Box::pin({
-                        let cdc_delete_filter: Option<Arc<dyn PhysicalExpr>> =
-                            cdc_delete_filter.clone();
+                        let polarity = polarity.clone();
                         let mut input_stream = input_stream.fork();
 
                         async move {
-                            let (parsed_buffer, errors) = Self::parse_record_batch(
-                                batch,
-                                polarity,
-                                &cdc_delete_filter,
-                                input_stream.as_mut(),
-                            )
-                            .await;
+                            let (parsed_buffer, errors) =
+                                Self::parse_record_batch(batch, &polarity, input_stream.as_mut())
+                                    .await;
                             let staged_buffer = parsed_buffer.map(|buffer| {
                                 let len = buffer.len();
                                 StagedInputBuffer::new(input_stream.stage(vec![buffer]), len)
@@ -2758,7 +3805,7 @@ impl DeltaTableInputEndpointInner {
                     self.queue.push_entry(
                         InputQueueEntry::new_with_aux(timestamp, QueueEntry::Rollback)
                             // If we started a transaction while processing the log entry, commit it now.
-                            .with_commit_transaction(true),
+                            .with_commit_transaction(commit_on_error),
                         Vec::new(),
                     );
 
@@ -2788,33 +3835,39 @@ impl DeltaTableInputEndpointInner {
 
     async fn parse_record_batch(
         batch: RecordBatch,
-        polarity: bool,
-        cdc_delete_filter: &Option<Arc<dyn PhysicalExpr>>,
+        polarity: &Polarity,
         input_stream: &mut dyn ArrowStream,
     ) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>) {
-        let result = if polarity {
-            if let Some(delete_filter_expr) = cdc_delete_filter {
-                let polarities =
-                    match Self::eval_delete_filter(delete_filter_expr.as_ref(), &batch).await {
-                        Ok(polarities) => polarities,
-                        Err(e) => {
-                            return (
-                                None,
-                                vec![ParseError::bin_envelope_error(e.to_string(), &[], None)],
-                            );
-                        }
-                    };
-                // println!(
-                //     "insert_with_polarities: {} updates, {} insertions",
-                //     polarities.len(),
-                //     polarities.iter().filter(|x| **x == true).count()
-                // );
-                input_stream.insert_with_polarities(&batch, &polarities, &None)
-            } else {
-                input_stream.insert(&batch, &None)
-            }
-        } else {
-            input_stream.delete(&batch, &None)
+        // `ChangeType` takes its polarities out of the batch, so resolve the
+        // polarity vector first and rebind `batch` to what is left.
+        let (batch, polarities) = match polarity {
+            Polarity::Fixed(_) => (batch, None),
+            Polarity::DeleteFilter(expr) => match eval_delete_filter(expr.as_ref(), &batch) {
+                Ok(polarities) => (batch, Some(polarities)),
+                Err(e) => {
+                    return (
+                        None,
+                        vec![ParseError::bin_envelope_error(e.to_string(), &[], None)],
+                    );
+                }
+            },
+            Polarity::ChangeType => match take_change_type_polarities(batch) {
+                Ok(split) => (split.0, Some(split.1)),
+                Err(e) => {
+                    return (
+                        None,
+                        vec![ParseError::bin_envelope_error(e.to_string(), &[], None)],
+                    );
+                }
+            },
+        };
+
+        let result = match (polarity, &polarities) {
+            (_, Some(polarities)) => input_stream.insert_with_polarities(&batch, polarities, &None),
+            (Polarity::Fixed(true), None) => input_stream.insert(&batch, &None),
+            (Polarity::Fixed(false), None) => input_stream.delete(&batch, &None),
+            // The other two variants always produce a polarity vector above.
+            (_, None) => unreachable!("only Polarity::Fixed reaches the deserializer unpolarized"),
         };
         let errors = result.map_or_else(
             |e| {
@@ -2849,7 +3902,6 @@ impl DeltaTableInputEndpointInner {
         new_version: i64,
         actions: &[Action],
         table: &DeltaTable,
-        cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
@@ -2863,6 +3915,7 @@ impl DeltaTableInputEndpointInner {
                 .filter(|action| match action {
                     Action::Add(add) if add.data_change => true,
                     Action::Remove(remove) if remove.data_change => true,
+                    Action::Cdc(_) => self.config.reads_change_feed(),
                     _ => false,
                 })
                 .collect::<Vec<_>>();
@@ -2880,6 +3933,13 @@ impl DeltaTableInputEndpointInner {
             );
         }
 
+        // A commit can turn VARIANT shredding on while we follow the table.
+        for action in actions {
+            if let Action::Protocol(protocol) = action {
+                refuse_variant_shredding(&self.endpoint_name, protocol)?;
+            }
+        }
+
         // Adopt a schema change carried by this commit before reading its data,
         // so the files are interpreted against the right schema.
         self.advance_schema(new_version, actions).await?;
@@ -2890,114 +3950,33 @@ impl DeltaTableInputEndpointInner {
         if self.config.is_cdc() {
             self.process_cdc_transaction(
                 actions,
+                new_version,
                 table,
-                cdc_delete_filter,
+                input_stream,
+                receiver,
+                start_transaction,
+            )
+            .await?;
+        } else if self.config.reads_change_feed() {
+            self.process_change_feed_log_entry(
+                new_version,
+                actions,
+                table,
                 input_stream,
                 receiver,
                 start_transaction,
             )
             .await?;
         } else {
-            // Compute the projected read set once for the whole transaction; each
-            // `process_action` borrows the `&str` view rather than re-collecting it
-            // per Add/Remove. `used_column_names` owns the strings the view points at.
-            let used_column_names = self.used_columns();
-            let used_columns: Vec<&str> = used_column_names.iter().map(String::as_str).collect();
-
-            // TODO: consider processing all Add actions and all Remove actions in one
-            // go using `ListingTable`, which understands partitioning and can probably
-            // parallelize the load.
-
-            // A same-path Add+Remove is a deletion-vector rewrite (DELETE/MERGE):
-            // Delta files are immutable and path-addressed, so the bytes are
-            // unchanged and only the DV differs. Its logical change is just the
-            // rows the DV newly masks (deleted) or un-masks (restored), so we
-            // read only those rows rather than re-reading the whole file.
-            //
-            // Index the data-change `Add` actions by path (a metadata-only
-            // rewrite has data_change == false and never pairs). The Delta
-            // protocol allows at most one `Add` per path in a commit.
-            let adds_by_path: BTreeMap<&str, &AddAction> = actions
-                .iter()
-                .filter_map(|action| match action {
-                    Action::Add(add) if add.data_change => Some((add.path.as_str(), add)),
-                    _ => None,
-                })
-                .collect();
-
-            // Row-position delta of each same-path rewrite, keyed by file path.
-            // The pair is (newly deleted = rows the new DV masks but the old did
-            // not, restored = rows the old DV masked but the new does not).
-            let mut dv_deltas: BTreeMap<&str, (RoaringTreemap, RoaringTreemap)> = BTreeMap::new();
-            for action in actions {
-                let Action::Remove(remove) = action else {
-                    continue;
-                };
-                if !remove.data_change {
-                    continue;
-                }
-                if let Some(add) = adds_by_path.get(remove.path.as_str()) {
-                    let description = format!("file '{}'", remove.path);
-                    let old_dv = self
-                        .decode_dv(table, remove.deletion_vector.as_ref(), &description)
-                        .await?;
-                    let new_dv = self
-                        .decode_dv(table, add.deletion_vector.as_ref(), &description)
-                        .await?;
-                    // newly deleted = in the new DV but not the old; restored = the reverse.
-                    dv_deltas.insert(remove.path.as_str(), (&new_dv - &old_dv, &old_dv - &new_dv));
-                }
-            }
-
-            // Process deletes before inserts. Semantically, delete actions are
-            // applied before insert actions; however the delta standard doesn't
-            // guarantee that actions occur in any particular order in the transaction log
-            // entry.
-            //
-            // Each pass hands `process_follow_action` the row-index delta for its
-            // side of a same-path pair (the `Remove` retracts the newly-deleted
-            // rows; the `Add` inserts the restored rows) or `None` for an unpaired
-            // action, which is then read whole. `dv_deltas` is keyed only by
-            // data-change pairs, so a metadata-only action never matches.
-            for action in actions {
-                if let Action::Remove(remove) = action {
-                    let newly_deleted = dv_deltas
-                        .get(remove.path.as_str())
-                        .map(|(newly_deleted, _)| newly_deleted);
-                    self.process_follow_action(
-                        action,
-                        &remove.path,
-                        newly_deleted,
-                        false,
-                        table,
-                        &used_columns,
-                        input_stream,
-                        receiver,
-                        start_transaction.clone(),
-                    )
-                    .await?;
-                }
-            }
-
-            for action in actions {
-                if let Action::Add(add) = action {
-                    let restored = dv_deltas
-                        .get(add.path.as_str())
-                        .map(|(_, restored)| restored);
-                    self.process_follow_action(
-                        action,
-                        &add.path,
-                        restored,
-                        true,
-                        table,
-                        &used_columns,
-                        input_stream,
-                        receiver,
-                        start_transaction.clone(),
-                    )
-                    .await?;
-                }
-            }
+            self.process_follow_actions(
+                actions,
+                new_version,
+                table,
+                input_stream,
+                receiver,
+                start_transaction,
+            )
+            .await?;
         }
 
         // Empty buffer to indicate checkpointable state.
@@ -3019,6 +3998,367 @@ impl DeltaTableInputEndpointInner {
         Ok(())
     }
 
+    /// Apply one commit's `Add` and `Remove` actions as a ZSet delta: every added
+    /// file's rows are inserted, every removed file's rows retracted.
+    ///
+    /// This is what a `change_feed = off` connector does with every commit, and
+    /// what any connector does with a commit that recorded no change data.
+    async fn process_follow_actions(
+        &self,
+        actions: &[Action],
+        version: i64,
+        table: &DeltaTable,
+        input_stream: &mut dyn ArrowStream,
+        receiver: &mut Receiver<PipelineState>,
+        start_transaction: Option<Option<String>>,
+    ) -> AnyResult<()> {
+        // Compute the projected read set once for the whole transaction; each
+        // `process_action` borrows the `&str` view rather than re-collecting it
+        // per Add/Remove. `used_column_names` owns the strings the view points at.
+        let used_column_names = self.used_columns();
+        let used_columns: Vec<&str> = used_column_names.iter().map(String::as_str).collect();
+
+        // TODO: consider processing all Add actions and all Remove actions in one
+        // go using `ListingTable`, which understands partitioning and can probably
+        // parallelize the load.
+
+        // A same-path Add+Remove is a deletion-vector rewrite (DELETE/MERGE):
+        // Delta files are immutable and path-addressed, so the bytes are
+        // unchanged and only the DV differs. Its logical change is just the
+        // rows the DV newly masks (deleted) or un-masks (restored), so we
+        // read only those rows rather than re-reading the whole file.
+        //
+        // Index the data-change `Add` actions by path (a metadata-only
+        // rewrite has data_change == false and never pairs). The Delta
+        // protocol allows at most one `Add` per path in a commit.
+        let adds_by_path: BTreeMap<&str, &AddAction> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Add(add) if add.data_change => Some((add.path.as_str(), add)),
+                _ => None,
+            })
+            .collect();
+
+        // Row-position delta of each same-path rewrite, keyed by file path.
+        // The pair is (newly deleted = rows the new DV masks but the old did
+        // not, restored = rows the old DV masked but the new does not).
+        let mut dv_deltas: BTreeMap<&str, (RoaringTreemap, RoaringTreemap)> = BTreeMap::new();
+        for action in actions {
+            let Action::Remove(remove) = action else {
+                continue;
+            };
+            if !remove.data_change {
+                continue;
+            }
+            if let Some(add) = adds_by_path.get(remove.path.as_str()) {
+                let description = format!("file '{}'", remove.path);
+                let old_dv = self
+                    .decode_dv(table, remove.deletion_vector.as_ref(), &description)
+                    .await?;
+                let new_dv = self
+                    .decode_dv(table, add.deletion_vector.as_ref(), &description)
+                    .await?;
+                // newly deleted = in the new DV but not the old; restored = the reverse.
+                dv_deltas.insert(remove.path.as_str(), (&new_dv - &old_dv, &old_dv - &new_dv));
+            }
+        }
+
+        // Process deletes before inserts. Semantically, delete actions are
+        // applied before insert actions; however the delta standard doesn't
+        // guarantee that actions occur in any particular order in the transaction log
+        // entry.
+        //
+        // Each pass hands `process_follow_action` the row-index delta for its
+        // side of a same-path pair (the `Remove` retracts the newly-deleted
+        // rows; the `Add` inserts the restored rows) or `None` for an unpaired
+        // action, which is then read whole. `dv_deltas` is keyed only by
+        // data-change pairs, so a metadata-only action never matches.
+        for action in actions {
+            if let Action::Remove(remove) = action {
+                let newly_deleted = dv_deltas
+                    .get(remove.path.as_str())
+                    .map(|(newly_deleted, _)| newly_deleted);
+                self.process_follow_action(
+                    action,
+                    &remove.path,
+                    remove.partition_values.as_ref(),
+                    newly_deleted,
+                    false,
+                    version,
+                    // The `Remove` side of a same-path rewrite reads the file
+                    // its paired `Add` names: one immutable file, two deletion
+                    // vectors, so the same bytes and the same rows. Only the
+                    // `Add` records a row count, which is why the ratio comes
+                    // from there. An unpaired `Remove` finds nothing here and
+                    // is read whole below, unmeasured.
+                    adds_by_path
+                        .get(remove.path.as_str())
+                        .copied()
+                        .and_then(add_read_size),
+                    table,
+                    &used_columns,
+                    input_stream,
+                    receiver,
+                    start_transaction.clone(),
+                )
+                .await?;
+            }
+        }
+
+        for action in actions {
+            if let Action::Add(add) = action {
+                let restored = dv_deltas
+                    .get(add.path.as_str())
+                    .map(|(_, restored)| restored);
+                self.process_follow_action(
+                    action,
+                    &add.path,
+                    Some(&add.partition_values),
+                    restored,
+                    true,
+                    version,
+                    add_read_size(add),
+                    table,
+                    &used_columns,
+                    input_stream,
+                    receiver,
+                    start_transaction.clone(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ingest one commit from the change data files it recorded.
+    ///
+    /// A commit that recorded none is read from its `add` and `remove` actions
+    /// instead: the Delta protocol lets a writer skip change data files when a
+    /// commit only adds or only removes rows, so an append never writes one.
+    /// That path also covers a table whose `delta.enableChangeDataFeed` was
+    /// turned off after the connector started, and it applies deletion vectors,
+    /// which a change data file never carries.
+    async fn process_change_feed_log_entry(
+        &self,
+        new_version: i64,
+        actions: &[Action],
+        table: &DeltaTable,
+        input_stream: &mut dyn ArrowStream,
+        receiver: &mut Receiver<PipelineState>,
+        start_transaction: Option<Option<String>>,
+    ) -> AnyResult<()> {
+        self.warn_if_change_data_feed_disabled(new_version, actions);
+
+        // `cdc` actions carry `dataChange: false` by protocol -- they describe a
+        // change rather than making one -- so, unlike `add` and `remove`, they
+        // are not filtered on that flag.
+        let change_files: Vec<&AddCdcAction> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Cdc(file) => Some(file),
+                _ => None,
+            })
+            .collect();
+
+        if change_files.is_empty() {
+            self.metrics
+                .commits_from_file_actions
+                .fetch_add(1, Ordering::Relaxed);
+            return self
+                .process_follow_actions(
+                    actions,
+                    new_version,
+                    table,
+                    input_stream,
+                    receiver,
+                    start_transaction,
+                )
+                .await;
+        }
+        self.metrics
+            .commits_from_change_data
+            .fetch_add(1, Ordering::Relaxed);
+
+        // The commit's `add` and `remove` actions are deliberately ignored: the
+        // protocol requires a reader that finds change data files to take the
+        // row-level changes from them alone. Reading both would double-count.
+        let description = format!(
+            "change data files {}",
+            describe_paths(change_files.iter().map(|f| f.path.as_str()))
+        );
+
+        // Group files based on the values of partition columns (extracted from filenames).
+        let partition_keys = self.partition_value_keys()?;
+        let mut groups: BTreeMap<Vec<Option<Option<String>>>, Vec<&AddCdcAction>> = BTreeMap::new();
+        for file in &change_files {
+            let key = partition_keys
+                .iter()
+                .map(|key| file.partition_values.get(key).cloned())
+                .collect();
+            groups.entry(key).or_default().push(file);
+        }
+
+        let read_schema = self.change_data_read_schema()?;
+        let mut dfs: Vec<DataFrame> = Vec::new();
+        for group in groups.values() {
+            let df = self
+                .change_data_group_dataframe(table, group, &read_schema, &description)
+                .await?;
+            let df = self.project_physical_to_logical(df)?;
+            dfs.push(self.add_partition_columns(
+                df,
+                Some(&group[0].partition_values),
+                &[CHANGE_TYPE_COLUMN],
+                &description,
+            )?);
+        }
+
+        let mut dfs = dfs.into_iter();
+        // `change_files` is non-empty, so grouping produced at least one frame.
+        let df = dfs.next().expect("at least one change data file group");
+        let df = dfs.try_fold(df, |acc, df| {
+            acc.union(df).map_err(|e| {
+                anyhow!("internal error processing {description}; {REPORT_ERROR}; error combining change data files: {e}")
+            })
+        })?;
+
+        // Filter first: it may name Delta columns the SQL table never declares,
+        // which the projection then drops. This is the order `emit_provider`
+        // uses, so a row is admitted on the same terms in both modes.
+        let df = apply_filter(df, self.config.filter.as_deref(), &description, None)?;
+
+        let mut columns = self.used_columns();
+        columns.push(CHANGE_TYPE_COLUMN.to_string());
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let df = df.select_columns(&columns).map_err(|e| {
+            anyhow!("internal error processing {description}; {REPORT_ERROR}; error selecting columns: {e}")
+        })?;
+
+        // Retractions must reach the circuit before the insertions of the same
+        // commit.
+        for (half, predicate) in [
+            ("retractions", RETRACTED_CHANGE_TYPES),
+            ("insertions", INSERTED_CHANGE_TYPES),
+        ] {
+            let pass = apply_filter(df.clone(), Some(predicate), &description, None)?;
+            self.execute_df(
+                pass,
+                Polarity::ChangeType,
+                &format!("{description} ({half})"),
+                input_stream,
+                receiver,
+                start_transaction.clone(),
+                self.config.max_retries(),
+                Some(new_version),
+                // A `cdc` action carries the file's size but no row count, so
+                // there is no ratio to size the batch from, and the table it is
+                // read through has no statistics. The read keeps the configured
+                // batch size.
+                None,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// One frame over the change data files of a single partition.
+    ///
+    /// A `uc://` location has no directory to list, so its files are read
+    /// through the object store; every other location reads them through one
+    /// [`ListingTable`], spread over at most `target_partitions` readers.
+    ///
+    /// Either way one provider covers the whole group. Reading each file
+    /// through its own provider and unioning them gave the plan one partition
+    /// per file, all of which DataFusion then drove at once, so a commit of a
+    /// few hundred change data files held a few hundred Parquet readers open,
+    /// each with per-column state that no batch size reaches.
+    async fn change_data_group_dataframe(
+        &self,
+        table: &DeltaTable,
+        group: &[&AddCdcAction],
+        read_schema: &ReadSchema,
+        description: &str,
+    ) -> AnyResult<DataFrame> {
+        let provider: Arc<dyn TableProvider> = if location_is_unlistable(table) {
+            // An empty bitmap reads every row: a change data file never carries
+            // a deletion vector, and the protocol gives it no field to carry one
+            // in.
+            self.file_provider(
+                table,
+                group
+                    .iter()
+                    .map(|file| (file.path.as_str(), RoaringTreemap::new())),
+                ReadMode::NotInBitmap,
+                read_schema.clone(),
+            )
+            .await?
+        } else {
+            let urls = group
+                .iter()
+                .map(|file| file_listing_url(table, &file.path))
+                .collect::<AnyResult<Vec<_>>>()?;
+            Arc::new(
+                self.create_parquet_table(urls, read_schema.clone(), description)
+                    .await?,
+            )
+        };
+
+        self.datafusion.read_table(provider).map_err(|e| {
+            anyhow!("internal error processing {description}; {REPORT_ERROR}; error reading change data files: {e}")
+        })
+    }
+
+    /// Arrow schema for reading a change data file: the columns the connector
+    /// needs, plus the [`CHANGE_TYPE_COLUMN`] that only these files carry.
+    ///
+    /// A file read through a [`StreamingTable`] rather than a listing has no
+    /// projection pushdown, so this schema is the only bound on what it decodes.
+    fn change_data_read_schema(&self) -> AnyResult<ReadSchema> {
+        let table_schema = self.physical_read_schema(|name| self.needs_column(name))?;
+        let mut fields: Vec<FieldRef> = table_schema.schema().fields().to_vec();
+        fields.push(Arc::new(ArrowField::new(
+            CHANGE_TYPE_COLUMN,
+            ArrowDataType::Utf8,
+            true,
+        )));
+        Ok(ReadSchema::new(
+            &ArrowSchema::new(fields).with_metadata(table_schema.schema().metadata().clone()),
+        ))
+    }
+
+    /// Warn when a commit turns `delta.enableChangeDataFeed` off.
+    ///
+    /// Later commits then record no change data files and are read from their
+    /// `add` and `remove` actions, which stays correct but costs what `follow`
+    /// costs: whole rewritten files rather than the rows that changed.
+    ///
+    /// A `metaData` action carries the whole configuration, so the property is
+    /// off both when it reads `false` and when it is absent, which is what
+    /// `ALTER TABLE ... UNSET TBLPROPERTIES` leaves behind. Only a commit that
+    /// changes the state warns, so a table that never recorded a change feed is
+    /// silent and one that turns the property back on can warn again.
+    fn warn_if_change_data_feed_disabled(&self, version: i64, actions: &[Action]) {
+        let Some(enabled) = change_data_feed_state(actions) else {
+            return;
+        };
+
+        if !self
+            .change_data_feed_enabled
+            .swap(enabled, Ordering::Relaxed)
+            || enabled
+        {
+            return;
+        }
+        warn!(
+            "delta_table {}: table version {version} turned the table property \
+             '{ENABLE_CHANGE_DATA_FEED}' off; this and later commits record no change data \
+             and are read from the files they add and remove, which reads more data than the \
+             change feed would",
+            &self.endpoint_name
+        );
+    }
+
     /// Process a DeltaLake transaction in CDC mode:
     ///
     /// * Subtract rows in Remove actions from rows in Add actions, so that
@@ -3030,8 +4370,8 @@ impl DeltaTableInputEndpointInner {
     async fn process_cdc_transaction(
         &self,
         actions: &[Action],
+        version: i64,
         table: &DeltaTable,
-        cdc_delete_filter: Option<Arc<dyn PhysicalExpr>>,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
@@ -3072,27 +4412,44 @@ impl DeltaTableInputEndpointInner {
         }
 
         let description = format!(
-            "CDC transaction with {} adds {:?} and {} removes {:?}",
+            "CDC transaction with {} adds {} and {} removes {}",
             adds.len(),
-            adds.iter().map(|a| &a.path).collect::<Vec<_>>(),
+            describe_paths(adds.iter().map(|a| a.path.as_str())),
             removes_by_path.len(),
-            removes_by_path.keys().collect::<Vec<_>>(),
+            describe_paths(removes_by_path.keys().copied()),
         );
+
+        // How big this read is, from the log rather than from the files: an
+        // `Add` carries its compressed size and its row count. A `Remove`
+        // carries no row count, so the added files decide the bytes-per-row
+        // ratio; both sides of the transaction come from the same table, so
+        // that is the same ratio either way.
+        // Every add counts as a file the scan will open, and one whose row
+        // count the writer omitted still contributes its bytes, which skews the
+        // ratio towards smaller batches rather than larger.
+        let mut read_size = ReadSize::default();
+        for add in &adds {
+            read_size.add(add.size.max(0) as u64, add_records(add));
+        }
 
         // Drop add/remove pairs on the same path (metadata-only rewrites).
         // This loop must run before the removes side is built below: it
         // drains `removes_by_path` of every matched path, leaving only the
         // unpaired removes there.
-        let mut add_files: Vec<(&str, Option<&DeletionVectorDescriptor>)> = Vec::new();
+        let mut add_files: Vec<CdcFile<'_>> = Vec::new();
         for add in &adds {
             if removes_by_path.remove(add.path.as_str()).is_some() {
                 continue;
             }
-            add_files.push((add.path.as_str(), add.deletion_vector.as_ref()));
+            add_files.push(CdcFile {
+                path: add.path.as_str(),
+                partition_values: Some(&add.partition_values),
+                deletion_vector: add.deletion_vector.as_ref(),
+            });
         }
 
         let Some(adds_df) = self
-            .cdc_side_dataframe(table, &add_files, &description)
+            .files_dataframe(table, &add_files, &description)
             .await?
         else {
             // Every add paired with a remove (a pure soft-delete commit):
@@ -3101,14 +4458,18 @@ impl DeltaTableInputEndpointInner {
         };
 
         // The removes left unpaired by the loop above feed the `EXCEPT ALL`;
-        // `cdc_side_dataframe` masks any with an active DV so only live rows
+        // `files_dataframe` masks any with an active DV so only live rows
         // subtract.
-        let remove_files: Vec<(&str, Option<&DeletionVectorDescriptor>)> = removes_by_path
-            .iter()
-            .map(|(path, remove)| (*path, remove.deletion_vector.as_ref()))
+        let remove_files: Vec<CdcFile<'_>> = removes_by_path
+            .values()
+            .map(|remove| CdcFile {
+                path: remove.path.as_str(),
+                partition_values: remove.partition_values.as_ref(),
+                deletion_vector: remove.deletion_vector.as_ref(),
+            })
             .collect();
         let removes_df = self
-            .cdc_side_dataframe(table, &remove_files, &description)
+            .files_dataframe(table, &remove_files, &description)
             .await?;
 
         // The `cdc_order_by` expression is mandatory in CDC mode (enforced
@@ -3122,17 +4483,25 @@ impl DeltaTableInputEndpointInner {
             &description,
         )?;
 
+        // Compile against this transaction's frame: a schema change between
+        // commits moves the columns the expression binds by index.  The
+        // expression is mandatory in `cdc` mode (`validate_cdc_config`), so it
+        // always compiles to `Some`.
+        let delete_filter = self.compile_delete_filter(df.schema())?.ok_or_else(|| {
+            anyhow!("internal error processing {description}; {REPORT_ERROR}; 'cdc_delete_filter' is unset in cdc mode")
+        })?;
+
         let _record_count = self
             .execute_df(
                 df,
-                true,
-                cdc_delete_filter,
+                Polarity::DeleteFilter(delete_filter),
                 &description,
                 input_stream,
                 receiver,
                 start_transaction,
                 self.config.max_retries(),
-                table.version().map(|v| v as i64),
+                Some(version),
+                Some(read_size),
             )
             .await?;
 
@@ -3161,7 +4530,7 @@ impl DeltaTableInputEndpointInner {
             return Ok(());
         }
         let url = ensure_table_uri(&self.config.uri)
-            .map_err(|e| anyhow!("invalid Delta table uri '{}': {e}", &self.config.uri))?;
+            .map_err(|e| anyhow!("invalid Delta table uri '{}': {e}", self.config.uri))?;
         let table = self
             .retry(
                 &format!("error loading Delta table schema at version {version}"),
@@ -3201,6 +4570,28 @@ impl DeltaTableInputEndpointInner {
         self.pin_schema_to_version(new_version as u64).await
     }
 
+    /// Returns the adapter that resolves a listing's columns by field id, for a
+    /// `mode = 'id'` table whose files may name their columns logically, or
+    /// `None` to leave the listing DataFusion's own matching by name.
+    fn field_id_adapter_factory(&self) -> AnyResult<Option<FieldIdAdapterFactory>> {
+        if self.column_mapping_mode()? != Some(ColumnMappingMode::Id) {
+            return Ok(None);
+        }
+        Ok(Some(FieldIdAdapterFactory::new(&self.column_mapping()?)))
+    }
+
+    /// Returns the table's `delta.columnMapping.mode`, or `None` when the table
+    /// declares none.
+    fn column_mapping_mode(&self) -> AnyResult<Option<ColumnMappingMode>> {
+        Ok(self
+            .schema_snapshot()
+            .snapshot()
+            .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?
+            .snapshot()
+            .table_properties()
+            .column_mapping_mode)
+    }
+
     /// Logical-to-physical column-name pairs under Delta column mapping.
     ///
     /// With `delta.columnMapping.mode = 'name'` or `'id'` each column lives on
@@ -3227,28 +4618,168 @@ impl DeltaTableInputEndpointInner {
             .collect())
     }
 
+    /// Names of the table's partition columns.
+    ///
+    /// Delta keeps a partition column's value in the log action, never in the
+    /// data file, so the reader must add it back (see
+    /// [`add_partition_columns`](Self::add_partition_columns)).
+    fn partition_columns(&self) -> AnyResult<Vec<String>> {
+        Ok(self
+            .schema_snapshot()
+            .snapshot()
+            .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?
+            .metadata()
+            .partition_columns()
+            .to_vec())
+    }
+
+    /// The key the Delta log uses for each partition column: its physical name
+    /// under column mapping, its logical name otherwise.
+    fn partition_value_keys(&self) -> AnyResult<Vec<String>> {
+        let partition_columns = self.partition_columns()?;
+        Ok(self
+            .logical_schema()?
+            .fields()
+            .iter()
+            .filter(|field| partition_columns.contains(field.name()))
+            .map(|field| physical_name(field))
+            .collect())
+    }
+
+    /// Reproject `df` in table column order, supplying each partition column as
+    /// a constant from the file's log action. Every read side lays its columns
+    /// out the same way, so `UNION ALL` and `EXCEPT ALL` line up.
+    ///
+    /// `extra_columns` names columns to carry through that the table schema does
+    /// not declare, appended after the table's own. A change data file's
+    /// `_change_type` is the only one today; without it the reprojection, which
+    /// walks the table schema, would drop the column that decides each row's
+    /// polarity.
+    fn add_partition_columns(
+        &self,
+        df: DataFrame,
+        partition_values: Option<&HashMap<String, Option<String>>>,
+        extra_columns: &[&str],
+        description: &str,
+    ) -> AnyResult<DataFrame> {
+        let partition_columns = self.partition_columns()?;
+        if partition_columns.is_empty() {
+            return Ok(df);
+        }
+
+        let file_schema = df.schema().clone();
+        let logical_schema = self.logical_schema()?;
+        let projection = Self::partition_projection(
+            &logical_schema,
+            &partition_columns,
+            partition_values,
+            &file_schema,
+            extra_columns,
+            description,
+        )?;
+
+        df.select(projection).map_err(|e| {
+            anyhow!("internal error processing {description}; {REPORT_ERROR}; error adding partition columns: {e}")
+        })
+    }
+
+    /// The projection [`add_partition_columns`](Self::add_partition_columns)
+    /// applies: every column the table declares, in schema order, with each
+    /// partition column supplied as a literal from `partition_values`, followed
+    /// by whichever `extra_columns` the data file's `file_schema` carries.
+    ///
+    /// Columns are named with `ident`, never `col`: `col` reads its argument as
+    /// SQL and lowercases an unquoted identifier, so a table holding an uppercase
+    /// column `ORDER_ID` would be projected through a reference to
+    /// `order_id`, which matches nothing. `ident` takes the name verbatim, as
+    /// does `alias`.
+    fn partition_projection(
+        logical_schema: &ArrowSchema,
+        partition_columns: &[String],
+        partition_values: Option<&HashMap<String, Option<String>>>,
+        file_schema: &DFSchema,
+        extra_columns: &[&str],
+        description: &str,
+    ) -> AnyResult<Vec<Expr>> {
+        let mut projection: Vec<Expr> = Vec::new();
+        for field in logical_schema.fields() {
+            if partition_columns.contains(field.name()) {
+                // The log keys partition values by physical name. The Hive
+                // `key=value` directory layout is convention, not protocol, so
+                // a missing key is an error rather than a guess from the path.
+                let key = physical_name(field);
+                let value = partition_values
+                    .and_then(|values| values.get(&key))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "error processing {description}: the Delta log action records no value for partition column '{}' (log key '{key}'); a partition column is not stored in the data file, so 'partitionValues' is the only source.",
+                            field.name()
+                        )
+                    })?;
+                // The log stores partition values as strings.
+                let literal = match value {
+                    Some(value) => lit(value.clone()),
+                    None => lit(ScalarValue::Null),
+                };
+                projection.push(
+                    literal
+                        .cast_to(field.data_type(), file_schema)
+                        .map_err(|e| {
+                            anyhow!(
+                                "error processing {description}: cannot read partition column '{}' as {}: {e}",
+                                field.name(),
+                                field.data_type()
+                            )
+                        })?
+                        .alias(field.name()),
+                );
+            } else if file_schema.has_column_with_unqualified_name(field.name()) {
+                projection.push(ident(field.name()));
+            }
+        }
+        for name in extra_columns {
+            if file_schema.has_column_with_unqualified_name(name) {
+                projection.push(ident(*name));
+            }
+        }
+
+        Ok(projection)
+    }
+
+    /// The Delta table's logical Arrow schema at the version being read.
+    fn logical_schema(&self) -> AnyResult<SchemaRef> {
+        Ok(self
+            .schema_snapshot()
+            .snapshot()
+            .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?
+            .snapshot()
+            .arrow_schema())
+    }
+
     /// Arrow schema for reading the raw data files, named as they appear on disk:
     /// the logical schema restricted to columns `keep` accepts (in schema order,
     /// so read sides line up), with each column-mapped field renamed to its
     /// physical (`col-<uuid>`) name so DataFusion matches by name. It recurses
     /// into nested struct, list, and map fields. Logical names are restored afterwards:
     /// top level in `project_physical_to_logical`, nested in `relabel_nested_columns`.
-    /// The kept logical schema when column mapping is off.
-    fn physical_read_schema(&self, keep: impl Fn(&str) -> bool) -> AnyResult<SchemaRef> {
-        let schema_table = self.schema_snapshot();
-        let logical = schema_table
-            .snapshot()
-            .map_err(|e| anyhow!("error accessing Delta table snapshot: {e}"))?
-            .snapshot()
-            .arrow_schema();
+    /// With column mapping off this is just the kept logical schema.
+    ///
+    /// Partition columns are always excluded: Delta never stores them in the data
+    /// file.
+    ///
+    /// The result is a [`ReadSchema`], so string and binary columns are read as
+    /// view types and a decoded batch is not capped at 2 GiB per column.
+    fn physical_read_schema(&self, keep: impl Fn(&str) -> bool) -> AnyResult<ReadSchema> {
+        let logical = self.logical_schema()?;
+        let partition_columns = self.partition_columns()?;
         let fields: Vec<FieldRef> = logical
             .fields()
             .iter()
-            .filter(|f| keep(f.name()))
+            .filter(|f| keep(f.name()) && !partition_columns.contains(f.name()))
             .map(field_to_physical)
             .collect();
-        Ok(Arc::new(
-            ArrowSchema::new(fields).with_metadata(logical.metadata().clone()),
+        Ok(ReadSchema::new(
+            &ArrowSchema::new(fields).with_metadata(logical.metadata().clone()),
         ))
     }
 
@@ -3259,6 +4790,9 @@ impl DeltaTableInputEndpointInner {
     /// while the rest of the pipeline expects logical names. Unmapped columns
     /// (already logical, or Delta metadata like `__feldera_op`) pass through.
     /// This function is a no-op when column mapping is off.
+    ///
+    /// Names are taken verbatim, with `ident`, for the reason
+    /// [`partition_projection`](Self::partition_projection) gives.
     fn project_physical_to_logical(&self, df: DataFrame) -> AnyResult<DataFrame> {
         let pairs = self.column_mapping()?;
         if pairs.is_empty() {
@@ -3273,78 +4807,87 @@ impl DeltaTableInputEndpointInner {
             .fields()
             .iter()
             .map(|f| match to_logical.get(f.name().as_str()) {
-                Some(logical) => col(f.name()).alias(*logical),
-                None => col(f.name()),
+                Some(logical) => ident(f.name()).alias(*logical),
+                None => ident(f.name()),
             })
             .collect();
         df.select(exprs)
             .map_err(|e| anyhow!("error remapping column-mapped names: {e}"))
     }
 
+    /// A [`ListingTable`] reading `urls` as `schema` describes them: on-disk
+    /// (physical) column names, so the reader matches each file's columns;
+    /// `project_physical_to_logical` renames them back afterwards. Change data
+    /// files carry one column the table schema does not
+    /// ([`Self::change_data_read_schema`]).
+    ///
+    /// Under `mode = 'id'` a file may name its columns logically instead, which
+    /// no name matches, so those columns are resolved by field id
+    /// ([`FieldIdAdapterFactory`]).
     async fn create_parquet_table(
         &self,
-        files: Vec<String>,
+        urls: Vec<ListingTableUrl>,
+        schema: ReadSchema,
         description: &str,
     ) -> AnyResult<ListingTable> {
-        // Use the on-disk (physical) schema so the reader matches each file's
-        // columns; `project_physical_to_logical` renames them back afterwards.
-        let schema = self.physical_read_schema(|_| true)?;
-
-        let mut urls = Vec::with_capacity(files.len());
-        for file in files.iter() {
-            urls.push(ListingTableUrl::parse(file).map_err(|e| anyhow!("internal error processing {description}; {REPORT_ERROR}; error converting file path '{file}' to table URL: {e}"))?);
-        }
-
         let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
             .with_file_extension_opt(Some(".parquet"));
 
-        let table_config = ListingTableConfig::new_with_multi_paths(urls)
+        let mut table_config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(listing_options)
-            .with_schema(schema);
+            .with_schema(Arc::clone(schema.schema()));
+        if let Some(factory) = self.field_id_adapter_factory()? {
+            table_config = table_config.with_expr_adapter_factory(Arc::new(factory));
+        }
 
         ListingTable::try_new(table_config).map_err(|e| {
             anyhow!("internal error processing {description}; {REPORT_ERROR}; error creating Parquet table: {e}")
         })
     }
 
-    /// Build a streaming [`TableProvider`] over the data file at `path`
-    /// (relative and URL-encoded, as the Delta log stores it) that reads the
+    /// Build a streaming [`TableProvider`] over the data file at `path` (the
+    /// object-store key relative to the table root, which delta-rs decoded when
+    /// it read the log) that reads the
     /// rows `mode` picks out of `bitmap`: the file's live rows when applying a
     /// deletion vector ([`ReadMode::NotInBitmap`]), or a deletion-vector delta
     /// when following a same-path rewrite ([`ReadMode::InBitmap`]). The caller
     /// supplies the decoded bitmap: a deletion vector for the mask, or the
     /// difference of two deletion vectors for the delta.
     ///
-    /// `keep_column` picks the columns to read: the provider declares the
-    /// snapshot schema restricted to them, which doubles as the Parquet
-    /// projection (see [`filtered_parquet_table`]). It must match the columns
-    /// any file it unions with keeps, so the providers line up in one query. It
-    /// is a predicate rather than a fixed list because the callers differ:
-    /// follow keeps its `used_columns`, CDC keeps `keeps_cdc_column`.
+    /// `read_schema` names the columns to read, under their physical names, and
+    /// doubles as the Parquet projection (see [`filtered_parquet_table`]). It
+    /// must match the columns of any file this one unions with, so the providers
+    /// line up in one query, which is why the caller supplies it: every read
+    /// keeps `needs_column`, and a change data file carries one column the table
+    /// schema does not
+    /// ([`change_data_read_schema`](Self::change_data_read_schema)).
     async fn file_provider(
         &self,
         table: &DeltaTable,
-        path: &str,
-        bitmap: RoaringTreemap,
+        files: impl IntoIterator<Item = (&str, RoaringTreemap)>,
         mode: ReadMode,
-        keep_column: impl Fn(&str) -> bool,
+        read_schema: ReadSchema,
     ) -> AnyResult<Arc<dyn TableProvider>> {
-        // The provider declares the kept columns under their physical names so
-        // files read into one query line up by column; the caller renames them
-        // back to logical.
-        let read_schema = self.physical_read_schema(keep_column)?;
-
-        // Decode the URL-encoded Delta log path (per the spec) into an
-        // object-store key.
-        let file_path = Path::from_url_path(path)
-            .map_err(|e| anyhow!("invalid file path '{path}' in Delta log action: {e}"))?;
+        // delta-rs already decoded the log's URL-encoded path, so each path is
+        // the object-store key as written.
+        let files = files
+            .into_iter()
+            .map(|(path, bitmap)| {
+                Ok(MaskedFile {
+                    path: Path::parse(path).map_err(|e| {
+                        anyhow!("invalid file path '{path}' in Delta log action: {e}")
+                    })?,
+                    bitmap,
+                })
+            })
+            .collect::<AnyResult<Vec<_>>>()?;
 
         filtered_parquet_table(
-            table.log_store().object_store(None),
-            file_path,
-            bitmap,
+            table.log_store().object_store(),
+            files,
             read_schema,
             mode,
+            self.datafusion.copied_config().target_partitions(),
         )
         .await
     }
@@ -3373,69 +4916,107 @@ impl DeltaTableInputEndpointInner {
         }
     }
 
-    /// Build the [`DataFrame`] for one side (adds or removes) of a CDC
-    /// transaction, or `None` when the side has no files.
+    /// Build the [`DataFrame`] for a set of data files, or `None` when there are
+    /// no files: one side (adds or removes) of a CDC transaction, or a
+    /// distributed host's part of the snapshot.
     ///
-    /// Each file is `(path, deletion_vector)`. Files with an active DV stream
-    /// through a [`filtered_parquet_table`] that drops their deleted rows; the
-    /// rest are read together through one [`ListingTable`]. The pieces combine
+    /// Each file is `(path, deletion_vector)`. A file with an active DV streams
+    /// through a [`filtered_parquet_table`] that drops its deleted rows, and so
+    /// does every file of an unlistable `uc://` location; the rest are read
+    /// together through one [`ListingTable`]. The pieces combine
     /// with `UNION ALL`, each restricted to the same CDC read set (the columns
     /// [`Self::project_cdc_columns`] keeps), so they line up by position for the
     /// `EXCEPT ALL` in `build_cdc_dataframe` and never decode unused columns.
     ///
-    /// Plain files are addressed under the table root (see [`table_root_base`]),
+    /// Plain files are addressed under the table root (see [`file_listing_url`]),
     /// not the synthetic `delta-rs://` URL from `object_store_url()`. The latter
     /// folds the table path into the URL host (slashes become dashes), which
     /// routes DataFusion's object store but is malformed once joined with
     /// `Add.path`. `start_input_endpoint` registers the store under `root_url()`.
-    async fn cdc_side_dataframe(
+    async fn files_dataframe(
         &self,
         table: &DeltaTable,
-        files: &[(&str, Option<&DeletionVectorDescriptor>)],
+        files: &[CdcFile<'_>],
         description: &str,
     ) -> AnyResult<Option<DataFrame>> {
-        // Split by read strategy: files with an active DV are masked one by
-        // one; the rest are read together in one listing.
-        let mut plain: Vec<&str> = Vec::new();
-        let mut masked: Vec<(&str, &DeletionVectorDescriptor)> = Vec::new();
-        for &(path, dv) in files {
-            match dv.filter(|d| is_active_dv(d)) {
-                Some(dv) => masked.push((path, dv)),
-                None => plain.push(path),
+        // One schema for both sides, so the `EXCEPT ALL` below compares frames
+        // that were read the same way.
+        let read_schema = self.physical_read_schema(|name| self.needs_column(name))?;
+
+        // Split by read strategy: a file with an active DV, and every file when
+        // the location cannot be listed, goes through the object store; the rest
+        // are read through a listing. Both sides group by partition values, so
+        // each group's constant partition columns apply to all its files.
+        let unlistable = location_is_unlistable(table);
+        let mut plain: BTreeMap<PartitionKey, Vec<&CdcFile<'_>>> = BTreeMap::new();
+        let mut direct: BTreeMap<PartitionKey, Vec<DirectCdcFile<'_>>> = BTreeMap::new();
+        let partition_keys = self.partition_value_keys()?;
+        for file in files {
+            let dv = file.deletion_vector.filter(|d| is_active_dv(d));
+            let key: PartitionKey = partition_keys
+                .iter()
+                .map(|key| {
+                    file.partition_values
+                        .and_then(|values| values.get(key))
+                        .cloned()
+                })
+                .collect();
+            if unlistable || dv.is_some() {
+                direct.entry(key).or_default().push((file, dv));
+            } else {
+                plain.entry(key).or_default().push(file);
             }
         }
 
         let mut dfs: Vec<DataFrame> = Vec::new();
 
-        if !plain.is_empty() {
-            let base = table_root_base(table);
-            let files = plain.iter().map(|p| format!("{base}{p}")).collect();
-            let listing_table = Arc::new(self.create_parquet_table(files, description).await?);
+        for group in plain.values() {
+            let urls = group
+                .iter()
+                .map(|f| file_listing_url(table, f.path))
+                .collect::<AnyResult<Vec<_>>>()?;
+            let listing_table = Arc::new(
+                self.create_parquet_table(urls, read_schema.clone(), description)
+                    .await?,
+            );
             let df = self.datafusion.read_table(listing_table).map_err(|e| {
                 anyhow!("internal error processing {description}; {REPORT_ERROR}; error reading Parquet files: {e}")
             })?;
             let df = self.project_physical_to_logical(df)?;
-            // Drop unused columns when `skip_unused_columns` is set, so
-            // DataFusion never reads them off disk.
+            let df = self.add_partition_columns(df, group[0].partition_values, &[], description)?;
+            // Drop the columns the connector does not need.
             dfs.push(self.project_cdc_columns(df).map_err(|e| {
                 anyhow!("internal error processing {description}; {REPORT_ERROR}; {e}")
             })?);
         }
 
-        for (path, dv) in masked {
-            // Keep the same CDC read set as `project_cdc_columns` applies on the
-            // plain side (via `keeps_cdc_column`), so the two providers union
-            // cleanly.
-            let bitmap = self.decode_dv(table, Some(dv), description).await?;
+        // Each direct group reads through one provider rather than one per
+        // file, which is what bounds how many of their Parquet readers are open
+        // at once: the plan drives every partition it has concurrently, so one
+        // provider per file left the count unbounded. A file with no DV gets an
+        // empty bitmap, which reads every row.
+        for group in direct.values() {
+            let mut files = Vec::with_capacity(group.len());
+            for (file, dv) in group {
+                files.push((file.path, self.decode_dv(table, *dv, description).await?));
+            }
             let provider = self
-                .file_provider(table, path, bitmap, ReadMode::NotInBitmap, |name| {
-                    self.keeps_cdc_column(name)
-                })
+                .file_provider(table, files, ReadMode::NotInBitmap, read_schema.clone())
                 .await?;
             let df = self.datafusion.read_table(provider).map_err(|e| {
-                anyhow!("internal error processing {description}; {REPORT_ERROR}; error reading masked file '{path}': {e}")
+                anyhow!(
+                    "internal error processing {description}; {REPORT_ERROR}; error reading files {}: {e}",
+                    describe_paths(group.iter().map(|(file, _)| file.path))
+                )
             })?;
-            dfs.push(self.project_physical_to_logical(df)?);
+            let df = self.project_physical_to_logical(df)?;
+            // Every file in the group agrees on its partition values, so the
+            // first one speaks for all of them, as on the plain side.
+            let df =
+                self.add_partition_columns(df, group[0].0.partition_values, &[], description)?;
+            dfs.push(self.project_cdc_columns(df).map_err(|e| {
+                anyhow!("internal error processing {description}; {REPORT_ERROR}; {e}")
+            })?);
         }
 
         let mut dfs = dfs.into_iter();
@@ -3451,9 +5032,11 @@ impl DeltaTableInputEndpointInner {
         Ok(Some(df))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_action(
         &self,
         action: &Action,
+        version: i64,
         table: &DeltaTable,
         used_columns: &[&str],
         input_stream: &mut dyn ArrowStream,
@@ -3466,6 +5049,9 @@ impl DeltaTableInputEndpointInner {
                     &add.path,
                     true,
                     add.deletion_vector.as_ref(),
+                    Some(&add.partition_values),
+                    version,
+                    add_read_size(add),
                     table,
                     used_columns,
                     input_stream,
@@ -3481,6 +5067,11 @@ impl DeltaTableInputEndpointInner {
                     &remove.path,
                     false,
                     remove.deletion_vector.as_ref(),
+                    remove.partition_values.as_ref(),
+                    version,
+                    // A `Remove` action carries no row count, so its read is
+                    // unmeasured.
+                    None,
                     table,
                     used_columns,
                     input_stream,
@@ -3494,7 +5085,7 @@ impl DeltaTableInputEndpointInner {
     }
 
     // NOTE: Column projection (follow here, CDC in `process_cdc_transaction`) runs against the
-    // schema in `schema_table`, which `create_parquet_table` applies to every Parquet file we read.
+    // schema in `schema_table`, which every read path applies to the Parquet files it opens.
     // While following, that schema is the one active when the commit being read was written (see the
     // field's docs and `advance_schema`). Column-mapped physical names are stable across a rename, so
     // the reader handles each version's files against its own schema: DataFusion's schema adapter
@@ -3506,6 +5097,9 @@ impl DeltaTableInputEndpointInner {
         path: &str,
         polarity: bool,
         deletion_vector: Option<&DeletionVectorDescriptor>,
+        partition_values: Option<&HashMap<String, Option<String>>>,
+        version: i64,
+        read_size: Option<ReadSize>,
         table: &DeltaTable,
         used_columns: &[&str],
         input_stream: &mut dyn ArrowStream,
@@ -3513,35 +5107,34 @@ impl DeltaTableInputEndpointInner {
         start_transaction: Option<Option<String>>,
     ) -> AnyResult<()> {
         let description = format!("file '{path}'");
+        let read_schema = self.physical_read_schema(|name| self.needs_column(name))?;
 
-        // DV files, and uc:// tables (whose path-less location a ListingTable
-        // can't resolve), read through the object store directly. An empty bitmap
-        // reads every row. Other schemes use the ListingTable path.
-        let provider: Arc<dyn TableProvider> = if requires_direct_object_store_read(table)
-            || deletion_vector.is_some_and(is_active_dv)
-        {
-            let bitmap = match deletion_vector.filter(|d| is_active_dv(d)) {
-                Some(dv) => self.decode_dv(table, Some(dv), &description).await?,
-                None => RoaringTreemap::new(),
-            };
-            self.file_provider(table, path, bitmap, ReadMode::NotInBitmap, |name| {
-                used_columns.contains(&name)
-            })
-            .await?
-        } else {
-            let full_path = format!("{}{}", table_root_base(table), path);
-            Arc::new(
-                self.create_parquet_table(vec![full_path], &description)
+        // A DV file, or any file of an unlistable location, goes through the
+        // object store; an empty bitmap reads every row.
+        let provider: Arc<dyn TableProvider> =
+            if deletion_vector.is_some_and(is_active_dv) || location_is_unlistable(table) {
+                let bitmap = self.decode_dv(table, deletion_vector, &description).await?;
+                self.file_provider(table, [(path, bitmap)], ReadMode::NotInBitmap, read_schema)
+                    .await?
+            } else {
+                Arc::new(
+                    self.create_parquet_table(
+                        vec![file_listing_url(table, path)?],
+                        read_schema,
+                        &description,
+                    )
                     .await?,
-            )
-        };
+                )
+            };
 
         self.emit_provider(
             provider,
             polarity,
             used_columns,
+            partition_values,
             &description,
-            table,
+            version,
+            read_size,
             input_stream,
             receiver,
             start_transaction,
@@ -3557,8 +5150,11 @@ impl DeltaTableInputEndpointInner {
         &self,
         action: &Action,
         path: &str,
+        partition_values: Option<&HashMap<String, Option<String>>>,
         dv_delta: Option<&RoaringTreemap>,
         polarity: bool,
+        version: i64,
+        read_size: Option<ReadSize>,
         table: &DeltaTable,
         used_columns: &[&str],
         input_stream: &mut dyn ArrowStream,
@@ -3572,16 +5168,21 @@ impl DeltaTableInputEndpointInner {
             Some(positions) if !positions.is_empty() => {
                 let description = format!("file '{path}'");
                 let provider = self
-                    .file_provider(table, path, positions.clone(), ReadMode::InBitmap, |name| {
-                        used_columns.contains(&name)
-                    })
+                    .file_provider(
+                        table,
+                        [(path, positions.clone())],
+                        ReadMode::InBitmap,
+                        self.physical_read_schema(|name| self.needs_column(name))?,
+                    )
                     .await?;
                 self.emit_provider(
                     provider,
                     polarity,
                     used_columns,
+                    partition_values,
                     &description,
-                    table,
+                    version,
+                    read_size,
                     input_stream,
                     receiver,
                     start_transaction,
@@ -3594,6 +5195,7 @@ impl DeltaTableInputEndpointInner {
             None => {
                 self.process_action(
                     action,
+                    version,
                     table,
                     used_columns,
                     input_stream,
@@ -3605,17 +5207,21 @@ impl DeltaTableInputEndpointInner {
         }
     }
 
-    /// Read `provider` restricted to `used_columns`, apply the connector's
-    /// optional `filter` expression (`self.config.filter`), and push the rows to
-    /// the input stream with `polarity`.
+    /// Apply the connector's optional `filter` to `provider`, project to
+    /// `used_columns`, and push the rows to the input stream with `polarity`.
+    ///
+    /// The filter runs first because it may name Delta columns `used_columns`
+    /// does not carry, the ones the SQL table never declares.
     #[allow(clippy::too_many_arguments)]
     async fn emit_provider(
         &self,
         provider: Arc<dyn TableProvider>,
         polarity: bool,
         used_columns: &[&str],
+        partition_values: Option<&HashMap<String, Option<String>>>,
         description: &str,
-        table: &DeltaTable,
+        version: i64,
+        read_size: Option<ReadSize>,
         input_stream: &mut dyn ArrowStream,
         receiver: &mut Receiver<PipelineState>,
         start_transaction: Option<Option<String>>,
@@ -3626,32 +5232,25 @@ impl DeltaTableInputEndpointInner {
         // Translate column-mapped physical names back to logical before any
         // logical-name projection or filter.
         let df = self.project_physical_to_logical(df)?;
+        let df = self.add_partition_columns(df, partition_values, &[], description)?;
+
+        let df = apply_filter(df, self.config.filter.as_deref(), description, None)?;
+
         let df = df.select_columns(used_columns).map_err(|e| {
             anyhow!("internal error processing {description}; {REPORT_ERROR}; error selecting columns: {e}")
         })?;
 
-        let df = if let Some(filter) = &self.config.filter {
-            let expr = df
-                .parse_sql_expr(filter)
-                .map_err(|e| anyhow!("invalid 'filter' expression '{filter}': {e}"))?;
-            df.filter(expr).map_err(|e| {
-                anyhow!("internal error processing {description}; {REPORT_ERROR}; error applying 'filter': {e}")
-            })?
-        } else {
-            df
-        };
-
         let _record_count = self
             .execute_df(
                 df,
-                polarity,
-                None,
+                Polarity::Fixed(polarity),
                 description,
                 input_stream,
                 receiver,
                 start_transaction,
                 self.config.max_retries(),
-                table.version().map(|v| v as i64),
+                Some(version),
+                read_size,
             )
             .await?;
 
@@ -3667,6 +5266,23 @@ async fn wait_running(receiver: &mut Receiver<PipelineState>) {
     let _ = receiver
         .wait_for(|state| state == &PipelineState::Running)
         .await;
+}
+
+#[cfg(test)]
+mod resume_timestamp_tests {
+    use super::raw_resume_timestamp;
+
+    #[test]
+    fn raw_resume_timestamp_strips_only_a_sql_literal() {
+        for (stored, raw) in [
+            ("2024-01-02T03:00:00", "2024-01-02T03:00:00"),
+            ("1704067200000", "1704067200000"),
+            ("timestamp '2024-01-02T03:00:00'", "2024-01-02T03:00:00"),
+            ("date '2024-01-02'", "2024-01-02"),
+        ] {
+            assert_eq!(raw_resume_timestamp(stored), raw);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3695,7 +5311,7 @@ mod format_datafusion_error_tests {
             "missing actionable hint; got: {msg}"
         );
         assert!(
-            msg.contains("datafusion_memory_mb"),
+            msg.contains("'datafusion_memory'"),
             "missing knob name; got: {msg}"
         );
     }
@@ -3741,6 +5357,271 @@ mod format_datafusion_error_tests {
 }
 
 #[cfg(test)]
+mod change_type_tests {
+    use super::*;
+    use arrow::array::{Int64Array, LargeStringArray, StringArray, StringViewArray};
+    use std::sync::Arc;
+
+    /// Every width of string array a read can produce for `_change_type`.
+    const STRING_TYPES: [ArrowDataType; 3] = [
+        ArrowDataType::Utf8,
+        ArrowDataType::LargeUtf8,
+        ArrowDataType::Utf8View,
+    ];
+
+    /// A batch of `id` values tagged with `change_types`, shaped like a change
+    /// data file: the table's columns followed by `_change_type` stored as
+    /// `string_type`.
+    fn batch_typed(change_types: Vec<Option<&str>>, string_type: &ArrowDataType) -> RecordBatch {
+        let ids: Vec<i64> = (0..change_types.len() as i64).collect();
+        let column: ArrayRef = match string_type {
+            ArrowDataType::Utf8 => Arc::new(StringArray::from(change_types)),
+            ArrowDataType::LargeUtf8 => Arc::new(LargeStringArray::from(change_types)),
+            ArrowDataType::Utf8View => Arc::new(StringViewArray::from(change_types)),
+            other => panic!("{other:?} is not a string type"),
+        };
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int64, false),
+                ArrowField::new(CHANGE_TYPE_COLUMN, string_type.clone(), true),
+            ])),
+            vec![Arc::new(Int64Array::from(ids)), column],
+        )
+        .unwrap()
+    }
+
+    fn batch(change_types: Vec<Option<&str>>) -> RecordBatch {
+        batch_typed(change_types, &ArrowDataType::Utf8)
+    }
+
+    /// The polarity mapping reads `_change_type` at any string width. A read
+    /// schema asks for view types, so this column arrives as `Utf8View` and a
+    /// reader bound to `Utf8` would reject every change data file.
+    #[test]
+    fn change_types_read_at_every_string_width() {
+        for string_type in STRING_TYPES {
+            let (batch, polarities) = take_change_type_polarities(batch_typed(
+                vec![Some("insert"), Some("delete")],
+                &string_type,
+            ))
+            .unwrap_or_else(|e| panic!("{string_type:?} column must be readable: {e}"));
+
+            assert_eq!(polarities, vec![true, false], "at {string_type:?}");
+            assert_eq!(batch.num_rows(), 2, "at {string_type:?}");
+        }
+    }
+
+    /// A column that is not a string at all is an error naming its type, so
+    /// widening the reader did not lose the type check.
+    #[test]
+    fn non_string_change_type_column_is_an_error() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                CHANGE_TYPE_COLUMN,
+                ArrowDataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+
+        let error = take_change_type_polarities(batch)
+            .expect_err("a non-string change type column must not be ingested")
+            .to_string();
+        assert!(
+            error.contains(CHANGE_TYPE_COLUMN) && error.contains("Int64"),
+            "the error must name the column and its type; got: {error}"
+        );
+    }
+
+    /// Each `_change_type` the protocol defines maps to a polarity: `insert` and
+    /// `update_postimage` insert, `delete` and `update_preimage` retract.
+    ///
+    /// The two images of an update therefore carry opposite polarities, so an
+    /// update reaches the circuit as a retraction of the old row and an
+    /// insertion of the new one.
+    #[test]
+    fn change_types_map_to_polarities() {
+        let (batch, polarities) = take_change_type_polarities(batch(vec![
+            Some("insert"),
+            Some("update_postimage"),
+            Some("update_preimage"),
+            Some("delete"),
+        ]))
+        .unwrap();
+
+        assert_eq!(polarities, vec![true, true, false, false]);
+        // The polarity column is consumed here, not passed to the deserializer.
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
+        assert_eq!(batch.num_rows(), 4);
+    }
+
+    /// A `_change_type` the protocol does not define, and a NULL, are each an
+    /// error naming the value that was rejected and the column it came from.
+    #[test]
+    fn unknown_change_type_is_an_error() {
+        for (change_type, expected) in [(Some("upsert"), "'upsert'"), (None, "NULL")] {
+            let error = take_change_type_polarities(batch(vec![change_type]))
+                .expect_err("an unrecognized change type must not be ingested")
+                .to_string();
+            assert!(
+                error.contains(expected) && error.contains(CHANGE_TYPE_COLUMN),
+                "the error must name the value and the column; got: {error}"
+            );
+        }
+    }
+
+    /// A batch with no `_change_type` column is an error naming the missing
+    /// column.
+    #[test]
+    fn missing_change_type_column_is_an_error() {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        )
+        .unwrap();
+
+        let error = take_change_type_polarities(batch)
+            .expect_err("a batch without the change type column must not be ingested")
+            .to_string();
+        assert!(
+            error.contains(CHANGE_TYPE_COLUMN),
+            "the error must name the missing column; got: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod change_type_split_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    /// One row per `_change_type` worth telling apart: the protocol's four, a
+    /// value outside them, and NULL.
+    fn rows() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int64, false),
+                ArrowField::new(CHANGE_TYPE_COLUMN, ArrowDataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    Some("insert"),
+                    Some("delete"),
+                    Some("update_preimage"),
+                    Some("update_postimage"),
+                    Some("upsert"),
+                    None,
+                ])),
+            ],
+        )
+        .expect("the batch is well formed")
+    }
+
+    async fn kept(batch: RecordBatch, predicate: &str) -> Vec<i64> {
+        let df = SessionContext::new()
+            .read_batch(batch)
+            .expect("a batch reads as a frame");
+        apply_filter(df, Some(predicate), "change type split", None)
+            .expect("the predicate parses")
+            .collect()
+            .await
+            .expect("the frame collects")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// The retraction and insertion predicates place every row in exactly one
+    /// pass: each of the protocol's four values, a value outside them, and NULL.
+    ///
+    /// Values the protocol does not define belong to the insertion pass, where
+    /// `take_change_type_polarities` rejects them. The insertion predicate names
+    /// NULL explicitly, since `NULL NOT IN (..)` is NULL rather than true.
+    #[tokio::test]
+    async fn the_two_passes_partition_every_row() {
+        let retracted = kept(rows(), RETRACTED_CHANGE_TYPES).await;
+        let inserted = kept(rows(), INSERTED_CHANGE_TYPES).await;
+
+        assert_eq!(retracted, vec![2, 3], "'delete' and 'update_preimage'");
+        assert_eq!(
+            inserted,
+            vec![1, 4, 5, 6],
+            "the rest, including the unknown value and NULL, which \
+             `take_change_type_polarities` then rejects"
+        );
+
+        let mut both: Vec<i64> = retracted.iter().chain(inserted.iter()).copied().collect();
+        both.sort_unstable();
+        assert_eq!(
+            both,
+            (1..=6).collect::<Vec<i64>>(),
+            "the passes must cover every row exactly once"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reserved_change_type_column_tests {
+    use super::*;
+
+    fn schema(names: &[&str]) -> ArrowSchema {
+        ArrowSchema::new(
+            names
+                .iter()
+                .map(|name| ArrowField::new(*name, ArrowDataType::Int64, false))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// A table schema that declares no `_change_type` column reports no
+    /// collision.
+    #[test]
+    fn a_table_without_the_reserved_column_is_accepted() {
+        assert_eq!(reserved_change_type_column(&schema(&["id", "value"])), None);
+    }
+
+    /// A column named `_change_type` in any casing is reported as the collision,
+    /// under the spelling the table itself uses.
+    ///
+    /// Delta schemas carry no case-sensitivity information, so the name is
+    /// matched ignoring case.
+    #[test]
+    fn the_reserved_column_is_found_whatever_its_case() {
+        for name in [CHANGE_TYPE_COLUMN, "_Change_Type", "_CHANGE_TYPE"] {
+            assert_eq!(
+                reserved_change_type_column(&schema(&["id", name])),
+                Some(name),
+                "a column named {name} collides with the change feed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod is_skippable_tests {
     use super::DeltaTableInputEndpointInner;
     use feldera_types::program_schema::{ColumnType, Field};
@@ -3778,7 +5659,9 @@ mod is_skippable_tests {
 #[cfg(test)]
 mod column_mapping_tests {
     use super::{field_to_physical, nested_physical_to_logical, relabel_nested_columns};
-    use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray};
+    use arrow::array::{
+        ArrayRef, ListArray, RecordBatch, StringArray, StringViewArray, StructArray,
+    };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use std::collections::HashMap;
@@ -3790,6 +5673,45 @@ mod column_mapping_tests {
             "delta.columnMapping.physicalName".to_string(),
             physical.to_string(),
         )]))
+    }
+
+    /// Relabeling rebuilds each column's `ArrayData` with renamed fields, and a
+    /// view array's layout is several data buffers behind a buffer of views
+    /// rather than one values buffer behind offsets. Since reads ask for view
+    /// types, a column-mapped nested string column arrives here as one, so the
+    /// rebuild has to carry that layout through untouched.
+    #[test]
+    fn relabel_carries_view_arrays_through() {
+        let ids: ArrayRef = Arc::new(StringViewArray::from(vec!["t1", "t2"]));
+        let after: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("col-id", DataType::Utf8View, true)),
+            ids.clone(),
+        )]));
+        let batch = RecordBatch::try_from_iter(vec![("after", after)]).unwrap();
+
+        let map = nested_physical_to_logical(&Schema::new(vec![mapped(
+            "after",
+            struct_of(vec![mapped("id", DataType::Utf8View, "col-id")]),
+            "col-after",
+        )]));
+        let relabeled = relabel_nested_columns(&batch, &map).unwrap();
+
+        let DataType::Struct(children) = relabeled.schema().field(0).data_type().clone() else {
+            panic!("`after` must stay a struct");
+        };
+        assert_eq!(children[0].name(), "id");
+        assert_eq!(
+            children[0].data_type(),
+            &DataType::Utf8View,
+            "relabeling renames fields, it must not change their types"
+        );
+
+        let after = relabeled
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(after.column(0).as_ref(), ids.as_ref());
     }
 
     /// A `struct<..>` data type from mapped fields.
@@ -3980,5 +5902,1859 @@ mod column_mapping_tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         assert_eq!(element.column(0).as_ref(), ids.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod partition_projection_tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    /// The partition value the log action records for the file under test.
+    const PARTITION_VALUE: &str = "EAST";
+
+    /// Project one data file holding `data_column` from a table partitioned by
+    /// `partition_column`, the way a follow-mode read does.
+    ///
+    /// Delta keeps a partition column in the log action alone, so the file holds
+    /// every other column and the projection puts the partition value back.
+    async fn project(data_column: &str, partition_column: &str) -> DataFrame {
+        let table_schema = ArrowSchema::new(vec![
+            ArrowField::new(data_column, ArrowDataType::Int64, false),
+            ArrowField::new(partition_column, ArrowDataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                data_column,
+                ArrowDataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+        )
+        .expect("the batch is well formed");
+
+        let df = SessionContext::new()
+            .read_batch(batch)
+            .expect("a batch reads as a frame");
+        let file_schema = df.schema().clone();
+        let partition_values = HashMap::from([(
+            partition_column.to_string(),
+            Some(PARTITION_VALUE.to_string()),
+        )]);
+        let projection = DeltaTableInputEndpointInner::partition_projection(
+            &table_schema,
+            &[partition_column.to_string()],
+            Some(&partition_values),
+            &file_schema,
+            &[],
+            "a data file",
+        )
+        .expect("the projection is built");
+
+        df.select(projection)
+            .expect("the projection resolves against the file's columns")
+    }
+
+    fn column_names(df: &DataFrame) -> Vec<String> {
+        df.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    async fn partition_column_values(df: DataFrame, column: &str) -> Vec<String> {
+        df.collect()
+            .await
+            .expect("the frame collects")
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name(column)
+                    .expect("the partition column is projected")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("the partition column reads as a string")
+                    .iter()
+                    .map(|value| value.expect("the log recorded a value").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Uppercase column names, as a table loaded from a system that folds
+    /// identifiers to upper case carries. Read as SQL, an unquoted `ID` names
+    /// column `id`, which such a table does not have.
+    #[tokio::test]
+    async fn an_uppercase_column_keeps_its_case() {
+        let df = project("ID", "REGION").await;
+
+        assert_eq!(column_names(&df), vec!["ID", "REGION"]);
+        assert_eq!(
+            partition_column_values(df, "REGION").await,
+            vec![PARTITION_VALUE; 2],
+            "every row takes the partition value from the log action"
+        );
+    }
+
+    /// A column name holding a dot. Read as SQL it splits into a table
+    /// qualifier and a column, naming neither.
+    #[tokio::test]
+    async fn a_dotted_column_name_is_not_a_qualifier() {
+        let df = project("src.id", "src.app").await;
+
+        assert_eq!(column_names(&df), vec!["src.id", "src.app"]);
+    }
+}
+
+#[cfg(test)]
+mod change_data_feed_state_tests {
+    use super::{ENABLE_CHANGE_DATA_FEED, change_data_feed_state};
+    use deltalake::kernel::{Action, DataType, StructField, StructType, new_metadata};
+
+    /// A `metaData` action carrying `configuration`.
+    fn metadata(configuration: &[(&str, &str)]) -> Action {
+        let schema =
+            StructType::try_new(vec![StructField::new("id", DataType::LONG, true)]).unwrap();
+        Action::Metadata(
+            new_metadata(&schema, Vec::<String>::new(), configuration.iter().copied()).unwrap(),
+        )
+    }
+
+    /// The property reads as on only when it is present and `true`.
+    ///
+    /// The absent case is the one that matters: `ALTER TABLE ... UNSET
+    /// TBLPROPERTIES` writes a `metaData` whose configuration simply lacks the
+    /// key, so reading it as "unchanged" leaves the connector reading every
+    /// later commit from its file actions with nothing in the log to say why.
+    #[test]
+    fn absent_property_reads_as_off() {
+        assert_eq!(
+            change_data_feed_state(&[metadata(&[(ENABLE_CHANGE_DATA_FEED, "true")])]),
+            Some(true)
+        );
+        assert_eq!(
+            change_data_feed_state(&[metadata(&[(ENABLE_CHANGE_DATA_FEED, "false")])]),
+            Some(false)
+        );
+        assert_eq!(change_data_feed_state(&[metadata(&[])]), Some(false));
+        assert_eq!(
+            change_data_feed_state(&[metadata(&[("delta.appendOnly", "true")])]),
+            Some(false),
+            "a metaData that sets other properties still drops this one"
+        );
+    }
+
+    /// Delta writes the property lowercase, but the value is compared without
+    /// regard to case, as the table property parser does.
+    #[test]
+    fn value_case_is_ignored() {
+        assert_eq!(
+            change_data_feed_state(&[metadata(&[(ENABLE_CHANGE_DATA_FEED, "TRUE")])]),
+            Some(true)
+        );
+    }
+
+    /// A commit with no `metaData` says nothing about the property, so the
+    /// connector keeps what it knows rather than reading absence as off.
+    #[test]
+    fn commit_without_metadata_is_silent() {
+        assert_eq!(change_data_feed_state(&[]), None);
+    }
+
+    /// The last `metaData` wins, since it is the state the commit leaves.
+    #[test]
+    fn last_metadata_wins() {
+        assert_eq!(
+            change_data_feed_state(&[
+                metadata(&[(ENABLE_CHANGE_DATA_FEED, "true")]),
+                metadata(&[]),
+            ]),
+            Some(false)
+        );
+        assert_eq!(
+            change_data_feed_state(&[
+                metadata(&[]),
+                metadata(&[(ENABLE_CHANGE_DATA_FEED, "true")]),
+            ]),
+            Some(true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_size_tests {
+    use super::*;
+
+    /// 8192 rows is DataFusion's default and the ceiling here: the budget only
+    /// shrinks a batch, it never asks for a bigger one than configured.
+    const DEFAULT_ROWS: usize = 8192;
+
+    fn rows(bytes: u64, records: u64, partitions: usize) -> Option<usize> {
+        let mut size = ReadSize::default();
+        size.add(bytes, records);
+        size.batch_rows(partitions, DEFAULT_ROWS)
+    }
+
+    /// An ordinary table keeps the full batch, so bounding decode memory costs
+    /// nothing until the rows are actually wide.
+    #[test]
+    fn ordinary_rows_keep_the_default_batch() {
+        // 200 bytes per row compressed over 10M rows.
+        assert_eq!(rows(2_000_000_000, 10_000_000, 32), Some(DEFAULT_ROWS));
+        // Even a single reader is capped by the configured batch size.
+        assert_eq!(rows(2_000_000_000, 10_000_000, 1), Some(DEFAULT_ROWS));
+    }
+
+    /// Wide rows shrink the batch, and the result stays inside the budget.
+    #[test]
+    fn wide_rows_shrink_the_batch() {
+        const PARTITIONS: usize = 32;
+        // 64 KiB per row compressed over 1000 rows.
+        let bytes = 64 * 1024 * 1000;
+        let per_row = 64 * 1024 * COMPRESSED_EXPANSION;
+
+        // Spread over enough files to use every partition, so all of them
+        // decode at once and the budget covers the sum.
+        let rows = rows(bytes, 1000, PARTITIONS).expect("a sized read picks a batch");
+        assert!(
+            (MIN_BATCH_ROWS..DEFAULT_ROWS).contains(&rows),
+            "expected a smaller batch inside the floor; got {rows}"
+        );
+        let held = rows as u64 * per_row * PARTITIONS as u64;
+        assert!(
+            held <= DECODE_BUDGET_BYTES,
+            "{PARTITIONS} readers of {rows} rows hold {held} bytes, over the budget"
+        );
+    }
+
+    /// More concurrent readers each get a smaller batch, since the budget covers
+    /// the scan and not one reader.
+    #[test]
+    fn concurrency_divides_the_budget() {
+        let bytes = 16 * 1024 * 1000;
+        let few = rows(bytes, 1000, 4).unwrap();
+        let many = rows(bytes, 1000, 64).unwrap();
+        assert!(
+            many < few,
+            "64 readers must take smaller batches than 4; got {many} against {few}"
+        );
+    }
+
+    /// Rows wide enough to make even the floor exceed the budget still get the
+    /// floor: shrinking without limit costs more than it saves.
+    #[test]
+    fn the_floor_holds() {
+        // 8 MiB per row.
+        assert_eq!(rows(8 * 1024 * 1024, 1, 32), Some(MIN_BATCH_ROWS));
+    }
+
+    /// A configured batch size below the floor is honored rather than raised to
+    /// it, and above all does not panic: `clamp` requires `min <= max`, so a
+    /// floor above the configured size used to abort the connector task on the
+    /// first sized read. A plain `"batch_size": 32` reaches this.
+    #[test]
+    fn a_batch_size_below_the_floor_is_honored() {
+        for configured in [1, 32, MIN_BATCH_ROWS - 1] {
+            let mut size = ReadSize::default();
+            size.add(2_000_000_000, 10_000_000);
+            assert_eq!(
+                size.batch_rows(32, configured),
+                Some(configured),
+                "a configured {configured}-row batch must survive the budget"
+            );
+        }
+    }
+
+    /// A read the log did not measure falls back to the configured batch size
+    /// rather than guessing. A writer that omits `stats` leaves `numRecords`
+    /// absent, which is the common way this happens.
+    #[test]
+    fn an_unmeasured_read_picks_nothing() {
+        assert_eq!(rows(0, 0, 32), None);
+        assert_eq!(rows(1_000_000, 0, 32), None, "bytes without a row count");
+        assert_eq!(rows(0, 1_000, 32), None, "rows without a byte count");
+    }
+
+    /// One `Add` action measures the file it adds, which is what makes a follow
+    /// read sized: before this, follow mode passed nothing and every read fell
+    /// back to the configured batch size.
+    #[test]
+    fn an_add_action_measures_its_file() {
+        let add = AddAction {
+            path: "part-00000.parquet".to_string(),
+            size: 4_000_000,
+            stats: Some(r#"{"numRecords":1000}"#.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            add_read_size(&add),
+            Some(ReadSize {
+                bytes: 4_000_000,
+                records: 1000
+            })
+        );
+    }
+
+    /// A writer that omits `numRecords` leaves no ratio, so the read stays
+    /// unmeasured rather than being sized from a guess.
+    #[test]
+    fn an_add_without_statistics_is_unmeasured() {
+        let add = AddAction {
+            path: "part-00000.parquet".to_string(),
+            size: 4_000_000,
+            stats: None,
+            ..Default::default()
+        };
+        assert_eq!(add_read_size(&add), None);
+
+        let malformed = AddAction {
+            stats: Some("not json".to_string()),
+            ..add.clone()
+        };
+        assert_eq!(add_read_size(&malformed), None);
+    }
+
+    /// Summing the log's files is what produces the ratio.
+    #[test]
+    fn sizes_accumulate() {
+        let mut size = ReadSize::default();
+        size.add(100, 10);
+        size.add(200, 20);
+        assert_eq!(
+            size,
+            ReadSize {
+                bytes: 300,
+                records: 30
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod version_suffix_tests {
+    use super::*;
+
+    /// A version-scoped read names the commit it is reading. The follow loop
+    /// never reloads its table handle, so reporting `DeltaTable::version()`
+    /// here named the version the connector *started* from on every retry, and
+    /// sent whoever read the log to the wrong commit.
+    #[test]
+    fn a_version_is_named() {
+        assert_eq!(version_suffix(Some(107273)), " (table version: 107273)");
+    }
+
+    /// The initial snapshot spans many commits, so it names none.
+    #[test]
+    fn no_version_adds_nothing() {
+        assert_eq!(version_suffix(None), "");
+    }
+}
+
+#[cfg(test)]
+mod describe_paths_tests {
+    use super::*;
+
+    /// Up to `DESCRIBED_PATHS` paths are named in full.
+    #[test]
+    fn short_lists_are_named_in_full() {
+        assert_eq!(describe_paths(Vec::<&str>::new()), "[]");
+        assert_eq!(describe_paths(vec!["a", "b"]), r#"["a", "b"]"#);
+        assert_eq!(
+            describe_paths(vec!["a", "b", "c"]),
+            r#"["a", "b", "c"]"#,
+            "a list at the limit must not claim a remainder"
+        );
+    }
+
+    /// Past the limit the description stays a fixed size whatever the commit
+    /// touched, and still says how much it left out.
+    #[test]
+    fn long_lists_are_summarized() {
+        assert_eq!(
+            describe_paths(vec!["a", "b", "c", "d"]),
+            r#"["a", "b", "c"] and 1 more"#
+        );
+        let many: Vec<String> = (0..100).map(|i| format!("part-{i:05}.parquet")).collect();
+        let description = describe_paths(many.iter().map(String::as_str));
+        assert!(
+            description.ends_with("and 97 more"),
+            "expected a remainder count; got: {description}"
+        );
+        assert!(
+            description.len() < 120,
+            "the description must stay short; got {} chars",
+            description.len()
+        );
+    }
+}
+
+/// How the Parquet reader decides the Arrow type of a string column, which is
+/// what bounds a decoded batch: `Utf8` carries 32-bit offsets and so caps one
+/// batch at 2 GiB per column, `Utf8View` does not.
+#[cfg(test)]
+mod read_schema_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, StringArray};
+    use datafusion::prelude::SessionConfig;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+    use std::path::{Path, PathBuf};
+
+    /// Write `values` as a single `Utf8` column named `s` and return the file's path.
+    ///
+    /// `rows_per_write` batches keep the writer's own buffers small while every
+    /// row still lands in one row group, so what the reader decodes in one batch
+    /// is decided by the read batch size alone.
+    fn write_parquet(dir: &Path, values: &[&str], rows_per_write: usize) -> PathBuf {
+        let path = dir.join("part-00000.parquet");
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(true)
+            .set_max_row_group_row_count(Some(values.len().max(1)))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), Some(props))
+                .unwrap();
+        for chunk in values.chunks(rows_per_write) {
+            let column: ArrayRef = Arc::new(StringArray::from_iter_values(chunk.iter().copied()));
+            writer
+                .write(&RecordBatch::try_new(schema.clone(), vec![column]).unwrap())
+                .unwrap();
+        }
+        writer.close().unwrap();
+        path
+    }
+
+    /// Read `path` the way the connector reads a data file: one `ListingTable`
+    /// whose schema is supplied rather than inferred (see
+    /// [`DeltaTableInputEndpointInner::create_parquet_table`]).
+    ///
+    /// `force_view_types` sets the session option of the same name, and
+    /// `read_schema` is what the listing table declares.
+    async fn read_one_batch(
+        path: &Path,
+        read_schema: SchemaRef,
+        force_view_types: bool,
+        batch_size: usize,
+    ) -> Result<RecordBatch, DataFusionError> {
+        let config = SessionConfig::new()
+            .set_bool(
+                "datafusion.execution.parquet.schema_force_view_types",
+                force_view_types,
+            )
+            .set_usize("datafusion.execution.batch_size", batch_size);
+        let ctx = SessionContext::new_with_config(config);
+
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).unwrap();
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension_opt(Some(".parquet"));
+        let table = ListingTable::try_new(
+            ListingTableConfig::new_with_multi_paths(vec![url])
+                .with_listing_options(listing_options)
+                .with_schema(read_schema),
+        )?;
+
+        let mut stream = ctx.read_table(Arc::new(table))?.execute_stream().await?;
+        stream
+            .next()
+            .await
+            .expect("the file holds at least one row")
+    }
+
+    fn schema_of(data_type: ArrowDataType) -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s", data_type, false,
+        )]))
+    }
+
+    /// A filter keeps the batch size it was planned with, whatever the task
+    /// context says later. That is why `execute_stream` plans a second time
+    /// once it knows the size rather than only setting it on the context.
+    ///
+    /// `FilterExec` takes the size at planning time and hands it to a
+    /// coalescer, so it buffers the scan's smaller batches back up to it. The
+    /// scan itself does follow the context, which is the weaker property
+    /// `a_file_scan_takes_its_batch_size_from_the_task_context` pins; this test
+    /// exists because that one is not enough to conclude anything about a plan.
+    /// If DataFusion ever makes the filter read the context too, this fails and
+    /// the second planning pass can go.
+    #[tokio::test]
+    async fn a_filter_keeps_the_batch_size_it_was_planned_with() {
+        const ROWS: usize = 20_000;
+        const PLANNED: usize = 8192;
+        const AFTER: usize = 100;
+        let dir = tempfile::tempdir().unwrap();
+        let values: Vec<String> = (0..ROWS).map(|i| format!("row-{i:08}")).collect();
+        let path = write_parquet(
+            dir.path(),
+            &values.iter().map(String::as_str).collect::<Vec<_>>(),
+            1000,
+        );
+
+        // One partition, so every row passes through one filter and its
+        // coalescer has enough input to reach the planned size.
+        let config = SessionConfig::new()
+            .set_usize("datafusion.execution.batch_size", PLANNED)
+            .with_target_partitions(1);
+        let ctx = SessionContext::new_with_config(config);
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).unwrap();
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension_opt(Some(".parquet"));
+        let table = ListingTable::try_new(
+            ListingTableConfig::new_with_multi_paths(vec![url])
+                .with_listing_options(listing_options)
+                .with_schema(schema_of(ArrowDataType::Utf8)),
+        )
+        .unwrap();
+        let df = ctx
+            .read_table(Arc::new(table))
+            .unwrap()
+            .filter(ident("s").not_eq(lit("absent")))
+            .unwrap();
+
+        let (mut state, logical) = df.into_parts();
+        let plan = state.create_physical_plan(&logical).await.unwrap();
+        state.config_mut().options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(AFTER).unwrap();
+
+        let mut largest = 0;
+        let mut stream = execute_stream(plan, state.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            largest = largest.max(batch.unwrap().num_rows());
+        }
+        assert_eq!(
+            largest, PLANNED,
+            "the filter must still be emitting the batch size it was planned with"
+        );
+
+        // Planning again with the smaller size is what actually bounds it.
+        let plan = state.create_physical_plan(&logical).await.unwrap();
+        let mut largest = 0;
+        let mut rows = 0;
+        let mut stream = execute_stream(plan, state.task_ctx()).unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            largest = largest.max(batch.num_rows());
+            rows += batch.num_rows();
+        }
+        assert_eq!(
+            largest, AFTER,
+            "a replanned filter must follow the new size"
+        );
+        assert_eq!(rows, ROWS, "every row must still come through");
+    }
+
+    /// One file can become many scan partitions, which is why the budget reads
+    /// the count off the plan instead of assuming one partition per file.
+    ///
+    /// DataFusion splits a scan's files into byte ranges once the scan reads at
+    /// least `repartition_file_min_size` in total. The test lowers that
+    /// threshold rather than writing a 10 MB file, and asserts both directions:
+    /// above it one file yields several partitions, below it one.
+    #[tokio::test]
+    async fn a_scan_can_open_more_partitions_than_it_has_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let values: Vec<String> = (0..20_000).map(|i| format!("row-{i:08}")).collect();
+        let path = write_parquet(
+            dir.path(),
+            &values.iter().map(String::as_str).collect::<Vec<_>>(),
+            1000,
+        );
+        let file_bytes = std::fs::metadata(&path).unwrap().len() as usize;
+
+        // Below the threshold the one file stays one partition; above it, the
+        // scan splits the file by byte range and runs several readers.
+        for (min_size, expect_split) in [(file_bytes * 2, false), (file_bytes / 4, true)] {
+            let config = SessionConfig::new()
+                .with_target_partitions(8)
+                .set_usize("datafusion.optimizer.repartition_file_min_size", min_size);
+            let ctx = SessionContext::new_with_config(config);
+
+            let url = ListingTableUrl::parse(format!("file://{}", path.display())).unwrap();
+            let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+                .with_file_extension_opt(Some(".parquet"));
+            let table = ListingTable::try_new(
+                ListingTableConfig::new_with_multi_paths(vec![url])
+                    .with_listing_options(listing_options)
+                    .with_schema(schema_of(ArrowDataType::Utf8)),
+            )
+            .unwrap();
+
+            let (state, plan) = ctx.read_table(Arc::new(table)).unwrap().into_parts();
+            let plan = state.create_physical_plan(&plan).await.unwrap();
+            let partitions = scan_partitions(&plan);
+
+            if expect_split {
+                assert!(
+                    partitions > 1,
+                    "one file over the threshold must split; got {partitions} partitions"
+                );
+            } else {
+                assert_eq!(
+                    partitions, 1,
+                    "one file under the threshold must stay one partition"
+                );
+            }
+        }
+    }
+
+    /// A NaN survives a listing-table read planned with the connector's session settings.
+    ///
+    /// parquet-rs leaves NaN out of min/max, so with statistics on DataFusion
+    /// reads `[1.5, NaN]` as the constant 1.5.
+    #[tokio::test]
+    async fn a_nan_survives_a_listing_table_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part-00000.parquet");
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "f",
+            ArrowDataType::Float64,
+            false,
+        )]));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        let column: ArrayRef = Arc::new(datafusion::arrow::array::Float64Array::from(vec![
+            1.5,
+            f64::NAN,
+        ]));
+        writer
+            .write(&RecordBatch::try_new(schema.clone(), vec![column]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+
+        let config = super::plan_listing_without_statistics(SessionConfig::new());
+        let ctx = SessionContext::new_with_config(config);
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).unwrap();
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension_opt(Some(".parquet"));
+        let table = ListingTable::try_new(
+            ListingTableConfig::new_with_multi_paths(vec![url])
+                .with_listing_options(listing_options)
+                .with_schema(schema.clone()),
+        )
+        .unwrap();
+
+        let (state, plan) = ctx.read_table(Arc::new(table)).unwrap().into_parts();
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+        let mut stream = execute_stream(plan, state.task_ctx()).unwrap();
+        let batch = stream.next().await.expect("the file holds rows").unwrap();
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+            .unwrap();
+        assert_eq!(column.value(0), 1.5);
+        assert!(
+            column.value(1).is_nan(),
+            "the NaN read back as {}",
+            column.value(1)
+        );
+    }
+
+    /// The batch size a file scan uses comes from the task context at execution
+    /// time, not from the session the plan was built with. `execute_stream`
+    /// relies on that: it plans once, sizes the batch from the read, and then
+    /// runs the same plan under a context carrying the size it chose. If
+    /// DataFusion ever binds the size at planning time instead, the override
+    /// becomes silent, so this pins the behavior rather than the API.
+    #[tokio::test]
+    async fn a_file_scan_takes_its_batch_size_from_the_task_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let values: Vec<String> = (0..1000).map(|i| format!("row-{i}")).collect();
+        let path = write_parquet(
+            dir.path(),
+            &values.iter().map(String::as_str).collect::<Vec<_>>(),
+            1000,
+        );
+
+        let planned = SessionConfig::new().set_usize("datafusion.execution.batch_size", 8192);
+        let ctx = SessionContext::new_with_config(planned);
+        let url = ListingTableUrl::parse(format!("file://{}", path.display())).unwrap();
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension_opt(Some(".parquet"));
+        let table = ListingTable::try_new(
+            ListingTableConfig::new_with_multi_paths(vec![url])
+                .with_listing_options(listing_options)
+                .with_schema(schema_of(ArrowDataType::Utf8)),
+        )
+        .unwrap();
+
+        let (mut state, plan) = ctx.read_table(Arc::new(table)).unwrap().into_parts();
+        let plan = state.create_physical_plan(&plan).await.unwrap();
+        state.config_mut().options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(100).unwrap();
+
+        let mut stream = execute_stream(plan, state.task_ctx()).unwrap();
+        let batch = stream.next().await.expect("the file holds rows").unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            100,
+            "the scan must use the task context's batch size, not the plan's"
+        );
+    }
+
+    /// A `Utf8` read schema caps one batch at 2 GiB for that column: the reader
+    /// gives up rather than build an array whose 32-bit offsets would overflow.
+    /// `Utf8View` has no such ceiling.
+    ///
+    /// Ignored because it has to allocate past `i32::MAX` to prove it. Run with
+    /// `cargo test -p dbsp_adapters --lib read_schema_lifts -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn read_schema_lifts_the_two_gib_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        // 8192 x 300 KiB = 2.5 GiB decoded, from a 300 KB file: one distinct
+        // value, dictionary-encoded, referenced by every row.
+        let value = "x".repeat(300 * 1024);
+        let values: Vec<&str> = vec![value.as_str(); 8192];
+        let path = write_parquet(dir.path(), &values, 128);
+
+        let error = read_one_batch(&path, schema_of(ArrowDataType::Utf8), false, 8192)
+            .await
+            .expect_err("2.5 GiB does not fit a Utf8 array");
+        assert!(
+            error
+                .to_string()
+                .contains("index overflow decoding byte array"),
+            "expected the 32-bit offset overflow; got: {error}"
+        );
+
+        let batch = read_one_batch(&path, schema_of(ArrowDataType::Utf8View), false, 8192)
+            .await
+            .expect("a view array has no 2 GiB ceiling");
+        assert_eq!(batch.num_rows(), 8192);
+        assert_eq!(batch.column(0).data_type(), &ArrowDataType::Utf8View);
+    }
+
+    /// A view read schema does not copy a dictionary-encoded value once per row,
+    /// it references the dictionary page's buffer. That is what keeps a small
+    /// file from decoding into gigabytes, so the saving is the point, not an
+    /// incidental optimization.
+    ///
+    /// Sized to stay small: 1024 rows of one 64 KiB value is 64 MiB inlined.
+    #[tokio::test]
+    async fn read_schema_does_not_expand_repeated_values() {
+        let dir = tempfile::tempdir().unwrap();
+        const ROWS: usize = 1024;
+        const VALUE_LEN: usize = 64 * 1024;
+        let value = "x".repeat(VALUE_LEN);
+        let values: Vec<&str> = vec![value.as_str(); ROWS];
+        let path = write_parquet(dir.path(), &values, 128);
+
+        let inlined = read_one_batch(&path, schema_of(ArrowDataType::Utf8), false, ROWS)
+            .await
+            .unwrap();
+        let viewed = read_one_batch(&path, schema_of(ArrowDataType::Utf8View), false, ROWS)
+            .await
+            .unwrap();
+
+        assert_eq!(inlined.num_rows(), ROWS);
+        assert_eq!(viewed.num_rows(), ROWS);
+        assert_eq!(viewed.column(0).data_type(), &ArrowDataType::Utf8View);
+
+        let inlined_bytes = inlined.column(0).get_array_memory_size();
+        let viewed_bytes = viewed.column(0).get_array_memory_size();
+        assert!(
+            inlined_bytes >= ROWS * VALUE_LEN,
+            "Utf8 must inline every repeat; got {inlined_bytes} bytes"
+        );
+        assert!(
+            viewed_bytes < inlined_bytes / 50,
+            "Utf8View must reference the dictionary page, not copy it; \
+             got {viewed_bytes} bytes against {inlined_bytes} inlined"
+        );
+    }
+
+    /// Every string and binary type becomes its view counterpart at every depth,
+    /// and nothing else changes: the Parquet reader validates a supplied schema
+    /// field by field, so a stray difference in name, nullability or any other
+    /// type would be rejected outright.
+    #[test]
+    fn read_schema_rewrites_only_string_and_binary_types() {
+        let element = Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true));
+        let nested = ArrowDataType::Struct(
+            vec![
+                Arc::new(ArrowField::new("s", ArrowDataType::LargeUtf8, false)),
+                Arc::new(ArrowField::new("b", ArrowDataType::LargeBinary, true)),
+                Arc::new(ArrowField::new("n", ArrowDataType::Int64, true)),
+                Arc::new(ArrowField::new("l", ArrowDataType::List(element), true)),
+            ]
+            .into(),
+        );
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("plain", ArrowDataType::Utf8, false),
+            ArrowField::new("bin", ArrowDataType::Binary, true),
+            ArrowField::new("num", ArrowDataType::Float64, true),
+            ArrowField::new("nested", nested, true),
+        ]);
+
+        let viewed = ReadSchema::new(&schema);
+        let viewed = viewed.schema();
+
+        assert_eq!(viewed.field(0).data_type(), &ArrowDataType::Utf8View);
+        assert!(!viewed.field(0).is_nullable());
+        assert_eq!(viewed.field(1).data_type(), &ArrowDataType::BinaryView);
+        assert_eq!(viewed.field(2).data_type(), &ArrowDataType::Float64);
+        let ArrowDataType::Struct(fields) = viewed.field(3).data_type() else {
+            panic!("the nested field must stay a struct");
+        };
+        assert_eq!(fields[0].data_type(), &ArrowDataType::Utf8View);
+        assert_eq!(fields[1].data_type(), &ArrowDataType::BinaryView);
+        assert_eq!(fields[2].data_type(), &ArrowDataType::Int64);
+        let ArrowDataType::List(item) = fields[3].data_type() else {
+            panic!("the list field must stay a list");
+        };
+        assert_eq!(item.data_type(), &ArrowDataType::Utf8View);
+        assert_eq!(item.name(), "item");
+        assert!(item.is_nullable());
+    }
+
+    /// `schema_force_view_types` cannot reach the connector's reads, whichever
+    /// way it is set: DataFusion consults it only when `ParquetFormat` *infers*
+    /// a schema, and every Delta read supplies one instead. The type follows the
+    /// supplied schema, which is why setting the option was a no-op and
+    /// [`DeltaTableInputEndpointInner::physical_read_schema`] is the real lever.
+    #[tokio::test]
+    async fn force_view_types_does_not_reach_a_supplied_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_parquet(dir.path(), &["a", "bb"], 2);
+
+        for force_view_types in [false, true] {
+            let batch = read_one_batch(
+                &path,
+                schema_of(ArrowDataType::Utf8),
+                force_view_types,
+                1024,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                batch.column(0).data_type(),
+                &ArrowDataType::Utf8,
+                "schema_force_view_types={force_view_types} must not change a supplied schema"
+            );
+        }
+    }
+}
+
+/// Which columns a CDC read keeps, with and without `skip_unused_columns`.
+#[cfg(test)]
+mod cdc_projection_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::DeltaTableInputEndpointInner;
+    use crate::test::MockInputConsumer;
+    use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use datafusion::datasource::MemTable;
+    use deltalake::datafusion::prelude::{DataFrame, SessionContext};
+    use feldera_types::program_schema::{
+        ColumnType, Field, PropertyValue, Relation, SourcePosition, SqlIdentifier,
+    };
+    use feldera_types::transport::delta_table::DeltaTableReaderConfig;
+    use serde_json::json;
+
+    /// SQL field named `name`. A nullable `unused` field is the only shape
+    /// `skip_unused_columns` may skip.
+    fn field(name: &str, unused: bool) -> Field {
+        Field::new(SqlIdentifier::new(name, false), ColumnType::varchar(true)).with_unused(unused)
+    }
+
+    /// SQL table declaring `s` (read), `spare` (declared but unused).
+    fn relation(skip_unused_columns: bool) -> Relation {
+        let zero = SourcePosition {
+            start_line_number: 0,
+            start_column: 0,
+            end_line_number: 0,
+            end_column: 0,
+        };
+        let mut properties = BTreeMap::new();
+        if skip_unused_columns {
+            properties.insert(
+                "skip_unused_columns".to_string(),
+                PropertyValue {
+                    value: "true".to_string(),
+                    key_position: zero,
+                    value_position: zero,
+                },
+            );
+        }
+        Relation::new(
+            SqlIdentifier::new("test_table", false),
+            vec![field("s", false), field("spare", true)],
+            false,
+            properties,
+        )
+    }
+
+    /// CDC endpoint whose expressions name three columns the SQL table does not
+    /// declare: `region` (`filter`) and the two CDC metadata columns.
+    fn endpoint(skip_unused_columns: bool) -> DeltaTableInputEndpointInner {
+        endpoint_ordered_by(skip_unused_columns, "__feldera_ts")
+    }
+
+    /// As [`endpoint`], with `cdc_order_by` under the caller's control.
+    fn endpoint_ordered_by(
+        skip_unused_columns: bool,
+        cdc_order_by: &str,
+    ) -> DeltaTableInputEndpointInner {
+        let config: DeltaTableReaderConfig = serde_json::from_value(json!({
+            "uri": "/tmp/does-not-exist",
+            "mode": "cdc",
+            "filter": "region = 'us'",
+            "cdc_delete_filter": "__feldera_op = 'd'",
+            "cdc_order_by": cdc_order_by,
+        }))
+        .unwrap();
+        DeltaTableInputEndpointInner::new(
+            "test_endpoint",
+            config,
+            SessionContext::new(),
+            Box::new(MockInputConsumer::new()),
+            relation(skip_unused_columns),
+            None,
+            None,
+        )
+    }
+
+    /// A frame shaped like one CDC read side: the declared columns, the columns
+    /// the connector's expressions name, and `junk`, which nothing names.
+    async fn cdc_side_frame() -> DataFrame {
+        let schema = Arc::new(ArrowSchema::new(
+            [
+                "s",
+                "spare",
+                "region",
+                "junk",
+                "__feldera_op",
+                "__feldera_ts",
+            ]
+            .iter()
+            .map(|name| ArrowField::new(*name, ArrowDataType::Utf8, true))
+            .collect::<Vec<_>>(),
+        ));
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "cdc_side",
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+        ctx.table("cdc_side").await.unwrap()
+    }
+
+    fn column_names(df: &DataFrame) -> Vec<String> {
+        df.schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect()
+    }
+
+    /// The flag governs declared columns the circuit ignores, so a column the
+    /// SQL table never declared is dropped with the flag off too.
+    #[tokio::test]
+    async fn projection_drops_undeclared_columns() {
+        let endpoint = endpoint(false);
+        let df = endpoint
+            .project_cdc_columns(cdc_side_frame().await)
+            .unwrap();
+        assert_eq!(
+            column_names(&df),
+            vec!["s", "spare", "region", "__feldera_op", "__feldera_ts"],
+            "'junk' is declared nowhere and named by no expression, so the CDC \
+             read must drop it even with 'skip_unused_columns' off"
+        );
+    }
+
+    /// With the flag on the declared-but-unused column goes too; the columns an
+    /// expression names stay, or the expression cannot resolve them.
+    #[tokio::test]
+    async fn skip_unused_columns_also_drops_declared_unused_columns() {
+        let endpoint = endpoint(true);
+        let df = endpoint
+            .project_cdc_columns(cdc_side_frame().await)
+            .unwrap();
+        assert_eq!(
+            column_names(&df),
+            vec!["s", "region", "__feldera_op", "__feldera_ts"],
+        );
+    }
+
+    /// The flag may not skip a declared column an expression names: `cdc_order_by`
+    /// resolves against the projected frame.
+    #[tokio::test]
+    async fn skip_unused_columns_keeps_a_column_an_expression_names() {
+        let endpoint = endpoint_ordered_by(true, "spare");
+        let df = endpoint
+            .project_cdc_columns(cdc_side_frame().await)
+            .unwrap();
+        assert_eq!(
+            column_names(&df),
+            vec!["s", "spare", "region", "__feldera_op"],
+            "'spare' is declared and unused, but 'cdc_order_by' names it"
+        );
+    }
+
+    /// A dropped column leaves the optimized plan, so nothing downstream of the
+    /// projection can ask the scan for it. The frame reads a `MemTable`, so this
+    /// pins the plan, not Parquet pushdown.
+    #[tokio::test]
+    async fn dropped_columns_leave_the_optimized_plan() {
+        let endpoint = endpoint(false);
+        let df = endpoint
+            .project_cdc_columns(cdc_side_frame().await)
+            .unwrap();
+        let plan = format!("{}", df.into_optimized_plan().unwrap().display_indent());
+        assert!(
+            !plan.contains("junk"),
+            "the dropped column must not appear in the plan; plan was:\n{plan}"
+        );
+    }
+}
+
+/// Two containers of one storage account share a DataFusion registry key, so
+/// connectors must route their object stores privately.
+#[cfg(test)]
+mod object_store_routing_tests {
+    use super::DeltaTableInputEndpoint;
+    use crate::test::MockInputConsumer;
+    use deltalake::datafusion::execution::runtime_env::RuntimeEnv;
+    use deltalake::logstore::object_store::{ObjectStore, memory::InMemory};
+    use feldera_adapterlib::utils::datafusion::{
+        create_runtime_env, with_private_object_store_registry,
+    };
+    use feldera_types::config::{PipelineConfig, RuntimeConfig};
+    use feldera_types::transport::delta_table::DeltaTableReaderConfig;
+    use serde_json::json;
+    use std::sync::Arc;
+    use url::Url;
+
+    /// The one account holding every container these tests read.
+    const ACCOUNT: &str = "teststorageaccount.dfs.core.windows.net";
+
+    fn pipeline_config() -> PipelineConfig {
+        PipelineConfig {
+            global: RuntimeConfig {
+                workers: 1,
+                ..Default::default()
+            },
+            multihost: None,
+            name: None,
+            given_name: None,
+            storage_config: None,
+            secrets_dir: None,
+            inputs: Default::default(),
+            outputs: Default::default(),
+            program_ir: None,
+        }
+    }
+
+    /// The URL a connector registers its store under and resolves reads through.
+    fn table_root(container: &str) -> Url {
+        Url::parse(&format!(
+            "abfss://{container}@{ACCOUNT}/standard/orders/v0/"
+        ))
+        .unwrap()
+    }
+
+    /// A snapshot connector on `container`, wired the way
+    /// `create_integrated_input_endpoint` wires one: a private registry over the
+    /// pipeline's shared env.
+    fn connector(container: &str, shared_env: &Arc<RuntimeEnv>) -> DeltaTableInputEndpoint {
+        let config: DeltaTableReaderConfig = serde_json::from_value(json!({
+            "uri": table_root(container).to_string(),
+            "mode": "snapshot",
+        }))
+        .unwrap();
+
+        DeltaTableInputEndpoint::new(
+            container,
+            &config,
+            &pipeline_config(),
+            with_private_object_store_registry(shared_env).unwrap(),
+            Box::new(MockInputConsumer::new()),
+            None,
+        )
+    }
+
+    /// Two connectors on two containers, each with its own store registered.
+    fn two_container_pipeline() -> Vec<(DeltaTableInputEndpoint, Url, Arc<dyn ObjectStore>)> {
+        let shared_env = create_runtime_env(&pipeline_config()).unwrap();
+
+        ["bronze", "silver"]
+            .iter()
+            .map(|container| {
+                let endpoint = connector(container, &shared_env);
+                let root = table_root(container);
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                endpoint
+                    .datafusion
+                    .runtime_env()
+                    .register_object_store(&root, store.clone());
+                (endpoint, root, store)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_connector_resolves_its_own_container() {
+        for (endpoint, root, own_store) in two_container_pipeline() {
+            let resolved = endpoint
+                .datafusion
+                .runtime_env()
+                .object_store_registry
+                .get_store(&root)
+                .expect("a connector must resolve its own table root");
+            assert!(
+                Arc::ptr_eq(&resolved, &own_store),
+                "connector on '{root}' resolved to another container's store",
+            );
+        }
+    }
+
+    /// Registering per connector is not enough; the registries must differ too.
+    #[test]
+    fn a_colliding_root_resolves_to_the_connectors_own_store() {
+        let pipeline = two_container_pipeline();
+
+        for (endpoint, root, own_store) in &pipeline {
+            for (_, sibling_root, _) in &pipeline {
+                if sibling_root == root {
+                    continue;
+                }
+                // The sibling root collides on the registry key, so it still
+                // resolves; it must resolve to this connector's own store.
+                let resolved = endpoint
+                    .datafusion
+                    .runtime_env()
+                    .object_store_registry
+                    .get_store(sibling_root)
+                    .expect("a sibling root shares this connector's registry key");
+                assert!(
+                    Arc::ptr_eq(&resolved, own_store),
+                    "connector on '{root}' resolved '{sibling_root}' to a sibling's store",
+                );
+            }
+        }
+    }
+
+    /// Isolating store routing must not fork the pipeline's memory budget.
+    #[test]
+    fn connectors_share_the_pipeline_memory_budget() {
+        let shared_env = create_runtime_env(&pipeline_config()).unwrap();
+
+        for container in ["bronze", "silver"] {
+            let endpoint = connector(container, &shared_env);
+            let env = endpoint.datafusion.runtime_env();
+            assert!(Arc::ptr_eq(&env.memory_pool, &shared_env.memory_pool));
+            assert!(Arc::ptr_eq(&env.disk_manager, &shared_env.disk_manager));
+            // The caches are rebuilt rather than cloned, so they are the ones
+            // that can silently fork on a datafusion upgrade.
+            assert!(Arc::ptr_eq(
+                &env.cache_manager.get_file_metadata_cache(),
+                &shared_env.cache_manager.get_file_metadata_cache(),
+            ));
+            assert!(Arc::ptr_eq(
+                &env.cache_manager.get_list_files_cache().unwrap(),
+                &shared_env.cache_manager.get_list_files_cache().unwrap(),
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod distributed_snapshot_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use super::{
+        DeltaResumeInfo, DeltaTableInputEndpointInner, Polarity, QueueEntry, validate_distributed,
+    };
+    use crate::integrated::DistributedInput;
+    use crate::test::{MockDeZSet, MockInputConsumer, TestStruct};
+    use crate::{DeCollectionHandle, PipelineState};
+    use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use chrono::Utc;
+    use datafusion::datasource::MemTable;
+    use deltalake::DeltaTable;
+    use deltalake::datafusion::prelude::SessionContext;
+    use deltalake::kernel::{DataType, PrimitiveType, StructField};
+    use deltalake::operations::create::CreateBuilder;
+    use deltalake::protocol::SaveMode;
+    use feldera_adapterlib::transport::InputQueueEntry;
+    use feldera_types::coordination::{InputDistribution, InputShard};
+    use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+    use feldera_types::serde_with_context::SqlSerdeConfig;
+    use feldera_types::transport::delta_table::DeltaTableReaderConfig;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::watch::channel;
+    use tokio::time::timeout;
+
+    /// Writes a table partitioned by `part`, whose rows have IDs `0..n_rows`
+    /// and `part` equal to `p{id % 3}`, in `n_writes` appends, so that the
+    /// table has several files.  Returns the table and its URI.
+    async fn write_table(
+        dir: &std::path::Path,
+        n_rows: i64,
+        n_writes: i64,
+    ) -> (DeltaTable, String) {
+        let uri = format!("file://{}", dir.display());
+        let mut table = CreateBuilder::new()
+            .with_location(&uri)
+            .with_save_mode(SaveMode::Ignore)
+            .with_columns([
+                StructField::new("id", DataType::Primitive(PrimitiveType::Long), false),
+                StructField::new("part", DataType::Primitive(PrimitiveType::String), true),
+            ])
+            .with_partition_columns(["part"])
+            .await
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int64, false),
+            ArrowField::new("part", ArrowDataType::Utf8, true),
+        ]));
+        for write in 0..n_writes {
+            let ids = (0..n_rows)
+                .filter(|id| id % n_writes == write)
+                .collect::<Vec<_>>();
+            let parts = ids
+                .iter()
+                .map(|id| format!("p{}", id % 3))
+                .collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringArray::from(parts)),
+                ],
+            )
+            .unwrap();
+            table = table
+                .write(vec![batch])
+                .with_save_mode(SaveMode::Append)
+                .await
+                .unwrap();
+        }
+        (table, uri)
+    }
+
+    fn endpoint(uri: &str, shard: InputShard) -> DeltaTableInputEndpointInner {
+        endpoint_with(uri, "snapshot", Some(shard), None)
+    }
+
+    fn endpoint_with(
+        uri: &str,
+        mode: &str,
+        shard: Option<InputShard>,
+        choice: Option<serde_json::Value>,
+    ) -> DeltaTableInputEndpointInner {
+        endpoint_with_config(json!({"uri": uri, "mode": mode}), shard, choice)
+    }
+
+    fn endpoint_with_config(
+        config: serde_json::Value,
+        shard: Option<InputShard>,
+        choice: Option<serde_json::Value>,
+    ) -> DeltaTableInputEndpointInner {
+        endpoint_with_consumer(config, shard, choice, MockInputConsumer::new())
+    }
+
+    fn endpoint_with_consumer(
+        config: serde_json::Value,
+        shard: Option<InputShard>,
+        choice: Option<serde_json::Value>,
+        consumer: MockInputConsumer,
+    ) -> DeltaTableInputEndpointInner {
+        resumed_endpoint(config, shard, choice, consumer, None)
+    }
+
+    fn resumed_endpoint(
+        config: serde_json::Value,
+        shard: Option<InputShard>,
+        choice: Option<serde_json::Value>,
+        consumer: MockInputConsumer,
+        resume_info: Option<DeltaResumeInfo>,
+    ) -> DeltaTableInputEndpointInner {
+        let config: DeltaTableReaderConfig = serde_json::from_value(config).unwrap();
+        let relation = Relation::new(
+            SqlIdentifier::new("t", false),
+            vec![
+                Field::new(SqlIdentifier::new("id", false), ColumnType::bigint(false)),
+                Field::new(SqlIdentifier::new("part", false), ColumnType::varchar(true)),
+            ],
+            false,
+            BTreeMap::new(),
+        );
+        DeltaTableInputEndpointInner::new(
+            "t.delta",
+            config,
+            SessionContext::new(),
+            Box::new(consumer),
+            relation,
+            resume_info,
+            shard.map(|shard| DistributedInput { shard, choice }),
+        )
+    }
+
+    fn shard(host: usize) -> InputShard {
+        InputShard::new(host, 3, InputDistribution { home: 1 }).unwrap()
+    }
+
+    /// Only the home host follows the log.
+    #[test]
+    fn home_host_follows() {
+        let follows = |mode, shard| endpoint_with("/tmp/t", mode, shard, None).follows();
+        assert!(follows("snapshot_and_follow", None));
+        assert!(follows("snapshot_and_follow", Some(shard(1))));
+        assert!(!follows("snapshot_and_follow", Some(shard(0))));
+        assert!(!follows("snapshot_and_follow", Some(shard(2))));
+        assert!(!follows("snapshot", Some(shard(1))));
+    }
+
+    /// A distributed connector that reads its snapshot in a transaction
+    /// requests the transaction once it runs, before it reads, and the
+    /// snapshot query reuses its label.  Other connectors request it only when
+    /// they read.
+    #[tokio::test]
+    async fn distributed_snapshot_transaction_starts_early() {
+        let endpoint = |transaction_mode, shard| {
+            endpoint_with_config(
+                json!({"uri": "/tmp/t", "mode": "snapshot", "transaction_mode": transaction_mode}),
+                shard,
+                None,
+            )
+        };
+
+        let consumer = MockInputConsumer::new();
+        let distributed = endpoint_with_consumer(
+            json!({"uri": "/tmp/t", "mode": "snapshot", "transaction_mode": "snapshot"}),
+            Some(shard(2)),
+            None,
+            consumer.clone(),
+        );
+
+        // A paused connector does not request the transaction.
+        let (sender, mut receiver) = channel(PipelineState::Paused);
+        let request = distributed.start_distributed_snapshot_transaction(&mut receiver);
+        let mut request = std::pin::pin!(request);
+        assert!(
+            timeout(Duration::from_millis(100), request.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(distributed.queue.len(), 0);
+
+        // Once it runs, it does.
+        sender.send_replace(PipelineState::Running);
+        request.await;
+        assert_eq!(distributed.queue.len(), 1);
+        // The request is one that every host makes.
+        distributed.queue.flush_with_aux();
+        assert!(consumer.state().transaction_on_all_hosts);
+        let label = Some(Some("snapshot-0".to_string()));
+        assert_eq!(distributed.snapshot_transaction_label(), label);
+        // Only the first snapshot query reuses it.
+        assert_eq!(
+            distributed.snapshot_transaction_label(),
+            Some(Some("snapshot-1".to_string()))
+        );
+
+        for (transaction_mode, shard) in [("none", Some(shard(2))), ("snapshot", None)] {
+            let endpoint = endpoint(transaction_mode, shard);
+            let (_sender, mut receiver) = channel(PipelineState::Running);
+            endpoint
+                .start_distributed_snapshot_transaction(&mut receiver)
+                .await;
+            assert_eq!(endpoint.queue.len(), 0, "{transaction_mode} {shard:?}");
+        }
+    }
+
+    /// A host that resumes before it started its share of the snapshot reads
+    /// it in the transaction that every host joins, and records that it
+    /// started it, also across a flush that the transaction holds back.  A
+    /// host that resumes after it started its share reads it in a transaction
+    /// of its own, because the other hosts may have finished theirs and will
+    /// not join.
+    #[tokio::test]
+    async fn resumed_share_joins_all_hosts_transaction_only_if_not_started() {
+        let config = json!({"uri": "/tmp/t", "mode": "snapshot", "transaction_mode": "snapshot"});
+        for started in [false, true] {
+            let resume_info = DeltaResumeInfo {
+                snapshot_started: started,
+                ..DeltaResumeInfo::snapshot_pending(7)
+            };
+            let consumer = MockInputConsumer::new();
+            // A multihost pipeline without an open transaction holds the
+            // request back.
+            consumer.state().open_transaction = Some(None);
+            let endpoint = resumed_endpoint(
+                config.clone(),
+                Some(shard(2)),
+                None,
+                consumer.clone(),
+                Some(resume_info),
+            );
+            let (_sender, mut receiver) = channel(PipelineState::Running);
+            endpoint
+                .start_distributed_snapshot_transaction(&mut receiver)
+                .await;
+            assert_eq!(endpoint.queue.len(), usize::from(!started), "{started}");
+            endpoint.queue(false);
+            assert_eq!(endpoint.queue.len(), usize::from(!started), "{started}");
+            assert!(
+                endpoint
+                    .last_checkpointable_status
+                    .lock()
+                    .unwrap()
+                    .snapshot_started
+            );
+        }
+    }
+
+    /// A read error in a distributed snapshot keeps the snapshot's
+    /// transaction open, so that the retry reads into the same transaction.
+    /// Without distribution, the error commits the transaction.
+    #[tokio::test]
+    async fn distributed_snapshot_error_keeps_transaction_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (table, uri) = write_table(dir.path(), 3, 1).await;
+        let table = Arc::new(table);
+
+        // Dividing by zero fails while the query runs, after planning.
+        let ctx = SessionContext::new();
+        let zero = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                ArrowDataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![0]))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "zero",
+            Arc::new(MemTable::try_new(zero.schema(), vec![vec![zero]]).unwrap()),
+        )
+        .unwrap();
+
+        for (shard, stays_open) in [(Some(shard(2)), true), (None, false)] {
+            let consumer = MockInputConsumer::new();
+            let endpoint = endpoint_with_consumer(
+                json!({"uri": uri, "mode": "snapshot", "transaction_mode": "snapshot"}),
+                shard,
+                None,
+                consumer.clone(),
+            );
+            *endpoint.schema_table.lock().unwrap() = Some(table.clone());
+
+            // The snapshot's first records start its transaction.
+            let transaction = Some(Some("snapshot-0".to_string()));
+            endpoint.queue.push_entry(
+                InputQueueEntry::new_with_aux(Utc::now(), QueueEntry::ResumeInfo(None))
+                    .with_start_transaction(transaction.clone()),
+                Vec::new(),
+            );
+            endpoint.queue.flush_with_aux();
+            assert!(consumer.state().transaction_in_progress);
+
+            let dataframe = ctx.sql("select 10 / id as id from zero").await.unwrap();
+            let mut input_stream = MockDeZSet::<TestStruct, TestStruct>::new()
+                .configure_arrow_deserializer(SqlSerdeConfig::default())
+                .unwrap();
+            let (_sender, mut receiver) = channel(PipelineState::Running);
+            assert!(
+                endpoint
+                    .execute_df_inner(
+                        dataframe,
+                        Polarity::Fixed(true),
+                        input_stream.as_mut(),
+                        &mut receiver,
+                        &transaction,
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+            endpoint.queue.flush_with_aux();
+            assert_eq!(
+                consumer.state().transaction_in_progress,
+                stays_open,
+                "{shard:?}"
+            );
+        }
+    }
+
+    /// A distributed connector rejects the settings that it cannot honor.
+    #[test]
+    fn distributed_rejects_unsupported_settings() {
+        let validate = |config: serde_json::Value| {
+            let mut config = config;
+            config["uri"] = json!("/tmp/t");
+            validate_distributed(&serde_json::from_value(config).unwrap())
+        };
+        for config in [
+            json!({"mode": "snapshot"}),
+            json!({"mode": "follow"}),
+            json!({"mode": "snapshot", "transaction_mode": "snapshot"}),
+            json!({"mode": "snapshot_and_follow", "transaction_mode": "snapshot"}),
+        ] {
+            assert!(validate(config.clone()).is_ok(), "{config}");
+        }
+        for config in [
+            json!({"mode": "snapshot_and_follow"}),
+            json!({"mode": "cdc"}),
+            json!({"mode": "snapshot", "timestamp_column": "ts"}),
+        ] {
+            assert!(validate(config.clone()).is_err(), "{config}");
+        }
+    }
+
+    /// Hosts other than host 0 read the snapshot at host 0's version.
+    #[test]
+    fn followers_read_the_chosen_version() {
+        let chosen =
+            |shard, choice| endpoint_with("/tmp/t", "snapshot", shard, choice).chosen_version();
+        assert_eq!(chosen(None, None).unwrap(), None);
+        assert_eq!(chosen(Some(shard(0)), None).unwrap(), None);
+        assert_eq!(chosen(Some(shard(2)), Some(json!(7))).unwrap(), Some(7));
+        assert!(chosen(Some(shard(2)), None).is_err());
+        assert!(chosen(Some(shard(2)), Some(json!("seven"))).is_err());
+    }
+
+    /// Returns the `(id, part)` rows of `shard`'s part of `table`'s snapshot,
+    /// sorted.
+    async fn read_share(
+        table: &Arc<DeltaTable>,
+        uri: &str,
+        shard: InputShard,
+    ) -> Vec<(i64, String)> {
+        let endpoint = endpoint(uri, shard);
+        *endpoint.schema_table.lock().unwrap() = Some(table.clone());
+        endpoint.register_snapshot_table(table).await.unwrap();
+        let batches = endpoint
+            .datafusion
+            .sql("select id, part from snapshot")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let parts = arrow::compute::cast(batch.column(1), &ArrowDataType::Utf8).unwrap();
+            let parts = parts.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                assert!(!parts.is_null(i));
+                rows.push((ids.value(i), parts.value(i).to_string()));
+            }
+        }
+        // The files are read in parallel, so the order varies.
+        rows.sort();
+        rows
+    }
+
+    /// The hosts together read every row of the snapshot exactly once, with
+    /// its partition value, whether or not every host has files.
+    #[tokio::test]
+    async fn hosts_divide_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (table, uri) = write_table(dir.path(), 60, 4).await;
+        let table = Arc::new(table);
+        let n_files = table.snapshot().unwrap().log_data().num_files();
+        assert!(n_files >= 3, "the table should have several files");
+
+        // Three hosts, and more hosts than files, so that some hosts read none.
+        for n_hosts in [3, n_files + 2] {
+            let mut all = Vec::new();
+            for host in 0..n_hosts {
+                let shard = InputShard::new(host, n_hosts, InputDistribution { home: 1 }).unwrap();
+                all.extend(read_share(&table, &uri, shard).await);
+            }
+            let ids = all.iter().map(|(id, _part)| *id).collect::<BTreeSet<_>>();
+            assert_eq!(all.len(), 60, "{n_hosts} hosts read {} rows", all.len());
+            assert_eq!(ids, (0..60).collect::<BTreeSet<_>>());
+            for (id, part) in &all {
+                assert_eq!(part, &format!("p{}", id % 3));
+            }
+        }
+    }
+
+    /// A host that opened the table for its snapshot share but read nothing
+    /// yet checkpoints the version, and on resume reads its share at that
+    /// version, even if the table changed and host 0 made no choice.
+    #[tokio::test]
+    async fn checkpoint_before_snapshot_keeps_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (table, uri) = write_table(dir.path(), 60, 4).await;
+        let version = table.version().unwrap() as i64;
+        let config = json!({"uri": uri, "mode": "snapshot"});
+
+        // Host 2 opens the table at host 0's version.
+        let host2 = endpoint_with(&uri, "snapshot", Some(shard(2)), Some(json!(version)));
+        let opened = host2.open_table().await.unwrap();
+        host2.record_snapshot_version(&opened);
+        let checkpoint = host2.last_resume_status.lock().unwrap().clone().unwrap();
+        assert_eq!(checkpoint, DeltaResumeInfo::snapshot_pending(version));
+        assert_eq!(
+            *host2.last_checkpointable_status.lock().unwrap(),
+            checkpoint
+        );
+        let expected = read_share(&Arc::new(opened), &uri, shard(2)).await;
+        assert!(!expected.is_empty());
+
+        // The table changes, and host 2 resumes from the checkpoint, without
+        // a choice from host 0.
+        let (newer, _uri) = write_table(dir.path(), 90, 1).await;
+        assert!(newer.version().unwrap() as i64 > version);
+        let checkpoint =
+            serde_json::from_value(serde_json::to_value(&checkpoint).unwrap()).unwrap();
+        let resumed = resumed_endpoint(
+            config.clone(),
+            Some(shard(2)),
+            None,
+            MockInputConsumer::new(),
+            Some(checkpoint),
+        );
+        assert!(DeltaTableInputEndpointInner::snapshot_incomplete(
+            &resumed.last_resume_status.lock().unwrap()
+        ));
+        let reopened = resumed.open_table().await.unwrap();
+        assert_eq!(reopened.version().unwrap() as i64, version);
+        assert_eq!(
+            read_share(&Arc::new(reopened), &uri, shard(2)).await,
+            expected
+        );
+
+        // A connector that is not distributed records nothing, and neither
+        // does a host that resumes.
+        for endpoint in [endpoint_with(&uri, "snapshot", None, None), resumed] {
+            let before = endpoint.last_resume_status.lock().unwrap().clone();
+            let opened = endpoint.open_table().await.unwrap();
+            endpoint.record_snapshot_version(&opened);
+            assert_eq!(*endpoint.last_resume_status.lock().unwrap(), before);
+        }
+
+        // Older checkpoints, without the new field, still parse.
+        let old: DeltaResumeInfo =
+            serde_json::from_value(json!({"version": 3, "snapshot_timestamp": null, "eoi": false}))
+                .unwrap();
+        assert_eq!(old, DeltaResumeInfo::follow_mode(3, false));
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("snapshot_pending")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_bounds_tests {
+    use super::DeltaTableInputEndpointInner;
+    use crate::test::MockInputConsumer;
+    use deltalake::datafusion::prelude::SessionContext;
+    use feldera_adapterlib::utils::datafusion::array_to_string;
+    use feldera_types::program_schema::{ColumnType, Field, Relation, SqlIdentifier};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    /// The bounds of `column` that the connector reads from the log of a table with `fields`,
+    /// `partitions`, `configuration`, and one file per `(partition values, stats)` of `files`. The
+    /// table has no data file, so reading one fails.
+    async fn bounds(
+        fields: Vec<Value>,
+        partitions: Value,
+        configuration: Value,
+        files: Vec<(Value, Option<Value>)>,
+        column: &str,
+        filter: Option<&str>,
+    ) -> Option<Option<(String, String)>> {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = json!({"id": "t", "format": {"provider": "parquet", "options": {}},
+            "schemaString": json!({"type": "struct", "fields": fields}).to_string(),
+            "partitionColumns": partitions, "configuration": configuration, "createdTime": 0});
+        let mut log = vec![
+            json!({"protocol": {"minReaderVersion": 2, "minWriterVersion": 5}}),
+            json!({"metaData": meta}),
+        ];
+        for (i, (partition_values, stats)) in files.into_iter().enumerate() {
+            log.push(json!({"add": {"path": format!("{i}.parquet"), "size": 1,
+                "partitionValues": partition_values, "modificationTime": 0, "dataChange": true,
+                "stats": stats.map(|s| s.to_string())}}));
+        }
+        let log: Vec<String> = log.iter().map(Value::to_string).collect();
+        std::fs::create_dir(dir.path().join("_delta_log")).unwrap();
+        std::fs::write(
+            dir.path().join("_delta_log/00000000000000000000.json"),
+            log.join("\n"),
+        )
+        .unwrap();
+        let table = deltalake::open_table(url::Url::from_directory_path(dir.path()).unwrap())
+            .await
+            .unwrap();
+
+        let mut config =
+            json!({"uri": "/tmp/unused", "mode": "snapshot", "timestamp_column": column});
+        if let Some(filter) = filter {
+            config["snapshot_filter"] = json!(filter);
+        }
+        let field = Field::new(
+            SqlIdentifier::new(column, false),
+            ColumnType::timestamp(false),
+        );
+        let endpoint = DeltaTableInputEndpointInner::new(
+            "test_endpoint",
+            serde_json::from_value(config).unwrap(),
+            SessionContext::new(),
+            Box::new(MockInputConsumer::new()),
+            Relation::new(
+                SqlIdentifier::new("t", false),
+                vec![field],
+                false,
+                BTreeMap::new(),
+            ),
+            None,
+            None,
+        );
+        let field = endpoint.schema.field(column).unwrap();
+        let bounds = endpoint.timestamp_bounds_from_log(&table, field).unwrap()?;
+        let bounds = bounds.collect().await.unwrap();
+        Some(bounds.iter().find(|b| b.num_rows() > 0).map(|b| {
+            (
+                array_to_string(b.column(0)).unwrap(),
+                array_to_string(b.column(1)).unwrap(),
+            )
+        }))
+    }
+
+    fn field(name: &str, typ: &str, metadata: Value) -> Value {
+        json!({"name": name, "type": typ, "nullable": true, "metadata": metadata})
+    }
+
+    /// The stats of a file with one row of `values`, none of them NULL.
+    fn one_row(values: Value) -> Option<Value> {
+        let nulls: serde_json::Map<_, _> = values
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| (k.clone(), json!(0)))
+            .collect();
+        Some(json!({"numRecords": 1, "nullCount": nulls, "minValues": values, "maxValues": values}))
+    }
+
+    fn some(min: &str, max: &str) -> Option<Option<(String, String)>> {
+        Some(Some((min.to_string(), max.to_string())))
+    }
+
+    /// Under column mapping, the log keys statistics by physical name. A partition column's
+    /// bounds come from its partition values, where NULL matches no range. The log keeps a
+    /// timestamp to the millisecond, so only a timestamp's max is rounded up.
+    #[tokio::test]
+    async fn bounds_from_log() {
+        let mapped = |name: &str, typ: &str, id: i64| {
+            let physical = json!({"delta.columnMapping.id": id,
+                "delta.columnMapping.physicalName": format!("col-{name}")});
+            field(name, typ, physical)
+        };
+        let fields = || vec![mapped("ts", "timestamp", 1), mapped("day", "date", 2)];
+        let mapping =
+            || json!({"delta.columnMapping.mode": "name", "delta.columnMapping.maxColumnId": "2"});
+        let file = |day: Value, ts: &str| (json!({"col-day": day}), one_row(json!({"col-ts": ts})));
+        let files = || {
+            vec![
+                file(json!("2024-01-05"), "2024-01-05T10:00:00.000Z"),
+                file(json!("2024-01-03"), "2024-01-03T08:00:00.000Z"),
+                file(Value::Null, "2024-01-04T00:00:00.000Z"),
+            ]
+        };
+
+        assert_eq!(
+            bounds(fields(), json!(["day"]), mapping(), files(), "ts", None).await,
+            some("2024-01-03T08:00:00Z", "2024-01-05T10:00:00.001Z")
+        );
+        assert_eq!(
+            bounds(fields(), json!(["day"]), mapping(), files(), "day", None).await,
+            some("2024-01-03", "2024-01-05")
+        );
+    }
+
+    /// A file whose `ts` is all NULL matches no range, so it needs no statistics, and a table with
+    /// only such files is empty. The query finds the bounds when a filter is set, when the log keeps
+    /// no statistics for the column (by default, only for the first 32 columns), and when only
+    /// some files have them.
+    #[tokio::test]
+    async fn bounds_from_log_need_statistics_and_no_filter() {
+        let ts = || vec![field("ts", "timestamp", json!({}))];
+        let stats = || {
+            (
+                json!({}),
+                one_row(json!({"ts": "2024-01-05T10:00:00.000Z"})),
+            )
+        };
+        let nulls = |n: i64| {
+            (
+                json!({}),
+                Some(json!({"numRecords": 2, "nullCount": {"ts": n}})),
+            )
+        };
+        assert_eq!(
+            bounds(
+                ts(),
+                json!([]),
+                json!({}),
+                vec![stats(), nulls(2)],
+                "ts",
+                None
+            )
+            .await,
+            some("2024-01-05T10:00:00Z", "2024-01-05T10:00:00.001Z")
+        );
+
+        // Only a timestamp's max is rounded up, and partition values compare as numbers.
+        let n = vec![field("n", "long", json!({}))];
+        let files = ["9", "10", "-2"]
+            .map(|n| (json!({ "n": n }), None))
+            .to_vec();
+        assert_eq!(
+            bounds(n, json!(["n"]), json!({}), files, "n", None).await,
+            some("-2", "10")
+        );
+
+        let mut wide: Vec<Value> = (0..32)
+            .map(|i| field(&format!("p{i}"), "long", json!({})))
+            .collect();
+        wide.extend(ts());
+        for (fields, files, filter) in [
+            (ts(), vec![stats()], Some("ts > now()")),
+            (wide, vec![stats()], None),
+            (ts(), vec![stats(), (json!({}), None)], None),
+            (ts(), vec![stats(), nulls(1)], None),
+        ] {
+            assert_eq!(
+                bounds(fields, json!([]), json!({}), files, "ts", filter).await,
+                None
+            );
+        }
+        for files in [vec![], vec![nulls(2)]] {
+            assert_eq!(
+                bounds(ts(), json!([]), json!({}), files, "ts", None).await,
+                Some(None)
+            );
+        }
     }
 }

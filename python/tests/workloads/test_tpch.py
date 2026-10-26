@@ -21,6 +21,10 @@ from feldera.testutils import (
     wait_end_of_input,
 )
 from feldera.runtime_config import Resources
+
+# The connector settings below keep the older `max_output_buffer_time_millis`
+# spelling: the runtime integration platform may predate the rename, and a
+# manager from before it drops the current name.
 import tempfile
 import os
 import argparse
@@ -195,8 +199,8 @@ def run_cli():
         s3_region = args.s3_region
     else:
         input_mode = "delta"
-        s3_path = "s3://batchtofeldera"
-        s3_region = "ap-southeast-2"
+        s3_path = "s3://feldera-demo-datasets/tpch/sf0.1"
+        s3_region = "us-west-1"
 
     mode = args.mode
 
@@ -1643,8 +1647,8 @@ class TestTPCH(unittest.TestCase):
         config = TPCHTestConfig(
             "transaction",
             "delta",
-            s3_path="s3://batchtofeldera",
-            s3_region="ap-southeast-2",
+            s3_path="s3://feldera-demo-datasets/tpch/sf0.1",
+            s3_region="us-west-1",
             s3_skip_signature=True,
         )
         tpch_test(config)
@@ -1653,8 +1657,8 @@ class TestTPCH(unittest.TestCase):
         config = TPCHTestConfig(
             "stream",
             "delta",
-            s3_path="s3://batchtofeldera",
-            s3_region="ap-southeast-2",
+            s3_path="s3://feldera-demo-datasets/tpch/sf0.1",
+            s3_region="us-west-1",
             s3_skip_signature=True,
         )
         tpch_test(config)

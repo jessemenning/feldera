@@ -1,3 +1,4 @@
+use feldera_types::size::ConfigSize;
 use std::{
     backtrace::Backtrace,
     borrow::Cow,
@@ -13,7 +14,7 @@ use actix_web::{HttpResponse, HttpResponseBuilder, ResponseError};
 use anyhow::Error as AnyError;
 use dbsp::{
     Error as DbspError,
-    circuit::{LayoutError, circuit_builder::BootstrapInfo},
+    circuit::{LayoutError, bootstrap::BootstrapInfo},
     storage::backend::StorageError,
 };
 use feldera_types::{
@@ -157,6 +158,11 @@ pub enum ConfigError {
         error: String,
     },
 
+    InvalidSoftDeleteConfig {
+        endpoint_name: String,
+        error: String,
+    },
+
     CyclicDependency {
         cycle: Vec<(String, String)>,
     },
@@ -168,12 +174,17 @@ pub enum ConfigError {
     FtRequiresStorage,
     FtRequiresFtInput,
 
-    /// `datafusion_memory_mb` was set to a value greater than or equal to
-    /// the pipeline's effective memory budget, which would leave no memory
-    /// for the DBSP circuit.
+    /// `datafusion_memory` was set to a value greater than or equal to the
+    /// pipeline's effective memory budget, which would leave no memory for
+    /// the DBSP circuit.
     DatafusionMemoryExceedsBudget {
-        datafusion_memory_mb: u64,
-        max_rss_mb: u64,
+        datafusion_memory: ConfigSize,
+        max_rss: ConfigSize,
+    },
+
+    /// A `dev_tweaks` setting is outside the range it accepts.
+    InvalidDevTweaks {
+        error: String,
     },
 
     InvalidLayout(LayoutError),
@@ -207,6 +218,7 @@ impl DbspDetailedError for ConfigError {
             Self::InvalidParserConfig { .. } => Cow::from("InvalidParserConfig"),
             Self::InvalidTransportConfig { .. } => Cow::from("InvalidTransportConfig"),
             Self::InvalidOutputBufferConfig { .. } => Cow::from("InvalidOutputBufferConfig"),
+            Self::InvalidSoftDeleteConfig { .. } => Cow::from("InvalidSoftDeleteConfig"),
             Self::FtRequiresStorage => Cow::from("FtRequiresStorage"),
             Self::FtRequiresFtInput => Cow::from("FtWithNonFtInput"),
             Self::CyclicDependency { .. } => Cow::from("CyclicDependency"),
@@ -214,6 +226,7 @@ impl DbspDetailedError for ConfigError {
             Self::DatafusionMemoryExceedsBudget { .. } => {
                 Cow::from("DatafusionMemoryExceedsBudget")
             }
+            Self::InvalidDevTweaks { .. } => Cow::from("InvalidDevTweaks"),
             Self::InvalidLayout(_) => Cow::from("LayoutError"),
         }
     }
@@ -397,6 +410,15 @@ impl Display for ConfigError {
                     "invalid output buffer configuration for endpoint '{endpoint_name}': {error}"
                 )
             }
+            Self::InvalidSoftDeleteConfig {
+                endpoint_name,
+                error,
+            } => {
+                write!(
+                    f,
+                    "endpoint '{endpoint_name}' cannot use the 'soft_delete' property: {error}"
+                )
+            }
             Self::CyclicDependency { cycle } => {
                 let mut cycle = cycle.clone();
                 cycle.push(cycle[0].clone());
@@ -429,12 +451,13 @@ impl Display for ConfigError {
                 "Fault tolerance is configured, but it cannot be enabled because the pipeline has at least one non-fault-tolerant input adapter"
             ),
             Self::DatafusionMemoryExceedsBudget {
-                datafusion_memory_mb,
-                max_rss_mb,
+                datafusion_memory,
+                max_rss,
             } => write!(
                 f,
-                "'datafusion_memory_mb' ({datafusion_memory_mb} MB) must be less than the pipeline's memory budget ({max_rss_mb} MB); the difference is the budget available to the DBSP circuit"
+                "'datafusion_memory' ({datafusion_memory}) must be less than the pipeline's memory budget ({max_rss}); the difference is the budget available to the DBSP circuit"
             ),
+            Self::InvalidDevTweaks { error } => write!(f, "invalid dev_tweaks: {error}"),
             Self::InvalidLayout(e) => write!(f, "Multihost layout error: {e}"),
         }
     }
@@ -472,9 +495,9 @@ impl ConfigError {
         }
     }
 
-    pub fn duplicate_input_endpoint(endpoint_name: &str) -> Self {
+    pub fn duplicate_input_endpoint(endpoint_name: impl Into<String>) -> Self {
         Self::DuplicateInputEndpoint {
-            endpoint_name: endpoint_name.to_owned(),
+            endpoint_name: endpoint_name.into(),
         }
     }
 
@@ -601,6 +624,13 @@ impl ConfigError {
 
     pub fn invalid_output_buffer_configuration(endpoint_name: &str, error: &str) -> Self {
         Self::InvalidOutputBufferConfig {
+            endpoint_name: endpoint_name.to_string(),
+            error: error.to_string(),
+        }
+    }
+
+    pub fn invalid_soft_delete_configuration(endpoint_name: &str, error: &str) -> Self {
+        Self::InvalidSoftDeleteConfig {
             endpoint_name: endpoint_name.to_string(),
             error: error.to_string(),
         }
@@ -1359,7 +1389,7 @@ impl ControllerError {
         }
     }
 
-    pub fn duplicate_input_endpoint(endpoint_name: &str) -> Self {
+    pub fn duplicate_input_endpoint(endpoint_name: impl Into<String>) -> Self {
         Self::Config {
             config_error: Box::new(ConfigError::duplicate_input_endpoint(endpoint_name)),
         }
@@ -1509,6 +1539,15 @@ impl ControllerError {
     pub fn invalid_output_buffer_configuration(endpoint_name: &str, error: &str) -> Self {
         Self::Config {
             config_error: Box::new(ConfigError::invalid_output_buffer_configuration(
+                endpoint_name,
+                error,
+            )),
+        }
+    }
+
+    pub fn invalid_soft_delete_configuration(endpoint_name: &str, error: &str) -> Self {
+        Self::Config {
+            config_error: Box::new(ConfigError::invalid_soft_delete_configuration(
                 endpoint_name,
                 error,
             )),

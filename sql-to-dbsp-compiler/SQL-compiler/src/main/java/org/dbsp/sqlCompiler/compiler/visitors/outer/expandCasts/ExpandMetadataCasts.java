@@ -39,17 +39,14 @@ public class ExpandMetadataCasts extends CircuitCloneVisitor {
             DBSPExpression lateness = this.expand(cm.lateness);
             if (lateness != cm.lateness)
                 changes = true;
-            DBSPExpression watermark = this.expand(cm.watermark);
-            if (watermark != cm.watermark)
-                changes = true;
             if (changes) {
                 cm = new InputColumnMetadata(cm.getNode(), cm.name, cm.type, cm.isPrimaryKey,
-                        lateness, watermark, def, cm.defaultValuePosition, cm.interned);
+                        lateness, def, cm.defaultValuePosition, cm.interned);
             }
             metas.add(cm);
         }
         if (changes)
-            return new TableMetadata(metadata.tableName, metas, metadata.getForeignKeys(),
+            return new TableMetadata(metadata.tableName, metas, metadata.getForeignKeys(), metadata.expectedSize,
                     metadata.materialized, metadata.isStreaming(), metadata.skipUnusedColumns);
         return null;
     }

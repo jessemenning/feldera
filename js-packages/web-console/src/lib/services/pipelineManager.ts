@@ -1,27 +1,42 @@
+import { singleton } from 'common-lib/array'
+import { tuple } from 'common-lib/tuple'
 import {
+  addTenantUser as _addTenantUser,
   type CombinedDesiredStatus as _CombinedDesiredStatus,
   type CombinedStatus as _CombinedStatus,
   checkpointPipeline as _checkpointPipeline,
+  createTenant as _createTenant,
   deleteApiKey as _deleteApiKey,
+  deleteOidcTrust as _deleteOidcTrust,
   deletePipeline as _deletePipeline,
+  deleteTenant as _deleteTenant,
+  deleteTenantUser as _deleteTenantUser,
   getCheckpointStatus as _getCheckpointStatus,
   getCheckpointSyncStatus as _getCheckpointSyncStatus,
   getCheckpoints as _getCheckpoints,
   getClusterEvent as _getClusterEvent,
   getConfig as _getConfig,
+  getConfigOwners as _getConfigOwners,
   getConfigSession as _getConfigSession,
+  getOidcTrust as _getOidcTrust,
   getPipeline as _getPipeline,
   getPipelineDataflowGraph as _getPipelineDataflowGraph,
   getPipelineEvent as _getPipelineEvent,
   getPipelineInputConnectorStatus as _getPipelineInputConnectorStatus,
   getPipelineOutputConnectorStatus as _getPipelineOutputConnectorStatus,
   getPipelineStats as _getPipelineStats,
+  listOidcTrust as _listOidcTrust,
+  listTenants as _listTenants,
+  listTenantUsers as _listTenantUsers,
   type ProgramStatus as _ProgramStatus,
   patchPipeline as _patchPipeline,
+  patchTenant as _patchTenant,
   postApiKey as _postApiKey,
+  postOidcTrust as _postOidcTrust,
   postPipeline as _postPipeline,
   postUpdateRuntime as _postUpdateRuntime,
   putPipeline as _putPipeline,
+  putTenantUser as _putTenantUser,
   syncCheckpoint as _syncCheckpoint,
   type CheckpointMetadata,
   type CheckpointResponse,
@@ -36,6 +51,7 @@ import {
   listClusterEvents,
   listPipelineEvents,
   listPipelines,
+  type NewOidcTrustRequest,
   type PatchPipeline,
   type PipelineSelectedInfo,
   type PostPutPipeline,
@@ -48,7 +64,9 @@ import {
   postPipelineResume,
   postPipelineStart,
   postPipelineStop,
-  startSamplyProfile
+  startSamplyProfile,
+  type TenantInfo,
+  type TenantMember
 } from '$lib/services/manager'
 
 export type {
@@ -59,9 +77,15 @@ export type {
   CheckpointStatus,
   InputEndpointConfig,
   InputEndpointStatus,
+  MemberRole,
+  NewOidcTrustRequest,
+  // RBAC/OIDC-trust/tenant admin types (generated from the manager's OpenAPI).
+  OidcTrustDescr,
   OutputEndpointConfig,
   OutputEndpointStatus,
+  Role,
   RuntimeConfig,
+  RustCompilerMessage,
   SqlCompilerMessage
 } from '$lib/services/manager'
 
@@ -72,8 +96,6 @@ export type { ProgramSchema } from '$lib/services/manager'
 export type ProgramStatus = _ProgramStatus
 
 import JSONbig from 'true-json-bigint'
-import { singleton } from '$lib/functions/common/array'
-import { tuple } from '$lib/functions/common/tuple'
 import { felderaEndpoint } from '$lib/functions/configs/felderaEndpoint'
 import { applyAuthToRequest, getAuthorizationHeaders, handleAuthResponse } from '$lib/services/auth'
 import { createClient } from '$lib/services/manager/client'
@@ -593,8 +615,10 @@ export const getConfigSession = (options?: FetchOptions) =>
 
 export const getApiKeys = (options?: FetchOptions) => mapResponse(listApiKeys(options), (v) => v)
 
-export const postApiKey = (name: string, options?: FetchOptions) =>
-  mapResponse(_postApiKey({ body: { name }, ...options }), (v) => v)
+export type ApiKeyRole = 'read' | 'write'
+
+export const postApiKey = (name: string, role: ApiKeyRole = 'read', options?: FetchOptions) =>
+  mapResponse(_postApiKey({ body: { name, role }, ...options }), (v) => v)
 
 export const deleteApiKey = (name: string, options?: FetchOptions) =>
   mapResponse(
@@ -604,6 +628,101 @@ export const deleteApiKey = (name: string, options?: FetchOptions) =>
       throw new Error(`Failed to delete ${name} API key`)
     }
   )
+
+// A tenant member (generated `TenantMember`). Members appear after their first
+// login or via pre-provisioning; `role` is normally read/write/admin, but an
+// owner resolved by the IdP can also appear and is shown read-only.
+export type TenantUser = TenantMember
+export type Tenant = TenantInfo
+
+// OIDC trust relationships, tenant users, and tenant administration. These go
+// through the generated client (same auth + 401-refresh interceptors as every
+// other call), wrapped in `mapResponse` for uniform error handling.
+
+// An optional `tenant` (name or UUID) sets a per-call `Feldera-Tenant` header,
+// letting an owner view/manage a specific tenant on the admin page without
+// changing the global acting-tenant selection. Omit it to use the current tenant.
+const tenantHdr = (tenant?: string) => (tenant ? { headers: { 'Feldera-Tenant': tenant } } : {})
+
+export const getOidcTrustList = (tenant?: string, options?: FetchOptions) =>
+  mapResponse(_listOidcTrust({ ...tenantHdr(tenant), ...options }), (v) => v ?? [])
+
+export const postOidcTrust = (body: NewOidcTrustRequest, tenant?: string, options?: FetchOptions) =>
+  mapResponse(_postOidcTrust({ body, ...tenantHdr(tenant), ...options }), (v) => v)
+
+export const deleteOidcTrust = (name: string, tenant?: string, options?: FetchOptions) =>
+  mapResponse(_deleteOidcTrust({ path: { name }, ...tenantHdr(tenant), ...options }), (v) => v)
+
+// The platform owners, from deploy-time configuration and read-only here.
+export const getConfiguredOwners = (options?: FetchOptions) =>
+  mapResponse(_getConfigOwners({ ...options }), (v) => v)
+
+// Tenant users & roles (min role: admin).
+
+export const getTenantUsers = (tenant?: string, options?: FetchOptions) =>
+  mapResponse(_listTenantUsers({ ...tenantHdr(tenant), ...options }), (v) => v ?? [])
+
+// Pre-provision a member by identity, before their first login. The grant is
+// dormant until that identity authenticates into the tenant through the IdP.
+// The member's provider (OIDC issuer) is fixed to the platform's configured
+// issuer server-side; only the subject/email/role are caller-supplied.
+export const addTenantUser = (
+  body: { subject: string; email?: string; role: 'read' | 'write' | 'admin' },
+  tenant?: string,
+  options?: FetchOptions
+) => mapResponse(_addTenantUser({ body, ...tenantHdr(tenant), ...options }), (v) => v)
+
+export const setTenantUserRole = (
+  userId: string,
+  role: 'read' | 'write' | 'admin',
+  tenant?: string,
+  options?: FetchOptions
+) =>
+  mapResponse(
+    _putTenantUser({ path: { user_id: userId }, body: { role }, ...tenantHdr(tenant), ...options }),
+    (v) => v
+  )
+
+export const removeTenantUser = (userId: string, tenant?: string, options?: FetchOptions) =>
+  mapResponse(
+    _deleteTenantUser({ path: { user_id: userId }, ...tenantHdr(tenant), ...options }),
+    (v) => v
+  )
+
+// Tenant administration (min role: owner).
+
+export const getTenants = (options?: FetchOptions) =>
+  mapResponse(_listTenants({ ...options }), (v) => v ?? [])
+
+// The tenant's provider (OIDC issuer) is fixed to the platform's configured
+// issuer server-side; it is not caller-settable.
+export const createTenant = (name: string, options?: FetchOptions) =>
+  mapResponse(_createTenant({ body: { name }, ...options }), (v) => v)
+
+// Renaming changes only the name. A login resolves its tenant by name, so the
+// new name is what the identity provider must assert for those users to land here.
+// `displaceExisting` takes the name from the tenant that holds it, which is how a
+// tenant no login reaches is recovered: the name it needs is the one the first
+// login already created a tenant under.
+export const renameTenant = (
+  tenantId: string,
+  name: string,
+  displaceExisting = false,
+  options?: FetchOptions
+) =>
+  mapResponse(
+    _patchTenant({
+      path: { tenant_id: tenantId },
+      body: { name, displace_existing: displaceExisting },
+      ...options
+    }),
+    (v) => v
+  )
+
+// Refused unless the tenant holds no pipelines, API keys or OIDC trusts, since
+// everything tenant-scoped cascades on the delete.
+export const deleteTenant = (tenantId: string, options?: FetchOptions) =>
+  mapResponse(_deleteTenant({ path: { tenant_id: tenantId }, ...options }), (v) => v)
 
 export const dismissDeploymentError = (pipeline_name: string) =>
   mapResponse(postPipelineDismissError({ path: { pipeline_name } }), (v) => v)
@@ -905,7 +1024,10 @@ const streamingFetch = (
         }
         // For other non-2XX status codes, try to parse JSON error
         return response.json().then((body) => {
-          return new Error(apiErrorText(body), { cause: body })
+          // The status travels with the body. A caller that has to tell a transient 503
+          // from a request not worth repeating cannot recover it from the message, and
+          // `error_code` names the error rather than how to react to it.
+          return new Error(apiErrorText(body), { cause: { ...body, status: response.status } })
         })
       },
       (e) => {
@@ -949,15 +1071,25 @@ export const relationEgressStream = async (
   )
 }
 
+/**
+ * Opens the pipeline log stream.
+ *
+ * `cursor` asks the server to carry on from where a previous connection stopped, instead
+ * of sending the whole log again. Pass the position from the last response, or an empty
+ * string the first time. Either way the response reports where it resumed in its
+ * `feldera-logs-*` headers and the body holds nothing but log lines. See
+ * `$lib/functions/pipelines/logCursor` for how the position is kept.
+ */
 export const pipelineLogsStream = async (
   pipelineName: string,
+  cursor: string,
   requestInit?: RequestInit,
   options?: FetchOptions
 ) => {
   return streamResponse(
     streamingFetch(
       getAuthenticatedFetch(options),
-      `${felderaEndpoint}/v0/pipelines/${pipelineName}/logs`,
+      `${felderaEndpoint}/v0/pipelines/${pipelineName}/logs?cursor=${encodeURIComponent(cursor)}`,
       requestInit ?? {}
     )
   )

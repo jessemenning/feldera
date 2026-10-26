@@ -3,8 +3,16 @@
 
   export type MetricsMode = 'overview' | 'node' | 'top-nodes'
 
-  /** Node identity attributes shown beside the node title, in display order. */
-  const idAttributes = [
+  /** Node identity attributes shown beside the node title, in display order. `hint` is shown on hover. */
+  const idAttributes: { key: string; label: string; hint?: (isRegion: boolean) => string }[] = [
+    {
+      key: 'consumers',
+      label: 'consumers',
+      hint: (isRegion) =>
+        isRegion
+          ? 'Count of edges from this region to consumers outside the region.'
+          : 'Count of edges to the operators consuming this operator\'s output.'
+    },
     { key: 'parent', label: 'parent ID' },
     { key: 'persistentId', label: 'persistent ID' }
   ]
@@ -30,9 +38,13 @@
   import type { TooltipData } from './ProfilerTooltip.svelte'
   import KeyValueBlock from './metrics/blocks/KeyValueBlock.svelte'
   import MetricsDistributionBlock from './metrics/blocks/MetricsDistributionBlock.svelte'
+  import { setCollapsed } from './metrics/collapsedBlocks.svelte'
   import { buildBlocks, type RenderableBlock } from './metrics/dispatch'
   import { buildGlobalMetrics, type GlobalMetrics } from '../functions/globalMetrics'
-  import type { LookupCoordinator } from '../functions/lookup'
+  import type { LookupCoordinator, SearchProgress } from '../functions/lookup'
+  import { buildSearchTargets, matchTargets } from '../functions/metricsSearch'
+  import { positiveMod, Tooltip, type SearchDirection } from 'common-ui'
+  import { tick } from 'svelte'
 
   interface Props {
     mode: MetricsMode
@@ -51,8 +63,15 @@
     onSearchNode?: (query: string) => void
   }
 
-  const { mode, tooltipData, rootNodeId, globalMetrics, showAdvanced, lookup, onSearchNode }: Props =
-    $props()
+  const {
+    mode,
+    tooltipData,
+    rootNodeId,
+    globalMetrics,
+    showAdvanced,
+    lookup,
+    onSearchNode
+  }: Props = $props()
 
   // Pipeline-wide totals for the overview's "Global stats" tile. Empty (so the tile is hidden) on
   // any non-overview view or when the bundle carried no stats.
@@ -71,7 +90,7 @@
     nodeAttributes && isNodeView
       ? idAttributes.flatMap((r) => {
           const value = nodeAttributes.attributes.get(r.key)
-          return value ? [{ ...r, value }] : []
+          return value ? [{ ...r, value, hint: r.hint?.(nodeAttributes.isRegion) }] : []
         })
       : []
   )
@@ -79,6 +98,21 @@
     nodeAttributes ? buildBlocks(nodeAttributes, showAdvanced) : []
   )
   const showAttributesView = $derived(mode === 'overview' || mode === 'node')
+
+  const genericTable = $derived(
+    tooltipData && 'genericTable' in tooltipData ? tooltipData.genericTable : null
+  )
+
+  // Scroll targets the search can jump to in the current view, in DOM order; each carries a
+  // `data-block-id` anchor (see {@link buildSearchTargets}).
+  const searchTargets = $derived(
+    buildSearchTargets({
+      showAttributesView,
+      globalEntries: globalMetricEntries,
+      blocks,
+      topNodeRows: genericTable?.rows ?? []
+    })
+  )
 
   let containerEl: HTMLDivElement | undefined = $state()
 
@@ -98,47 +132,49 @@
     return () => observer.disconnect()
   })
 
-  // Search priorities: block title, then metric label, then metric id. Always returns the
-  // *block* to scroll to — metrics in distribution blocks share grid cells with their
-  // siblings and don't have a single DOM anchor, so block-level is the reliable target.
-  function findMatchingBlockId(query: string): string | null {
-    const q = query.trim().toLowerCase()
-    if (!q || blocks.length === 0) return null
-    for (const b of blocks) {
-      if (b.title?.toLowerCase().includes(q)) return b.id
-    }
-    for (const b of blocks) {
-      for (const e of b.entries) {
-        if (e.label.toLowerCase().includes(q)) return b.id
-      }
-    }
-    for (const b of blocks) {
-      for (const e of b.entries) {
-        if (e.row.metric.toLowerCase().includes(q)) return b.id
-      }
-    }
-    return null
-  }
+  // Search cursor. A new query starts at the first match; repeating the same query steps the
+  // cursor (Enter / down → next, Shift-Enter / up → previous), wrapping modulo the match count.
+  // Imperative — no $state on purpose
+  let searchQuery = ''
+  let matchCursor = 0
 
-  // Imperative handler. Each Enter on the panel's search input calls this directly via the
-  // lookup coordinator, so identical queries still re-fire (unlike a reactive `$effect` on a
-  // query prop, where Svelte would dedupe equal values).
-  function runSearch(query: string) {
-    if (!containerEl) return
-    const matchId = findMatchingBlockId(query)
-    if (!matchId) return
-    const el = containerEl.querySelector<HTMLElement>(`[data-block-id="${matchId}"]`)
-    el?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  // Called imperatively on every submit, so pressing Enter again on the same query advances to the
+  // next match rather than being ignored. Matches are the full target list in DOM order,
+  // so a new query starts at the first match from the top.
+  // Returns the match count so the layout can enable/disable the nav buttons.
+  function runSearch(query: string, direction: SearchDirection): SearchProgress {
+    if (!containerEl) return { current: 0, total: 0 }
+    const ids = matchTargets(searchTargets, query)
+    if (ids.length === 0) {
+      searchQuery = query
+      return { current: 0, total: 0 }
+    }
+    if (query === searchQuery) {
+      matchCursor += direction === 'prev' ? -1 : 1
+    } else {
+      matchCursor = 0
+      searchQuery = query
+    }
+    const n = ids.length
+    matchCursor = positiveMod(matchCursor, n)
+    const target = ids[matchCursor]
+    // A hit inside a collapsed block would scroll to a hidden row.
+    setCollapsed(target, false)
+    // Scrolling before the expanded rows are laid out clamps the scroll to the collapsed
+    // height, leaving the match short of the top of the panel.
+    const container = containerEl
+    tick().then(() =>
+      container
+        .querySelector<HTMLElement>(`[data-block-id="${target}"]`)
+        ?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    )
+    return { current: matchCursor + 1, total: n }
   }
 
   $effect(() => {
     if (!lookup) return
     return lookup.register('Metrics', runSearch)
   })
-
-  const genericTable = $derived(
-    tooltipData && 'genericTable' in tooltipData ? tooltipData.genericTable : null
-  )
 </script>
 
 {#snippet attributesView()}
@@ -161,7 +197,10 @@
         >{nodeAttributes.title}</button>
         {#each identityRows as row (row.key)}
           <span class="text-surface-800-200">
-            <span class="font-medium">{row.label}:</span>
+            <span class="font-medium" class:cursor-help={row.hint}>{row.label}:</span>
+            {#if row.hint}
+              <Tooltip class="max-w-80" placement="bottom">{row.hint}</Tooltip>
+            {/if}
             <span class="break-all font-mono">{row.value}</span>
           </span>
         {/each}
@@ -170,17 +209,17 @@
     <!-- Two same-width columns once the container is at least TWO_COLUMN_THRESHOLD_PX wide;
          otherwise one column. CSS multi-column flow auto-distributes blocks; the column
          count is driven by the ResizeObserver on the scroll container. -->
-    <div class="gap-3" style="column-count: {useTwoColumns ? 2 : 1};">
+    <div class="gap-2" style="column-count: {useTwoColumns ? 2 : 1};">
       <!-- Overview-only cumulative pipeline metrics from `stats.json`, tiled alongside the node
            blocks. Driven by the bundle's global metrics, not the selected node, so it shows in the
            overview even when the root node carries no attributes and no node tooltip is produced. -->
       {#if globalMetricEntries.length > 0}
-        <div class="mb-3 break-inside-avoid">
+        <div class="mb-2 break-inside-avoid">
           <KeyValueBlock id="global-metrics" title="Global stats" entries={globalMetricEntries} />
         </div>
       {/if}
       {#each blocks as b (b.id)}
-        <div class="mb-3 break-inside-avoid">
+        <div class="mb-2 break-inside-avoid">
           <MetricsDistributionBlock id={b.id} title={b.title} entries={b.entries} />
         </div>
       {/each}
@@ -194,7 +233,7 @@
       No top-nodes data — select a metric to compute.
     </div>
   {:else}
-    <div class="rounded-container bg-white-dark p-4 shadow-sm">
+    <div class="rounded-base bg-white-dark p-4 shadow-sm">
       <h3 class="mb-3 text-base font-semibold text-surface-900-100">{genericTable.header}</h3>
       <table class="w-full border-collapse text-sm">
         <thead>
@@ -205,8 +244,8 @@
           </tr>
         </thead>
         <tbody>
-          {#each genericTable.rows as row}
-            <tr class="border-t border-surface-200-800">
+          {#each genericTable.rows as row, i}
+            <tr class="border-t border-surface-200-800" data-block-id="top-node-{i}">
               <td class="px-2 py-1">
                 <button
                   type="button"

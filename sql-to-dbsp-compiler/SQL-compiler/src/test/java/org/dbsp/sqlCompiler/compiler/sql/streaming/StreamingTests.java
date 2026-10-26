@@ -1,5 +1,6 @@
 package org.dbsp.sqlCompiler.compiler.sql.streaming;
 
+import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessRetainKeysOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
@@ -24,6 +25,7 @@ import org.dbsp.sqlCompiler.compiler.sql.tools.CompilerCircuitStream;
 import org.dbsp.sqlCompiler.compiler.sql.tools.InputOutputChange;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.FindUnboundedState;
 import org.dbsp.sqlCompiler.ir.expression.DBSPTupleExpression;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPDateLiteral;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPDoubleLiteral;
@@ -40,7 +42,10 @@ import org.dbsp.util.NullPrintStream;
 import org.junit.Assert;
 import org.junit.Test;
 
+import javax.annotation.Nullable;
 import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Tests that exercise streaming features. */
 public class StreamingTests extends StreamingTestBase {
@@ -95,6 +100,38 @@ public class StreamingTests extends StreamingTestBase {
             }
         };
         ccs.visit(visitor);
+    }
+
+    @Test
+    public void negativeFloatingPointLateness() {
+        String sql = """
+                CREATE TABLE T(d DOUBLE NOT NULL LATENESS 10, r REAL NOT NULL LATENESS 10);
+                CREATE VIEW V AS SELECT CAST(d AS INT) AS d, CAST(r AS INT) AS r FROM T;""";
+        var ccs = this.getCCS(sql);
+        ccs.stepWeightOne("INSERT INTO T VALUES(-5, -6);",
+                """
+                         d  | r
+                        ---------
+                         -5 | -6""");
+    }
+
+    @Test
+    public void floatingPointTemporalFilter() {
+        // The window has no upper bound; the largest value, NaN, is its upper end
+        String sql = """
+                CREATE TABLE T(d DOUBLE NOT NULL);
+                CREATE VIEW V AS SELECT CAST(d AS VARCHAR) AS d FROM T
+                WHERE d >= CAST(EXTRACT(EPOCH FROM NOW()) AS DOUBLE);""";
+        var ccs = this.getCCS(sql);
+        ccs.stepWeightOne("""
+                INSERT INTO T VALUES (-1), (5), (CAST('Infinity' AS DOUBLE)), (CAST('NaN' AS DOUBLE));
+                INSERT INTO now VALUES ('1970-01-01 00:00:00');""",
+                """
+                 d
+                -----
+                 5.0
+                 inf
+                 NaN""");
     }
 
     @Test
@@ -869,6 +906,501 @@ public class StreamingTests extends StreamingTestBase {
         });
     }
 
+    /** Asserts the placement of the trace GC operators around a join.
+     * The circuit must contain exactly one join.
+     * @param cc          Compiled circuit.
+     * @param leftValues  retain_values operators expected on the left join input.
+     * @param rightValues retain_values operators expected on the right join input.
+     * @param rightLastN  retain_n_values operators expected on the right join input. */
+    void checkJoinGC(CompilerCircuit cc, int leftValues, int rightValues, int rightLastN) {
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            @Nullable DBSPJoinBaseOperator join = null;
+            final List<OutputPort> retainValuesData = new ArrayList<>();
+            final List<OutputPort> retainNData = new ArrayList<>();
+
+            @Override
+            public void postorder(DBSPJoinBaseOperator operator) {
+                Assert.assertNull("more than one join", this.join);
+                this.join = operator;
+            }
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainValuesOperator operator) {
+                this.retainValuesData.add(operator.left());
+            }
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainNValuesOperator operator) {
+                this.retainNData.add(operator.left());
+            }
+
+            @Override
+            public void endVisit() {
+                DBSPJoinBaseOperator join = this.join;
+                Assert.assertNotNull(join);
+                Assert.assertEquals(leftValues,
+                        Linq.where(this.retainValuesData, p -> p.equals(join.left())).size());
+                Assert.assertEquals(rightValues,
+                        Linq.where(this.retainValuesData, p -> p.equals(join.right())).size());
+                Assert.assertEquals(rightLastN,
+                        Linq.where(this.retainNData, p -> p.equals(join.right())).size());
+                // No GC operators anywhere else
+                Assert.assertEquals(leftValues + rightValues, this.retainValuesData.size());
+                Assert.assertEquals(rightLastN, this.retainNData.size());
+            }
+        });
+    }
+
+    @Test
+    public void issue6829() {
+        // As-of lookup written as an inequality join plus ARG_MAX.
+        // The history row (1, 0, 7) must stay joinable forever
+        String sql = """
+                CREATE TABLE queries (
+                    entity_id BIGINT NOT NULL,
+                    query_ts BIGINT NOT NULL LATENESS 0,
+                    query_id BIGINT NOT NULL
+                ) WITH ('append_only' = 'true');
+                CREATE TABLE config_history (
+                    entity_id BIGINT NOT NULL,
+                    effective_ts BIGINT NOT NULL LATENESS 0,
+                    config_value BIGINT NOT NULL
+                ) WITH ('append_only' = 'true');
+                CREATE VIEW v AS
+                SELECT q.entity_id, q.query_ts, q.query_id,
+                       ARG_MAX(c.config_value, c.effective_ts) AS config_value
+                FROM queries q JOIN config_history c
+                  ON q.entity_id = c.entity_id
+                 AND c.effective_ts <= q.query_ts
+                GROUP BY q.entity_id, q.query_ts, q.query_id;""";
+        // GC happens when trace batches merge, and merging is per-shard, so
+        // every row uses entity 1, keeping a single worker busy.
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep();
+        this.checkJoinGC(ccs, 1, 0, 0);
+        this.run6829Circuit(ccs);
+        // Control: no input row is late, so the program without LATENESS
+        // must produce the same outputs; it has no GC operators.
+        CompilerCircuitStream control = this.getCCS(
+                sql.replace(" LATENESS 0", "")).compactAfterEachStep();
+        this.checkJoinGC(control, 0, 0, 0);
+        this.run6829Circuit(control);
+    }
+
+    /** No input row is ever late: each
+     * timestamp column arrives in non-decreasing order.
+     * The trace diagrams describe the inequality-join variant with
+     * LATENESS: they show the queries join trace and the bound of its
+     * integrate_trace_retain_values operator, the config_history waterline
+     * delayed by one transaction.  Rows above the ==== line are below the
+     * bound and may be dropped when trace batches merge. */
+    void run6829Circuit(CompilerCircuitStream ccs) {
+        // Before this step: bound = minimum, both tables are empty.
+        ccs.step("""
+                INSERT INTO config_history VALUES(1, 0, 7);
+                INSERT INTO queries VALUES(1, 10, 1);
+                """, """
+                 entity_id | query_ts | query_id | config_value | weight
+                ---------------------------------------------------------
+                 1         | 10       | 1        | 7            | 1""");
+        // Before this step, queries trace:
+        //   entity | query_ts | id
+        //  --------+----------+---
+        //  ==========================  bound = 0
+        //        1 |       10 |  1
+        // This row advances the effective_ts waterline to 2000.  Its
+        // effective_ts is above the final query's query_ts, so it never
+        // changes the lookup result, and it does not join query (1, 10, 1).
+        ccs.step("""
+                INSERT INTO config_history VALUES(1, 2000, 50);
+                """, """
+                 entity_id | query_ts | query_id | config_value | weight
+                ---------------------------------------------------------""");
+        // Before this step, queries trace:
+        //   entity | query_ts | id
+        //  --------+----------+---
+        //        1 |       10 |  1    droppable: future history rows all
+        //  ==========================  bound = 2000    exceed its query_ts
+        ccs.step("""
+                INSERT INTO config_history VALUES(1, 2001, 51);
+                """, """
+                 entity_id | query_ts | query_id | config_value | weight
+                ---------------------------------------------------------""");
+        // The merge after the previous step runs with bound 2000; it may
+        // drop query (1, 10, 1), whose output stands.  It must retain
+        // history row (1, 0, 7): the config_history trace has no GC bound.
+        ccs.step("""
+                INSERT INTO queries VALUES(1, 1000, 999);
+                """, """
+                 entity_id | query_ts | query_id | config_value | weight
+                ---------------------------------------------------------
+                 1         | 1000     | 999      | 7            | 1""");
+    }
+
+    @Test
+    public void issue6829Windowed() {
+        // The windowed-join variant of issue6829, with the streams' waterlines
+        // skewed: orders run far ahead of payments.
+        String sql = """
+                CREATE TABLE orders (
+                    order_id BIGINT NOT NULL,
+                    order_ts BIGINT NOT NULL LATENESS 0
+                ) WITH ('append_only' = 'true');
+                CREATE TABLE payments (
+                    order_id BIGINT NOT NULL,
+                    pay_ts BIGINT NOT NULL LATENESS 0
+                ) WITH ('append_only' = 'true');
+                CREATE VIEW v AS
+                SELECT o.order_id, o.order_ts, p.pay_ts
+                FROM orders o JOIN payments p
+                  ON o.order_id = p.order_id
+                 AND p.pay_ts >= o.order_ts
+                 AND p.pay_ts <= o.order_ts + 100;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep();
+        this.checkJoinGC(ccs, 1, 1, 0);
+        this.runCircuit6829Windowed(ccs);
+        // Control: no input row is late, so the program without LATENESS
+        // must produce the same outputs; it has no GC operators.
+        CompilerCircuitStream control = this.getCCS(
+                sql.replace(" LATENESS 0", "")).compactAfterEachStep();
+        this.checkJoinGC(control, 0, 0, 0);
+        this.runCircuit6829Windowed(control);
+    }
+
+    /** No input row is ever late:
+     * both timestamp columns arrive in non-decreasing order.  The outputs
+     * must therefore be identical with and without the LATENESS
+     * annotations.
+     * The trace diagrams describe the LATENESS variant: they show the
+     * orders join trace and the bound of its integrate_trace_retain_values
+     * operator, the payments waterline minus the window width 100, delayed
+     * by one transaction.  Payments never advance here, so the bound stays
+     * at minimum and every order must survive every merge. */
+    void runCircuit6829Windowed(CompilerCircuitStream ccs) {
+        // Before this step: bound = minimum, both tables are empty.
+        ccs.step("""
+                INSERT INTO orders VALUES(1, 0);
+                """, """
+                 order_id | order_ts | pay_ts | weight
+                ---------------------------------------""");
+        // Before this step, orders trace:
+        //   order | order_ts
+        //  -------+---------
+        //  ===================  bound = minimum
+        //       1 |        0
+        // This row advances the order_ts waterline to 500.
+        ccs.step("""
+                INSERT INTO orders VALUES(1, 500);
+                """, """
+                 order_id | order_ts | pay_ts | weight
+                ---------------------------------------""");
+        // Before this step, orders trace:
+        //   order | order_ts
+        //  -------+---------
+        //  ===================  bound = minimum
+        //       1 |        0    payment window [0, 100] still open
+        //       1 |      500
+        ccs.step("""
+                INSERT INTO orders VALUES(1, 501);
+                """, """
+                 order_id | order_ts | pay_ts | weight
+                ---------------------------------------""");
+        // The first payment: on time, because the payments waterline has
+        // never advanced.  It falls only inside the window of order (1, 0).
+        ccs.step("""
+                INSERT INTO payments VALUES(1, 50);
+                """, """
+                 order_id | order_ts | pay_ts | weight
+                ---------------------------------------
+                 1        | 0        | 50     | 1""");
+    }
+
+    @Test
+    public void issue6829Asof() {
+        String sql = """
+                CREATE TABLE queries (
+                    entity_id BIGINT NOT NULL,
+                    query_ts BIGINT NOT NULL LATENESS 0,
+                    query_id BIGINT NOT NULL
+                ) WITH ('append_only' = 'true');
+                CREATE TABLE config_history (
+                    entity_id BIGINT NOT NULL,
+                    effective_ts BIGINT NOT NULL LATENESS 0,
+                    config_value BIGINT NOT NULL
+                ) WITH ('append_only' = 'true');
+                CREATE VIEW v AS
+                SELECT q.entity_id, q.query_ts, q.query_id, c.config_value
+                FROM queries q
+                LEFT ASOF JOIN config_history c
+                MATCH_CONDITION(q.query_ts >= c.effective_ts)
+                ON q.entity_id = c.entity_id;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep();
+        this.checkJoinGC(ccs, 1, 0, 1);
+        this.run6829Circuit(ccs);
+        // Control: no input row is late, so the program without LATENESS
+        // must produce the same outputs; it has no GC operators.
+        CompilerCircuitStream control = this.getCCS(
+                sql.replace(" LATENESS 0", "")).compactAfterEachStep();
+        this.checkJoinGC(control, 0, 0, 0);
+        this.run6829Circuit(control);
+    }
+
+    @Test
+    public void issue7227() {
+        // A new left row can match an arbitrarily old right row, so the
+        // output's right timestamp has no lower bound.
+        String sql = """
+                CREATE TABLE L (k BIGINT NOT NULL, ts BIGINT NOT NULL LATENESS 0);
+                CREATE TABLE R (k BIGINT NOT NULL, ts BIGINT NOT NULL LATENESS 0);
+                CREATE LOCAL VIEW V AS
+                SELECT L.k, L.ts AS lts, R.ts AS rts
+                FROM L LEFT ASOF JOIN R
+                MATCH_CONDITION(L.ts >= R.ts)
+                ON L.k = R.k;
+                CREATE VIEW C AS SELECT rts, COUNT(*) AS c FROM V GROUP BY rts;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep();
+        ccs.step("""
+                INSERT INTO R VALUES(1, 0);
+                INSERT INTO L VALUES(1, 0);""", """
+                 rts | c | weight
+                ------------------
+                 0   | 1 | 1""");
+        // Both waterlines move to 100
+        ccs.step("""
+                INSERT INTO R VALUES(2, 100);
+                INSERT INTO L VALUES(2, 100);""", """
+                 rts | c | weight
+                ------------------
+                 100 | 1 | 1""");
+        // L(1, 200) is not late and matches R(1, 0)
+        ccs.step("""
+                INSERT INTO R VALUES(2, 200);
+                INSERT INTO L VALUES(1, 200);""", """
+                 rts | c | weight
+                ------------------
+                 0   | 1 | -1
+                 0   | 2 | 1""");
+    }
+
+    @Test
+    public void sessionGc() {
+        // LATENESS on the SESSION timestamp column with SESSION windows.
+        // The RetainKeys operators attach to the inputs of the JoinIndex of the LAG;
+        // the steps below run with compaction to check that this works.
+        String sql = """
+                CREATE TABLE events(
+                    ts  TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOURS,
+                    uid VARCHAR
+                );
+                CREATE VIEW sessions AS
+                SELECT uid, COUNT(*) AS cnt, window_start, window_end
+                FROM TABLE(SESSION(TABLE events, DESCRIPTOR(ts), DESCRIPTOR(uid), INTERVAL 10 MINUTES))
+                GROUP BY uid, window_start, window_end;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep().withStringTrim();
+        // TODO: window_start cannot have a waterline (a session can be unbounded)
+        // but window_end does, but the algorithm we use does not find it.
+        ccs.visit(new CircuitVisitor(ccs.compiler) {
+            int retainKeys = 0;
+            int retainNValues = 0;
+            int rollingWithWaterline = 0;
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                this.retainKeys++;
+            }
+
+            @Override
+            public void postorder(DBSPIntegrateTraceRetainNValuesOperator operator) {
+                this.retainNValues++;
+            }
+
+            @Override
+            public void postorder(DBSPPartitionedRollingAggregateWithWaterlineOperator operator) {
+                this.rollingWithWaterline++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.rollingWithWaterline);
+                Assert.assertEquals(2, this.retainKeys);
+                // MIN and MAX of the session timestamps read the same stream as the join that
+                // follows them, which keeps every row; the shared integral is not garbage collected
+                Assert.assertEquals(0, this.retainNValues);
+            }
+        });
+        // The waterline is max over all data of (ts - 1 hour); each step is
+        // filtered with the waterline computed from the previous steps.
+        // Before this step: waterline = minimum, table is empty.
+        // Two sessions start: 'a' has two events 5 minutes apart, 'b' one event
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 10:00:00', 'a'),
+                                         ('2020-01-01 10:05:00', 'a'),
+                                         ('2020-01-01 10:00:00', 'b');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   2 | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | 1
+                 b   |   1 | 2020-01-01 10:00:00 | 2020-01-01 10:10:00 | 1""");
+        // Before this step, table contents (rows above the ==== line are
+        // below the waterline):
+        //   ts    | uid |
+        //  -------+-----+
+        //  ==============  waterline = 10:05 - 1:00 = 09:05
+        //   10:00 | a   |
+        //   10:00 | b   |
+        //   10:05 | a   |
+        // 7 minutes after the last 'a' event: extends the 'a' session
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 10:12:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   | 2   | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | -1
+                 a   | 3   | 2020-01-01 10:00:00 | 2020-01-01 10:22:00 | 1""");
+        // Before this step:
+        //   ts    | uid |
+        //  -------+-----+
+        //  ==============  waterline = 10:12 - 1:00 = 09:12
+        //   10:00 | a   |
+        //   10:00 | b   |
+        //   10:05 | a   |
+        //   10:12 | a   |
+        // Far from the previous event: a new session
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 13:00:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                -----------------------------------------------------------------
+                 a   | 1   | 2020-01-01 13:00:00 | 2020-01-01 13:10:00 | 1""");
+        // Before this step:
+        //   ts    | uid |
+        //  -------+-----+
+        //   10:00 | a   | frozen
+        //   10:00 | b   | frozen
+        //   10:05 | a   | frozen
+        //   10:12 | a   | frozen
+        //  ==============  waterline = 13:00 - 1:00 = 12:00
+        //   13:00 | a   |
+        // The frozen sessions can no longer change; compaction may collect
+        // their state.  This row is below the waterline: late, dropped
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 11:30:00', 'a');""", """
+                 uid | cnt | window_start | window_end | weight
+                ------------------------------------------------""");
+        // Before this step: same contents and waterline as the previous step.
+        // Exactly on the waterline: not late; more than one gap away from
+        // both neighbor sessions, so it forms its own
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 12:00:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   1 | 2020-01-01 12:00:00 | 2020-01-01 12:10:00 | 1""");
+    }
+
+    @Test
+    public void sessionDelete() {
+        // Sessions react to deletions: removing a row can split a session in
+        // two, or move its start.  No LATENESS.
+        String sql = """
+                CREATE TABLE events(
+                    ts  TIMESTAMP NOT NULL,
+                    uid VARCHAR
+                );
+                CREATE VIEW sessions AS
+                SELECT uid, COUNT(*) AS cnt, window_start, window_end
+                FROM TABLE(SESSION(TABLE events, DESCRIPTOR(ts), DESCRIPTOR(uid), INTERVAL 10 MINUTES))
+                GROUP BY uid, window_start, window_end;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).withStringTrim();
+        // 10:05 and 10:20 are 15 minutes apart, so there are two sessions
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 10:00:00', 'a'),
+                                         ('2020-01-01 10:05:00', 'a'),
+                                         ('2020-01-01 10:20:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   | 2   | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | 1
+                 a   | 1   | 2020-01-01 10:20:00 | 2020-01-01 10:30:00 | 1""");
+        // 10:12 is within the gap of both neighbors, so it bridges the two
+        // sessions into one
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 10:12:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   | 2   | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | -1
+                 a   | 1   | 2020-01-01 10:20:00 | 2020-01-01 10:30:00 | -1
+                 a   | 4   | 2020-01-01 10:00:00 | 2020-01-01 10:30:00 | 1""");
+        // Removing the bridge splits the session again
+        ccs.step("""
+                REMOVE FROM events VALUES('2020-01-01 10:12:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   4 | 2020-01-01 10:00:00 | 2020-01-01 10:30:00 | -1
+                 a   |   2 | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | 1
+                 a   |   1 | 2020-01-01 10:20:00 | 2020-01-01 10:30:00 | 1""");
+        // Removing the first row of a session moves its window_start
+        ccs.step("""
+                REMOVE FROM events VALUES('2020-01-01 10:00:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   2 | 2020-01-01 10:00:00 | 2020-01-01 10:15:00 | -1
+                 a   |   1 | 2020-01-01 10:05:00 | 2020-01-01 10:15:00 | 1""");
+        // Removing the last remaining row of a session deletes it
+        ccs.step("""
+                REMOVE FROM events VALUES('2020-01-01 10:20:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   1 | 2020-01-01 10:20:00 | 2020-01-01 10:30:00 | -1""");
+    }
+
+    @Test
+    public void sessionGcLateMerge() {
+        // A session that straddles the waterline can still merge with an
+        // on-time row; the merged session's window_start comes from a value
+        // below the waterline, so value retention must keep it.
+        String sql = """
+                CREATE TABLE events(
+                    ts  TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOURS,
+                    uid VARCHAR
+                );
+                CREATE VIEW sessions AS
+                SELECT uid, COUNT(*) AS cnt, window_start, window_end
+                FROM TABLE(SESSION(TABLE events, DESCRIPTOR(ts), DESCRIPTOR(uid), INTERVAL 10 MINUTES))
+                GROUP BY uid, window_start, window_end;""";
+        CompilerCircuitStream ccs = this.getCCS(sql).compactAfterEachStep().withStringTrim();
+        // Before this step: waterline = minimum, table is empty
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 11:50:00', 'a'),
+                                         ('2020-01-01 11:55:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   2 | 2020-01-01 11:50:00 | 2020-01-01 12:05:00 | 1""");
+        // Before this step:
+        //   ts    | uid |
+        //  -------+-----+
+        //  ==============  waterline = 11:55 - 1:00 = 10:55
+        //   11:50 | a   |
+        //   11:55 | a   |
+        // An unrelated key advances the waterline to 12:00; the 'a' session
+        // now straddles it: its rows are below, but a row on the waterline
+        // can still merge with it
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 13:00:00', 'z');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 z   |   1 | 2020-01-01 13:00:00 | 2020-01-01 13:10:00 | 1""");
+        // Before this step:
+        //   ts    | uid |
+        //  -------+-----+
+        //   11:50 | a   | below the waterline, but the session is still live
+        //   11:55 | a   | (a row at 12:00..12:05 can merge with it)
+        //  ==============  waterline = 13:00 - 1:00 = 12:00
+        //   13:00 | z   |
+        // On-time row 9 minutes after 11:55: merges; window_start must still
+        // be 11:50, which only survives GC if value retention kept it
+        ccs.step("""
+                INSERT INTO events VALUES('2020-01-01 12:04:00', 'a');""", """
+                 uid | cnt | window_start        | window_end          | weight
+                ----------------------------------------------------------------
+                 a   |   2 | 2020-01-01 11:50:00 | 2020-01-01 12:05:00 | -1
+                 a   |   3 | 2020-01-01 11:50:00 | 2020-01-01 12:14:00 | 1""");
+    }
+
     @Test
     public void gcUpsertBoundary() {
         // The LATENESS column is not part of the primary key, so the input
@@ -1207,7 +1739,7 @@ public class StreamingTests extends StreamingTestBase {
     @Test
     public void gcKeyLateness() {
         // The LATENESS column is the primary key, so the compiler
-        // garbage-collects the input trace by key.  
+        // garbage-collects the input trace by key.
         String sql = """
                 CREATE TABLE t (
                     ts BIGINT NOT NULL PRIMARY KEY LATENESS 100,
@@ -1418,10 +1950,10 @@ public class StreamingTests extends StreamingTestBase {
         this.statementsFailingInCompilation("""
                 create table t (ts int not null LATENESS 2);
                 CREATE VIEW v WITH
-                ('emit_final' = '2') AS
+                ('emit_final' = '0') AS
                 SELECT ts, COUNT(*)
                 FROM t
-                GROUP BY ts;""", "View 'v' does not have a column with number 2");
+                GROUP BY ts;""", "Column '0' not found in 'v'");
         this.statementsFailingInCompilation("""
                 create table t (ts int);
                 CREATE VIEW v WITH
@@ -1512,6 +2044,107 @@ public class StreamingTests extends StreamingTestBase {
         ccs.visit(visitor);
     }
 
+    /** A view's LATENESS declarations combine with the waterlines inferred for its other
+     * columns (issue 1906): 'x' is filtered by its declaration, while 'ts' keeps the waterline
+     * of table 't', so emit_final on 'ts' compiles and fires. */
+    @Test
+    public void viewLatenessKeepsInheritedWaterline() {
+        String sql = """
+                CREATE TABLE t(ts INT NOT NULL LATENESS 2, x INT NOT NULL);
+                LATENESS v.x 1;
+                CREATE LOCAL VIEW v AS SELECT ts, x FROM t;
+                CREATE VIEW w WITH ('emit_final' = 'ts') AS
+                SELECT ts, COUNT(*) FROM v GROUP BY ts;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // waterline of ts is -1, of x is 9
+        ccs.step("INSERT INTO t VALUES (0, 10), (1, 10);", """
+                 ts | count | weight
+                ---------------------""");
+        // (2, 5) is late on x and dropped; waterline of ts becomes 3
+        ccs.step("INSERT INTO t VALUES (2, 5), (5, 10);", """
+                 ts | count | weight
+                ---------------------
+                  0 |     1 | 1
+                  1 |     1 | 1""");
+        // waterline of ts becomes 7; the dropped row never contributes a count
+        ccs.step("INSERT INTO t VALUES (9, 20);", """
+                 ts | count | weight
+                ---------------------
+                  5 |     1 | 1""");
+    }
+
+    /** A column with both a declared and an inherited waterline uses the larger one:
+     * 'ts' inherits ts - 1 from 't', and the declaration alone would give ts - 10. */
+    @Test
+    public void viewLatenessMergesWithInherited() {
+        String sql = """
+                CREATE TABLE t(ts INT NOT NULL LATENESS 1);
+                LATENESS v.ts 10;
+                CREATE LOCAL VIEW v AS SELECT ts FROM t;
+                CREATE VIEW w WITH ('emit_final' = 'ts') AS
+                SELECT ts, COUNT(*) FROM v GROUP BY ts;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // waterline of ts is 14: rows 0 and 8 are final; with ts - 10 only row 0 would be
+        ccs.step("INSERT INTO t VALUES (0), (8), (15);", """
+                 ts | count | weight
+                ---------------------
+                  0 |     1 | 1
+                  8 |     1 | 1""");
+    }
+
+    /** The mirror of viewLatenessMergesWithInherited: the declared waterline ts - 1 is the larger
+     * one, so it wins the MAX; the inherited ts - 10 alone would make only row 0 final. */
+    @Test
+    public void viewLatenessTighterThanInherited() {
+        String sql = """
+                CREATE TABLE t(ts INT NOT NULL LATENESS 10);
+                LATENESS v.ts 1;
+                CREATE LOCAL VIEW v AS SELECT ts FROM t;
+                CREATE VIEW w WITH ('emit_final' = 'ts') AS
+                SELECT ts, COUNT(*) FROM v GROUP BY ts;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // waterline of ts is 14
+        ccs.step("INSERT INTO t VALUES (0), (8), (15);", """
+                 ts | count | weight
+                ---------------------
+                  0 |     1 | 1
+                  8 |     1 | 1""");
+    }
+
+    /** 'ts' has an INTERVAL lateness both on table 't' (the inherited waterline) and on view 'v'
+     * (the declared one), so the MAX combines two TIMESTAMP values; the nullable 'x' gets its
+     * waterline from the declaration on 'v' alone. */
+    @Test
+    public void viewLatenessTimestampMerge() {
+        String sql = """
+                CREATE TABLE t(ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR, x INT);
+                LATENESS v.ts INTERVAL 1 DAY;
+                LATENESS v.x 1;
+                CREATE LOCAL VIEW v AS SELECT ts, x FROM t;
+                CREATE VIEW w WITH ('emit_final' = 'ts') AS
+                SELECT ts, COUNT(*) FROM v GROUP BY ts;""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // waterline of ts is 11:00 (inherited, ts - 1 hour), of x is 9
+        ccs.step("""
+                INSERT INTO t VALUES
+                ('2024-01-01 00:00:00', 10),
+                ('2024-01-01 08:00:00', 10),
+                ('2024-01-01 12:00:00', 10);""", """
+                 ts                  | count | weight
+                --------------------------------------
+                 2024-01-01 00:00:00 |     1 | 1
+                 2024-01-01 08:00:00 |     1 | 1""");
+        // x = 5 is late: the row is dropped by v, but t accepts it, so waterline of ts is 19:00
+        ccs.step("INSERT INTO t VALUES ('2024-01-01 20:00:00', 5);", """
+                 ts                  | count | weight
+                --------------------------------------
+                 2024-01-01 12:00:00 |     1 | 1""");
+        // waterline of ts is 23:00; the 20:00 row was dropped, so nothing new is final
+        ccs.step("INSERT INTO t VALUES ('2024-01-02 00:00:00', 10);", """
+                 ts                  | count | weight
+                --------------------------------------""");
+    }
+
     @Test
     public void issue1973() {
         String sql = """
@@ -1549,7 +2182,7 @@ public class StreamingTests extends StreamingTestBase {
     public void testDelayedOutput() {
         String sql = """
                 CREATE TABLE t (
-                    ts TIMESTAMP NOT NULL WATERMARK INTERVAL 1 MINUTE LATENESS INTERVAL 1 MINUTE
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE
                 );
                 CREATE VIEW test as
                 SELECT SUM(YEAR(TS)), TIMESTAMP_TRUNC(ts, MINUTE) FROM t
@@ -1557,30 +2190,30 @@ public class StreamingTests extends StreamingTestBase {
                 GROUP BY TIMESTAMP_TRUNC(ts, MINUTE);""";
         var ccs = this.getCCS(sql);
         ccs.step("""
-                 INSERT INTO T VALUES ('0001-01-01 00:00:00');
-                 INSERT INTO now VALUES ('0001-01-01 00:00:00');""",
+                 INSERT INTO T VALUES ('2020-01-01 00:00:00');
+                 INSERT INTO now VALUES ('2020-01-01 00:00:00');""",
                 """
                   sum | timestamp | weight
                  --------------------------""");
         ccs.step("""
-                 INSERT INTO T VALUES ('0001-01-01 00:00:10');
-                 INSERT INTO now VALUES ('0001-01-01 00:00:10');""",
+                 INSERT INTO T VALUES ('2020-01-01 00:00:10');
+                 INSERT INTO now VALUES ('2020-01-01 00:00:10');""",
                 """
                   sum | timestamp           | weight
                  ------------------------------------""");
         ccs.step("""
-                 INSERT INTO T VALUES ('0001-01-01 00:01:00');
-                 INSERT INTO now VALUES ('0001-01-01 00:01:00');""",
+                 INSERT INTO T VALUES ('2020-01-01 00:01:00');
+                 INSERT INTO now VALUES ('2020-01-01 00:01:00');""",
                 """
                   sum | timestamp           | weight
                  ------------------------------------""");
         ccs.step("""
-                 INSERT INTO T VALUES ('0001-01-01 00:02:01');
-                 INSERT INTO now VALUES ('0001-01-01 00:02:01');""",
+                 INSERT INTO T VALUES ('2020-01-01 00:02:01');
+                 INSERT INTO now VALUES ('2020-01-01 00:02:01');""",
                 """
                   sum | timestamp           | weight
                  ------------------------------------
-                    2 | 0001-01-01 00:00:00 | 1""");
+                 4040 | 2020-01-01 00:00:00 | 1""");
     }
 
     @Test
@@ -1831,6 +2464,407 @@ public class StreamingTests extends StreamingTestBase {
         CompilerCircuit cc = this.getCC(sql);
         CircuitVisitor visitor = new Inspector(cc.compiler, 1, 1, 1);
         cc.visit(visitor);
+    }
+
+    @Test
+    public void twoLowerNowBounds() {
+        // The window's lower bound must be the tighter of the two.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts >= now() - INTERVAL 10 MINUTES
+                  AND ts >= now() - INTERVAL 100 MINUTES""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // At now() = 12:00 the bounds are ts >= 11:50 and ts >= 10:20; only id 1 satisfies both.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:55:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 10:30:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | 1""");
+    }
+
+    @Test
+    public void twoUpperNowBounds() {
+        // The mirror image: two upper bounds fold into the tighter one, the minimum.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts <= now() - INTERVAL 10 MINUTES
+                  AND ts <= now() - INTERVAL 100 MINUTES""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // At now() = 12:00 the bounds are ts <= 11:50 and ts <= 10:20; only id 2 satisfies both.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 10:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1""");
+    }
+
+    @Test
+    public void twoLowerAndTwoUpperNowBounds() {
+        // Both sides fold: the window is [now() - 50 MINUTES, now() - 20 MINUTES], the
+        // tighter bound on each side.  The bounds are interleaved.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts >= now() - INTERVAL 100 MINUTES
+                  AND ts <= now() - INTERVAL 10 MINUTES
+                  AND ts >= now() - INTERVAL 50 MINUTES
+                  AND ts <= now() - INTERVAL 20 MINUTES""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        ccs.visit(new Inspector(ccs.compiler, 1, 1, 1));
+        // At 12:00 the window is [11:10, 11:40].  Ids 2 and 3 are inside the looser
+        // bounds only; ids 4 and 5 should be selected.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:30:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 11:45:00');
+                 INSERT INTO t VALUES (4, '2024-01-01 11:10:00');
+                 INSERT INTO t VALUES (5, '2024-01-01 11:40:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | 1
+                 4  | 1
+                 5  | 1""");
+        // At 12:30 the window is [11:40, 12:10]: ids 1 and 4 leave, id 3 enters, id 5 stays.
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 12:30:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | -1
+                 4  | -1
+                 3  | 1""");
+    }
+
+    @Test
+    public void nowBoundsBroughtTogetherByReordering() {
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  x  INT,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts >= now() - INTERVAL 10 MINUTES
+                  AND x > 5
+                  AND ts >= now() - INTERVAL 100 MINUTES""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // At now() = 12:00 the bounds are ts >= 11:50 and ts >= 10:20; only id 1 satisfies both.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, 6, '2024-01-01 11:55:00');
+                 INSERT INTO t VALUES (2, 6, '2024-01-01 10:30:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | 1""");
+    }
+
+    @Test
+    public void nowEquality() {
+        // `ts = NOW()` is a documented temporal filter (docs/sql/datetime.md, "inequality
+        // or equality comparisons"), but it compiles into the window [MIN, now()), so the
+        // view holds every row strictly before now() and drops the row that equals it.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts = now()""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // Only id 2 has ts = 12:00.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 12:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 13:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1""");
+        // The clock moves to 13:00: id 2 leaves the view and id 3 enters.
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | -1
+                 3  | 1""");
+    }
+
+    @Test
+    public void nowEqualityReversed() {
+        // now() on the left
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE now() = ts AND id > 1""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // id 1 also has ts = 12:00, but is excluded by id > 1.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 12:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 12:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 13:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1""");
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | -1
+                 3  | 1""");
+    }
+
+    @Test
+    public void nowEqualityOffset() {
+        // Equality against a monotone expression of now()
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts = NOW() - INTERVAL 1 HOUR""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // At 12:00 the window is [11:00, 11:00], so only id 2 qualifies.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 10:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 12:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1""");
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | -1
+                 3  | 1""");
+    }
+
+    @Test
+    public void nowEqualityNonMonotone() {
+        // MINUTE(now()) is not monotone
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts INT
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts = MINUTE(NOW())""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // No window
+        ccs.visit(new Inspector(ccs.compiler, 0, 1, 0));
+        ccs.step("""
+                 INSERT INTO t VALUES (1, 0);
+                 INSERT INTO t VALUES (2, 30);
+                 INSERT INTO now VALUES ('2024-01-01 12:30:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1""");
+    }
+
+    @Test
+    public void separatedBoundsMakeOneWindow() {
+        // The two bounds are separated by a non-temporal conjunct.  Reordering moves the
+        // temporal conjuncts into an adjacent block and filter merging reunites them, so a
+        // single window carries both bounds.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP,
+                  a INT
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts >= now() - INTERVAL 1 HOUR AND a > 2 AND ts <= now()""";
+        CompilerCircuit cc = this.getCC(sql);
+        cc.visit(new Inspector(cc.compiler, 1, 1, 1));
+    }
+
+    @Test
+    public void unboundedLowerWindowLast() {
+        // ts2's window has no lower bound, so it should be applied after ts's bounded window
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP,
+                  ts2 TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts2 <= now() AND ts >= now() - INTERVAL 1 HOUR""";
+        CompilerCircuit cc = this.getCC(sql);
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            final List<DBSPWindowOperator> windows = new ArrayList<>();
+
+            @Override
+            public void postorder(DBSPWindowOperator operator) {
+                this.windows.add(operator);
+            }
+
+            @Override
+            public void endVisit() {
+                // Postorder is topological, so the bounded window must be visited first.
+                Assert.assertEquals(2, this.windows.size());
+                Assert.assertFalse(this.windows.get(0).lowerUnbounded);
+                Assert.assertTrue(this.windows.get(1).lowerUnbounded);
+            }
+        });
+    }
+
+    @Test
+    public void unboundedLowerWindowLastData() {
+        // Same query; the reordering must not change the results.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP,
+                  ts2 TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts2 <= now() AND ts >= now() - INTERVAL 1 HOUR""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:30:00', '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 10:00:00', '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 11:30:00', '2024-01-01 13:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | 1""");
+        // At 13:00 id 1 ages out of the bounded window; id 3's ts is now too old as well.
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | -1""");
+    }
+
+    @Test
+    public void nowReversedComparisonBoundary() {
+        // now() on the left of a plain inequality.  Swapping the operands must preserve
+        // inclusivity: the boundary row (ts equal to now()) is included by <=.
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE now() <= ts""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 12:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 13:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1
+                 3  | 1""");
+        // At 13:00 the boundary moves: id 2 leaves, id 3 sits on the new boundary and stays.
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | -1""");
+    }
+
+    @Test
+    public void nowInequality() {
+        // ts <> now() is not a temporal filter
+        String sql = """
+                CREATE TABLE t (
+                  id INT NOT NULL PRIMARY KEY,
+                  ts TIMESTAMP
+                );
+                CREATE VIEW v AS
+                SELECT id FROM t
+                WHERE ts <> NOW()""";
+        CompilerCircuitStream ccs = this.getCCS(sql);
+        // No window
+        ccs.visit(new Inspector(ccs.compiler, 0, 1, 0));
+        // At 12:00 every row except id 2 qualifies.
+        ccs.step("""
+                 INSERT INTO t VALUES (1, '2024-01-01 11:00:00');
+                 INSERT INTO t VALUES (2, '2024-01-01 12:00:00');
+                 INSERT INTO t VALUES (3, '2024-01-01 13:00:00');
+                 INSERT INTO now VALUES ('2024-01-01 12:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 1  | 1
+                 3  | 1""");
+        // At 13:00 id 2 enters and id 3 leaves.
+        ccs.step("""
+                 INSERT INTO now VALUES ('2024-01-01 13:00:00');
+                 """,
+                """
+                 id | weight
+                -------------
+                 2  | 1
+                 3  | -1""");
     }
 
     @Test
@@ -2475,64 +3509,6 @@ public class StreamingTests extends StreamingTestBase {
     }
 
     @Test
-    public void watermarkTest0() {
-        // Test for the example in the documentation
-        String sql = """
-                CREATE TABLE order_pickup (
-                   pickup_time TIMESTAMP NOT NULL WATERMARK INTERVAL '1:00' HOURS TO MINUTES,
-                   location VARCHAR
-                );
-                """;
-        this.getCCS(sql);
-    }
-
-    @Test
-    public void watermarkTest() {
-        String sql = """
-                CREATE TABLE series (
-                        distance DOUBLE,
-                        pickup TIMESTAMP NOT NULL WATERMARK INTERVAL '1:00' HOURS TO MINUTES
-                );
-                CREATE VIEW V AS
-                SELECT AVG(distance), CAST(pickup AS DATE) FROM series GROUP BY CAST(pickup AS DATE)""";
-        CompilerCircuitStream ccs = this.getCCS(sql);
-        ccs.step("INSERT INTO series VALUES(10, '2023-12-30 10:00:00');",
-                """
-                         avg  | date       | weight
-                        ---------------------------""");
-        // Insert tuple before watermark, should be processed
-        ccs.step("INSERT INTO series VALUES(10, '2023-12-29 10:00:00');",
-                """
-                         avg  | date       | weight
-                        ---------------------------
-                         10   | 2023-12-29 | 1""");
-        // Insert tuple after waterline, but not after watermark
-        // Waterline is advanced, no new outputs
-        ccs.step("INSERT INTO series VALUES(20, '2023-12-30 10:10:00');",
-                """
-                         avg  | date        | weight
-                        ---------------------------""");
-        // Insert tuple before last waterline, should be processed
-        // average does not change for 2023-12-19
-        ccs.step("INSERT INTO series VALUES(10, '2023-12-29 09:10:00');",
-                """
-                 avg  | date       | weight
-                ---------------------------""");
-        // Insert tuple in the past, but before the last waterline
-        // no new output
-        ccs.step("INSERT INTO series VALUES(10, '2023-12-30 10:00:00');",
-                """
-                         avg  | date        | weight
-                        ---------------------------""");
-        // Insert one more tuple that accepts all buffered 3 tuples
-        ccs.step("INSERT INTO series VALUES(10, '2023-12-31 10:00:00');",
-                """
-                         avg  | date        | weight
-                        ---------------------------
-                         13.333333333333334 | 2023-12-30 | 1""");
-    }
-
-    @Test
     public void latenessTest() {
         String sql = """
                 CREATE TABLE series (
@@ -2786,111 +3762,6 @@ public class StreamingTests extends StreamingTestBase {
         ccs.visit(visitor);
     }
 
-    // Test for https://github.com/feldera/feldera/issues/1462
-    @Test
-    public void testJoinNonMonotoneColumn() {
-        String script = """
-            CREATE TABLE series (
-                    metadata VARCHAR NOT NULL,
-                    event_time TIMESTAMP NOT NULL LATENESS INTERVAL '1:00' HOURS TO MINUTES
-            );
-
-            CREATE TABLE shift(
-                    person VARCHAR NOT NULL,
-                    on_call DATE
-            );
-
-            CREATE VIEW V AS
-            (SELECT * FROM series JOIN shift ON series.metadata = shift.person);
-            """;
-        CompilerCircuitStream ccs = this.getCCS(script);
-        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
-            int count = 0;
-
-            @Override
-            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
-                this.count++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(0, this.count);
-            }
-        };
-        ccs.visit(visitor);
-    }
-
-    @Test
-    public void testJoinTwoColumns() {
-        // One joined column is monotone, the other one isn't.
-        String sql = """
-            CREATE TABLE series (
-                    metadata VARCHAR NOT NULL,
-                    event_time TIMESTAMP NOT NULL LATENESS INTERVAL '1:00' HOURS TO MINUTES
-            );
-
-            CREATE TABLE shift(
-                    person VARCHAR NOT NULL,
-                    on_call DATE
-            );
-
-            CREATE VIEW V AS
-            (SELECT * FROM series JOIN shift
-             ON series.metadata = shift.person AND CAST(series.event_time AS DATE) = shift.on_call);
-            """;
-        CompilerCircuitStream ccs = this.getCCS(sql);
-        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
-            int count = 0;
-
-            @Override
-            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
-                this.count++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(1, this.count);
-            }
-        };
-        ccs.visit(visitor);
-    }
-
-    @Test
-    public void testJoinFilter() {
-        // Join two streams with lateness, and filter based on lateness column
-        String script = """
-            CREATE TABLE series (
-                    metadata VARCHAR NOT NULL,
-                    event_date DATE NOT NULL LATENESS INTERVAL 1 DAYS
-            );
-
-            CREATE TABLE shift(
-                    person VARCHAR NOT NULL,
-                    on_call DATE NOT NULL LATENESS INTERVAL 1 DAYS
-            );
-
-            CREATE VIEW V AS
-            (SELECT metadata, event_date FROM series JOIN shift
-             ON series.metadata = shift.person AND event_date > on_call);
-            """;
-        CompilerCircuitStream ccs = this.getCCS(script);
-        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
-            int count = 0;
-
-            @Override
-            public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
-                this.count++;
-            }
-
-            @Override
-            // TODO: should be 1
-            public void endVisit() {
-                Assert.assertEquals(0, this.count);
-            }
-        };
-        ccs.visit(visitor);
-    }
-
     @Test
     public void testAggregate() {
         String sql = """
@@ -3062,20 +3933,20 @@ public class StreamingTests extends StreamingTestBase {
                 where ( x >= NOW() + INTERVAL 30 DAYS
                     OR
                     y  >=  NOW() - INTERVAL 30 DAYS);""";
-        var ccs = this.getCCS(sql);
+        var ccs = this.getCCS(sql).withStringTrim();
         ccs.step("""
                 INSERT INTO NOW VALUES('2019-01-01 00:00:00');
                 INSERT INTO T VALUES('2020-01-11 00:00:00', '2020-01-11 00:00:00', 'z');""", """
                  site_id | weight
                 ------------------
-                 z|1""");
+                 z       | 1""");
         ccs.step("INSERT INTO NOW VALUES('2020-01-01 00:00:00')", """
                  site_id | weight
                 ------------------""");
         ccs.step("INSERT INTO NOW VALUES('2020-03-01 00:00:00')", """
                  site_id | weight
                 ------------------
-                 z| -1""");
+                 z       | -1""");
     }
 
     @Test
@@ -3089,7 +3960,7 @@ public class StreamingTests extends StreamingTestBase {
                        COUNT(CASE WHEN tt >= NOW() - INTERVAL 1 DAY THEN 1 END) AS c,
                        COUNT(*) AS total
                 FROM T GROUP BY k;""";
-        var ccs = this.getCCS(sql);
+        var ccs = this.getCCS(sql).withStringTrim();
         CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
             int window = 0;
             int aggregate = 0;
@@ -3120,14 +3991,57 @@ public class StreamingTests extends StreamingTestBase {
                 INSERT INTO T VALUES('b', '2019-12-30 00:00:00');""", """
                  k | s    | c | total | weight
                 --------------------------------
-                 a| 1    | 1 | 1     | 1
-                 b|NULL  | 0 | 1     | 1""");
+                 a | 1    | 1 | 1     | 1
+                 b |NULL  | 0 | 1     | 1""");
         // Two days later a's row leaves the window; b is unchanged
         ccs.step("INSERT INTO NOW VALUES('2020-01-03 00:00:00')", """
                  k | s    | c | total | weight
                 --------------------------------
-                 a| 1    | 1 | 1     | -1
-                 a|NULL  | 0 | 1     | 1""");
+                 a | 1    | 1 | 1     | -1
+                 a |NULL  | 0 | 1     | 1""");
+    }
+
+    @Test
+    public void nowFilterNextToArrayAgg() {
+        // AggregateCaseToFilterRule leaves the ARRAY_AGG call alone, but still
+        // rewrites the SUM, so AggregateNowFilterRule creates a window.
+        String sql = """
+                CREATE TABLE T(k VARCHAR, tt TIMESTAMP, v INT);
+                CREATE VIEW V AS
+                SELECT k,
+                       ARRAY_AGG(CASE WHEN v > 1 THEN v END ORDER BY v) AS a,
+                       SUM(CASE WHEN tt >= NOW() - INTERVAL 1 DAY THEN v END) AS s
+                FROM T GROUP BY k;""";
+        var ccs = this.getCCS(sql).withStringTrim();
+        CircuitVisitor visitor = new CircuitVisitor(ccs.compiler) {
+            int window = 0;
+
+            @Override
+            public void postorder(DBSPWindowOperator operator) {
+                this.window++;
+            }
+
+            @Override
+            public void endVisit() {
+                Assert.assertEquals(1, this.window);
+            }
+        };
+        ccs.visit(visitor);
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 00:00:00');
+                INSERT INTO T VALUES('a', '2020-01-01 00:00:00', 1);
+                INSERT INTO T VALUES('a', '2019-12-30 00:00:00', 2);
+                INSERT INTO T VALUES('b', '2019-12-30 00:00:00', 3);""", """
+                 k | a           | s    | weight
+                ----------------------------------
+                 a | { NULL, 2 } | 1    | 1
+                 b | { 3 }       |NULL  | 1""");
+        // Two days later the row with v = 1 leaves the window
+        ccs.step("INSERT INTO NOW VALUES('2020-01-03 00:00:00')", """
+                 k | a           | s    | weight
+                ----------------------------------
+                 a | { NULL, 2 } | 1    | -1
+                 a | { NULL, 2 } |NULL  | 1""");
     }
 
     @Test
@@ -3158,26 +4072,27 @@ public class StreamingTests extends StreamingTestBase {
             }
         };
         ccs.visit(visitor);
+        ccs.withStringTrim();
         ccs.step("""
                 INSERT INTO NOW VALUES('2020-01-10 00:00:00');
                 INSERT INTO T VALUES('a', '2020-01-10 00:00:00');
                 INSERT INTO T VALUES('a', '2020-01-05 00:00:00');""", """
                  k | d    | w    | total | weight
                 ----------------------------------
-                 a| 1    | 2    | 2     | 1""");
+                 a | 1    | 2    | 2     | 1""");
         // Two days later the newest row leaves the 1-day window;
         // both rows are still inside the 7-day window
         ccs.step("INSERT INTO NOW VALUES('2020-01-12 00:00:00')", """
                  k | d    | w    | total | weight
                 ----------------------------------
-                 a| 1    | 2    | 2     | -1
-                 a|NULL  | 2    | 2     | 1""");
+                 a | 1    | 2    | 2     | -1
+                 a |NULL  | 2    | 2     | 1""");
         // Ten days after the first step both rows have left both windows
         ccs.step("INSERT INTO NOW VALUES('2020-01-20 00:00:00')", """
                  k | d    | w    | total | weight
                 ----------------------------------
-                 a|NULL  | 2    | 2     | -1
-                 a|NULL  |NULL  | 2     | 1""");
+                 a |NULL  | 2    | 2     | -1
+                 a |NULL  |NULL  | 2     | 1""");
     }
 
     @Test
@@ -3292,18 +4207,18 @@ public class StreamingTests extends StreamingTestBase {
                 CREATE VIEW V AS
                 SELECT k, ARRAY_AGG(x) FILTER (WHERE tt >= NOW() - INTERVAL 1 DAY) AS agg
                 FROM T GROUP BY k;""";
-        var ccs = this.getCCS(sql);
+        var ccs = this.getCCS(sql).withStringTrim();
         ccs.step("""
                 INSERT INTO NOW VALUES('2020-01-01 00:00:00');
                 INSERT INTO T VALUES('a', '2020-01-01 00:00:00', 10);""", """
                  k | agg  | weight
                 -------------------
-                 a|{ 10 } | 1""");
+                 a |{ 10 } | 1""");
         ccs.step("INSERT INTO NOW VALUES('2020-01-03 00:00:00')", """
                  k | agg  | weight
                 -------------------
-                 a|{ 10 } | -1
-                 a|{}     | 1""");
+                 a |{ 10 } | -1
+                 a |{}     | 1""");
     }
 
     static final String issue4909data = """
@@ -3360,7 +4275,7 @@ public class StreamingTests extends StreamingTestBase {
                         lsd >= NOW() - INTERVAL 30 DAYS
                         OR op IS NOT NULL
                     );
-                """);
+                """).withStringTrim();
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             @Override
             public void postorder(DBSPJoinBaseOperator join) {
@@ -3369,12 +4284,12 @@ public class StreamingTests extends StreamingTestBase {
         });
         // Validated using Postgres on the right date
         ccs.step(issue4909data, """
-                 s | weight
-                ----------------
-                 charlie| 1
-                 india| 1
-                 kilo| 1
-                 mike| 1""");
+                 s        | weight
+                -------------------
+                 charlie  | 1
+                 india    | 1
+                 kilo     | 1
+                 mike     | 1""");
     }
 
     @Test
@@ -3408,7 +4323,7 @@ public class StreamingTests extends StreamingTestBase {
                         lsd >= NOW() - INTERVAL 30 DAYS
                         OR op IS NOT NULL
                     );
-                """);
+                """).withStringTrim();
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             @Override
             public void postorder(DBSPJoinBaseOperator join) {
@@ -3417,18 +4332,18 @@ public class StreamingTests extends StreamingTestBase {
         });
         // Validated using Postgres on the right date
         ccs.step(issue4909data, """
-                 s | weight
-                ----------------
-                 alpha| 1
-                 bravo| 1
-                 charlie| 1
-                 delta| 1
-                 echo| 1
-                 foxtrot| 1
-                 india| 1
-                 kilo| 1
-                 mike| 1
-                 sierra| 1""");
+                 s        | weight
+                -------------------
+                 alpha    | 1
+                 bravo    | 1
+                 charlie  | 1
+                 delta    | 1
+                 echo     | 1
+                 foxtrot  | 1
+                 india    | 1
+                 kilo     | 1
+                 mike     | 1
+                 sierra   | 1""");
     }
 
     @Test
@@ -3462,7 +4377,7 @@ public class StreamingTests extends StreamingTestBase {
                         lsd >= NOW() - INTERVAL 30 DAYS
                         AND op IS NOT NULL
                     );
-                """);
+                """).withStringTrim();
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             @Override
             public void postorder(DBSPJoinBaseOperator join) {
@@ -3471,27 +4386,27 @@ public class StreamingTests extends StreamingTestBase {
         });
         // Validated using Postgres on the right date
         ccs.step(issue4909data, """
-                 s | weight
-                ----------------
-                 alpha| 1
-                 bravo| 1
-                 charlie| 1
-                 delta| 1
-                 echo| 1
-                 foxtrot| 1
-                 golf| 1
-                 hotel| 1
-                 india| 1
-                 juliet| 1
-                 kilo| 1
-                 lima| 1
-                 mike| 1
-                 november| 1
-                 oscar| 1
-                 papa| 1
-                 quebec| 1
-                 romeo| 1
-                 sierra| 1""");
+                 s        | weight
+                -------------------
+                 alpha    | 1
+                 bravo    | 1
+                 charlie  | 1
+                 delta    | 1
+                 echo     | 1
+                 foxtrot  | 1
+                 golf     | 1
+                 hotel    | 1
+                 india    | 1
+                 juliet   | 1
+                 kilo     | 1
+                 lima     | 1
+                 mike     | 1
+                 november | 1
+                 oscar    | 1
+                 papa     | 1
+                 quebec   | 1
+                 romeo    | 1
+                 sierra   | 1""");
     }
 
     @Test
@@ -3527,8 +4442,155 @@ public class StreamingTests extends StreamingTestBase {
             
             CREATE VIEW v
             WITH ('emit_final' = 'ts')
-            AS SELECT t1.ts
+            AS SELECT t1.ts, t1.x, t2.y
             FROM t1 LEFT JOIN t2 on t1.ts = t2.ts;""";
         this.getCCS(sql);
+    }
+
+    @Test
+    public void changeLog() {
+        // TLOG is a log of insertions and deletions applied to a table with
+        // primary key t_key; view T reconstructs the current table contents
+        // from the log entries of the last 25 hours.
+        String sql = """
+                CREATE TABLE TLOG (
+                    t_key INT NOT NULL,
+                    payload VARCHAR,
+                    op VARCHAR NOT NULL,
+                    ts TIMESTAMP NOT NULL
+                ) WITH ('append_only' = 'true');
+
+                CREATE LOCAL VIEW RECENT AS
+                SELECT * FROM TLOG
+                WHERE ts >= NOW() - INTERVAL 25 HOURS AND ts <= NOW();
+
+                CREATE VIEW T AS
+                SELECT t_key, payload
+                FROM (
+                    SELECT t_key, payload, op,
+                           ROW_NUMBER() OVER (PARTITION BY t_key ORDER BY ts DESC) AS rn
+                    FROM RECENT
+                ) latest
+                WHERE rn = 1 AND op = 'insert';""";
+        var ccs = this.getCCS(sql).withStringTrim();
+        FindUnboundedState gc = new FindUnboundedState(ccs.compiler);
+        ccs.visit(gc);
+        // The temporal filter's window operator bounds its own state; its
+        // bounded output propagates to the TOP-1 operator, and the NOW-derived
+        // window-bound computation is bounded because the NOW table holds one
+        // row.  The circuit has no unbounded state.
+        Assert.assertTrue(gc.unbounded.toString(), gc.unbounded.isEmpty());
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 01:00:00');
+                INSERT INTO TLOG VALUES(1, 'aaa', 'insert', '2020-01-01 00:00:00');
+                INSERT INTO TLOG VALUES(2, 'bbb', 'insert', '2020-01-01 00:10:00');""", """
+                 t_key | payload | weight
+                --------------------------
+                 1     | aaa     | 1
+                 2     | bbb     | 1""");
+        // An update is a newer insertion for an existing key
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 01:10:00');
+                INSERT INTO TLOG VALUES(1, 'ccc', 'insert', '2020-01-01 00:20:00');""", """
+                 t_key | payload | weight
+                --------------------------
+                 1     | aaa     | -1
+                 1     | ccc     | 1""");
+        // The latest entry for key 2 is a deletion, so the key disappears
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 01:20:00');
+                INSERT INTO TLOG VALUES(2, NULL, 'delete', '2020-01-01 00:30:00');""", """
+                 t_key | payload | weight
+                --------------------------
+                 2     | bbb     | -1""");
+        // Out-of-order entries older than the latest entry for their key
+        // leave the view unchanged
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 01:30:00');
+                INSERT INTO TLOG VALUES(1, 'xxx', 'insert', '2020-01-01 00:15:00');
+                INSERT INTO TLOG VALUES(1, NULL, 'delete', '2020-01-01 00:18:00');""", """
+                 t_key | payload | weight
+                --------------------------""");
+        // A key deleted earlier reappears with a newer insertion
+        ccs.step("""
+                INSERT INTO NOW VALUES('2020-01-01 01:40:00');
+                INSERT INTO TLOG VALUES(2, 'ddd', 'insert', '2020-01-01 00:40:00');""", """
+                 t_key | payload | weight
+                --------------------------
+                 2     | ddd     | 1""");
+        // 25 hours later all key-1 entries have left the window, so key 1
+        // disappears; key 2 keeps its 00:40 insertion
+        ccs.step("INSERT INTO NOW VALUES('2020-01-02 01:30:00');", """
+                 t_key | payload | weight
+                --------------------------
+                 1     | ccc     | -1""");
+        // ... and once the 00:40 insertion ages out too, T becomes empty
+        ccs.step("INSERT INTO NOW VALUES('2020-01-02 01:45:00');", """
+                 t_key | payload | weight
+                --------------------------
+                 2     | ddd     | -1""");
+    }
+
+    @Test
+    public void softDeleteLog() {
+        // The example from docs/sql/streaming.md: reconstruct the current
+        // contents of a soft-deleted stream with bounded state and aggregate
+        // over it.
+        String sql = """
+                CREATE TABLE input_log (
+                    id BIGINT,
+                    s VARCHAR,
+                    ts TIMESTAMP NOT NULL,
+                    is_delete BOOLEAN DEFAULT CAST(CONNECTOR_METADATA()['is_delete'] AS BOOLEAN)
+                ) WITH (
+                    'append_only' = 'true',
+                    'connectors' = '[{
+                        "name": "changes",
+                        "soft_delete": true,
+                        "transport": {
+                            "name": "kafka_input",
+                            "config": {
+                                "topic": "changes",
+                                "start_from": "earliest",
+                                "bootstrap.servers": "example.com:9092",
+                                "include_timestamp": true
+                            }
+                        },
+                        "format": {
+                            "name": "json",
+                            "config": { "update_format": "insert_delete" }
+                        }
+                    }]'
+                );
+
+                CREATE LOCAL VIEW recent AS
+                SELECT * FROM input_log
+                WHERE ts >= NOW() - INTERVAL 7 DAYS AND ts <= NOW();
+
+                CREATE LOCAL VIEW input AS
+                SELECT id, s, ts
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY id ORDER BY ts DESC, is_delete NULLS FIRST
+                    ) AS rn
+                    FROM recent
+                )
+                WHERE rn = 1 AND is_delete IS NOT TRUE;
+
+                CREATE VIEW input_stats AS
+                SELECT
+                    id, s, ts,
+                    COUNT(*) OVER minute_window AS rows_last_minute,
+                    COUNT(*) OVER hour_window AS rows_last_hour,
+                    COUNT(*) OVER day_window AS rows_last_day
+                FROM input
+                WINDOW
+                    minute_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 MINUTE PRECEDING AND CURRENT ROW),
+                    hour_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW),
+                    day_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW);""";
+        var ccs = this.getCCS(sql);
+        FindUnboundedState gc = new FindUnboundedState(ccs.compiler);
+        ccs.visit(gc);
+        Assert.assertTrue(gc.unbounded.toString(), gc.unbounded.isEmpty());
     }
 }

@@ -16,10 +16,10 @@ from an HTTP URL, and a `VENDOR_VIEW` which sends the changes of the view
 to a Kafka topic in a format that can be consumed by Debezium:
 
 ```sql
-create table VENDOR (
-    id bigint not null primary key,
-    name varchar,
-    address varchar
+CREATE TABLE vendor (
+    id BIGINT NOT NULL PRIMARY KEY,
+    name VARCHAR,
+    address VARCHAR
 ) WITH ('connectors' = '[{
     "transport": {
         "name": "url_input", "config": {"path": "https://feldera-basics-tutorial.s3.amazonaws.com/vendor.json"}
@@ -27,10 +27,10 @@ create table VENDOR (
     "format": { "name": "json" }
 }]');
 
-create view VENDOR_VIEW
+CREATE VIEW vendor_view
 WITH (
     'connectors' = '[{
-        "max_queued_bytes": 1000000,
+        "max_queued_size": "1M",
         "format": {
             "name": "json",
             "config": {
@@ -46,7 +46,7 @@ WITH (
         }
     }]'
 )
-as select * from VENDOR;
+AS SELECT * FROM vendor;
 ```
 
 :::info
@@ -93,8 +93,12 @@ The following attributes are common to all connectors:
   By default, it will be named `unnamed-{index}`, with the zero-based index
   within the list of connectors of its table/view.
 
-* `paused` - If set to to true the connector will not fetch or push data to the pipeline when started
-   unless [explicitly enabled through the API](/api/control-input-connector).
+* `paused` - If set to true the connector is created in the Paused state:
+   an input connector does not fetch data from its source, and an output
+   connector discards the output of its view instead of writing it to its sink.
+   The connector stays in that state until it is started through the API
+   ([input](/api/control-input-connector), [output](/api/control-output-connector)).
+   See [connector orchestration](/connectors/orchestration).
    By default this is set to false.
 
 * `labels` - An optional list of text labels associated with the connector.
@@ -107,26 +111,28 @@ The following attributes are common to all connectors:
   to implement [automatic connector orchestration](/connectors/orchestration#automatic-connector-orchestration).
 
 * <a name="max_queued_records">`max_queued_records`</a> and <a
-  name="max_queued_bytes">`max_queued_bytes`</a> - The approximate
-  maximum number of records or bytes to keep in memory.
+  name="max_queued_bytes">`max_queued_size`</a> - The approximate
+  maximum number of records, or amount of data such as `"100Mi"`, to
+  keep in memory.
 
   For an input connector, these are maximum amounts that the endpoint
   will read into memory, before the endpoint pauses further reading
   until the pipeline has consumed some of the backlog.  We recommend
-  setting `max_queued_bytes` rather than `max_queued_records` to limit
+  setting `max_queued_size` rather than `max_queued_records` to limit
   memory consumption, since records can be any size.
 
   For an output connector, `max_queued_records` is the maximum number
   that the endpoint will hold in memory waiting for the output
   endpoint to send them, before the circuit pauses execution until the
-  backlog subsides.  Output connectors do not yet honor `max_queued_bytes`.
+  backlog subsides.  Output connectors do not yet honor `max_queued_size`.
 
   These values are approximate: the pipeline pauses input or execution
   soon after they are exceeded, but not always instantly.
 
   By default, `max_queued_records` is 1,000,000.  If
-  `max_queued_bytes` is unspecified, then it defaults to `1000 *
-  max_queued_records`.
+  `max_queued_size` is unspecified, then it defaults to `1000 *
+  max_queued_records` bytes.  `max_queued_bytes`, a number of bytes, is a
+  deprecated alias of `max_queued_size`.
 
 * <a name="max_batch_size">`max_batch_size`</a> - Maximum number of records from this connector to process in a single batch.
 
@@ -169,6 +175,142 @@ The following attributes are common to all connectors:
   re-send it. Modifying the connector configuration causes a fresh
   snapshot to be replayed on the next start.
 
+* <a name="soft_delete">`soft_delete`</a> – *(Input connectors only)* When `true`, the connector
+  ingests deletions as insertions and reports the original polarity of each
+  record in the `is_delete` metadata attribute. The default is `false`.
+  See [Soft deletes](#soft-deletes).
+
+* <a name="distributed">`distributed`</a> – *(Input connectors only)* When
+  `true`, in a multihost pipeline, the connector runs on every host and each
+  host reads a different part of its input.  When `false` (the default), the
+  connector runs on one host, which reads all of its input.  In a single-host
+  pipeline, this setting has no effect.
+
+  Only the [Kafka](/connectors/sources/kafka#distributed-connectors),
+  [Delta Lake](/connectors/sources/delta#distributed-connectors), and
+  [Iceberg](/connectors/sources/iceberg#distributed-connectors) input
+  connectors support this setting.  For other connectors, a pipeline with
+  `distributed` set to `true` fails to start.
+
+### Soft deletes
+
+An input connector normally applies the changes it reads to the table it is
+attached to: an insertion adds a record, a deletion removes it. The table
+therefore holds the current contents of the input stream, and the records the
+stream deleted are gone.
+
+Setting `soft_delete` to `true` converts the table into a log of every operation
+the connector reads. The connector pushes every record to the table as an
+insertion, including the records the stream deletes, and attaches the
+`is_delete` metadata attribute to the deleted ones. The table then represents
+the unbounded stream of updates rather than the current contents of the stream,
+and a query can select the part of it that it needs.
+
+SQL programs can access the polarity of a record with the
+[`CONNECTOR_METADATA()`](/sql/grammar#connector_metadata) function:
+
+| Metadata attribute | SQL type  | `CONNECTOR_METADATA()` field |
+|--------------------|-----------|------------------------------|
+| Record polarity    | `BOOLEAN` | `is_delete`                  |
+
+The attribute is `true` for a deleted record and absent for an inserted one, so
+the column is `NULL` for insertions.
+
+A SQL query can recover the current contents of the stream from such a log by
+ranking the changes of each key by time, keeping the most recent one, and
+returning it only when it is an insertion.
+
+Such a query needs a column that orders the changes of a key in time. Any
+column of the table can serve. When the record itself carries no suitable
+timestamp, a connector metadata attribute is often the better choice, since
+several connectors report the time at which they received each change. Feldera
+does not add such a column on its own, so declare one that suits the source.
+The example below uses the timestamp the Kafka connector reports for each
+message as the `kafka_timestamp` metadata attribute:
+
+```sql
+CREATE TABLE changes (
+    id BIGINT,
+    s VARCHAR,
+    -- Both columns come from connector metadata: the timestamp of the change,
+    -- and whether it was a deletion.
+    ts TIMESTAMP DEFAULT CAST(CONNECTOR_METADATA()['kafka_timestamp'] AS TIMESTAMP),
+    is_delete BOOLEAN DEFAULT CAST(CONNECTOR_METADATA()['is_delete'] AS BOOLEAN)
+) WITH (
+    'connectors' = '[{
+        "soft_delete": true,
+        "transport": {
+            "name": "kafka_input",
+            "config": {
+                "topic": "changes",
+                "start_from": "earliest",
+                "bootstrap.servers": "example.com:9092",
+                "include_timestamp": true
+            }
+        },
+        "format": {
+            "name": "json",
+            "config": { "update_format": "insert_delete" }
+        }
+    }]'
+);
+
+-- The current contents of the stream: the latest change of each key, kept only
+-- when that change was an insertion.
+CREATE MATERIALIZED VIEW live AS
+SELECT id, s, ts
+FROM (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY id ORDER BY ts DESC, is_delete NULLS FIRST
+    ) AS rn
+    FROM changes
+)
+WHERE rn = 1 AND is_delete IS NOT TRUE;
+```
+
+Ranking one key at a time and keeping a single row is the
+[TopK pattern](/sql/aggregates#window-aggregates), which Feldera evaluates
+efficiently.
+
+The `is_delete` term in the `ORDER BY` clause breaks the tie between changes
+that carry the same timestamp. A CDC stream reports an update as a single
+message that deletes the old value of a record and inserts the new one, so
+those two changes carry one timestamp; ranking the insertion first keeps the
+updated record, where ranking the deletion first would drop it.
+
+As written, `live` needs unbounded state. A change carrying any timestamp can
+arrive at any moment and displace the record that is currently the latest one
+for its key, so Feldera has to keep every insertion and deletion the stream
+ever reported. An application that only needs values from a bounded time frame
+can filter the changes with a temporal filter before ranking them, which
+bounds the state of the query; see
+[Soft deletes with temporal filters](/sql/streaming#soft-deletes-with-temporal-filters).
+
+Notes and restrictions:
+
+* The table must not have a primary key: a deletion in such a table identifies
+  a key rather than a record, so there is nothing to insert in its place. The
+  compiler rejects a `soft_delete` connector attached to a table that has one.
+
+* Soft deletes are a property of the connector, not of the data format, so they
+  apply to every format that expresses deletions, e.g., the
+  [JSON](/formats/json#encoding-data-change-events) and
+  [Avro](/formats/avro) change event formats and
+  [Debezium](/connectors/sources/debezium) streams, as well as to integrated
+  connectors such as [Delta Lake](/connectors/sources/delta) in `cdc` mode. A
+  format that only expresses insertions, e.g., [CSV](/formats/csv) or
+  [Parquet](/formats/parquet), is unaffected.
+
+* Like any column default, the `is_delete` column takes its value from the
+  metadata only when the record itself does not contain the column. A record
+  that carries an `is_delete` value overrides the polarity reported by the
+  connector. Use a column name that doesn't occur in the table to avoid such
+  conflicts.
+
+* Deletions that a soft-delete connector reads do not cancel out earlier
+  insertions of the same record, so the table can receive several copies of a
+  record that the input stream inserted and deleted repeatedly.
+
 ### Configuring the output buffer
 
 By default a Feldera pipeline sends a batch of changes to the output transport
@@ -190,13 +332,13 @@ output buffer:
 
 * `enable_output_buffer` - Enable output buffer.
 
-* `max_output_buffer_time_millis` - Maximum time in milliseconds data is kept
-   in the output buffer.
+* `max_output_buffer_time` - Maximum time data is kept in the output
+   buffer, for example `"500ms"` or `"10s"`. Replaces the deprecated
+   `max_output_buffer_time_millis` (integer milliseconds).
 
    When not specified, data is kept in the buffer indefinitely until one of
    the other trigger conditions is satisfied.  When this option is
-   set the buffer will be flushed at most every
-   `max_output_buffer_time_millis` milliseconds.
+   set the buffer will be flushed at least that often.
 
    This configuration option requires the `enable_output_buffer` flag
    to be set.
@@ -224,7 +366,7 @@ For more information, see:
 * [Tutorial on using input and output connectors](/tutorials/basics/part3)
 * [Tutorial on using HTTP-based input and output](/tutorials/basics/part2)
 * [Tables and views with uniqueness constraints](/connectors/unique_keys)
-* [Input connector orchestration](/connectors/orchestration)
+* [Connector orchestration](/connectors/orchestration)
 * [Synchronous processing with completion tokens](/connectors/completion-tokens)
 * [Configuring connectors with secrets](/connectors/secret-references)
 * [Supported source transports](/connectors/sources)

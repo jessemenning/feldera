@@ -553,6 +553,9 @@ impl InputGenerator {
                 .iter()
                 .map(|plan| match plan.limit.unwrap_or(usize::MAX) {
                     0 => RowRangeSet::new(),
+                    // clippy::single_range_in_vec_init assumes a single range in a
+                    // slice literal is a typo for a length; here it is deliberate.
+                    #[allow(clippy::single_range_in_vec_init)]
                     limit => RowRangeSet::from_ranges(&[0..=limit - 1]),
                 })
                 .collect()
@@ -1251,7 +1254,6 @@ impl<'a> RecordGenerator<'a> {
                 name: SqlIdentifier::from("array_element"),
                 columntype,
                 lateness: None,
-                watermark: None,
                 default: None,
                 unused: false,
             };

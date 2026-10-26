@@ -60,7 +60,7 @@ public class RustFileWriter extends RustWriter {
         }
     }
 
-    void generatePreamble() {
+    void generatePreamble(DBSPCompiler compiler) {
         this.builder().append(COMMON_PREAMBLE);
         long limit = this.used.getRecursionLimit();
         if (limit > 240) {
@@ -79,6 +79,8 @@ public class RustFileWriter extends RustWriter {
         }
         this.builder().append(this.rustPreamble())
                 .newline();
+        if (!compiler.options.ioOptions.emitHandles)
+            this.builder().append(CATALOG_PREAMBLE);
         this.generateStructures();
     }
 
@@ -105,7 +107,7 @@ public class RustFileWriter extends RustWriter {
         if (this.findUsed) {
             this.used = this.analyze(compiler);
         }
-        this.generatePreamble();
+        this.generatePreamble(compiler);
         if (!this.used.tupleSizesUsed.isEmpty()) {
             this.builder().append("use feldera_macros::declare_tuple;").newline();
         }
@@ -156,8 +158,6 @@ public class RustFileWriter extends RustWriter {
                     fn.apply(meta.defaultValue);
                 if (meta.lateness != null)
                     fn.apply(meta.lateness);
-                if (meta.watermark != null)
-                    fn.apply(meta.watermark);
             }
         }
 

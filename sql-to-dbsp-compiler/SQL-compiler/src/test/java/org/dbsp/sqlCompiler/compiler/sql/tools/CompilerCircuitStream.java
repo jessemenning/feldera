@@ -3,6 +3,8 @@ package org.dbsp.sqlCompiler.compiler.sql.tools;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.frontend.TableContents;
+import org.dbsp.sqlCompiler.compiler.frontend.TableData;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.TestSerialize;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.util.Linq;
 
@@ -12,6 +14,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Helper class for testing.  Holds together
@@ -22,6 +25,9 @@ import java.util.List;
 public class CompilerCircuitStream extends CompilerCircuit {
     final InputOutputChangeStream stream;
     boolean compactAfterEachStep;
+    /** When true, string cells in expected tables are trimmed before validation,
+     * so cells can be padded for alignment; see {@link TableParser#parseValue}. */
+    boolean trimStrings = false;
 
     public CompilerCircuitStream(DBSPCompiler compiler, BaseSQLTests test) {
         this(compiler, new InputOutputChangeStream(), test);
@@ -39,7 +45,7 @@ public class CompilerCircuitStream extends CompilerCircuit {
     public CompilerCircuitStream(DBSPCompiler compiler, InputOutputChangeStream streams, BaseSQLTests test) {
         super(compiler);
         this.stream = streams;
-        test.addRustTestCase(this);
+        test.runOneTestCase(this);
         this.compactAfterEachStep = false;
     }
 
@@ -53,6 +59,21 @@ public class CompilerCircuitStream extends CompilerCircuit {
         super(compiler);
         this.stream = streams;
         test.addFailingRustTestCase(failureMessage, this);
+    }
+
+    /** Trim string cells in expected tables before validating.
+     * Without this a string cell must end flush against the next column
+     * separator, since trailing spaces are part of the value. */
+    public CompilerCircuitStream withStringTrim() {
+        this.trimStrings = true;
+        return this;
+    }
+
+    /** Replaces the circuit with the copy obtained by serializing it to JSON and decoding
+     * the JSON back, so the Rust code is generated from the decoded circuit. */
+    public CompilerCircuitStream setRoundTripThroughJson() {
+        this.circuit = new TestSerialize(this.compiler).apply(this.circuit);
+        return this;
     }
 
     /** Compiles a SQL script composed of INSERT statements.
@@ -79,10 +100,36 @@ public class CompilerCircuitStream extends CompilerCircuit {
     public void step(String script, String expected) {
         Change input = this.toChange(script);
         DBSPType outputType = this.circuit.getSingleOutputType();
-        Change output = TableParser.parseChangeTable(expected, outputType);
+        Change output = TableParser.parseChangeTable(expected, outputType, this.trimStrings);
         this.stream.addPair(input, output);
         if (this.compactAfterEachStep)
             this.blockForCompaction();
+    }
+
+    /**
+     * Add a step to a change stream with several output views.
+     * A step is described as an input-output pair.
+     *
+     * @param script   SQL script that describes insertions and deletions into the input tables.
+     * @param expected For each output view, by name, a text representation of the output produced
+     *                 for this step, with a column of weights last.
+     */
+    public void stepMultiView(String script, Map<String, String> expected) {
+        Change input = this.toChange(script);
+        List<DBSPSinkOperator> sinks = Linq.where(
+                Linq.list(this.circuit.sinkOperators.values()), sink -> !sink.metadata.system);
+        if (expected.size() != sinks.size())
+            throw new RuntimeException("Expected outputs for " + expected.keySet() +
+                    ", but the circuit has " + sinks.size() + " output views");
+        TableData[] outputs = new TableData[sinks.size()];
+        for (int i = 0; i < sinks.size(); i++) {
+            DBSPSinkOperator sink = sinks.get(i);
+            String table = expected.get(sink.viewName.name());
+            if (table == null)
+                throw new RuntimeException("No expected output for view " + sink.viewName);
+            outputs[i] = TableParser.parseChangeTable(table, sink.getType(), this.trimStrings).sets[0];
+        }
+        this.step(input, new Change(outputs));
     }
 
     /**

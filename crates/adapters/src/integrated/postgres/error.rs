@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use postgres::error::SqlState;
 
 pub(super) enum BackoffError {
     Temporary(anyhow::Error),
@@ -6,6 +7,38 @@ pub(super) enum BackoffError {
 }
 
 impl BackoffError {
+    /// Classifies a failure to open a connection.
+    ///
+    /// Almost every way that connecting can fail is worth waiting out: the
+    /// server may be starting up or recovering from a crash, refusing
+    /// connections during maintenance, out of connection slots, or unreachable.
+    /// So this denies a short list rather than allowing one, unlike
+    /// [`From<postgres::Error>`], which classifies statements failing on a
+    /// connection that is already established.
+    ///
+    /// Only a configuration the connector cannot outlast is permanent. Retrying
+    /// a wrong password or a database that does not exist would spin until
+    /// someone changes the connector's configuration, which restarts it anyway.
+    pub fn connecting(value: postgres::Error) -> Self {
+        let permanent = value.code().is_some_and(|code| {
+            [
+                SqlState::INVALID_PASSWORD,
+                SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                SqlState::INVALID_CATALOG_NAME,
+                SqlState::INSUFFICIENT_PRIVILEGE,
+            ]
+            .contains(code)
+        });
+
+        // Chain rather than interpolate, so that the server's message survives:
+        // see the note in `From<postgres::Error>`.
+        if permanent {
+            Self::Permanent(anyhow::Error::new(value).context("cannot connect to postgres"))
+        } else {
+            Self::Temporary(anyhow::Error::new(value).context("cannot connect to postgres yet"))
+        }
+    }
+
     pub fn should_retry(&self) -> bool {
         match self {
             BackoffError::Temporary(_) => true,
@@ -13,11 +46,27 @@ impl BackoffError {
         }
     }
 
+    /// Flattens the error and everything it is chained to into one message.
+    ///
+    /// `{:#}` walks the chain, so the server's message and its DETAIL survive,
+    /// which is the whole reason the postgres error is chained rather than
+    /// interpolated. `{:?}` walks it too, but also prints the backtrace anyhow
+    /// captured, which runs to kilobytes whenever `RUST_BACKTRACE` is set and
+    /// leaves no room under the cap the endpoint status applies.
     pub fn inner(self) -> anyhow::Error {
         match self {
             BackoffError::Permanent(error) | BackoffError::Temporary(error) => {
-                // include the context info
-                anyhow!("{error:?}")
+                anyhow!("{error:#}")
+            }
+        }
+    }
+
+    /// Byte length of the formatted error chain, so a caller embedding a
+    /// payload in its context can size it to what [`Self::inner`] leaves over.
+    pub fn message_len(&self) -> usize {
+        match self {
+            BackoffError::Permanent(error) | BackoffError::Temporary(error) => {
+                format!("{error:?}").len()
             }
         }
     }
@@ -30,12 +79,15 @@ impl BackoffError {
     }
 }
 
+/// Classifies a statement failing on an established connection.
+///
+/// Use [`BackoffError::connecting`] for a failure to open the connection in the
+/// first place, where far more of the failures are transient.
 impl From<postgres::Error> for BackoffError {
     fn from(value: postgres::Error) -> Self {
-        use postgres::error::SqlState;
-
-        if value.is_closed()
-            || value.code().is_some_and(|c| {
+        let code = value.code().cloned();
+        let temporary = value.is_closed()
+            || code.as_ref().is_some_and(|c| {
                 [
                     SqlState::CONNECTION_FAILURE,
                     SqlState::CONNECTION_DOES_NOT_EXIST,
@@ -46,14 +98,22 @@ impl From<postgres::Error> for BackoffError {
                 .contains(c)
             })
             // value.code() is none when connection is refused by the OS
-            || value.code().is_none()
-        {
-            Self::Temporary(anyhow!("failed to connect to postgres: {value}"))
+            || code.is_none();
+
+        // Keep the postgres error as the source instead of interpolating it:
+        // `Display for postgres::Error` reports only the kind ("db error"), and
+        // the server's message and DETAIL reach the report solely through the
+        // error chain, which `BackoffError::inner` formats in full.
+        if temporary {
+            Self::Temporary(
+                anyhow::Error::new(value)
+                    .context(format!("postgres error: transient: SqlState: {code:?}")),
+            )
         } else {
-            Self::Permanent(anyhow!(
-                "postgres error: permanent: SqlState: {:?}: {value}",
-                value.code()
-            ))
+            Self::Permanent(
+                anyhow::Error::new(value)
+                    .context(format!("postgres error: permanent: SqlState: {code:?}")),
+            )
         }
     }
 }

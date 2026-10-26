@@ -1,9 +1,10 @@
 use crate::common_error::CommonError;
+use crate::compiler::rust_compiler::{FileDeliveryMode, FileUploadMetadata, deliver_program_info};
 use crate::compiler::util::{
+    CleanupDecision, ProcessGroupTerminator, UtilError, checksum_buffer,
     cleanup_specific_directories, cleanup_specific_files, crate_name_pipeline_base,
-    crate_name_pipeline_globals, create_new_file, create_new_file_with_content,
-    encode_dir_as_string, read_file_content, recreate_dir, CleanupDecision, ProcessGroupTerminator,
-    UtilError,
+    crate_name_pipeline_globals, create_dir_if_not_exists, create_new_file,
+    create_new_file_with_content, encode_dir_as_string, read_file_content, recreate_dir,
 };
 use crate::config::{CommonConfig, CompilerConfig};
 use crate::db::error::DBError;
@@ -11,15 +12,15 @@ use crate::db::storage::Storage;
 use crate::db::storage_postgres::StoragePostgres;
 use crate::db::types::pipeline::PipelineId;
 use crate::db::types::program::{
-    generate_program_info, RuntimeSelector, SqlCompilationInfo, SqlCompilerMessage,
+    RuntimeSelector, SqlCompilationInfo, SqlCompilerMessage, generate_program_info,
 };
 use crate::db::types::tenant::TenantId;
-use crate::db::types::utils::validate_program_config;
+use crate::db::types::utils::{validate_program_config, validate_program_info};
 use crate::db::types::version::Version;
 use crate::error::source_error;
 use crate::has_unstable_feature;
 use feldera_ir::Dataflow;
-use feldera_observability::ReqwestTracingExt;
+use feldera_types::config::PipelineConfigProgramInfo;
 use futures_util::StreamExt;
 use indoc::formatdoc;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ use tokio::{
     fs,
     process::Command,
     sync::Mutex,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tracing::{debug, error, info, trace, warn};
 use utoipa::ToSchema;
@@ -81,10 +82,14 @@ pub async fn sql_compiler_task(
             if let Err(e) = cleanup_sql_compilation(&config, db.clone()).await {
                 match e {
                     SqlCompilationCleanupError::Database(e) => {
-                        error!("SQL worker {worker_id}: compilation cleanup failed: database error occurred: {e}");
+                        error!(
+                            "SQL worker {worker_id}: compilation cleanup failed: database error occurred: {e}"
+                        );
                     }
                     SqlCompilationCleanupError::Utility(e) => {
-                        error!("SQL worker {worker_id}: compilation cleanup failed: filesystem operation error occurred: {e}");
+                        error!(
+                            "SQL worker {worker_id}: compilation cleanup failed: filesystem operation error occurred: {e}"
+                        );
                     }
                 }
                 unexpected_error = true;
@@ -114,11 +119,15 @@ pub async fn sql_compiler_task(
                     outdated_version,
                     latest_version,
                 } => {
-                    debug!("SQL worker {worker_id}: compilation canceled: pipeline program version ({outdated_version}) is outdated by latest ({latest_version})");
+                    debug!(
+                        "SQL worker {worker_id}: compilation canceled: pipeline program version ({outdated_version}) is outdated by latest ({latest_version})"
+                    );
                 }
                 e => {
                     unexpected_error = true;
-                    error!("SQL worker {worker_id}: compilation canceled: unexpected database error occurred: {e}");
+                    error!(
+                        "SQL worker {worker_id}: compilation canceled: unexpected database error occurred: {e}"
+                    );
                 }
             }
         }
@@ -148,7 +157,10 @@ pub async fn sql_compiler_task(
 /// 3. Updates pipeline database `program_status` to `CompilingSql`
 /// 4. Performs SQL compilation on `program_code`, configured with `program_config`
 /// 5. Upon completion, the compilation status is set to `SqlCompiled` with the `program_info`
-///    containing the output of the SQL compiler (inputs, outputs, `main.rs`, `stubs.rs`, etc.)
+///    containing the output of the SQL compiler (inputs, outputs, `main.rs`, `stubs.rs`, etc.).
+///    A Gen-2 program without Rust UDFs needs no Rust compilation, so its program info is
+///    delivered here and it is set to `Success` directly, ready to run without entering the
+///    Rust compiler queue.
 ///
 /// Note that this function assumes it runs in isolation, and as such at the beginning resets
 /// any lingering pipelines that have `CompilingSql` status to `Pending`. This recovers from
@@ -224,16 +236,73 @@ pub(crate) async fn attempt_end_to_end_sql_compilation(
                 pipeline.program_version,
                 duration.as_secs_f64()
             );
-            db.lock()
-                .await
-                .transit_program_status_to_sql_compiled(
-                    tenant_id,
-                    pipeline.id,
-                    pipeline.program_version,
-                    &compilation_info,
-                    &program_info,
-                )
-                .await?;
+
+            // A Gen-2 program without Rust UDFs needs no Rust compilation: deliver its
+            // program info (which carries the circuit IR) and mark the program ready to
+            // run, so it never enters the serialized Rust compilation queue. Every other
+            // program moves to SqlCompiled and waits for the Rust compiler, which builds a
+            // Gen-2 program's UDFs into a shared library.
+            let is_gen2 = validate_program_config(&pipeline.program_config, true)
+                .map(|config| config.runtime_version().is_gen2())
+                .unwrap_or(false);
+            if is_gen2 && !gen2_has_rust_udfs(&pipeline.udf_rust) {
+                let delivery = match validate_program_info(&program_info) {
+                    Ok(program_info) => {
+                        deliver_gen2_program_info(
+                            common_config,
+                            config,
+                            pipeline.id,
+                            pipeline.program_version,
+                            &program_info.to_pipeline_config_program_info(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(format!("Gen-2 program info is not valid: {error}")),
+                };
+                match delivery {
+                    Ok(program_info_integrity_checksum) => {
+                        db.lock()
+                            .await
+                            .transit_program_status_to_success_no_binary(
+                                tenant_id,
+                                pipeline.id,
+                                pipeline.program_version,
+                                &compilation_info,
+                                &program_info,
+                                &program_info_integrity_checksum,
+                            )
+                            .await?;
+                    }
+                    Err(error) => {
+                        error!(
+                            pipeline_id = %pipeline.id,
+                            pipeline = %pipeline.name,
+                            "Gen-2 program info delivery failed (program version: {}): {error}",
+                            pipeline.program_version
+                        );
+                        db.lock()
+                            .await
+                            .transit_program_status_to_system_error(
+                                tenant_id,
+                                pipeline.id,
+                                pipeline.program_version,
+                                &error,
+                            )
+                            .await?;
+                    }
+                }
+            } else {
+                db.lock()
+                    .await
+                    .transit_program_status_to_sql_compiled(
+                        tenant_id,
+                        pipeline.id,
+                        pipeline.program_version,
+                        &compilation_info,
+                        &program_info,
+                    )
+                    .await?;
+            }
         }
         Err(e) => match e {
             SqlCompilationError::NoLongerExists => {
@@ -334,23 +403,68 @@ impl From<UtilError> for SqlCompilationError {
     }
 }
 
+/// How long a cached SQL compiler jar is retained after its last use.
+pub(crate) const JAR_CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Removes a cached SQL compiler jar that was not accessed within
+/// [`JAR_CACHE_RETENTION`]; jars still read by compilations or validations
+/// stay cached. Missing metadata or access times never remove.
+pub(crate) fn decide_stale_jar(jar_name: &str, metadata: Option<Metadata>) -> CleanupDecision {
+    let Some(metadata) = metadata else {
+        debug!("Failed to get metadata for JAR file");
+        return CleanupDecision::Ignore;
+    };
+    let atime = match metadata.accessed() {
+        Ok(atime) => atime,
+        Err(e) => {
+            debug!("Failed to get access time for JAR file: {:?}", e);
+            return CleanupDecision::Ignore;
+        }
+    };
+    let Ok(elapsed) = atime.elapsed() else {
+        warn!(
+            "Unable to determine access time for JAR file, your system clock may be set incorrectly."
+        );
+        return CleanupDecision::Ignore;
+    };
+    if elapsed < JAR_CACHE_RETENTION {
+        trace!(
+            "Keeping {jar_name} because it was accessed within the retention window ({elapsed:?} ago)"
+        );
+        CleanupDecision::Keep {
+            motivation: "Accessed within the retention window".to_string(),
+        }
+    } else {
+        CleanupDecision::Remove
+    }
+}
+
+/// Directory in which downloaded SQL compiler jars for non-platform runtime
+/// versions are cached.
+pub(crate) fn jar_cache_dir(config: &CompilerConfig) -> PathBuf {
+    config
+        .working_dir()
+        .join("sql-compilation")
+        .join("jar-cache")
+}
+
 /// Determines the path to the SQL compiler executable based on the runtime selector.
 fn determine_sql_compiler_path(
     config: &CompilerConfig,
     runtime_selector: &RuntimeSelector,
 ) -> PathBuf {
     match runtime_selector {
-        RuntimeSelector::Platform(_) => PathBuf::from(&config.sql_compiler_path),
-        RuntimeSelector::Sha(sha) => config
-            .working_dir()
-            .join("sql-compilation")
-            .join("jar-cache")
-            .join(format!("sql2dbsp-jar-with-dependencies-{sha}.jar")),
-        RuntimeSelector::Version(version) => config
-            .working_dir()
-            .join("sql-compilation")
-            .join("jar-cache")
-            .join(format!("sql2dbsp-jar-with-dependencies-{version}.jar")),
+        // The Gen-2 engine consumes the platform SQL compiler's program info; only the
+        // Rust half of the compilation differs.
+        RuntimeSelector::Platform(_) | RuntimeSelector::Gen2(_) => {
+            PathBuf::from(&config.sql_compiler_path)
+        }
+        RuntimeSelector::Sha(sha) => {
+            jar_cache_dir(config).join(format!("sql2dbsp-jar-with-dependencies-{sha}.jar"))
+        }
+        RuntimeSelector::Version(version) => {
+            jar_cache_dir(config).join(format!("sql2dbsp-jar-with-dependencies-{version}.jar"))
+        }
     }
 }
 
@@ -363,10 +477,7 @@ async fn fetch_sql_compiler(
         "This code-path is only enabled in unstable mode"
     );
 
-    let jar_cache_dir = config
-        .working_dir()
-        .join("sql-compilation")
-        .join("jar-cache");
+    let jar_cache_dir = jar_cache_dir(config);
     fs::create_dir_all(&jar_cache_dir).await.map_err(|e| SqlCompilationError::SystemError(format!(
         "Unable initialize JAR cache directory '{}': {}. If possible, fall-back to platform version by removing `runtime_version` in the program config.",
         jar_cache_dir.display(),
@@ -400,13 +511,12 @@ async fn fetch_sql_compiler(
 
     let response = client
         .get(&jar_cache_url)
-        .with_sentry_tracing()
         .send()
         .await
         .map_err(|e| {
         SqlCompilationError::SystemError(format!(
             "Unable to fetch SQL-to-DBSP compiler at '{}': {}, source error: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
-            &jar_cache_url,
+            jar_cache_url,
             e,
             source_error(&e)
         ))
@@ -438,7 +548,7 @@ async fn fetch_sql_compiler(
             SqlCompilationError::SystemError(format!(
                 "Timed out while waiting for the next HTTP response chunk when downloading the SQL-to-DBSP compiler from '{}'.
                 This might be due to slow network, please retry compilation; alternatively, fall back to the platform compiler by removing or changing `runtime_version` in the program config.",
-                &jar_cache_url,
+                jar_cache_url,
             ))
         })?;
 
@@ -446,7 +556,7 @@ async fn fetch_sql_compiler(
             Some(chunk) => {
                 let bytes = chunk.map_err(|e| SqlCompilationError::SystemError(format!(
                     "Unable to read JAR from HTTP stream '{}': {}, source error: {}. If possible, fall-back to platform version or change `runtime_version` in the program config.",
-                    &jar_cache_url,
+                    jar_cache_url,
                     e,
                     source_error(&e)
                 )))?;
@@ -496,6 +606,56 @@ pub(crate) fn ephemeral_compilation_dir(config: &CompilerConfig) -> PathBuf {
         .join("ephemeral")
 }
 
+/// Delivers the Gen-2 program info artifact so the runner can fetch its circuit
+/// IR. The artifact is named by its own integrity checksum; the runner rebuilds the same
+/// name. Returns that checksum. The SQL compiler delivers it for a program without Rust
+/// UDFs, the Rust compiler for a program with them.
+pub(crate) async fn deliver_gen2_program_info(
+    common_config: &CommonConfig,
+    config: &CompilerConfig,
+    pipeline_id: PipelineId,
+    program_version: Version,
+    program_info: &PipelineConfigProgramInfo,
+) -> Result<String, String> {
+    let program_info_str = serde_json::to_string(program_info)
+        .map_err(|e| format!("failed to serialize Gen-2 program info: {e}"))?;
+    let program_info_integrity_checksum = checksum_buffer(program_info_str.as_bytes())
+        .await
+        .map_err(|e| format!("failed to checksum Gen-2 program info: {e:?}"))?;
+
+    // The compiler's HTTP server serves program info artifacts from this directory,
+    // so deliver here for the runner's program_info_url to resolve.
+    let pipeline_binaries_dir = config
+        .working_dir()
+        .join("rust-compilation")
+        .join("pipeline-binaries");
+    create_dir_if_not_exists(&pipeline_binaries_dir)
+        .await
+        .map_err(|e| format!("failed to create pipeline-binaries directory: {e:?}"))?;
+
+    let program_info_metadata = FileUploadMetadata {
+        pipeline_id,
+        program_version,
+        source_checksum: program_info_integrity_checksum.clone(),
+        integrity_checksum: program_info_integrity_checksum.clone(),
+    };
+    deliver_program_info(
+        common_config,
+        &FileDeliveryMode::from_config(config),
+        &program_info_str,
+        &program_info_metadata,
+        &pipeline_binaries_dir,
+    )
+    .await
+    .map_err(|e| format!("failed to deliver Gen-2 program info: {e:?}"))?;
+    Ok(program_info_integrity_checksum)
+}
+
+/// Whether a Gen-2 program has Rust UDFs to compile into a shared library.
+pub(crate) fn gen2_has_rust_udfs(udf_rust: &str) -> bool {
+    !udf_rust.trim().is_empty()
+}
+
 /// Performs the SQL compilation:
 /// - Prepares a working directory for input and output
 /// - Call the SQL-to-DBSP compiler executable via a process
@@ -540,6 +700,7 @@ pub(crate) async fn perform_sql_compilation(
     })?;
 
     let runtime_selector = program_config.runtime_version();
+
     let use_platform_compiler =
         program_config.use_platform_compiler && !runtime_selector.is_platform();
     assert!(has_unstable_feature("runtime_version") || runtime_selector.is_platform());
@@ -592,10 +753,15 @@ pub(crate) async fn perform_sql_compilation(
     // Outputs
     let output_json_schema_file_path = working_dir.join("schema.json");
     let output_dataflow_file_path = working_dir.join("dataflow.json");
+    let output_jit_file_path = working_dir.join("jit.json");
     let output_rust_directory_path = working_dir.join("rust");
-    recreate_dir(&output_rust_directory_path.join("crates"))
-        .await
-        .map_err(|e| SqlCompilationError::SystemError(e.to_string()))?;
+    // The Gen-2 engine runs the circuit from the JIT IR and skips the Rust half of
+    // compilation, so the Rust output tree is only prepared for other runtimes.
+    if !runtime_selector.is_gen2() {
+        recreate_dir(&output_rust_directory_path.join("crates"))
+            .await
+            .map_err(|e| SqlCompilationError::SystemError(e.to_string()))?;
+    }
     let output_rust_udf_stubs_file_path = working_dir
         .join("rust")
         .join("crates")
@@ -620,7 +786,6 @@ pub(crate) async fn perform_sql_compilation(
         assert!(sql_compiler_executable_file_path.exists());
     }
 
-    let runtime_crates_path = runtime_selector.runtime_sources(config);
     // Call executable with arguments
     //
     // In the future, it might be that flags can be passed to the SQL compiler through
@@ -632,20 +797,37 @@ pub(crate) async fn perform_sql_compilation(
         .arg(input_sql_file_path.as_os_str())
         .arg("-js")
         .arg(output_json_schema_file_path.as_os_str())
-        .arg("-o")
-        .arg(output_rust_directory_path.as_os_str())
         .arg("--dataflow")
         .arg(output_dataflow_file_path.as_os_str())
         .arg("-i")
         .arg("-je")
         .arg("--alltables")
-        .arg("--ignoreOrder")
-        .arg("--runtime")
-        .arg(runtime_crates_path)
-        .arg("--crates") // Generate multiple crates instead of a single main.rs
-        .arg(crate_name_pipeline_base(pipeline_id));
+        .arg("--ignoreOrder");
+    if runtime_selector.is_gen2() {
+        // The Gen-2 engine consumes the circuit IR and skips Rust codegen. `--gen2` emits
+        // the IR and drops the primary-key columns from an indexed source's value; `--jit`
+        // would emit the IR without that dedup. `-o` names the file the IR goes to, which
+        // `--crates` would conflict with, so the Rust output arguments stay in the else arm.
+        command
+            .arg("--gen2")
+            .arg("-o")
+            .arg(output_jit_file_path.as_os_str());
+    } else {
+        let runtime_crates_path = runtime_selector.runtime_sources(config);
+        command
+            .arg("-o")
+            .arg(output_rust_directory_path.as_os_str())
+            .arg("--runtime")
+            .arg(runtime_crates_path)
+            .arg("--crates") // Generate multiple crates instead of a single main.rs
+            .arg(crate_name_pipeline_base(pipeline_id));
+    }
     #[cfg(feature = "feldera-enterprise")]
     command.arg("--enterprise");
+    // Every runtime sends stdout to stdout.log. The Gen-2 IR goes to its own file through
+    // `-o` rather than by hijacking stdout, so a stray byte from the JVM (a warning, an
+    // `-XX` message) cannot land inside the IR and turn into an unrelated deserialization
+    // error, and the diagnostics file keeps its contents.
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_stdout_file.into_std().await))
@@ -755,9 +937,9 @@ pub(crate) async fn perform_sql_compilation(
             Ok(messages) => messages,
             Err(e) => {
                 if !exit_status.success() {
-                    return Err(SqlCompilationError::SystemError(
-                        format!("SQL compiler process returned with exit status code ({exit_code}) and stderr which cannot be deserialized due to {e}:\n{stderr_str}")
-                    ));
+                    return Err(SqlCompilationError::SystemError(format!(
+                        "SQL compiler process returned with exit status code ({exit_code}) and stderr which cannot be deserialized due to {e}:\n{stderr_str}"
+                    )));
                 } else {
                     error!(
                         pipeline_id = %pipeline_id,
@@ -803,19 +985,42 @@ pub(crate) async fn perform_sql_compilation(
 
         // For IR-only compilation (used to compute diffs), skip packaging the
         // generated Rust: only the schema, dataflow, and connectors are needed.
-        let (main_rust, stubs) = match output {
-            SqlCompilationOutput::Full => {
-                // The base64-encoded gzipped tar archive of the Rust output directory
-                let main_rust = encode_dir_as_string(&output_rust_directory_path)?;
-                // Read stubs.rs
-                let stubs = read_file_content(&output_rust_udf_stubs_file_path).await?;
-                (main_rust, stubs)
+        let (main_rust, stubs) = if runtime_selector.is_gen2() {
+            // The Gen-2 engine skips Rust codegen, so there is no generated Rust to package.
+            (String::new(), String::new())
+        } else {
+            match output {
+                SqlCompilationOutput::Full => {
+                    // The base64-encoded gzipped tar archive of the Rust output directory
+                    let main_rust = encode_dir_as_string(&output_rust_directory_path)?;
+                    // Read stubs.rs
+                    let stubs = read_file_content(&output_rust_udf_stubs_file_path).await?;
+                    (main_rust, stubs)
+                }
+                SqlCompilationOutput::IrOnly => (String::new(), String::new()),
             }
-            SqlCompilationOutput::IrOnly => (String::new(), String::new()),
+        };
+
+        // For Gen-2, read back the JIT circuit IR the compiler emitted via
+        // `--jit`.
+        let circuit_ir = if runtime_selector.is_gen2() {
+            let jit_str = read_file_content(&output_jit_file_path).await?;
+            let jit: serde_json::Value = serde_json::from_str(&jit_str).map_err(|e| {
+                SqlCompilationError::SystemError(
+                    CommonError::json_deserialization_error(
+                        "jit.json from SQL compiler".to_string(),
+                        e,
+                    )
+                    .to_string(),
+                )
+            })?;
+            Some(jit)
+        } else {
+            None
         };
 
         // Generate the program information
-        match generate_program_info(schema, main_rust, stubs, Some(dataflow)) {
+        match generate_program_info(schema, main_rust, stubs, Some(dataflow), circuit_ir) {
             Ok(program_info) => {
                 let program_info = match serde_json::to_value(program_info) {
                     Ok(value) => value,
@@ -1003,7 +1208,7 @@ pub(crate) async fn cleanup_sql_compilation(
         cleanup_specific_directories(
             "SQL compilation directories",
             &sql_pipelines_dir,
-            Arc::new(move |dirname: &str| {
+            Arc::new(move |dirname: &str, _metadata: Option<Metadata>| {
                 let spl: Vec<&str> = dirname.splitn(2, '-').collect();
                 if spl.len() == 2 && spl[0] == "pipeline" {
                     if let Ok(uuid) = Uuid::parse_str(spl[1]) {
@@ -1027,49 +1232,18 @@ pub(crate) async fn cleanup_sql_compilation(
                 }
             }),
             true,
+            false,
         )
         .await?;
     }
 
     // (3) Clean up JAR cache to make sure it does not grow unboundedly
-    let jar_cache_dir = config
-        .working_dir()
-        .join("sql-compilation")
-        .join("jar-cache");
+    let jar_cache_dir = jar_cache_dir(config);
     if jar_cache_dir.is_dir() {
         cleanup_specific_files(
             "SQL JAR cache",
             &jar_cache_dir,
-            Arc::new(move |_jar_name: &str, metadata: Option<Metadata>| {
-                // Get rid of JAR files that have not been accessed within the last week
-                const MAX_AGE: Duration = Duration::from_secs(7*24*60*60);
-                if let Some(metadata) = metadata {
-                    match metadata.accessed() {
-                        Ok(atime) => {
-                            if let Ok(elapsed) = atime.elapsed() {
-                                if elapsed < MAX_AGE {
-                                    trace!("Keeping {_jar_name} because it was accessed within the last 7 days ({elapsed:?} ago)");
-                                    CleanupDecision::Keep {
-                                        motivation: "Accessed within the last week".to_string(),
-                                    }
-                                } else {
-                                    CleanupDecision::Remove
-                                }
-                            } else {
-                                warn!("Unable to determine access time for JAR file, your system clock may be set incorrectly.");
-                                CleanupDecision::Ignore
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Failed to get access time for JAR file: {:?}", e);
-                            CleanupDecision::Ignore
-                        }
-                    }
-                } else {
-                    debug!("Failed to get metadata for JAR file");
-                    CleanupDecision::Ignore
-                }
-            }),
+            Arc::new(decide_stale_jar),
             true,
             true,
         )
@@ -1082,7 +1256,74 @@ pub(crate) async fn cleanup_sql_compilation(
 #[cfg(test)]
 mod test {
     use crate::auth::TenantRecord;
-    use crate::compiler::test::{list_content_as_sorted_names, CompilerTest};
+
+    /// At the SQL stage, a Gen-2 program with Rust UDFs waits for the Rust compiler to build
+    /// its UDF library.
+    #[tokio::test]
+    async fn gen2_sql_stage_leaves_rust_udfs_to_the_rust_compiler() {
+        crate::enable_test_unstable_features();
+        let test = CompilerTest::new().await;
+        let tenant_id = TenantRecord::default().id;
+        let gen2 = serde_json::json!({ "runtime_version": "gen2" });
+        let program_code = "CREATE TABLE t (x INT);";
+        let create = |name: &'static str, udf_rust: &'static str, udf_toml: &'static str| {
+            test.create_pipeline_with_program_config(
+                tenant_id,
+                name,
+                "v0",
+                program_code,
+                udf_rust,
+                udf_toml,
+                gen2.clone(),
+            )
+        };
+
+        let with_udfs = create("with-udfs", "pub fn f() {}", "").await;
+        test.sql_compiler_tick().await;
+        let pipeline = test.get_pipeline(tenant_id, with_udfs).await;
+        assert_eq!(pipeline.program_status, ProgramStatus::SqlCompiled);
+        assert_eq!(pipeline.program_info_integrity_checksum, None);
+
+        let toml_only = create("toml-only", "", "chrono = \"0.4\"").await;
+        test.sql_compiler_tick().await;
+        let pipeline = test.get_pipeline(tenant_id, toml_only).await;
+        assert_eq!(pipeline.program_status, ProgramStatus::Success);
+        assert!(pipeline.program_info_integrity_checksum.is_some());
+    }
+
+    /// A jar unaccessed past the retention window is removed, a recently
+    /// accessed one is kept, and missing metadata never removes.
+    #[test]
+    fn stale_jar_decision() {
+        use crate::compiler::sql_compiler::{JAR_CACHE_RETENTION, decide_stale_jar};
+        use crate::compiler::util::CleanupDecision;
+        let tempdir = tempfile::tempdir().unwrap();
+        let jar_path = tempdir.path().join("a.jar");
+        std::fs::write(&jar_path, b"jar").unwrap();
+        let recent = std::fs::metadata(&jar_path).unwrap();
+        assert!(matches!(
+            decide_stale_jar("a.jar", Some(recent)),
+            CleanupDecision::Keep { .. }
+        ));
+        let old_time = std::time::SystemTime::now() - JAR_CACHE_RETENTION - JAR_CACHE_RETENTION;
+        let times = std::fs::FileTimes::new()
+            .set_accessed(old_time)
+            .set_modified(old_time);
+        std::fs::File::options()
+            .write(true)
+            .open(&jar_path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        let old = std::fs::metadata(&jar_path).unwrap();
+        assert_eq!(
+            decide_stale_jar("a.jar", Some(old)),
+            CleanupDecision::Remove
+        );
+        assert_eq!(decide_stale_jar("a.jar", None), CleanupDecision::Ignore);
+    }
+
+    use crate::compiler::test::{CompilerTest, list_content_as_sorted_names};
     use crate::compiler::util::{create_new_file, recreate_dir};
     use crate::db::types::program::ProgramStatus;
     use crate::db::types::utils::validate_program_info;
@@ -1118,7 +1359,7 @@ mod test {
                 .create_pipeline(tenant_id, "p1", "v0", program_code)
                 .await;
             test.sql_compiler_tick().await;
-            test.check_outcome_sql_compiled(tenant_id, pipeline_id, program_code)
+            test.check_outcome_sql_compiled(tenant_id, pipeline_id, program_code, true)
                 .await;
             test.delete_pipeline(tenant_id, pipeline_id, "p1").await;
             test.sql_compiler_tick().await;
@@ -1171,7 +1412,7 @@ mod test {
             .await;
         test.sql_compiler_tick().await;
         let pipeline_descr = test
-            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code)
+            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code, false)
             .await;
 
         // Check the types of the table and view
@@ -1350,7 +1591,7 @@ mod test {
             CREATE TABLE t3 (val INT) WITH ( 'materialized' = 'false' );
             CREATE VIEW v1 AS SELECT * FROM t1;
             CREATE LOCAL VIEW v2 AS SELECT * FROM t1;
-            CREATE MATERIALIZED VIEW v3 AS SELECT * FROM t1;
+            CREATE MATERIALIZED VIEW v3 AS SELECT * FROM t3;
         "#};
 
         // Create and compile
@@ -1359,7 +1600,7 @@ mod test {
             .await;
         test.sql_compiler_tick().await;
         let pipeline_descr = test
-            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code)
+            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code, false)
             .await;
 
         // Check materialized outcome
@@ -1424,7 +1665,7 @@ mod test {
 
         // Check result
         let pipeline_descr = test
-            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code)
+            .check_outcome_sql_compiled(tenant_id, pipeline_id, program_code, false)
             .await;
         let input_connectors = validate_program_info(&pipeline_descr.program_info.clone().unwrap())
             .unwrap()
@@ -1448,9 +1689,11 @@ mod test {
         assert_eq!(table_properties_only.name, "t1");
         assert_eq!(table_properties_only.properties.len(), 1);
         assert!(table_properties_only.properties.contains_key("connectors"));
-        assert!(table_properties_only.properties["connectors"]
-            .value
-            .contains("\"name\": \"c1\""));
+        assert!(
+            table_properties_only.properties["connectors"]
+                .value
+                .contains("\"name\": \"c1\"")
+        );
     }
 
     /// Tests that SQL compiler recovers from an incorrect platform version.
@@ -1534,11 +1777,13 @@ mod test {
         test.sql_compiler_tick().await;
         let pipeline_descr = test.get_pipeline(tenant_id, pipeline_id).await;
         assert_eq!(pipeline_descr.program_status, ProgramStatus::SqlError);
-        assert!(pipeline_descr
-            .program_error
-            .sql_compilation
-            .is_some_and(|info| info.messages.len() == 1
-                && info.messages[0].to_owned().error_type == "Error parsing SQL"));
+        assert!(
+            pipeline_descr
+                .program_error
+                .sql_compilation
+                .is_some_and(|info| info.messages.len() == 1
+                    && info.messages[0].to_owned().error_type == "Error parsing SQL")
+        );
     }
 
     /// Tests that compilation fails with an invalid connector.
@@ -1561,11 +1806,13 @@ mod test {
         assert_eq!(pipeline_descr.program_status, ProgramStatus::SqlError);
         // First message is a warning about the connector missing a name
         // Second message is an error
-        assert!(pipeline_descr
-            .program_error
-            .sql_compilation
-            .is_some_and(|info| info.messages.len() == 2
-                && info.messages[1].to_owned().error_type == "ConnectorGenerationError"));
+        assert!(
+            pipeline_descr
+                .program_error
+                .sql_compilation
+                .is_some_and(|info| info.messages.len() == 2
+                    && info.messages[1].to_owned().error_type == "ConnectorGenerationError")
+        );
     }
 
     /// Tests that the cleanup ignores files and directories that do not follow the pattern.

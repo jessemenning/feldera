@@ -23,6 +23,31 @@ sample Grafana dashboard for Feldera.
 [Monitoring and Profiling]: /tutorials/monitoring
 [Feldera template dashboard]: https://raw.githubusercontent.com/feldera/feldera/main/deploy/grafana_dashboard.json
 
+# Pipeline Status
+
+This metric reports the status of a pipeline, the same status that `GET
+/v0/pipelines/{name}` reports.  Unlike every other metric here, it is
+reported for pipelines that are not running.
+
+A pipeline reports one series per status, told apart by the `status`
+label: the series for the status the pipeline is currently in has value
+1, and the series for each of the remaining statuses has value 0.  A
+paused pipeline named `sales`, for example, reports:
+
+```
+pipeline_status{pipeline="pipeline-01234567-...",pipeline_name="sales",status="Paused"} 1
+pipeline_status{pipeline="pipeline-01234567-...",pipeline_name="sales",status="Running"} 0
+pipeline_status{pipeline="pipeline-01234567-...",pipeline_name="sales",status="Stopped"} 0
+# ...and 0 for every other status.
+```
+
+To alert on every pipeline that is not running, for example, use
+`pipeline_status{status="Running"} == 0`.
+
+| Name | Type | Description |
+| :--- | :--- | :---------- |
+| <a name='pipeline_status'>`pipeline_status`</a> |gauge | Whether the pipeline is in the status named by the status label: 1 if it is, 0 if it is not. |
+
 # Process Metrics
 
 These metrics report statistics for a running Feldera pipeline
@@ -73,7 +98,7 @@ which Feldera is built.
 | <a name='dbsp_runtime_elapsed_seconds_total'>`dbsp_runtime_elapsed_seconds_total`</a> |counter | Time elapsed while the pipeline is executing a step, multiplied by the number of foreground and background threads, in seconds. |
 | <a name='dbsp_step_latency_seconds'>`dbsp_step_latency_seconds`</a> |histogram | Latency of DBSP steps over the last 60 seconds or 1000 steps, whichever is less, in seconds |
 | <a name='dbsp_steps_total'>`dbsp_steps_total`</a> |counter | Total number of DBSP steps executed. |
-| <a name='max_rss_bytes'>`max_rss_bytes`</a> |gauge | Configured maximum process RSS in bytes. A value of 0 means no limit is configured. |
+| <a name='max_rss_bytes'>`max_rss_bytes`</a> |gauge | Memory limit in bytes: the configured limit or the memory available to the process, whichever is smaller, minus memory reserved for other components. A value of 0 means there is no limit. |
 | <a name='memory_pressure'>`memory_pressure`</a> |gauge | Current memory pressure level in [0..3]: low=0, moderate=1, high=2, critical=3. |
 | <a name='memory_pressure_epoch'>`memory_pressure_epoch`</a> |gauge | Monotonic counter incremented whenever memory pressure transitions to high/critical. |
 | <a name='output_stall_seconds'>`output_stall_seconds`</a> |gauge | If the pipeline is currently stalled because one or more output connectors' output buffers were full, this is the time in seconds for which it has been stalled.<br/><br/>If the pipeline is not currently stalled, this is zero.<br/><br/>If this is nonzero, then the output connectors causing the stall can be identified by observing which values of `output_connector_queued_records` are greater than or equal to the configured maximum (which defaults to 1,000,000). |
@@ -104,9 +129,11 @@ to work with data larger than memory.
 | :--- | :--- | :---------- |
 | <a name='files_created_total'>`files_created_total`</a> |counter | Total number of files created. |
 | <a name='files_deleted_total'>`files_deleted_total`</a> |counter | Total number of files deleted. |
+| <a name='files_synced_total'>`files_synced_total`</a> |counter | Total number of files fsynced to stable storage individually. |
 | <a name='storage_byte_seconds_total'>`storage_byte_seconds_total`</a> |counter | Storage usage integrated over time during this run of the pipeline, in bytes × seconds. |
 | <a name='storage_cache_usage_bytes'>`storage_cache_usage_bytes`</a> |gauge | The number of bytes of memory currently in use for caching data on storage. |
 | <a name='storage_cache_usage_limit_bytes_total'>`storage_cache_usage_limit_bytes_total`</a> |counter | The limit for the number of bytes of memory for caching data on storage. |
+| <a name='storage_commit_all_latency_seconds'>`storage_commit_all_latency_seconds`</a> |histogram | Latency in seconds of making a checkpoint's files durable, counting the whole operation however the backend performs it. |
 | <a name='storage_fbuf_slab_alloc_served_by_slab_percent'>`storage_fbuf_slab_alloc_served_by_slab_percent`</a> |gauge | The percentage of `FBuf` allocation requests served by slab pools. |
 | <a name='storage_fbuf_slab_alloc_total'>`storage_fbuf_slab_alloc_total`</a> |counter | The total number of `FBuf` allocation requests across all slab size classes and fallbacks. |
 | <a name='storage_fbuf_slab_free_served_by_slab_percent'>`storage_fbuf_slab_free_served_by_slab_percent`</a> |gauge | The percentage of `FBuf` deallocation requests served by slab pools. |
@@ -117,7 +144,7 @@ to work with data larger than memory.
 | <a name='storage_fbuf_slab_size_class_free_total'>`storage_fbuf_slab_size_class_free_total`</a> |counter | The total number of `FBuf` deallocation requests for each slab size class. |
 | <a name='storage_read_block_bytes'>`storage_read_block_bytes`</a> |histogram | Sizes in bytes of blocks read from storage. |
 | <a name='storage_read_latency_seconds'>`storage_read_latency_seconds`</a> |histogram | Read latency for storage blocks in seconds |
-| <a name='storage_sync_latency_seconds'>`storage_sync_latency_seconds`</a> |histogram | Sync latency in seconds |
+| <a name='storage_sync_latency_seconds'>`storage_sync_latency_seconds`</a> |histogram | Latency in seconds of syncing one file to stable storage. |
 | <a name='storage_usage_bytes'>`storage_usage_bytes`</a> |gauge | The number of bytes of storage currently in use |
 | <a name='storage_write_block_bytes'>`storage_write_block_bytes`</a> |histogram | Sizes in bytes of blocks written to storage. |
 | <a name='storage_write_latency_seconds'>`storage_write_latency_seconds`</a> |histogram | Write latency for storage blocks in seconds |
@@ -187,6 +214,33 @@ These metrics accumulate across checkpoint and resume.
 | <a name='output_connector_batch_records_written'>`output_connector_batch_records_written`</a> |gauge | Number of records written so far in the current output batch. Non-zero while a batch write is in progress. Resets to 0 after the batch is committed. |
 | <a name='output_connector_buffered_records'>`output_connector_buffered_records`</a> |gauge | Number of records currently buffered by the output connector. |
 | <a name='output_connector_bytes_total'>`output_connector_bytes_total`</a> |counter | Total number of bytes of records sent by the output connector. |
+| <a name='output_connector_delta_merge_append_microseconds_total'>`output_connector_delta_merge_append_microseconds_total`</a> |counter | Time spent encoding new rows to parquet and streaming them out. |
+| <a name='output_connector_delta_merge_batch_walk_microseconds_total'>`output_connector_delta_merge_batch_walk_microseconds_total`</a> |counter | Time spent walking the batch: serializing each row and encoding each key. The one phase that follows the batch size rather than the table size. |
+| <a name='output_connector_delta_merge_bytes_written_total'>`output_connector_delta_merge_bytes_written_total`</a> |counter | Bytes written to object storage: new data files plus deletion vectors. |
+| <a name='output_connector_delta_merge_commit_microseconds_total'>`output_connector_delta_merge_commit_microseconds_total`</a> |counter | Time spent writing the commit to the Delta log. |
+| <a name='output_connector_delta_merge_compaction_failures_total'>`output_connector_delta_merge_compaction_failures_total`</a> |counter | Maintenance steps that failed. The table is left intact and the next step retries, but nothing was reclaimed by this one. |
+| <a name='output_connector_delta_merge_compaction_wait_microseconds_total'>`output_connector_delta_merge_compaction_wait_microseconds_total`</a> |counter | Time flushes waited for the compaction step that the commit before them started. Not part of the flush latency. |
+| <a name='output_connector_delta_merge_compactions_total'>`output_connector_delta_merge_compactions_total`</a> |counter | Maintenance steps the connector completed, when 'auto_compact' asks it to maintain the table. |
+| <a name='output_connector_delta_merge_deletion_vector_microseconds_total'>`output_connector_delta_merge_deletion_vector_microseconds_total`</a> |counter | Time spent reading, merging and writing deletion vectors. |
+| <a name='output_connector_delta_merge_files_appended_total'>`output_connector_delta_merge_files_appended_total`</a> |counter | Data files added to the target table. |
+| <a name='output_connector_delta_merge_files_dropped_total'>`output_connector_delta_merge_files_dropped_total`</a> |counter | Data files removed outright because every row in them was superseded. |
+| <a name='output_connector_delta_merge_flush_latency_microseconds'>`output_connector_delta_merge_flush_latency_microseconds`</a> |histogram | Wall time of one merge-mode flush: the row lookup, the writes and the commit. The lookup dominates it, so this is where object-store latency shows up; the scanned and pruned counters cannot. |
+| <a name='output_connector_delta_merge_keys_not_found_total'>`output_connector_delta_merge_keys_not_found_total`</a> |counter | Changed keys the lookup did not find in the target table. This includes inserts of new keys, which the connector looks up whenever the table held data when it started, so a nonzero rate is normal. |
+| <a name='output_connector_delta_merge_keys_probed_total'>`output_connector_delta_merge_keys_probed_total`</a> |counter | Changed keys whose row had to be located in the target table. Below the changed-key count by however many inserts skipped the lookup. |
+| <a name='output_connector_delta_merge_log_scan_microseconds_total'>`output_connector_delta_merge_log_scan_microseconds_total`</a> |counter | Time spent walking the Delta log: building the lookup's candidate file list, and counting the table's rows after the commit. Follows the table's file count rather than the batch size. |
+| <a name='output_connector_delta_merge_lookup_passes_total'>`output_connector_delta_merge_lookup_passes_total`</a> |counter | Lookup passes run. Above one per flush only when the key set exceeded `lookup_chunk_size`. |
+| <a name='output_connector_delta_merge_probe_files_pruned_total'>`output_connector_delta_merge_probe_files_pruned_total`</a> |counter | Data files the lookup skipped without opening, on the statistics in the Delta log or on their partition. |
+| <a name='output_connector_delta_merge_probe_files_scanned_total'>`output_connector_delta_merge_probe_files_scanned_total`</a> |counter | Data files whose footer the lookup opened. |
+| <a name='output_connector_delta_merge_probe_key_bytes_read_total'>`output_connector_delta_merge_probe_key_bytes_read_total`</a> |counter | Compressed bytes of key columns the lookup read out of the data files. A lookup that cannot prune reads the key column of the whole table on every flush, so this against 'bytes_written' is the read amplification. |
+| <a name='output_connector_delta_merge_probe_microseconds_total'>`output_connector_delta_merge_probe_microseconds_total`</a> |counter | Time spent locating the rows a flush supersedes. Usually the largest share, and the one 'max_concurrent_probes' moves. |
+| <a name='output_connector_delta_merge_probe_row_groups_pruned_total'>`output_connector_delta_merge_probe_row_groups_pruned_total`</a> |counter | Row groups the lookup skipped on their footer statistics. |
+| <a name='output_connector_delta_merge_probe_row_groups_scanned_total'>`output_connector_delta_merge_probe_row_groups_scanned_total`</a> |counter | Row groups whose key columns the lookup read. |
+| <a name='output_connector_delta_merge_ranges_walked_total'>`output_connector_delta_merge_ranges_walked_total`</a> |counter | Key ranges walked by merge-mode flushes. Above the flush count when `threads` split a batch into ranges written in parallel. |
+| <a name='output_connector_delta_merge_reclaim_incomplete'>`output_connector_delta_merge_reclaim_incomplete`</a> |gauge | 1 when files a step can rewrite are still mostly superseded after the last maintenance step. Sustained, it means reclamation is falling behind the writes. |
+| <a name='output_connector_delta_merge_reclaimed_rows_total'>`output_connector_delta_merge_reclaimed_rows_total`</a> |counter | Superseded rows the connector's own maintenance removed from storage. |
+| <a name='output_connector_delta_merge_rows_appended_total'>`output_connector_delta_merge_rows_appended_total`</a> |counter | Row versions appended to the target Delta table: inserts plus the new side of updates. |
+| <a name='output_connector_delta_merge_rows_superseded_total'>`output_connector_delta_merge_rows_superseded_total`</a> |counter | Rows marked deleted by a deletion vector: deletes plus the old side of updates. |
+| <a name='output_connector_delta_merge_tombstone_ratio_permille'>`output_connector_delta_merge_tombstone_ratio_permille`</a> |gauge | Superseded rows per thousand rows in the target table, as of the last flush. The signal for when to run OPTIMIZE. |
 | <a name='output_connector_errors_encode_total'>`output_connector_errors_encode_total`</a> |counter | Total number of errors encountered encoding records to send. |
 | <a name='output_connector_errors_transport_total'>`output_connector_errors_transport_total`</a> |counter | Total number of errors encountered at the transport layer sending records. |
 | <a name='output_connector_extra_memory_bytes'>`output_connector_extra_memory_bytes`</a> |gauge | Additional memory used by an output connector beyond that used for buffered records. |

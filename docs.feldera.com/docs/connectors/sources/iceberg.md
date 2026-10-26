@@ -30,12 +30,13 @@ The Iceberg input connector supports [fault tolerance](/pipelines/fault-toleranc
 
 | Property                    | Type   | Description   |
 |-----------------------------|--------|---------------|
-| `mode`*                     | enum   | Table read mode. Currently, the only supported mode is `snapshot`, in which the connector reads a snapshot of the table and stops.|
-| `transaction_mode`          | enum   | Determines how the connector breaks up its input into transactions. Supported values are `none` (default) and `snapshot`. See [below](#transactions) for details. |
+| `mode`*                     | enum   | <p>Table read mode. Supported values:</p><ul><li>`snapshot` - read a snapshot of the table and stop.</li><li>`follow` - skip the initial snapshot and only ingest subsequent changes to the table (new and deleted rows) by following its transaction log.</li><li>`snapshot_and_follow` - read a snapshot of the table, then switch to `follow` mode.</li></ul><p>`follow` and `snapshot_and_follow` require an Iceberg catalog (set `catalog_type`); they cannot be used with `metadata_location`, which points at a fixed snapshot. See [Follow mode](#follow-mode) below.</p>|
+| `transaction_mode`          | enum   | Determines how the connector breaks up its input into transactions. Supported values are `none` (default), `snapshot`, `catchup`, and `always`. See [below](#transactions) for details. |
 | `timestamp_column`          | string | Table column that serves as an event timestamp. When this option is specified, table rows are ingested in the timestamp order, respecting the [`LATENESS`](/sql/streaming#lateness-expressions) property of the column: each ingested row has a timestamp no more than `LATENESS` time units earlier than the most recent timestamp of any previously ingested row. See details [below](#ingesting-time-series-data-from-iceberg). |
 | `snapshot_filter`           | string | <p>Optional row filter.  When specified, only rows that satisfy the filter condition are included in the snapshot.  The condition must be a valid SQL Boolean expression that can be used in the `where` clause of the `select * from snapshot where ..` query.</p><p> This option can be used to specify the range of event times to include in the snapshot, e.g.: `ts BETWEEN TIMESTAMP '2005-01-01 00:00:00' AND TIMESTAMP '2010-12-31 23:59:59'`.</p>
 | `snapshot_id`               | integer| <p>Optional table snapshot id.  When this option is set, the connector reads the specified snapshot of the table.</p><p>Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest snapshot of the table is used.</p>
 | `datetime`                  | string | <p>Optional timestamp for the snapshot in the ISO-8601/RFC-3339 format, e.g., "2024-12-09T16:09:53+00:00". When this option is set, the connector reads the version of the table as of the specified point in time (based on the server time recorded in the transaction log, not the event time encoded in the data). </p><p> Note: at most one of `version` and `datetime` options can be specified.  When neither of the two options is specified, the latest committed version of the table is used.</p>|
+| `end_snapshot_id`           | integer| <p>Optional final snapshot id. Valid only in `follow` and `snapshot_and_follow` modes. When set, the connector stops after fully ingesting the snapshot with this id, then signals end-of-input.</p><p>Iceberg snapshot ids are not ordered, so this bound is an exact match: the id must name a snapshot committed after the starting snapshot and already present in the table's current history. The connector rejects any other value at startup (including a not-yet-committed id) rather than follow forever.</p>|
 | `metadata_location`         | string | Location of the table metadata JSON file. This property is used to access an Iceberg table directly, without a catalog. It is mutually exclusive with the `catalog_type` property.|
 | `table_name`                | string | Specifies the Iceberg table name within the catalog in the `namespace.table` format. This option is applicable when an Iceberg catalog is configured using the `catalog_type` property.|
 | `catalog_type`              | enum   | Type of the Iceberg catalog used to access the table. Supported options include `rest`, `glue`, and `s3tables`. This property is mutually exclusive with `metadata_location`.|
@@ -128,10 +129,13 @@ S3 and GCP FileIO implementations require additional configuration options docum
 | Property                    | Type   | Description   |
 |-----------------------------|--------|---------------|
 | `gcs.project-id`            | string | Google Cloud Project ID.|
-| `gcs.service.path`          | string | Google Cloud Storage endpoint.|
+| `gcs.service.host`          | string | Google Cloud Storage endpoint. The old name `gcs.service.path` is still accepted.|
 | `gcs.no-auth`               | string | Set to `"true"` to allow unauthenticated requests.|
 | `gcs.credentials-json`      | string | Google Cloud Storage credentials JSON string, base64 encoded.|
 | `gcs.oauth2.token`          | string | String representation of the access token used for temporary access.|
+
+The S3 and GCS FileIO also accept `opendal.io-timeout-ms`: the time limit, in milliseconds, for one read
+call before it is retried. The connector sets it to `60000` (60 s) unless you set it.
 
 ## Data type mapping
 
@@ -147,10 +151,10 @@ The following table lists supported Iceberg data types and corresponding Feldera
 | `decimal(P,S)`              | `DECIMAL(P, S)`  | The largest supported precision `P` is 28.|
 | `date`                      | `DATE`           |               |
 | `time`                      | `TIME`           |               |
-| `timestamp`                 | `TIMESTAMP`      | Timestamp values are rounded to the nearest millisecond.|
-| `timestamp_ns`              | `TIMESTAMP`      | Timestamp values are rounded to the nearest millisecond.|
-| `timestamptz`               | `TIMESTAMP WITH TIME ZONE` | Timestamp values are rounded to the nearest millisecond.|
-| `timestamptz_ns`            | `TIMESTAMP WITH TIME ZONE` | Timestamp values are rounded to the nearest millisecond.|
+| `timestamp`                 | `TIMESTAMP`      | Timestamp values are truncated to the microsecond.|
+| `timestamp_ns`              | `TIMESTAMP`      | Timestamp values are truncated to the microsecond.|
+| `timestamptz`               | `TIMESTAMP WITH TIME ZONE` | Timestamp values are truncated to the microsecond.|
+| `timestamptz_ns`            | `TIMESTAMP WITH TIME ZONE` | Timestamp values are truncated to the microsecond.|
 | `string`                    | `STRING`         |               |
 | `fixed(L)`                  | `BINARY(L)`      |               |
 | `binary`                    | `VARBINARY`      |               |
@@ -158,8 +162,9 @@ The following table lists supported Iceberg data types and corresponding Feldera
 | `struct`                    | `ROW(...)`       | Read as a whole column; nested fields map by name.|
 | `list`                      | `<element> ARRAY`| |
 | `map`                       | `MAP<<key>, <value>>` | |
+| `variant`                   |                  | Not supported: a table with a `variant` column opens, but reading that column fails. |
 
-All Iceberg data types are supported, including the nested types (`struct`, `list`,
+All other Iceberg data types are supported, including the nested types (`struct`, `list`,
 and `map`), which the connector reads as whole columns.
 
 ## Column selection
@@ -169,15 +174,44 @@ declaration. Other columns of the Iceberg table are never read. In addition,
 when the table declaration sets the [`skip_unused_columns` property](/sql/grammar#ignoring-unused-columns), the connector skips declared columns that no view uses, provided they are
 nullable or have default values.
 
+## Follow mode
+
+In `follow` and `snapshot_and_follow` modes the connector continuously ingests
+changes committed to the table after its starting snapshot. It polls the catalog
+for new snapshots and, for each one, ingests added rows as inserts and
+removed rows as deletes.
+
+The starting snapshot is chosen the same way as in `snapshot` mode: by
+`snapshot_id`, by `datetime`, or, when neither is set, the latest snapshot at the
+time the connector starts. In `follow` mode the connector ingests only changes
+committed after the starting snapshot; in `snapshot_and_follow` mode it first
+reads the starting snapshot in full, then follows.
+
+Requirements and limitations:
+
+* **A catalog is required.** Set `catalog_type`; follow mode cannot be used with
+  `metadata_location`, which points at a fixed snapshot and cannot observe new
+  commits.
+* **Copy-on-write only.** Follow mode reads copy-on-write changes. If a followed
+  snapshot adds a merge-on-read delete file (position or equality deletes), the
+  connector stops with an error. Configure the writer to use copy-on-write.
+
 ## Transactions
 
 The Iceberg connector can be configured to automatically initiate [transactions](/pipelines/transactions)
-when ingesting the table snapshot. The `transaction_mode` property configures this feature:
+when ingesting the table. The `transaction_mode` property configures this feature:
 
 * `none` - the connector does not group inputs into transactions. This is the default.
-* `snapshot` - ingest the initial snapshot of the table in one or several transactions.
+* `snapshot` - ingest the initial snapshot of the table in one or several transactions. Changes
+  ingested afterward, in the follow phase, are not grouped into transactions.
+* `catchup` - ingest the initial snapshot like `snapshot`. In the follow phase, the connector
+  groups all table commits that are already available into a single transaction: while catching up
+  on a backlog it ingests many commits per transaction, and once caught up it ingests about one
+  commit per transaction. This is the most efficient mode for backfill and steady-state following.
+* `always` - ingest the initial snapshot like `snapshot`. In the follow phase, each table commit is
+  ingested in its own transaction.
 
-### Ingesting table snapshot using transactions
+### Ingesting the table snapshot using transactions
 
 When `transaction_mode` is set to `snapshot`, the connector ingests the snapshot of the table
 in one or several transactions. The exact behavior depends on the value of the `timestamp_column`
@@ -214,7 +248,83 @@ An unordered read has no seekable interior boundary, so a checkpoint taken while
 progress resumes by re-reading the whole snapshot. Set `timestamp_column` to get incremental,
 bounded-re-read checkpointing on large tables. Once the snapshot has been fully ingested, a
 restart resumes directly into the completed state and reads nothing further, regardless of
-`timestamp_column`.
+`timestamp_column`.  In `snapshot_and_follow` mode, such a restart continues to follow the
+table after the last snapshot that the connector ingested, without reading the initial
+snapshot again.  If the table had no snapshot when the connector started, a restart follows
+the table from its first snapshot.
+
+## Distributed connectors
+
+In a multihost pipeline, Feldera assigns each input connector to one
+host by default.  That host does all of the work to read the
+connector's data.  When one input connector reads most of the
+pipeline's data, one host does most of the work.
+
+To spread the work of reading an Iceberg table's snapshot across the
+hosts, set the generic [`distributed`](/connectors#distributed)
+attribute to `true`.  Then the connector runs on every host, and each
+host reads a different subset of the snapshot's data files.  Together,
+the hosts read each file exactly once.
+
+```json
+{
+  "transport": {
+    "name": "iceberg_input",
+    "config": {
+      "mode": "snapshot_and_follow",
+      "transaction_mode": "snapshot",
+      "catalog_type": "rest",
+      "rest.uri": "http://iceberg-rest:8181",
+      "table_name": "analytics.events"
+    }
+  },
+  "distributed": true
+}
+```
+
+A distributed connector works as follows:
+
+- Host 0 picks the snapshot that the connector's configuration selects
+  (the current snapshot, or the one that `snapshot_id` or `datetime`
+  selects).  The other hosts read the same snapshot, so that all of
+  the hosts read one snapshot.
+- The hosts divide the snapshot's data files, not its partitions, so an
+  unpartitioned table divides as well as a partitioned one.  Each data
+  file's delete files go with it.
+- In `follow` and `snapshot_and_follow` modes, only one host follows the
+  table's new snapshots, because they form a single sequence.  The
+  other hosts end their input after their part of the snapshot.
+- With `transaction_mode` set to `snapshot`, `catchup`, or `always`,
+  the hosts read the snapshot in one transaction, which commits after
+  every host has read its part.  If the pipeline resumes from a
+  checkpoint taken before the snapshot completed, each host reads its
+  part in its own transaction.
+- In `snapshot_and_follow` mode, a distributed connector requires a
+  [`transaction_mode`](#transactions) other than `none`, so that the
+  host that follows the table reads changes only after every host has
+  read its part of the snapshot.  Otherwise, it could read changes to
+  rows before the other hosts read those rows from the snapshot.  (After
+  a resume from a checkpoint taken before the snapshot completed, the
+  hosts read their parts in separate transactions, so this can still
+  happen.)
+- When the pipeline resumes from a checkpoint, each host continues from
+  its own checkpointed state.
+  As for any multihost pipeline, the pipeline must have the same number
+  of hosts as when it took the checkpoint (see [checkpoint
+  sync](/pipelines/checkpoint-sync#how-sync-works)).
+
+Limits:
+
+- A distributed connector does not support
+  [`timestamp_column`](#ingesting-time-series-data-from-iceberg),
+  because each host reads its part of the snapshot in its own order.
+  Thus, [tables with LATENESS] that need the snapshot in timestamp order
+  cannot use a distributed connector.
+- The pipeline and its multihost coordinator must both support
+  distributed Iceberg connectors.  Otherwise, the pipeline fails to
+  start.
+
+[tables with LATENESS]: /sql/streaming/#lateness-expressions
 
 ## Ingesting time series data from Iceberg
 
@@ -266,7 +376,7 @@ CREATE TABLE iceberg_table(
   id BIGINT,
   name STRING,
   b BOOLEAN,
-  ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 day,
+  ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 DAY,
   dt DATE
 ) WITH (
   'materialized' = 'true',
@@ -296,13 +406,13 @@ data. These credentials can either be the same, when using a single IAM identity
 services, or different, when using separate IAM identities.
 
 ```sql
-create table iceberg_table(
-  id bigint,
+CREATE TABLE iceberg_table(
+  id BIGINT,
   name STRING,
   b BOOLEAN,
   ts TIMESTAMP,
   dt DATE
-) with (
+) WITH (
     'materialized' = 'true',
     'connectors' = '[{
         "transport": {
@@ -334,13 +444,13 @@ files from S3 (`s3.*`). These credentials can either be the same, when using a s
 identity for both, or different, when using separate IAM identities.
 
 ```sql
-create table iceberg_table(
-  id bigint,
+CREATE TABLE iceberg_table(
+  id BIGINT,
   name STRING,
   b BOOLEAN,
   ts TIMESTAMP,
   dt DATE
-) with (
+) WITH (
     'materialized' = 'true',
     'connectors' = '[{
         "transport": {
@@ -368,14 +478,14 @@ Create an Iceberg input connector to read a snapshot of a table stored in an S3 
 through a REST catalog running on `http://127.0.0.1:8181`.
 
 ```sql
-create table iceberg_table(
-  id bigint,
+CREATE TABLE iceberg_table(
+  id BIGINT,
   name STRING,
   b BOOLEAN,
   ts TIMESTAMP,
   dt DATE
 )
-with (
+WITH (
     'materialized' = 'true',
     'connectors' = '[{
         "transport": {
@@ -401,13 +511,13 @@ Read an Iceberg table from the local file system. Use the specified snapshot id.
 Only select records with timestamp `2023-01-01 00:00:00` or later.
 
 ```sql
-create table iceberg_table(
-  id bigint,
+CREATE TABLE iceberg_table(
+  id BIGINT,
   name STRING,
   b BOOLEAN,
   ts TIMESTAMP,
   dt DATE
-) with (
+) WITH (
     'materialized' = 'true',
     'connectors' = '[{
         "transport": {

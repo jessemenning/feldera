@@ -1,8 +1,9 @@
 use crate::circuit::GlobalNodeId;
 use crate::circuit::checkpointer::Checkpointer;
-use crate::circuit::circuit_builder::{CircuitHandle, ConcurrentRestoreOutcome};
 use crate::circuit::metrics::{DBSP_STEP, DBSP_STEP_LATENCY_MICROSECONDS};
+use crate::circuit::operator_traits::OperatorCheckpoint;
 use crate::circuit::schedule::CommitProgress;
+use crate::circuit::{bootstrap::ConcurrentRestoreOutcome, circuit_builder::CircuitHandle};
 use crate::monitor::visual_graph::Graph;
 use crate::operator::dynamic::balance::{BalancerHint, PartitioningPolicy};
 use crate::storage::backend::StorageError;
@@ -15,17 +16,19 @@ use anyhow::Error as AnyError;
 use crossbeam::channel::{Receiver, Select, Sender, TryRecvError, bounded};
 use feldera_buffer_cache::ThreadType;
 use feldera_ir::LirCircuit;
-use feldera_storage::{FileCommitter, StorageBackend, StoragePath};
+use feldera_storage::{StorageBackend, StoragePath};
 use feldera_types::checkpoint::CheckpointMetadata;
 use feldera_types::config::DevTweaks;
-use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
+use feldera_types::config::dev_tweaks::{
+    BufferCacheAllocationStrategy, BufferCacheStrategy, MAX_MERGE_THRESHOLD_BATCHES,
+};
 pub use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use feldera_types::transaction::CommitProgressSummary;
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{
@@ -47,7 +50,7 @@ use crate::circuit::circuit_builder::Stream;
 use crate::profile::{DbspProfile, GraphProfile, WorkerProfile};
 
 use super::SchedulerError;
-use super::circuit_builder::BootstrapInfo;
+use super::bootstrap::BootstrapInfo;
 use super::runtime::WorkerPanicInfo;
 
 /// Default ratio of merger threads to worker threads.
@@ -343,6 +346,12 @@ pub struct CircuitConfig {
     /// Used to calculate the memory pressure level.
     pub max_rss_bytes: Option<u64>,
 
+    /// Part of the process memory, in bytes, that other parts of the process
+    /// (such as DataFusion) use outside the circuit. The circuit's memory
+    /// limit is `max_rss_bytes`, or the memory available to the process if
+    /// lower, minus this amount.
+    pub reserved_memory_bytes: u64,
+
     /// Optionally, CPU numbers for pinning the worker threads.
     pub pin_cpus: Vec<usize>,
 
@@ -381,6 +390,29 @@ pub struct CircuitConfig {
 /// chunk size.
 pub fn splitter_output_chunk_size() -> usize {
     Runtime::with_dev_tweaks(|d| d.splitter_chunk_size_records() as usize)
+}
+
+/// Returns how many keys a lazy input map resolves before it yields.
+///
+/// The `LazyUpsert` operator yields after scanning
+/// `lazy_input_map_keys_per_step` keys, regardless of the number of output
+/// updates it has produced.
+///
+/// # Returns
+///
+/// Keys, or the default when no runtime or no tweak sets it.
+pub fn lazy_input_map_keys_per_step() -> usize {
+    Runtime::with_dev_tweaks(|d| d.lazy_input_map_keys_per_step() as usize)
+}
+
+/// Returns the minimum size of the key blocks in the accumulator used by the lazy
+/// upsert operator.
+///
+/// # Returns
+///
+/// Bytes, or the default when no runtime or no tweak sets it.
+pub fn lazy_input_map_key_block_bytes() -> usize {
+    Runtime::with_dev_tweaks(|d| d.lazy_input_map_key_block_bytes() as usize)
 }
 
 /// Returns the number of records to preallocate in the first iteration of loops
@@ -447,8 +479,73 @@ pub fn max_level0_batch_size_records() -> usize {
     max_level0_batch_size_records
 }
 
+/// Merge threshold of an accumulator's spine: how many batches each level
+/// above level 1 waits for before it merges them; zero means the built-in
+/// minimum.
+///
+/// Configurable via `dev_tweaks.accumulator_merge_threshold_batches`.
+pub fn accumulator_merge_threshold_batches() -> usize {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    checked_merge_threshold_batches(
+        Runtime::with_dev_tweaks(|d| d.accumulator_merge_threshold_batches()),
+        "accumulator_merge_threshold_batches",
+        &WARNED,
+    )
+}
+
+/// Merge threshold of an integral's spine: how many batches each level above
+/// level 1 waits for before it merges them; zero means the built-in minimum.
+///
+/// Configurable via `dev_tweaks.integral_merge_threshold_batches`.
+pub fn integral_merge_threshold_batches() -> usize {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    checked_merge_threshold_batches(
+        Runtime::with_dev_tweaks(|d| d.integral_merge_threshold_batches()),
+        "integral_merge_threshold_batches",
+        &WARNED,
+    )
+}
+
+/// Clamps a value that slipped past `DevTweaks::validate`, warning once per
+/// setting.  This function runs on worker threads, where a panic would abort
+/// the pipeline, so it does not assert.
+fn checked_merge_threshold_batches(batches: u16, name: &str, warned: &AtomicBool) -> usize {
+    if batches > MAX_MERGE_THRESHOLD_BATCHES && !warned.swap(true, Ordering::Relaxed) {
+        warn!(
+            "dev_tweaks.{name} is {batches}, past the largest value accepted, {MAX_MERGE_THRESHOLD_BATCHES}; using {MAX_MERGE_THRESHOLD_BATCHES}"
+        );
+    }
+    usize::from(batches.min(MAX_MERGE_THRESHOLD_BATCHES))
+}
+
 pub fn negative_weight_multiplier() -> u16 {
     Runtime::with_dev_tweaks(|d| d.negative_weight_multiplier())
+}
+
+/// The share of the records at a spine's highest level with negative weights
+/// above which the level merges its batches.
+///
+/// Configurable via `dev_tweaks.top_level_negative_weight_fraction`.  A value
+/// that slipped past `DevTweaks::validate` is brought into range with a
+/// warning rather than asserted, because this runs on worker threads, where a
+/// panic aborts the pipeline.
+pub fn top_level_negative_weight_fraction() -> f64 {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let fraction = Runtime::with_dev_tweaks(|d| d.top_level_negative_weight_fraction());
+    if (0.0..=1.0).contains(&fraction) {
+        return fraction;
+    }
+    let used = if fraction.is_nan() {
+        1.0
+    } else {
+        fraction.clamp(0.0, 1.0)
+    };
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "dev_tweaks.top_level_negative_weight_fraction is {fraction}, outside 0 through 1; using {used}"
+        );
+    }
+    used
 }
 
 /// Configuration for storage in a [Runtime]-hosted circuit.
@@ -522,6 +619,7 @@ impl CircuitConfig {
         Self {
             layout: Layout::new_solo(n),
             max_rss_bytes: None,
+            reserved_memory_bytes: 0,
             pin_cpus: Vec::new(),
             mode: Mode::Ephemeral,
             step_size: StepSize::default(),
@@ -534,6 +632,11 @@ impl CircuitConfig {
 
     pub fn with_max_rss_bytes(mut self, max_rss: Option<u64>) -> Self {
         self.max_rss_bytes = max_rss;
+        self
+    }
+
+    pub fn with_reserved_memory_bytes(mut self, reserved: u64) -> Self {
+        self.reserved_memory_bytes = reserved;
         self
     }
 
@@ -577,6 +680,11 @@ impl CircuitConfig {
         self
     }
 
+    pub fn with_lazy_input_map_keys_per_step(mut self, keys: u64) -> Self {
+        self.dev_tweaks.lazy_input_map_keys_per_step = Some(keys);
+        self
+    }
+
     pub fn with_buffer_cache_strategy(mut self, strategy: BufferCacheStrategy) -> Self {
         self.dev_tweaks.buffer_cache_strategy = Some(strategy);
         self
@@ -597,7 +705,9 @@ impl CircuitConfig {
 
     #[cfg(test)]
     pub fn with_fbuf_slab_bytes_per_class(mut self, bytes_per_class: usize) -> Self {
-        self.dev_tweaks.fbuf_slab_bytes_per_class = Some(bytes_per_class);
+        self.dev_tweaks.fbuf_slab_size_per_class = Some(
+            feldera_types::size::ConfigSize::from_bytes(bytes_per_class as u64),
+        );
         self
     }
 
@@ -824,7 +934,7 @@ impl Runtime {
                         }
                     }
                     Ok(Command::EnableProfiler) => {
-                        profiler.enable_cpu_profiler();
+                        profiler.enable_cpu_profiler(circuit.runtime_idle());
                         // Send response.
                         if status_sender.send(Ok(Response::Unit)).is_err() {
                             return;
@@ -858,11 +968,8 @@ impl Runtime {
                             return;
                         }
                     }
-                    Ok(Command::Checkpoint(base)) => {
-                        let mut files = Vec::new();
-                        let response = circuit
-                            .checkpoint(&base, &mut files)
-                            .map(|_| Response::CheckpointCreated(files));
+                    Ok(Command::PrepareCheckpoint) => {
+                        let response = circuit.checkpoint().map(Response::CheckpointPrepared);
                         if status_sender.send(response).is_err() {
                             return;
                         }
@@ -1235,7 +1342,7 @@ enum Command {
         runtime_elapsed: Duration,
     },
     GetLir,
-    Checkpoint(StoragePath),
+    PrepareCheckpoint,
     Restore(StoragePath),
     SetBalancerHintsByGlobalId(Vec<(GlobalNodeId, BalancerHint)>),
     SetBalancerHints(Vec<(String, BalancerHint)>),
@@ -1289,7 +1396,7 @@ impl Debug for Command {
                 .field("runtime_elapsed", runtime_elapsed)
                 .finish(),
             Command::GetLir => write!(f, "GetLir"),
-            Command::Checkpoint(path) => f.debug_tuple("Checkpoint").field(path).finish(),
+            Command::PrepareCheckpoint => write!(f, "PrepareCheckpoint"),
             Command::Restore(path) => f.debug_tuple("Restore").field(path).finish(),
             Command::SetBalancerHintsByGlobalId(hints) => f
                 .debug_tuple("SetBalancerHintsByGlobalId")
@@ -1336,7 +1443,7 @@ enum Response {
     CommitProgress(CommitProgress),
     ProfileDump(Graph),
     Profile(WorkerProfile),
-    CheckpointCreated(Vec<Arc<dyn FileCommitter>>),
+    CheckpointPrepared(Vec<Box<dyn OperatorCheckpoint>>),
     CheckpointRestored(Option<BootstrapInfo>),
     ConcurrentRestore(ConcurrentRestoreOutcome),
     Lir(LirCircuit),
@@ -1531,11 +1638,14 @@ impl DBSPHandle {
         // Use `Select` to wait for responses from all workers simultaneously.
         // This way if one of the workers panics, leaving other workers waiting
         // for it in exchange operators, we won't deadlock waiting for these
-        // workers.
+        // workers.  The panic receiver covers a worker that never replies
+        // because it is blocked on a background thread that panicked.
+        let panic_receiver = self.runtime.as_ref().unwrap().panic_receiver();
         let mut select = Select::new();
         for receiver in self.status_receivers.iter() {
             select.recv(receiver);
         }
+        let panic_index = select.recv(&panic_receiver);
 
         fn handle_panic(this: &mut DBSPHandle) -> Result<(), DbspError> {
             // Retrieve panic info before killing the circuit.
@@ -1549,6 +1659,11 @@ impl DBSPHandle {
         for _ in 0..self.status_receivers.len() {
             let ready = select.select();
             let worker = ready.index();
+            // A panic may preempt pending replies; the command fails either way.
+            if worker == panic_index {
+                let _ = ready.recv(&panic_receiver);
+                return handle_panic(self);
+            }
 
             match ready.recv(&self.status_receivers[worker]) {
                 Err(_) => return handle_panic(self),
@@ -1572,7 +1687,7 @@ impl DBSPHandle {
         }
 
         // Send command.
-        if self.command_senders[worker].send(command.clone()).is_err() {
+        if self.command_senders[worker].send(command).is_err() {
             let panic_info = self.collect_panic_info().unwrap_or_default();
 
             // Worker thread panicked. Exit without waiting for all workers to exit
@@ -1582,7 +1697,18 @@ impl DBSPHandle {
         }
         self.runtime.as_ref().unwrap().unpark_worker(worker);
 
-        let reply = match self.status_receivers[worker].recv() {
+        // The worker never replies if it is blocked on a background thread
+        // that panicked.
+        let panic_receiver = self.runtime.as_ref().unwrap().panic_receiver();
+        let mut select = Select::new();
+        let reply_index = select.recv(&self.status_receivers[worker]);
+        select.recv(&panic_receiver);
+        let ready = select.select();
+        if ready.index() != reply_index {
+            let _ = ready.recv(&panic_receiver);
+            return handle_panic(self);
+        }
+        let reply = match ready.recv(&self.status_receivers[worker]) {
             Err(_) => return handle_panic(self),
             Ok(Err(e)) => {
                 let _ = self.kill_inner();
@@ -1896,7 +2022,7 @@ impl DBSPHandle {
                     "Concurrent bootstrap not possible ({reason}); falling back to a \
                      non-concurrent bootstrap"
                 );
-                self.bootstrap_info = info.clone();
+                self.bootstrap_info.clone_from(&info);
                 return Ok(ConcurrentRestoreOutcome::FellBack { reason, info });
             }
             ConcurrentRestoreOutcome::Concurrent(info) => info,
@@ -2620,13 +2746,20 @@ impl<'a> CheckpointBuilder<'a> {
         }
     }
 
-    /// Prepares and commits the checkpoint.
+    /// Prepares, commits, and publishes the checkpoint.
+    ///
+    /// This combines [prepare](Self::prepare) with
+    /// [CheckpointCommitter::commit] and [CheckpointPublisher::publish].
+    /// Callers can manually run the separate steps to do them in a separate
+    /// thread or to wait between committing and publishing.
     pub fn run(self) -> Result<CheckpointMetadata, DbspError> {
-        self.prepare().and_then(CheckpointCommitter::commit)
+        self.prepare()
+            .and_then(CheckpointCommitter::commit)
+            .and_then(CheckpointPublisher::publish)
     }
 
     /// Prepares the checkpoint and returns a committer that can be used to
-    /// commit it later.
+    /// commit and publish it later.
     pub fn prepare(self) -> Result<CheckpointCommitter, DbspError> {
         // Don't allow checkpointing during concurrent bootstrapping.
         // Both circuit copies derive checkpoint file names from the same
@@ -2653,20 +2786,18 @@ impl<'a> CheckpointBuilder<'a> {
         // directories during the first checkpoint commit on fresh storage.
         checkpointer.lock().unwrap().ensure_catalog_exists()?;
 
-        let uuid = Uuid::now_v7();
-        let checkpoint_dir = Checkpointer::checkpoint_dir(uuid);
-        let mut readers = Vec::new();
+        let mut worker_checkpoints = Vec::new();
         self.handle
-            .broadcast_command(Command::Checkpoint(checkpoint_dir), |_worker, resp| {
-                let Response::CheckpointCreated(r) = resp else {
+            .broadcast_command(Command::PrepareCheckpoint, |_worker, resp| {
+                let Response::CheckpointPrepared(r) = resp else {
                     panic!("Expected checkpoint response, got {resp:?}");
                 };
-                readers.push(r);
+                worker_checkpoints.push(r);
             })?;
         Ok(CheckpointCommitter {
+            runtime: self.handle.runtime().clone(),
             checkpointer,
-            uuid,
-            readers,
+            worker_checkpoints,
             fingerprint: self.handle.fingerprint,
             name: self.name,
             steps: self.steps,
@@ -2675,11 +2806,24 @@ impl<'a> CheckpointBuilder<'a> {
     }
 }
 
-/// Committer for a checkpoint.
+/// Size of the private buffer cache of each thread that writes a checkpoint.
+///
+/// A size of 0 is not a good choice because writing a batch file does read back
+/// the file trailer when it transforms itself into a reader in `into_reader`.
+const CHECKPOINT_THREAD_CACHE_BYTES: usize = 64 * 1024;
+
+/// First phase of checkpoint commit.
+///
+/// The first phase writes all the data for the checkpoint into its directory.
+/// It does not update the checkpoint catalog, so the checkpoint is not yet
+/// visible.  This gives the client a chance to wait for output connectors to
+/// complete the output corresponding to the checkpoint, and to write its own
+/// state into the checkpoint directory, before publication in the second phase.
 pub struct CheckpointCommitter {
+    runtime: Runtime,
     checkpointer: Arc<Mutex<Checkpointer>>,
-    uuid: Uuid,
-    readers: Vec<Vec<Arc<dyn FileCommitter>>>,
+    /// For each worker, the checkpoints of its operators.
+    worker_checkpoints: Vec<Vec<Box<dyn OperatorCheckpoint>>>,
     fingerprint: u64,
     name: Option<String>,
     steps: Option<u64>,
@@ -2687,41 +2831,164 @@ pub struct CheckpointCommitter {
 }
 
 impl CheckpointCommitter {
-    /// Commits the checkpoint.
+    /// Executes the first phase of checkpoint commit.
     ///
-    /// Committing a checkpoint ensures that its data is on stable storage.  It
-    /// can run in the background while the circuit processes more steps.
-    pub fn commit(self) -> Result<CheckpointMetadata, DbspError> {
-        for reader in self.readers.into_iter().flatten() {
-            reader.commit()?;
-        }
-        self.checkpointer.lock().unwrap().commit(
-            self.uuid,
+    /// Committing a checkpoint writes its data and ensures that it is on stable
+    /// storage.  It can run in the background while the circuit processes more
+    /// steps.
+    ///
+    /// This method commits the checkpoint and returns an object that carries
+    /// the checkpoint's metadata and publishes it.  In between, the client can
+    /// wait for output connectors to complete writing the output corresponding
+    /// to the checkpoint.
+    pub fn commit(self) -> Result<CheckpointPublisher, DbspError> {
+        let uuid = Uuid::now_v7();
+
+        // Spawn threads to write out all the operators' checkpoints, and then
+        // wait for all of them.
+        //
+        // We used to populate the spine batches that we write to disk back into
+        // the spines, so that any batches that are in memory before the
+        // checkpoint are on storage afterward.  We don't do that anymore (it
+        // would be difficult since we're not keeping the spines from doing
+        // further merges while we write).  It's probably at least as valid to
+        // do it this way; the batches that were spilled to disk were the
+        // smallest ones in the spines and are ordinarily due to be merged soon
+        // anyhow.
+        //
+        // We wait for all of them even if one of them fails so that we don't
+        // leave any zombies.
+        let commit_thread_results = self
+            .worker_checkpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, operators)| {
+                let runtime = self.runtime.clone();
+                std::thread::Builder::new()
+                    .name(format!("dbsp-commit-{index}"))
+                    .spawn(move || {
+                        // This thread doesn't run in the context of a dbsp
+                        // foreground or background thread, which means it would
+                        // by default use, and pollute, the shared auxiliary
+                        // buffer cache.  Use a small private cache instead.
+                        let _guard = runtime
+                            .enter()
+                            .with_private_cache(CHECKPOINT_THREAD_CACHE_BYTES);
+                        let checkpoint_dir = Checkpointer::checkpoint_dir(uuid);
+                        let mut committers = Vec::new();
+                        for operator in operators {
+                            committers.extend(operator.write(&checkpoint_dir)?);
+                        }
+                        Ok::<_, DbspError>(committers)
+                    })
+                    .expect("should be able to start checkpoint thread")
+            })
+            .collect_vec()
+            .into_iter()
+            .map(|handle| handle.join())
+            .collect_vec();
+
+        // Check for errors, then get the FileCommitters out of them.
+        let file_committers = commit_thread_results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|error| {
+                    #[allow(clippy::manual_map)]
+                    let message = if let Some(v) = error.downcast_ref::<String>() {
+                        Some(v.clone())
+                    } else if let Some(v) = error.downcast_ref::<&str>() {
+                        Some(v.to_string())
+                    } else {
+                        None
+                    };
+
+                    Err(DbspError::Runtime(RuntimeError::CheckpointPanic(message)))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect_vec();
+
+        // Commit the FileCommitters.
+        //
+        // Clone the backend rather than holding the checkpointer lock across
+        // the syncs.
+        let backend = self.checkpointer.lock().unwrap().backend().clone();
+        backend.commit_all(&file_committers)?;
+
+        let metadata = self.checkpointer.lock().unwrap().commit(
+            uuid,
             self.fingerprint,
             self.name,
             self.steps,
             self.processed_records,
-        )
+        )?;
+        Ok(CheckpointPublisher {
+            checkpointer: self.checkpointer,
+            metadata,
+        })
+    }
+}
+
+/// Second phase of checkpoint commit.
+///
+/// The second phase adds the checkpoint to the checkpoint catalog, which makes
+/// it visible.
+///
+/// A publisher that is dropped instead leaves the committed checkpoint's
+/// directory on disk, costing the space of one checkpoint until the pipeline
+/// restarts: the running pipeline's GC visits only the checkpoints in the
+/// catalog, and this one never reached it, so `Checkpointer::gc_startup`
+/// reclaims the directory at the next start.
+pub struct CheckpointPublisher {
+    checkpointer: Arc<Mutex<Checkpointer>>,
+    metadata: CheckpointMetadata,
+}
+
+impl CheckpointPublisher {
+    /// Returns the metadata for the committed checkpoint.
+    ///
+    /// The metadata is complete before publication, so that a client that
+    /// records it elsewhere, such as in the checkpoint's own state file, can do
+    /// so while the checkpoint is still invisible.
+    pub fn metadata(&self) -> &CheckpointMetadata {
+        &self.metadata
+    }
+
+    /// Executes the final phase of checkpoint commit.
+    ///
+    /// This method updates the checkpoint catalog, which publishes the
+    /// checkpoint, and returns its metadata.
+    pub fn publish(self) -> Result<CheckpointMetadata, DbspError> {
+        self.checkpointer.lock().unwrap().publish(&self.metadata)?;
+        Ok(self.metadata)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use feldera_types::size::ConfigSize;
     use std::fs::{File, create_dir_all};
     use std::io;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use std::{fs, vec};
 
-    use super::CircuitStorageConfig;
+    use super::{CHECKPOINT_THREAD_CACHE_BYTES, CheckpointPublisher, CircuitStorageConfig};
+    use crate::algebra::OrdZSet as DynOrdZSet;
     use crate::circuit::CircuitConfig;
     use crate::circuit::checkpointer::Checkpointer;
-    use crate::circuit::runtime::TOKIO_WORKER_INDEX;
+    use crate::circuit::operator_traits::OperatorCheckpoint;
+    use crate::circuit::runtime::{AUXILIARY_CACHE, TOKIO_WORKER_INDEX, current_thread_type};
     use crate::dynamic::{ClonableTrait, DowncastTrait, DynData, Erase};
     use crate::operator::Generator;
     use crate::operator::TraceBound;
     use crate::storage::backend::StorageError;
-    use crate::trace::BatchReaderFactories;
+    use crate::storage::buffer_cache::BufferCache;
+    use crate::trace::{BatchReaderFactories, Filter, Spine, Trace, TraceRole};
+    use crate::typed_batch::Batch as _;
     use crate::utils::Tup2;
     use crate::{
         Circuit, DBSPHandle, Error as DbspError, IndexedZSetHandle, InputHandle, OrdZSet,
@@ -2729,7 +2996,9 @@ pub(crate) mod tests {
     };
     use anyhow::anyhow;
     use feldera_buffer_cache::ThreadType;
+    use feldera_storage::{FileCommitter, StoragePath};
     use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
+    use smallvec::SmallVec;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -2902,6 +3171,54 @@ pub(crate) mod tests {
         }
     }
 
+    /// A background panic must fail a later `unicast_command`, not just the
+    /// command that was waiting when it happened.
+    #[test]
+    fn test_unicast_command_after_background_panic() {
+        let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+        let (mut handle, _) = Runtime::init_circuit(1, move |circuit| {
+            let (_stream, _input_handle) = circuit.add_input_map::<u64, u64, i64, _>(|v, u| {
+                *v = ((*v as i64) + *u) as u64;
+            });
+            if Runtime::worker_index() == 0 {
+                let runtime = Runtime::runtime().unwrap();
+                let panic_tx = panic_tx.clone();
+                runtime.tokio_merger_runtime().unwrap().spawn(async move {
+                    TOKIO_WORKER_INDEX
+                        .scope(0, async move {
+                            let _ =
+                                std::panic::catch_unwind(|| panic!("injected background panic"));
+                            let _ = panic_tx.send(());
+                        })
+                        .await;
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        panic_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for panic task to complete");
+
+        // Call on another thread, so that a hang fails the test instead of
+        // stalling it forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.get_current_balancer_policies());
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("unicast_command hung after a background panic");
+        assert!(
+            matches!(
+                result,
+                Err(DbspError::Runtime(RuntimeError::WorkerPanic { .. }))
+            ),
+            "expected WorkerPanic, got {result:?}"
+        );
+    }
+
     /// Check that a panic in the tokio merger runtime is propagated to the client.
     #[test]
     fn test_panic_in_tokio_merger_runtime() {
@@ -2951,6 +3268,71 @@ pub(crate) mod tests {
         } else {
             panic!();
         }
+    }
+
+    /// A merger that panics while a worker waits for it must fail the step
+    /// instead of hanging it.
+    ///
+    /// The spine's key filter panics when a merge evaluates it, killing the
+    /// merger in the middle of a merge.  Within the same step, the worker
+    /// keeps inserting batches into the spine until backpressure blocks it on
+    /// merges that will never happen, so the worker never replies.  Only the
+    /// runtime's panic signal can end the wait.
+    #[test]
+    fn test_merger_panic_while_worker_waits_for_merges() {
+        const MERGER_PANIC: &str = "injected merger panic";
+
+        let (mut handle, _) = Runtime::init_circuit(1, |circuit| {
+            let mut spine = Spine::<DynOrdZSet<DynData>>::new(
+                &BatchReaderFactories::new::<u64, (), ZWeight>(),
+                Arc::new(String::from("merger_panic")),
+                TraceRole::Integral,
+            );
+            // Fail only on the merger's thread: a worker evaluates the filter
+            // too, when it spills a batch to storage.
+            spine.retain_keys(Filter::new(Box::new(|_key: &DynData| {
+                if current_thread_type() == Some(ThreadType::Background) {
+                    panic!("{MERGER_PANIC}");
+                }
+                true
+            })));
+
+            let mut next_key = 0u64;
+            circuit.add_source(Generator::new(move || {
+                // A level-0 merge takes at most 128 batches and backpressure
+                // starts at 128 loose ones, so 1000 batches force the worker
+                // to wait for a merge.
+                for _ in 0..1000 {
+                    let batch = OrdZSet::from_keys((), vec![Tup2(next_key, 1)]);
+                    next_key += 1;
+                    // An operator would await the insertion; blocking the
+                    // thread instead withholds the reply just the same.
+                    futures::executor::block_on(spine.insert(batch.into_inner()));
+                }
+            }));
+            Ok(())
+        })
+        .unwrap();
+
+        // Step on another thread, so that a hang fails the test instead of
+        // stalling it forever.
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_sender.send(handle.transaction());
+        });
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the step hung on a worker waiting for a panicked merger");
+
+        let Err(DbspError::Runtime(RuntimeError::WorkerPanic { panic_info })) = result else {
+            panic!("the step should fail with the merger's panic, but returned {result:?}");
+        };
+        assert!(
+            panic_info.iter().any(|(_worker, thread_type, info)| {
+                *thread_type == ThreadType::Background && info.to_string().contains(MERGER_PANIC)
+            }),
+            "the error should report the merger's panic: {panic_info:?}"
+        );
     }
 
     /// Regression test for the deadlock in `RuntimeHandle::join` (commit 1 of
@@ -3172,14 +3554,22 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn mkconfig(path: &Path) -> CircuitConfig {
-        CircuitConfig::with_workers(1).with_storage(Some(
+        mkconfig_with(path, 1, 0)
+    }
+
+    /// Like [mkconfig], with `workers` workers, keeping batches smaller than
+    /// `min_spill_size` in memory.  A step's output batches stay in memory
+    /// unless `min_spill_size` is 0.
+    fn mkconfig_with(path: &Path, workers: usize, min_storage_bytes: usize) -> CircuitConfig {
+        CircuitConfig::with_workers(workers).with_storage(Some(
             CircuitStorageConfig::for_config(
                 StorageConfig {
                     path: path.to_string_lossy().into_owned(),
                     cache: StorageCacheConfig::default(),
                 },
                 StorageOptions {
-                    min_storage_bytes: Some(0),
+                    min_spill_size: Some(ConfigSize::from_bytes(min_storage_bytes as u64)),
+                    min_step_spill_size: (min_storage_bytes == 0).then_some(ConfigSize::ZERO),
                     ..StorageOptions::default()
                 },
             )
@@ -3259,6 +3649,278 @@ pub(crate) mod tests {
             .gather_batches_for_checkpoint(&cpm)
             .expect("failed to gather batches");
         assert_eq!(batchfiles.len(), 1);
+    }
+
+    /// `commit` must leave the checkpoint out of the catalog; only `publish`
+    /// puts it there.
+    ///
+    /// The controller relies on this split: it commits operator data, waits for
+    /// output connectors to transmit the output the checkpoint covers, and only
+    /// then publishes.  Folding publication back into `commit` would make a
+    /// checkpoint restorable before its output was transmitted
+    /// (feldera/feldera#7031).
+    #[test]
+    fn commit_does_not_publish_checkpoint() {
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig(_temp.path());
+        let backend = cconf.storage.as_ref().unwrap().backend.clone();
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(cconf).unwrap();
+        let mut batch = vec![Tup2(1, Tup2(2, 1))];
+        input_handle.append(&mut batch);
+        dbsp.transaction().unwrap();
+
+        let publisher = dbsp
+            .checkpoint()
+            .prepare()
+            .expect("prepare failed")
+            .commit()
+            .expect("commit failed");
+        assert_eq!(
+            Checkpointer::read_checkpoints(&*backend)
+                .expect("failed to read catalog")
+                .len(),
+            0,
+            "commit published the checkpoint; it must stay out of the catalog until publish"
+        );
+
+        let metadata_uuid = publisher.metadata().uuid;
+        let cpm = publisher.publish().expect("publish failed");
+        assert_eq!(
+            metadata_uuid, cpm.uuid,
+            "the metadata reported before publication names a different checkpoint"
+        );
+        let published = Checkpointer::read_checkpoints(&*backend)
+            .expect("failed to read catalog")
+            .iter()
+            .map(|cpm| cpm.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(published, vec![cpm.uuid]);
+    }
+
+    /// An operator checkpoint that panics in `write`, with a payload of each
+    /// kind that `commit` must handle.
+    #[derive(Debug)]
+    enum PanickingCheckpoint {
+        Str,
+        String,
+        NotAString,
+    }
+
+    impl OperatorCheckpoint for PanickingCheckpoint {
+        fn write(
+            self: Box<Self>,
+            _base: &StoragePath,
+        ) -> Result<SmallVec<[Arc<dyn FileCommitter>; 1]>, DbspError> {
+            match *self {
+                Self::Str => std::panic::panic_any("str payload"),
+                Self::String => std::panic::panic_any(String::from("String payload")),
+                Self::NotAString => std::panic::panic_any(42u32),
+            }
+        }
+    }
+
+    /// A panic on a thread that writes a checkpoint in the background must
+    /// come back from `commit` as an error that carries the panic message.
+    /// It must not publish the checkpoint or mark the runtime as panicked,
+    /// so the circuit keeps running and can take the next checkpoint.
+    #[test]
+    fn commit_reports_panic_while_writing_checkpoint() {
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig_with(_temp.path(), 2, 0);
+        let backend = cconf.storage.as_ref().unwrap().backend.clone();
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(cconf).unwrap();
+        let mut batch = vec![Tup2(1, Tup2(2, 1))];
+        input_handle.append(&mut batch);
+        dbsp.transaction().unwrap();
+
+        for (checkpoint, expected) in [
+            (PanickingCheckpoint::Str, Some("str payload")),
+            (PanickingCheckpoint::String, Some("String payload")),
+            (PanickingCheckpoint::NotAString, None),
+        ] {
+            let mut committer = dbsp.checkpoint().prepare().expect("prepare failed");
+            // A thread of its own, beside the real workers', so that the
+            // real operators still write while this one panics.
+            committer
+                .worker_checkpoints
+                .push(vec![Box::new(checkpoint)]);
+
+            let Err(error) = committer.commit() else {
+                panic!("commit succeeded although an operator panicked");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    DbspError::Runtime(RuntimeError::CheckpointPanic(message))
+                        if message.as_deref() == expected
+                ),
+                "expected CheckpointPanic({expected:?}), got {error:?}"
+            );
+            assert!(
+                !dbsp.runtime.as_ref().unwrap().panicked(),
+                "a checkpoint thread's panic marked the runtime as panicked"
+            );
+        }
+        assert!(
+            Checkpointer::read_checkpoints(&*backend)
+                .expect("failed to read catalog")
+                .is_empty(),
+            "a failed checkpoint was published"
+        );
+
+        dbsp.transaction().unwrap();
+        let cpm = dbsp
+            .checkpoint()
+            .run()
+            .expect("checkpoint after a panic failed");
+        let published = Checkpointer::read_checkpoints(&*backend)
+            .expect("failed to read catalog")
+            .iter()
+            .map(|cpm| cpm.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(published, vec![cpm.uuid]);
+    }
+
+    /// An operator checkpoint that records the buffer cache that `write` runs
+    /// with.
+    #[derive(Debug)]
+    struct CacheProbe(Arc<Mutex<Option<Arc<BufferCache>>>>);
+
+    impl OperatorCheckpoint for CacheProbe {
+        fn write(
+            self: Box<Self>,
+            _base: &StoragePath,
+        ) -> Result<SmallVec<[Arc<dyn FileCommitter>; 1]>, DbspError> {
+            *self.0.lock().unwrap() = Runtime::buffer_cache();
+            Ok(SmallVec::new())
+        }
+    }
+
+    /// Each thread that writes a checkpoint uses a small buffer cache of its
+    /// own, so that writing the spines' in-memory batches does not evict the
+    /// blocks that output connectors keep in the shared auxiliary cache.
+    #[test]
+    fn commit_threads_use_private_buffer_caches() {
+        let _temp = tempdir().expect("Can't create temp dir for storage");
+        let cconf = mkconfig_with(_temp.path(), 2, usize::MAX);
+        let (mut dbsp, (input_handle, _, _)) = mkcircuit(cconf).unwrap();
+        for i in 0..10 {
+            input_handle.append(&mut vec![Tup2(i, Tup2(i, 1))]);
+            dbsp.transaction().unwrap();
+        }
+
+        let mut committer = dbsp.checkpoint().prepare().expect("prepare failed");
+        // Put a probe after each worker's operators, so that it runs on the
+        // same thread and sees the cache that their batches were written
+        // through.
+        let probes = committer
+            .worker_checkpoints
+            .iter_mut()
+            .map(|operators| {
+                let probe = Arc::new(Mutex::new(None));
+                operators.push(Box::new(CacheProbe(probe.clone())));
+                probe
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(probes.len(), 2);
+        committer
+            .commit()
+            .and_then(CheckpointPublisher::publish)
+            .expect("checkpoint failed");
+
+        let caches = probes
+            .iter()
+            .map(|probe| {
+                probe
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("a checkpoint thread has no buffer cache")
+            })
+            .collect::<Vec<_>>();
+        for cache in &caches {
+            assert!(
+                !Arc::ptr_eq(cache, &AUXILIARY_CACHE),
+                "a checkpoint thread wrote through the shared auxiliary cache"
+            );
+            assert_eq!(cache.occupancy().1, CHECKPOINT_THREAD_CACHE_BYTES);
+        }
+        assert!(
+            !Arc::ptr_eq(&caches[0], &caches[1]),
+            "two checkpoint threads share a buffer cache"
+        );
+    }
+
+    /// A checkpoint captures the circuit state at `prepare` time.  Steps that
+    /// run between `prepare` and `commit` must stay out of it, and the running
+    /// circuit must keep its own state after the checkpoint is written.
+    ///
+    /// The circuit has two workers, so `commit` writes on more than one
+    /// thread.
+    fn check_checkpoint_is_snapshot_at_prepare(min_storage_bytes: usize) {
+        const SAMPLE_SIZE: usize = 1000;
+        let temp = tempdir().expect("Can't create temp dir for storage");
+
+        let (cpm, expected_before) = {
+            let (mut dbsp, (input_handle, output_handle, sample_size_handle)) =
+                mkcircuit(mkconfig_with(temp.path(), 2, min_storage_bytes)).unwrap();
+            for i in 0..20 {
+                sample_size_handle.set_for_all(SAMPLE_SIZE);
+                input_handle.append(&mut vec![Tup2(i, Tup2(i, 1))]);
+                dbsp.transaction().unwrap();
+            }
+            let expected_before = output_handle.take_from_all()[0].clone();
+
+            let committer = dbsp.checkpoint().prepare().expect("prepare failed");
+
+            // Change every spine, and give them the chance to merge, before
+            // the checkpoint is written.
+            for i in 20..60 {
+                sample_size_handle.set_for_all(SAMPLE_SIZE);
+                input_handle.append(&mut vec![
+                    Tup2(i, Tup2(i, 1)),
+                    Tup2(i - 20, Tup2(i - 20, -1)),
+                ]);
+                dbsp.transaction().unwrap();
+            }
+            let expected_after = output_handle.take_from_all()[0].clone();
+            assert_ne!(expected_before, expected_after);
+
+            let cpm = committer
+                .commit()
+                .and_then(CheckpointPublisher::publish)
+                .expect("checkpoint failed");
+
+            // Writing the checkpoint leaves the running circuit unchanged.
+            sample_size_handle.set_for_all(SAMPLE_SIZE);
+            dbsp.transaction().unwrap();
+            assert_eq!(output_handle.take_from_all()[0], expected_after);
+            (cpm, expected_before)
+        };
+
+        let mut cconf = mkconfig_with(temp.path(), 2, min_storage_bytes);
+        cconf.storage.as_mut().unwrap().init_checkpoint = Some(cpm.uuid);
+        let (mut dbsp, (input_handle, output_handle, sample_size_handle)) =
+            mkcircuit(cconf).unwrap();
+        sample_size_handle.set_for_all(SAMPLE_SIZE);
+        input_handle.append(&mut vec![Tup2(1000, Tup2(1000, 1))]);
+        dbsp.transaction().unwrap();
+        let restored = output_handle.take_from_all()[0].filter(|Tup2(k, _), _| *k != 1000);
+        assert_eq!(restored, expected_before);
+    }
+
+    /// The spines' batches are on storage before the checkpoint, so `commit`
+    /// only has to sync them.
+    #[test]
+    fn checkpoint_is_snapshot_at_prepare_on_storage() {
+        check_checkpoint_is_snapshot_at_prepare(0);
+    }
+
+    /// The spines' batches are in memory, so `commit` writes them to storage
+    /// on its own threads.
+    #[test]
+    fn checkpoint_is_snapshot_at_prepare_in_memory() {
+        check_checkpoint_is_snapshot_at_prepare(usize::MAX);
     }
 
     /// If we call commit, we should preserve the checkpoint list across circuit

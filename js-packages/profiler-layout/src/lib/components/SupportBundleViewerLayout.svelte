@@ -2,16 +2,22 @@
   import { Switch } from '@skeletonlabs/skeleton-svelte'
   import type { ZipItem } from 'but-unzip'
   import {
+    isFindShortcut,
     PersistentContent,
+    SearchBar,
+    type SearchDirection,
     SegmentedControl,
     Select,
     type TabSpec,
     TabsPanel,
-    usePersistentRect
+    usePersistentRect,
+    useShortcut
   } from 'common-ui'
   import { Pane, PaneGroup, PaneResizer } from 'paneforge'
+  import { measurementLabel } from 'profiler-lib'
   import type {
     Dataflow,
+    DiagramTheme,
     JsonProfiles,
     MetricOption,
     NodeAttributes,
@@ -22,12 +28,13 @@
   import { type Snippet, untrack } from 'svelte'
   import type { TriageResults } from 'triage-types'
   import type { GlobalMetrics } from '../functions/globalMetrics'
-  import { createLookupCoordinator } from '../functions/lookup'
+  import { createLookupCoordinator, type SearchProgress } from '../functions/lookup'
   import { type AnalysisView, isNodeView, metricsModeOf } from '../functions/metricsMode'
   import { severityLabel, uniqueCategories, uniqueSeverities } from '../functions/triage'
   import type { MetricsMode } from './MetricsView.svelte'
   import ProfilerDiagram from './ProfilerDiagram.svelte'
   import type { TooltipData } from './ProfilerTooltip.svelte'
+  import MetricSelect from './MetricSelect.svelte'
   import ProfileTimestampSelector from './ProfileTimestampSelector.svelte'
   import ConfigTab from './tabs/ConfigTab.svelte'
   import IssuesTab from './tabs/IssuesTab.svelte'
@@ -50,6 +57,8 @@
      *  tab. Absent when the bundle carried no config. */
     runtimeConfig?: unknown
     triageResults: TriageResults
+    /** Palette the circuit diagram is drawn with; follows the application theme */
+    theme?: DiagramTheme
     profileFiles: [Date, ZipItem[]][]
     selectedTimestamp: Date | null
     onSelectTimestamp: (timestamp: Date) => void
@@ -58,6 +67,8 @@
     loadProfileControl?: Snippet
     /** Optional slot for a richer SQL panel; receives current highlight ranges */
     sqlPanel?: Snippet<[highlightRanges: SourcePositionRange[]]>
+    /** Ranges of the SQL that the selected node came from. Their `end` names the last character of
+     *  the range, not the position after it. */
     onHighlightSourceRanges?: (ranges: SourcePositionRange[]) => void
     /** Fired when the graph rendering enters or leaves its asynchronous layout phase.
      */
@@ -72,6 +83,7 @@
     globalMetrics,
     runtimeConfig,
     triageResults,
+    theme = 'light',
     profileFiles,
     selectedTimestamp,
     onSelectTimestamp,
@@ -110,13 +122,30 @@
   const issueSeverities = $derived(uniqueSeverities(triageResults.results))
   let nodeSearchQuery = $state('')
   let lookupQuery = $state('')
-  // Bound to the shared analysis-panel lookup <input>. Tabs (e.g. the log list) can request
-  // focus via the `onSearchShortcut` callback threaded through `analysisTabProps`.
-  let searchInputEl: HTMLInputElement | undefined = $state()
-  const onAnalysisSearchShortcut = () => {
-    searchInputEl?.focus()
-    searchInputEl?.select()
-  }
+  // The single source of truth for submitted search results, shared by the counter, the match
+  // highlight, and the nav buttons:
+  //   - `null`         → no active search (nothing highlighted, nothing to navigate).
+  //   - `{ total: 0 }` → searched, but the query matched nothing ("No results").
+  //   - `total > 0`    → `current` (1-based) of `total` matches.
+  // Editing or clearing the query must set this back to `null` so all three reset together.
+  let lookupProgress = $state<SearchProgress | null>(null)
+  let searchBar: ReturnType<typeof SearchBar> | undefined = $state()
+  let nodeSearchInput: HTMLInputElement | undefined = $state()
+
+  // Ctrl/Cmd-F targets the "Search node" input while focused on the circuit diagram, otherwise the
+  // active tab's search. Inactive on Config (no in-tab search), so native find runs there.
+  useShortcut(
+    isFindShortcut,
+    () => {
+      if (profilerDiagram?.isFocused()) {
+        nodeSearchInput?.focus()
+        nodeSearchInput?.select()
+      } else {
+        searchBar?.activate()
+      }
+    },
+    () => currentTab !== 'Config'
+  )
   let highlightRanges: SourcePositionRange[] = $state([])
 
   // The graph panel's diagram is hoisted to a <PersistentContent> overlay so it survives the
@@ -158,12 +187,13 @@
       // fires right after with the payload.
       analysisView = { nodeId }
       currentTab = 'Metrics'
+      highlightSource(nodeId)
     },
     displayTopNodes(data, _isSticky) {
       tooltipData = data.match({
         some: (topNodes) => ({
           genericTable: {
-            header: `Nodes with highest values for "${selectedMetricId}"`,
+            header: `Nodes with highest values for "${measurementLabel(selectedMetricId)}"`,
             columns: ['Node', 'Value', 'Operation'],
             rows: topNodes.map((n) => ({
               stub: { text: n.nodeId, onclick: () => profilerDiagram?.search(n.nodeId) },
@@ -184,29 +214,25 @@
     onError: (err) => {
       error = err
     },
-    onNodeDoubleClick: (nodeId, type) => {
-      if (type !== 'leaf') {
-        return
-      }
-      const profile = profilerDiagram?.getProfile()
-      if (!profile) {
-        return
-      }
-      const ranges = profile.getSourceRanges(nodeId)
-      if (ranges.length === 0) {
-        return
-      }
-      highlightRanges = ranges
-      onHighlightSourceRanges?.(ranges)
-    },
     onRenderingChange: (rendering) => {
       onRenderingChange?.(rendering)
     }
   }
 
+  /** Show the SQL the node was compiled from, selected and scrolled into view in the SQL panel.
+   *  A node compiled from no SQL selects nothing, so the two panels never show different nodes. */
+  function highlightSource(nodeId: string) {
+    // A region's double click expands it, so a single click is the only gesture left to reach
+    // its source. A region carries the positions of everything inside it (see
+    // `CircuitProfile.getSourceRanges`), so the same call serves regions and operators alike.
+    const ranges = profilerDiagram?.getProfile()?.getSourceRanges(nodeId) ?? []
+    highlightRanges = ranges
+    onHighlightSourceRanges?.(ranges)
+  }
+
   // Re-color the diagram when the selected metric changes. The selectMetric() call refreshes
   // the current sticky tooltip via the callbacks above, but those only touch tooltipData — so
-  // this does not feed back into any effect (no loop). Same shape as the original ProfilerLayout.
+  // this does not feed back into any effect (no loop).
   $effect(() => {
     profilerDiagram?.selectMetric(selectedMetricId)
   })
@@ -248,15 +274,21 @@
     }
   }
 
-  function handleLookup() {
-    if (lookupQuery) {
-      lookup.execute(currentTab, lookupQuery)
-    }
+  function handleLookup(direction: SearchDirection = 'next') {
+    lookupProgress = lookupQuery ? lookup.execute(currentTab, lookupQuery, direction) : null
+  }
+
+  // Drop the active tab's submitted results: run its search with an empty query to clear the
+  // highlight, then null the progress.
+  function resetLookup() {
+    lookup.execute(currentTab, '', 'next')
+    lookupProgress = null
   }
 
   $effect(() => {
     currentTab
     lookupQuery = ''
+    lookupProgress = null
   })
 
   // SQL panel tab state. Single-tab; bound state is required by TabsPanel.
@@ -283,8 +315,7 @@
     triageResults,
     issueSeverityFilter,
     issueCategoryFilter,
-    onSearchNode: (query) => profilerDiagram?.search(query),
-    onSearchShortcut: onAnalysisSearchShortcut
+    onSearchNode: (query) => profilerDiagram?.search(query)
   })
   const analysisTabs = $derived<TabSpec<AnalysisTabProps>[]>([
     {
@@ -321,10 +352,12 @@
 
 <!-- ── Graph panel (dataflow graph) ────────────────────────────────────────── -->
 {#snippet graphPanel()}
+  <!-- Clip only with a profile: without one the panel is short and clipping would hide the
+       "Load profile" dropdown that overflows it. -->
   <div
-    class="flex flex-col overflow-hidden rounded-container bg-surface-50-950 {hasProfile
-      ? 'h-full'
-      : ''}"
+    class="flex flex-col rounded-container bg-surface-50-950 {hasProfile
+      ? 'h-full overflow-hidden'
+      : 'overflow-visible'}"
   >
     <!-- Header -->
     <div class="flex flex-shrink-0 flex-wrap items-center gap-2 p-4">
@@ -333,11 +366,18 @@
       {#if hasProfile}
         <div class="ml-auto">
           <input
+            bind:this={nodeSearchInput}
             bind:value={nodeSearchQuery}
             type="text"
             placeholder="Search node"
             title="Search for a node by ID, by table or view name, or by a substring of a persistent ID"
-            onkeydown={(e) => e.key === 'Enter' && handleSearch()}
+            onkeydown={(e) => {
+              if (e.key === 'Enter') {
+                handleSearch()
+              } else if (e.key === 'Escape') {
+                nodeSearchInput?.blur()
+              }
+            }}
             class="input h-6 w-36 text-sm"
           />
         </div>
@@ -404,28 +444,22 @@
 {#snippet commonTabBarEnd()}
   <div class="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
     {#if metrics.length > 0}
-      <Select
-        bind:value={selectedMetricId}
-        class="px-2 w-42"
-        title="Select metric"
-      >
-        {#each metrics as metric (metric.id)}
-          <option class="text-base" value={metric.id}>{metric.label}</option>
-        {/each}
-      </Select>
+      <MetricSelect bind:value={selectedMetricId} {metrics} class="w-42" title="Select metric" />
     {/if}
-    <input
-      bind:this={searchInputEl}
+    <SearchBar
+      bind:this={searchBar}
       bind:value={lookupQuery}
-      type="text"
       placeholder={currentTab === 'Logs'
         ? 'Search logs'
         : currentTab === 'Issues'
           ? 'Search issues'
           : 'Search metrics'}
-      title="Search within active tab (Enter to jump, Ctrl/Cmd-F to focus)"
-      onkeydown={(e) => e.key === 'Enter' && handleLookup()}
-      class="input h-6 w-28 text-sm"
+      title="Search within active tab (Enter / Shift+Enter to step matches, Esc to clear, Ctrl/Cmd-F to toggle)"
+      results={lookupProgress}
+      onnext={() => handleLookup('next')}
+      onprevious={() => handleLookup('prev')}
+      onclear={resetLookup}
+      inputClass="h-8 w-40 text-sm"
     />
   </div>
 {/snippet}
@@ -579,6 +613,7 @@
       {dataflowData}
       {programCode}
       {callbacks}
+      {theme}
     />
   </PersistentContent>
 {/if}

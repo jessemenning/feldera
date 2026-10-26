@@ -1,13 +1,17 @@
 //! See crates/iceberg/srd/tests/README.md for a description of the Iceberg test harness.
 
-use crate::{
-    Controller,
-    test::{file_to_zset, wait},
-};
+#[cfg(any(
+    feature = "iceberg-tests-fs",
+    feature = "iceberg-tests-glue",
+    feature = "iceberg-tests-rest",
+    feature = "iceberg-tests-s3tables"
+))]
+use crate::test::file_to_zset;
+use crate::{Controller, test::wait};
 use crossbeam::channel::Receiver;
 use dbsp::DBData;
 use feldera_sqllib::Variant;
-#[cfg(feature = "iceberg-tests-fs")]
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
 use feldera_sqllib::{ByteArray, F32, F64, Timestamp, TimestampTz};
 use feldera_types::{
     program_schema::Field,
@@ -15,12 +19,27 @@ use feldera_types::{
 };
 use serde_json::json;
 
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
+#[cfg(any(
+    feature = "iceberg-tests-fs",
+    feature = "iceberg-tests-glue",
+    feature = "iceberg-tests-rest",
+    feature = "iceberg-tests-s3tables"
+))]
+use std::time::Instant;
 use tempfile::NamedTempFile;
+#[cfg(any(
+    feature = "iceberg-tests-fs",
+    feature = "iceberg-tests-glue",
+    feature = "iceberg-tests-rest",
+    feature = "iceberg-tests-s3tables"
+))]
 use tracing::info;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[cfg(feature = "iceberg-tests-fs")]
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
+use std::collections::BTreeMap;
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
 use std::io::Write;
 
 #[cfg(feature = "iceberg-tests-fs")]
@@ -28,11 +47,14 @@ use super::IcebergSubsetTestStruct;
 #[cfg(any(
     feature = "iceberg-tests-fs",
     feature = "iceberg-tests-glue",
-    feature = "iceberg-tests-rest"
+    feature = "iceberg-tests-rest",
+    feature = "iceberg-tests-follow"
 ))]
 use super::IcebergTestStruct;
 #[cfg(feature = "iceberg-tests-s3tables")]
 use super::S3TablesTestStruct;
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
+use super::TestStruct;
 use super::test_circuit_with_properties;
 
 fn init_logging() {
@@ -46,7 +68,7 @@ fn init_logging() {
         .try_init();
 }
 
-#[cfg(feature = "iceberg-tests-fs")]
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
 /// Store test dataset in an ndjson file
 fn data_to_ndjson(data: Vec<IcebergTestStruct>) -> NamedTempFile {
     println!("delta_table_output_test: preparing input file");
@@ -93,6 +115,12 @@ fn iceberg_connector_metrics(pipeline: &Controller) -> HashMap<String, f64> {
 /// `config` is the connector's transport config as a JSON object. This function
 /// forces `mode = snapshot`. Returns the output file and the connector's custom
 /// metrics captured just before the pipeline is stopped.
+#[cfg(any(
+    feature = "iceberg-tests-fs",
+    feature = "iceberg-tests-glue",
+    feature = "iceberg-tests-rest",
+    feature = "iceberg-tests-s3tables"
+))]
 fn iceberg_snapshot_to_json<T>(
     schema: &[Field],
     table_properties: &[(&str, &str)],
@@ -155,10 +183,37 @@ where
         + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
         + Sync,
 {
+    iceberg_input_pipeline_with_storage::<T>(
+        schema,
+        table_properties,
+        config,
+        output_file_path,
+        None,
+        false,
+    )
+}
+
+/// Like [`iceberg_input_pipeline`], with storage in `storage_dir`, if any, so
+/// that the pipeline can checkpoint and resume, and with the input connector
+/// `distributed` if requested.
+fn iceberg_input_pipeline_with_storage<T>(
+    schema: &[Field],
+    table_properties: &[(&str, &str)],
+    config: serde_json::Value,
+    output_file_path: &str,
+    storage_dir: Option<&std::path::Path>,
+    distributed: bool,
+) -> (Controller, Receiver<String>)
+where
+    T: DBData
+        + SerializeWithContext<SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Sync,
+{
     init_logging();
 
     // Create controller.
-    let config = serde_json::from_value(json!({
+    let mut config = json!({
       "name": "test",
       "workers": 4,
       "outputs": {
@@ -187,8 +242,14 @@ where
           }
         }
       }
-    }))
-    .unwrap();
+    });
+    if let Some(storage_dir) = storage_dir {
+        config["storage_config"] = json!({"path": storage_dir});
+    }
+    if distributed {
+        config["inputs"]["test_input1"]["distributed"] = json!(true);
+    }
+    let config = serde_json::from_value(config).unwrap();
 
     let schema = schema.to_vec();
     let table_properties: Vec<(String, String)> = table_properties
@@ -198,6 +259,8 @@ where
 
     let (err_sender, err_receiver) = crossbeam::channel::unbounded();
 
+    // A checkpoint needs a persistent id for the output.
+    let persistent_output_id = storage_dir.map(|_| "output");
     let controller = Controller::with_test_config(
         move |workers| {
             let table_properties: Vec<(&str, &str)> = table_properties
@@ -208,7 +271,7 @@ where
                 workers,
                 &schema,
                 &table_properties,
-                &[None],
+                &[persistent_output_id],
             ))
         },
         &config,
@@ -224,7 +287,10 @@ where
 }
 
 /// Generate up to `max_records` _unique_ records.
-#[cfg(feature = "iceberg-tests-fs")]
+///
+/// Keep the callers under ~200k: the nested columns cost the Python writer
+/// 1.4 GiB there, and three of these tests run at once.
+#[cfg(any(feature = "iceberg-tests-fs", feature = "iceberg-tests-follow"))]
 fn data(n_records: usize) -> Vec<IcebergTestStruct> {
     let mut result = Vec::with_capacity(n_records);
 
@@ -247,6 +313,11 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
             fixed: ByteArray::new([0u8; 5].as_slice()),
             varbin: ByteArray::new([0u8; 5].as_slice()),
             tstz: TimestampTz::from(Timestamp::from_naiveDateTime(time)),
+            string_array: vec![format!("a{i}"), format!("b{i}")],
+            struct1: TestStruct::for_id(i as u32),
+            struct_array: vec![TestStruct::for_id(i as u32)],
+            string_string_map: BTreeMap::from([(format!("k{i}"), format!("v{i}"))]),
+            string_struct_map: BTreeMap::from([(format!("k{i}"), TestStruct::for_id(i as u32))]),
         });
 
         time += std::time::Duration::from_secs(1);
@@ -258,20 +329,20 @@ fn data(n_records: usize) -> Vec<IcebergTestStruct> {
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_unordered() {
-    iceberg_localfs_input_test(1_000_000, json!({}), &|_| true);
+    iceberg_localfs_input_test(200_000, json!({}), &|_| true);
 }
 
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_ordered() {
-    iceberg_localfs_input_test(1_000_000, json!({ "timestamp_column": "ts" }), &|_| true);
+    iceberg_localfs_input_test(200_000, json!({ "timestamp_column": "ts" }), &|_| true);
 }
 
 #[test]
 #[cfg(feature = "iceberg-tests-fs")]
 fn iceberg_localfs_input_test_ordered_with_filter() {
     iceberg_localfs_input_test(
-        1_000_000,
+        200_000,
         json!({ "timestamp_column": "ts", "snapshot_filter": "i >= 10000" }),
         &|x| x.i >= 10000,
     );
@@ -341,18 +412,87 @@ fn create_localfs_table(data: &[IcebergTestStruct], extra_columns: bool) -> Stri
     // Uncomment to inspect output parquet files produced by the test.
     std::mem::forget(table_dir);
 
+    let mut extra: Vec<&str> = Vec::new();
+    if extra_columns {
+        extra.push("--extra-columns");
+    }
+    run_table_script(&table_path, ndjson_file.path(), &extra)
+}
+
+/// A `datetime` read must land on the snapshot current at that time.
+///
+/// The connector picks the last snapshot whose `timestamp-ms` is at or before
+/// the requested time, so the test reads the two timestamps back rather than
+/// assuming what the writer stamped.
+#[test]
+#[cfg(feature = "iceberg-tests-fs")]
+fn iceberg_localfs_input_test_datetime() {
+    use dbsp::trace::BatchReader;
+
+    let before = data(200);
+    let after: Vec<IcebergTestStruct> = data(400)[200..].to_vec();
+
+    let table_dir = tempfile::TempDir::new().unwrap();
+    let table_path = table_dir.path().display().to_string();
+    std::mem::forget(table_dir);
+
+    let first_ndjson = data_to_ndjson(before.clone());
+    run_table_script(&table_path, first_ndjson.path(), &[]);
+    let second_ndjson = data_to_ndjson(after);
+    let metadata_path = run_table_script(&table_path, second_ndjson.path(), &["--append"]);
+
+    let metadata: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metadata_path).unwrap()).unwrap();
+    let stamps: Vec<i64> = metadata["snapshot-log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["timestamp-ms"].as_i64().unwrap())
+        .collect();
+    assert_eq!(stamps.len(), 2, "expected one snapshot per append");
+    assert!(
+        stamps[1] > stamps[0],
+        "the two appends must land in different milliseconds, got {stamps:?}"
+    );
+
+    // Between the appends: the first is visible, the second is not.
+    let read_at = chrono::DateTime::from_timestamp_millis((stamps[0] + stamps[1]) / 2)
+        .unwrap()
+        .to_rfc3339();
+    let (mut json_file, _metrics) = iceberg_snapshot_to_json::<IcebergTestStruct>(
+        &IcebergTestStruct::schema(),
+        &[],
+        json!({ "metadata_location": metadata_path, "datetime": read_at }),
+    );
+
+    let expected = dbsp::OrdZSet::from_tuples(
+        (),
+        before
+            .into_iter()
+            .map(|x| dbsp::utils::Tup2(dbsp::utils::Tup2(x, ()), 1))
+            .collect(),
+    );
+    let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
+    assert_eq!(
+        zset.len_upper_bound(),
+        200,
+        "`datetime` must pin the table to the first snapshot"
+    );
+    assert_eq!(zset, expected);
+}
+
+/// Run the table-building script and return the metadata location it prints.
+#[cfg(feature = "iceberg-tests-fs")]
+fn run_table_script(table_path: &str, ndjson_path: &std::path::Path, extra: &[&str]) -> String {
     let script_path = "../iceberg/src/test/create_test_table_s3.py";
 
-    // Run the Python script using the Python interpreter
     let mut command = std::process::Command::new("python3");
     command
         .arg(script_path)
         .arg("--catalog=sql")
         .arg(format!("--warehouse-path={table_path}"))
-        .arg(format!("--json-file={}", ndjson_file.path().display()));
-    if extra_columns {
-        command.arg("--extra-columns");
-    }
+        .arg(format!("--json-file={}", ndjson_path.display()))
+        .args(extra);
     let output = command
         .output()
         .map_err(|e| {
@@ -625,14 +765,10 @@ fn iceberg_glue_s3_input_test() {
         &[],
         json!({
             "catalog_type": "glue",
-            "glue.warehouse": "s3://feldera-iceberg-test/",
-            "table_name": "iceberg_test.test_table_v2",
-            "glue.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            "glue.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            "glue.region": "us-east-1",
-            "s3.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            "s3.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            "s3.region": "us-east-1",
+            "glue.warehouse": "s3://feldera-ci-iceberg/",
+            "table_name": "iceberg_test.test_table_v3",
+            "glue.region": env_or("ICEBERG_TEST_REGION", "us-west-1"),
+            "s3.region": env_or("ICEBERG_TEST_REGION", "us-west-1"),
         }),
     );
 
@@ -640,7 +776,7 @@ fn iceberg_glue_s3_input_test() {
 
     // The data for this test is generated by the Python script, we don't know the
     // exact set of records in the dataset.
-    assert_eq!(zset.len(), 2000000);
+    assert_eq!(zset.len_upper_bound(), 2000000);
 }
 
 #[test]
@@ -672,7 +808,7 @@ fn iceberg_s3tables_input_test() {
 
     let zset = file_to_zset::<S3TablesTestStruct>(json_file.as_file_mut());
 
-    assert_eq!(zset.len(), 100);
+    assert_eq!(zset.len_upper_bound(), 100);
 }
 
 #[test]
@@ -687,16 +823,649 @@ fn iceberg_rest_s3_input_test() {
         json!({
             "catalog_type": "rest",
             "rest.uri": "http://localhost:8181",
-            "rest.warehouse": "s3://feldera-iceberg-test/",
-            "table_name": "iceberg_test.test_table_v2",
-            "s3.access-key-id": std::env::var("ICEBERG_TEST_AWS_ACCESS_KEY_ID").unwrap(),
-            "s3.secret-access-key": std::env::var("ICEBERG_TEST_AWS_SECRET_ACCESS_KEY").unwrap(),
-            "s3.region": "us-east-1",
+            "rest.warehouse": "s3://feldera-ci-iceberg/",
+            "table_name": "iceberg_test.test_table_v3",
+            "s3.region": env_or("ICEBERG_TEST_REGION", "us-west-1"),
         }),
     );
 
     let zset = file_to_zset::<IcebergTestStruct>(json_file.as_file_mut());
 
-    assert_eq!(zset.len(), 2000000);
+    assert_eq!(zset.len_upper_bound(), 2000000);
     //assert_eq!(zset, expected_zset);
+}
+
+// ---------------------------------------------------------------------------
+// Follow-mode tests (feature `iceberg-tests-follow`).
+//
+// These need a REST catalog and an S3 store that both the writer (pyiceberg)
+// and the connector (iceberg-rust) can reach. Defaults target the local docker
+// setup in crates/iceberg/src/test/README.md; override via FELDERA_ICEBERG_*.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(
+    feature = "iceberg-tests-follow",
+    feature = "iceberg-tests-glue",
+    feature = "iceberg-tests-rest"
+))]
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Connector transport config for a REST-catalog table `mode` on the test store.
+#[cfg(feature = "iceberg-tests-follow")]
+fn rest_follow_config(table: &str, mode: &str) -> serde_json::Value {
+    json!({
+        "mode": mode,
+        "catalog_type": "rest",
+        "rest.uri": env_or("FELDERA_ICEBERG_REST_URI", "http://localhost:8181"),
+        "rest.warehouse": env_or("FELDERA_ICEBERG_WAREHOUSE", "s3://test/iceberg-follow"),
+        "table_name": table,
+        "s3.endpoint": env_or("FELDERA_ICEBERG_S3_ENDPOINT", "http://localhost:9000"),
+        "s3.access-key-id": env_or("FELDERA_ICEBERG_S3_KEY", "minio"),
+        "s3.secret-access-key": env_or("FELDERA_ICEBERG_S3_SECRET", "miniopasswd"),
+        "s3.region": env_or("FELDERA_ICEBERG_S3_REGION", "us-east-1"),
+        // MinIO (and most non-AWS S3) serve path-style URLs; the opendal S3
+        // backend defaults to virtual-host style, so opt out explicitly.
+        "s3.path-style-access": env_or("FELDERA_ICEBERG_S3_PATH_STYLE", "true"),
+    })
+}
+
+/// The follow connector config for `table` with an extra `key = value` option
+/// merged in (e.g. a `snapshot_id` follow start point).
+#[cfg(feature = "iceberg-tests-follow")]
+fn rest_follow_config_with(
+    table: &str,
+    mode: &str,
+    key: &str,
+    value: serde_json::Value,
+) -> serde_json::Value {
+    let mut config = rest_follow_config(table, mode);
+    config
+        .as_object_mut()
+        .expect("iceberg connector config must be a JSON object")
+        .insert(key.to_string(), value);
+    config
+}
+
+/// Create (`op = "create"`) or append to (`op = "append"`) the REST-catalog test
+/// table with `chunk`, producing a new snapshot. Returns the new snapshot's id so
+/// a test can pin it as a follow start point. Shells out to the pyiceberg helper,
+/// since iceberg-rust cannot write tables.
+#[cfg(feature = "iceberg-tests-follow")]
+fn follow_table_op(op: &str, table: &str, chunk: &[IcebergTestStruct]) -> i64 {
+    let ndjson = data_to_ndjson(chunk.to_vec());
+    let script = "../iceberg/src/test/follow_table.py";
+    let python = env_or("FELDERA_ICEBERG_PYTHON", "python3");
+    let output = std::process::Command::new(python)
+        .arg(script)
+        .arg(format!("--op={op}"))
+        .arg(format!("--table={table}"))
+        .arg(format!("--json-file={}", ndjson.path().display()))
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run '{script}': {e}"));
+    if !output.status.success() {
+        panic!(
+            "'{script} --op={op}' failed (status {}):\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    // The writer prints the new snapshot id on its last stdout line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let last = stdout.trim().lines().last().unwrap_or_default();
+    last.parse::<i64>()
+        .unwrap_or_else(|_| panic!("'{script} --op={op}' printed unexpected output: {last:?}"))
+}
+
+/// Create the REST-catalog test table `table` without any snapshot.
+#[cfg(feature = "iceberg-tests-follow")]
+fn follow_table_create_empty(table: &str) {
+    let script = "../iceberg/src/test/follow_table.py";
+    let python = env_or("FELDERA_ICEBERG_PYTHON", "python3");
+    let output = std::process::Command::new(python)
+        .arg(script)
+        .arg("--op=create-empty")
+        .arg(format!("--table={table}"))
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run '{script}': {e}"));
+    if !output.status.success() {
+        panic!(
+            "'{script} --op=create-empty' failed (status {}):\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+/// Read a single custom metric of the Iceberg connector, or `0.0` if absent.
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_metric(pipeline: &Controller, name: &str) -> f64 {
+    iceberg_connector_metrics(pipeline)
+        .get(name)
+        .copied()
+        .unwrap_or(0.0)
+}
+
+/// Wait for the catchup target gauge to reset. The connector clears it just
+/// after it queues the commit, so it can lag the output.
+#[cfg(feature = "iceberg-tests-follow")]
+fn wait_catchup_window_closed(pipeline: &Controller) {
+    wait(
+        || {
+            iceberg_metric(
+                pipeline,
+                "input_connector_iceberg_catchup_target_sequence_number",
+            ) == -1.0
+        },
+        10_000,
+    )
+    .expect("catchup target gauge never reset");
+}
+
+/// Sum of the records the connector has ingested so far (snapshot phase plus
+/// follow phase), read from its custom metrics.
+#[cfg(feature = "iceberg-tests-follow")]
+fn ingested_records(pipeline: &Controller) -> u64 {
+    (iceberg_metric(pipeline, "input_connector_iceberg_snapshot_records_total")
+        + iceberg_metric(pipeline, "input_connector_iceberg_follow_records_total")) as u64
+}
+
+/// Run `body` against a running follow-mode pipeline, then stop it. The output
+/// file receives `insert_delete` JSON.
+#[cfg(feature = "iceberg-tests-follow")]
+fn with_follow_pipeline<F>(table: &str, mode: &str, body: F)
+where
+    F: FnOnce(&Controller, &std::path::Path),
+{
+    with_follow_pipeline_cfg(rest_follow_config(table, mode), body)
+}
+
+/// Like [`with_follow_pipeline`], but takes a fully built connector config so a
+/// test can add options such as a `snapshot_id` follow start point.
+#[cfg(feature = "iceberg-tests-follow")]
+fn with_follow_pipeline_cfg<F>(config: serde_json::Value, body: F)
+where
+    F: FnOnce(&Controller, &std::path::Path),
+{
+    let json_file = NamedTempFile::new().unwrap();
+    let (pipeline, err_receiver) = iceberg_input_pipeline::<IcebergTestStruct>(
+        &IcebergTestStruct::schema_with_lateness(),
+        &[],
+        config,
+        &json_file.path().display().to_string(),
+    );
+    pipeline.start();
+
+    // Surface connector errors promptly instead of hanging until a timeout.
+    let watch = err_receiver.clone();
+    let guard = std::thread::spawn(move || {
+        if let Ok(msg) = watch.recv() {
+            panic!("follow pipeline reported an error: {msg}");
+        }
+    });
+
+    body(&pipeline, json_file.path());
+
+    assert!(err_receiver.is_empty(), "follow pipeline reported errors");
+    pipeline.stop().unwrap();
+    drop(guard);
+}
+
+/// `snapshot_and_follow`: the initial snapshot is read, then a second snapshot
+/// committed before startup is caught up via follow. Every row lands once.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_snapshot_and_follow() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(10);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.snapshot_and_follow");
+
+    // Two snapshots exist before the connector starts.
+    follow_table_op("create", table, &all[..5]);
+    follow_table_op("append", table, &all[5..]);
+
+    with_follow_pipeline(table, "snapshot_and_follow", |pipeline, out_path| {
+        wait(|| ingested_records(pipeline) >= 10, 120_000)
+            .expect("timed out ingesting snapshot + follow");
+        // Let the output connector flush the ingested rows.
+        wait(|| output_record_count(out_path) >= 10, 60_000).expect("timed out writing output");
+
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 10);
+        assert_eq!(zset, expected_zset(&all));
+    });
+}
+
+/// `snapshot_and_follow`: a connector that resumes from a checkpoint taken
+/// while it followed the table continues to follow it, without reading the
+/// snapshot again.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_resume_does_not_reread_snapshot() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(10);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.resume_follow");
+    let storage_dir = tempfile::TempDir::new().unwrap();
+    let run = |out: &NamedTempFile| {
+        iceberg_input_pipeline_with_storage::<IcebergTestStruct>(
+            &IcebergTestStruct::schema_with_lateness(),
+            &[],
+            rest_follow_config(table, "snapshot_and_follow"),
+            &out.path().display().to_string(),
+            Some(storage_dir.path()),
+            false,
+        )
+    };
+
+    // Read the snapshot, then suspend while following.
+    follow_table_op("create", table, &all[..5]);
+    let first_out = NamedTempFile::new().unwrap();
+    let (pipeline, _errors) = run(&first_out);
+    pipeline.start();
+    wait(|| output_record_count(first_out.path()) >= 5, 120_000)
+        .expect("timed out reading the snapshot");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    pipeline.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(100))
+        .expect("timed out suspending")
+        .expect("suspend failed");
+    pipeline.stop().unwrap();
+
+    // Resume after another snapshot.  Only its rows are new.
+    follow_table_op("append", table, &all[5..]);
+    let second_out = NamedTempFile::new().unwrap();
+    let (pipeline, _errors) = run(&second_out);
+    pipeline.start();
+    wait(|| output_record_count(second_out.path()) >= 5, 120_000)
+        .expect("timed out following the table");
+    // Give a read of the snapshot time to show up.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    pipeline.stop().unwrap();
+
+    let zset = output_zset(second_out.path());
+    assert_eq!(zset.len_upper_bound(), 5, "the snapshot was read again");
+    assert_eq!(zset, expected_zset(&all[5..]));
+}
+
+/// `snapshot_and_follow` on a table with no snapshot, read by a distributed
+/// connector in a transaction: the empty snapshot's transaction commits, so it
+/// does not hold back the pipeline until the table gets a snapshot.  A
+/// connector that resumes then follows the table from its first snapshot.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_empty_table() {
+    use dbsp::trace::BatchReader;
+    use feldera_types::adapter_stats::TransactionStatus;
+
+    let all = data(5);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.empty_follow");
+    let storage_dir = tempfile::TempDir::new().unwrap();
+    let run = |out: &NamedTempFile| {
+        iceberg_input_pipeline_with_storage::<IcebergTestStruct>(
+            &IcebergTestStruct::schema_with_lateness(),
+            &[],
+            rest_follow_config_with(
+                table,
+                "snapshot_and_follow",
+                "transaction_mode",
+                json!("snapshot"),
+            ),
+            &out.path().display().to_string(),
+            Some(storage_dir.path()),
+            true,
+        )
+    };
+
+    follow_table_create_empty(table);
+    let first_out = NamedTempFile::new().unwrap();
+    let (pipeline, _errors) = run(&first_out);
+    pipeline.start();
+    wait(
+        || iceberg_metric(&pipeline, "input_connector_iceberg_phase") > 0.0,
+        60_000,
+    )
+    .expect("timed out reaching follow mode");
+    wait(
+        || {
+            pipeline.api_status(false).global_metrics.transaction_status
+                == TransactionStatus::NoTransaction
+        },
+        10_000,
+    )
+    .expect("the empty snapshot's transaction stayed open");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    pipeline.start_suspend(Box::new(move |result| sender.send(result).unwrap()));
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(100))
+        .expect("timed out suspending")
+        .expect("suspend failed");
+    pipeline.stop().unwrap();
+
+    // The table gets its first snapshot.  The connector follows it.
+    follow_table_op("append", table, &all);
+    let second_out = NamedTempFile::new().unwrap();
+    let (pipeline, _errors) = run(&second_out);
+    pipeline.start();
+    wait(|| output_record_count(second_out.path()) >= 5, 120_000)
+        .expect("timed out following the table");
+    assert_eq!(
+        iceberg_metric(&pipeline, "input_connector_iceberg_follow_records_total"),
+        5.0
+    );
+    pipeline.stop().unwrap();
+
+    let zset = output_zset(second_out.path());
+    assert_eq!(zset.len_upper_bound(), 5);
+    assert_eq!(zset, expected_zset(&all));
+}
+
+/// `follow`: no initial snapshot; a snapshot committed after startup is tailed.
+/// Rows present before the start snapshot are not ingested.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_live_append() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(10);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.live_append");
+
+    // The connector starts following after this snapshot, so these rows are
+    // not ingested.
+    follow_table_op("create", table, &all[..5]);
+
+    with_follow_pipeline(table, "follow", |pipeline, out_path| {
+        // Nothing to ingest until a new snapshot appears.
+        follow_table_op("append", table, &all[5..]);
+
+        wait(|| ingested_records(pipeline) >= 5, 120_000)
+            .expect("timed out tailing the appended snapshot");
+        wait(|| output_record_count(out_path) >= 5, 60_000).expect("timed out writing output");
+
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 5);
+        assert_eq!(zset, expected_zset(&all[5..]));
+    });
+}
+
+/// `follow` with an explicit `snapshot_id` start point. Three snapshots (A, B,
+/// C) exist before the connector starts; following from B must ingest only C's
+/// rows, never A's or B's, since `snapshots_after` walks the ancestry back to B.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_start_from_snapshot_id() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(15);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.start_from_id");
+
+    follow_table_op("create", table, &all[..5]); // snapshot A
+    let snapshot_b = follow_table_op("append", table, &all[5..10]); // snapshot B
+    follow_table_op("append", table, &all[10..]); // snapshot C
+
+    let config = rest_follow_config_with(table, "follow", "snapshot_id", json!(snapshot_b));
+    with_follow_pipeline_cfg(config, |pipeline, out_path| {
+        wait(|| ingested_records(pipeline) >= 5, 120_000)
+            .expect("timed out following from the pinned snapshot");
+        wait(|| output_record_count(out_path) >= 5, 60_000).expect("timed out writing output");
+
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 5);
+        assert_eq!(zset, expected_zset(&all[10..]));
+    });
+}
+
+/// `follow`: `end_snapshot_id` stops the connector after fully ingesting the
+/// named snapshot. Three snapshots (A, B, C) exist before startup; following
+/// from A with `end_snapshot_id = B` must ingest only B's rows, reach the
+/// completed phase, and never ingest C, even though C is in the same catch-up
+/// batch as B.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_end_snapshot_id() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(15);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.end_snapshot");
+
+    let snapshot_a = follow_table_op("create", table, &all[..5]); // snapshot A
+    let snapshot_b = follow_table_op("append", table, &all[5..10]); // snapshot B
+    follow_table_op("append", table, &all[10..]); // snapshot C
+
+    let mut config = rest_follow_config_with(table, "follow", "snapshot_id", json!(snapshot_a));
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert("end_snapshot_id".to_string(), json!(snapshot_b));
+
+    with_follow_pipeline_cfg(config, |pipeline, out_path| {
+        // Phase 2 = completed: only set once the end snapshot is reached.
+        wait(
+            || iceberg_metric(pipeline, "input_connector_iceberg_phase") == 2.0,
+            120_000,
+        )
+        .expect("timed out reaching the end snapshot");
+        wait(|| output_record_count(out_path) >= 5, 60_000).expect("timed out writing output");
+
+        // Stopped at B: C's rows are never ingested and exactly one follow
+        // snapshot was processed.
+        assert_eq!(ingested_records(pipeline), 5);
+        assert_eq!(
+            iceberg_metric(pipeline, "input_connector_iceberg_follow_snapshots_total"),
+            1.0
+        );
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 5);
+        assert_eq!(zset, expected_zset(&all[5..10]));
+    });
+}
+
+/// `transaction_mode = always`: each followed snapshot forms its own Feldera
+/// transaction. Following from A over two pre-committed snapshots (B, C) starts
+/// two follow transactions.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_transaction_always() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(15);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.txn_always");
+
+    let snapshot_a = follow_table_op("create", table, &all[..5]); // A
+    follow_table_op("append", table, &all[5..10]); // B
+    follow_table_op("append", table, &all[10..]); // C
+
+    let mut config = rest_follow_config_with(table, "follow", "snapshot_id", json!(snapshot_a));
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert("transaction_mode".to_string(), json!("always"));
+
+    with_follow_pipeline_cfg(config, |pipeline, out_path| {
+        wait(|| ingested_records(pipeline) >= 10, 120_000).expect("timed out following B and C");
+        wait(|| output_record_count(out_path) >= 10, 60_000).expect("timed out writing output");
+
+        // One transaction per followed snapshot: B and C. (Reverting the
+        // per-snapshot allocation drops this below 2.)
+        assert_eq!(
+            iceberg_metric(
+                pipeline,
+                "input_connector_iceberg_follow_transaction_starts"
+            ),
+            2.0
+        );
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 10);
+        assert_eq!(zset, expected_zset(&all[5..]));
+    });
+}
+
+/// `transaction_mode = catchup`: all snapshots caught up in one poll form a
+/// single Feldera transaction. Following from A over two pre-committed snapshots
+/// (B, C), both seen in the first poll, starts exactly one follow transaction.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_transaction_catchup() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(15);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.txn_catchup");
+
+    let snapshot_a = follow_table_op("create", table, &all[..5]); // A
+    follow_table_op("append", table, &all[5..10]); // B
+    follow_table_op("append", table, &all[10..]); // C
+
+    let mut config = rest_follow_config_with(table, "follow", "snapshot_id", json!(snapshot_a));
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert("transaction_mode".to_string(), json!("catchup"));
+
+    with_follow_pipeline_cfg(config, |pipeline, out_path| {
+        wait(|| ingested_records(pipeline) >= 10, 120_000).expect("timed out following B and C");
+        wait(|| output_record_count(out_path) >= 10, 60_000).expect("timed out writing output");
+
+        // B and C are committed before startup, so the first catch-up poll sees
+        // both and groups them into one transaction. (In `always` this is 2;
+        // that difference is the point of the mode.)
+        assert_eq!(
+            iceberg_metric(
+                pipeline,
+                "input_connector_iceberg_follow_transaction_starts"
+            ),
+            1.0
+        );
+        wait_catchup_window_closed(pipeline);
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 10);
+        assert_eq!(zset, expected_zset(&all[5..]));
+    });
+}
+
+/// `transaction_mode = catchup` with `end_snapshot_id` landing mid-batch: the
+/// catchup window opens targeting the batch's last snapshot (C), but the end
+/// bound B is reached first. The open catchup transaction (holding B's rows)
+/// must be committed at the end bound, C must never be read, and the target
+/// gauge must reset. This is the one interaction the plain `end_snapshot_id`
+/// test (transaction_mode `none`) does not exercise.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_transaction_catchup_end_snapshot_id() {
+    use dbsp::trace::BatchReader;
+
+    let all = data(15);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.txn_catchup_end");
+
+    let snapshot_a = follow_table_op("create", table, &all[..5]); // A
+    let snapshot_b = follow_table_op("append", table, &all[5..10]); // B
+    follow_table_op("append", table, &all[10..]); // C
+
+    let mut config = rest_follow_config_with(table, "follow", "snapshot_id", json!(snapshot_a));
+    {
+        let object = config.as_object_mut().unwrap();
+        object.insert("transaction_mode".to_string(), json!("catchup"));
+        object.insert("end_snapshot_id".to_string(), json!(snapshot_b));
+    }
+
+    with_follow_pipeline_cfg(config, |pipeline, out_path| {
+        // Phase 2 = completed: only set once the end snapshot is reached.
+        wait(
+            || iceberg_metric(pipeline, "input_connector_iceberg_phase") == 2.0,
+            120_000,
+        )
+        .expect("timed out reaching the end snapshot");
+        wait(|| output_record_count(out_path) >= 5, 60_000).expect("timed out writing output");
+
+        // Only B ingested; C never read even though it shared the catch-up batch.
+        assert_eq!(ingested_records(pipeline), 5);
+        assert_eq!(
+            iceberg_metric(pipeline, "input_connector_iceberg_follow_snapshots_total"),
+            1.0
+        );
+        // The end bound committed the open catchup transaction: exactly one
+        // follow transaction started, and the target gauge reset on close.
+        assert_eq!(
+            iceberg_metric(
+                pipeline,
+                "input_connector_iceberg_follow_transaction_starts"
+            ),
+            1.0
+        );
+        wait_catchup_window_closed(pipeline);
+        let zset = output_zset(out_path);
+        assert_eq!(zset.len_upper_bound(), 5);
+        assert_eq!(zset, expected_zset(&all[5..10]));
+    });
+}
+
+/// Covers the follow delete path (removed files), which the append-only follow
+/// tests miss. A copy-on-write overwrite removes the old files and adds new
+/// ones; drop one row and edit another, then expect the four survivors.
+#[test]
+#[cfg(feature = "iceberg-tests-follow")]
+fn iceberg_rest_follow_copy_on_write_delete() {
+    let all = data(5);
+    let ns = env_or("FELDERA_ICEBERG_NAMESPACE", "follow_ns");
+    let table = &format!("{ns}.cow_delete");
+
+    follow_table_op("create", table, &all);
+
+    let mut updated = all[..4].to_vec();
+    updated[2].s = "cow-updated".to_string();
+
+    with_follow_pipeline(table, "snapshot_and_follow", |pipeline, out_path| {
+        wait(|| ingested_records(pipeline) >= 5, 120_000).expect("timed out ingesting snapshot");
+        follow_table_op("overwrite", table, &updated);
+        // Overwrite reads 5 deletes + 4 inserts, so ingested reaches 14.
+        wait(|| ingested_records(pipeline) >= 14, 120_000)
+            .expect("timed out following the overwrite");
+        // Deletes and inserts may reach the output in separate steps, so wait
+        // for the final state, not a line count.
+        let expected = expected_zset(&updated);
+        let _ = wait(|| output_zset(out_path) == expected, 60_000);
+        assert_eq!(output_zset(out_path), expected);
+    });
+}
+
+/// Number of complete `insert_delete` records written to the output file so
+/// far (one JSON value per line).
+#[cfg(feature = "iceberg-tests-follow")]
+fn output_record_count(path: &std::path::Path) -> usize {
+    std::fs::read(path)
+        .map(|bytes| bytes.iter().filter(|&&b| b == b'\n').count())
+        .unwrap_or(0)
+}
+
+/// The zset of the output file, ignoring a partly written last line.
+#[cfg(feature = "iceberg-tests-follow")]
+fn output_zset(path: &std::path::Path) -> dbsp::OrdZSet<IcebergTestStruct> {
+    let bytes = std::fs::read(path).unwrap();
+    let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    crate::test::bytes_to_zset::<IcebergTestStruct>(&bytes[..complete])
+}
+
+/// The all-`+1` zset the connector should produce for `data`.
+#[cfg(feature = "iceberg-tests-follow")]
+fn expected_zset(data: &[IcebergTestStruct]) -> dbsp::OrdZSet<IcebergTestStruct> {
+    dbsp::OrdZSet::from_tuples(
+        (),
+        data.iter()
+            .cloned()
+            .map(|x| dbsp::utils::Tup2(dbsp::utils::Tup2(x, ()), 1))
+            .collect(),
+    )
 }

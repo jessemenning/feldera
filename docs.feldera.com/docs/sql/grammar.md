@@ -10,8 +10,8 @@ form.
 - Parentheses `()` are used for grouping productions together.
 - The vertical bar `|` indicates choice between two constructs.
 
-SQL reserved keywords cannot be used as table and view names.  In
-addition, the following keywords are reserved: `USER`, `NOW`.
+SQL [reserved keywords](#reserved-keywords) cannot be used as table and
+view names.
 Identifiers starting with "Feldera" (in any case combination) are used
 for system objects, such as the error view, and should not be used for
 user-defined objects.
@@ -62,7 +62,7 @@ See [user-defined types](types.md#user-defined-types)
 ```
 createTableStatement
   :   CREATE TABLE name
-      '(' tableElement [, tableElement ]* ')'
+      '(' tableElement [, tableElement ]* [ , ] ')'
       [ 'WITH' keyValueList ]
 
 tableElement
@@ -95,6 +95,8 @@ keyValue
     |   INTERNED
 -->
 
+The list of `tableElement`s may end with a comma.
+
 Columns that are part of a `PRIMARY KEY` cannot have nullable types.
 
 Columns that are part of a `FOREIGN KEY` must refer to `PRIMARY KEY`
@@ -107,10 +109,10 @@ their types.  Here is an example:
 
 ```sql
 CREATE TABLE empsalary (
-    depname varchar not null PRIMARY KEY,
-    empno bigint FOREIGN KEY REFERENCES employee(empid),
-    salary int,
-    enroll_date date
+    depname VARCHAR NOT NULL PRIMARY KEY,
+    empno BIGINT FOREIGN KEY REFERENCES employee(empid),
+    salary INT,
+    enroll_date DATE
 );
 ```
 
@@ -121,10 +123,10 @@ string.  Here is an example:
 
 ```sql
 CREATE TABLE empsalary (
-    depname varchar,
-    empno bigint,
-    salary int,
-    enroll_date date
+    depname VARCHAR,
+    empno BIGINT,
+    salary INT,
+    enroll_date DATE
 ) WITH (
     'materialized' = 'true'
 );
@@ -146,7 +148,7 @@ Kafka connector, the following expression can be used to extract the
 kafka topic name as a column default value:
 
 ```sql
-CREATE TABLE T(
+CREATE TABLE t(
   kafka_topic VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['kafka_topic'] AS VARCHAR),
   ...
 )
@@ -173,7 +175,12 @@ WITH (
 ```
 
 For the available metadata properties that can be extracted, see the
-documentation for each connector.
+documentation for each connector.  One property, `is_delete`, is reported by any
+input connector configured with
+[soft deletes](/connectors#soft-deletes).  A request to the
+[HTTP input connector](/connectors/sources/http#connector-metadata) can
+attach any properties to its records through the `connector_metadata` query
+parameter.
 
 #### Materialized tables
 
@@ -234,10 +241,11 @@ currently only the Delta table and Iceberg connectors can take
 advantage of this feature.
 
 Note: The simplest way to exclude unused columns is to omit them from
-the Feldera SQL table declaration. The connector never reads columns
-that aren't declared in the SQL schema. Additionally, the SQL compiler
-emits warnings for declared but unused columns—use these as a guide to
-optimize your schema.
+the Feldera SQL table declaration. A connector may still read an
+undeclared column that its own configuration names, such as the Delta
+connector's `filter`; that connector's documentation gives the exact
+rule. Additionally, the SQL compiler emits warnings for declared but
+unused columns—use these as a guide to optimize your schema.
 
 Why not always skip unused columns?  When a table is materialized, the
 pipeline stores internally the contents of the table ingested so far.
@@ -253,7 +261,7 @@ https://docs.feldera.com/pipelines/modifying/#limitation-3-table-evolution-is-no
 Example:
 
 ```sql
-CREATE TABLE T(x INT, unused INT DEFAULT 0)
+CREATE TABLE t(x INT, unused INT DEFAULT 0)
 WITH ('skip_unused_columns' = 'true');
 ```
 
@@ -266,10 +274,6 @@ latenessStatement
 ```
 
 See [Streaming SQL Extensions, LATENESS](streaming.md#lateness-expressions)
-
-<!-- ### WATERMARKS
-
-See [Streaming SQL Extensions, WATERMARKS](streaming.md#watermark-expressions) -->
 
 ## Creating user-defined functions.
 
@@ -296,7 +300,8 @@ createAggregateStatement
 keyword can be used to indicate that the declared view is not exposed
 to the outside world as an output of the computation.  This is useful
 for modularizing the SQL code, by declaring intermediate views that
-are used in the implementation of other views.
+are used in the implementation of other views.  A `LOCAL` view cannot
+have [connectors](/connectors/) attached, since it produces no output.
 The `MATERIALIZED` keyword instructs Feldera to maintain a full copy
 of the view's output in addition to producing the
 stream of changes.
@@ -355,13 +360,15 @@ values
   :   { VALUES | VALUE } expression [, expression ]*
 
 select
-  :   SELECT [ hintComment ] [ ALL | DISTINCT [ ON '(' expression [ ',' expression ]* ')' ] ] { * | projectItem [, projectItem ]* }
+  :   SELECT [ hintComment ] [ ALL | DISTINCT [ ON '(' expression [ ',' expression ]* ')' ] ] { * | projectItem [, projectItem ]* [ , ] }
       FROM tableExpression
       [ WHERE booleanExpression ]
       [ GROUP BY { ALL | [ ALL | DISTINCT ] { groupItem [, groupItem ]* } } ]
       [ HAVING booleanExpression ]
       [ QUALIFY booleanExpression ]
 ```
+
+The list of `projectItem`s may end with a comma.
 
 `DISTINCT ON` allows you to eliminate duplicate rows based on
 specified expressions, keeping the first row in each group as
@@ -396,7 +403,7 @@ groupItem:
 
 selectWithoutFrom
   :   SELECT [ ALL | DISTINCT ]
-          { * | projectItem [, projectItem ]* }
+          { * | projectItem [, projectItem ]* [ , ] }
 
 selectWithExclude
   :   SELECT [ tableName '.' ] '*' [ ( 'EXCLUDE' | 'EXCEPT' ) parensColumnList ]
@@ -588,9 +595,9 @@ Feldera than in standard databases; the statement is used to specify
 fragment:
 
 ```sql
-CREATE VIEW V AS SELECT id, ... FROM ...;
+CREATE VIEW v AS SELECT id, ... FROM ...;
 
-CREATE INDEX v_index ON V(id);
+CREATE INDEX v_index ON v(id);
 ```
 
 The `CREATE INDEX` statement creates an index named `v_index` over the
@@ -653,30 +660,30 @@ to `GROUP BY`.
 Example using `GROUPING`:
 
 ```sql
-select deptno, job, count(*) as c, grouping(deptno) as d,
-  grouping(job) j, grouping(deptno, job) as x
-from emp
-group by cube(deptno, job);
+SELECT deptno, job, COUNT(*) AS c, GROUPING(deptno) AS d,
+  GROUPING(job) j, GROUPING(deptno, job) AS x
+FROM emp
+GROUP BY CUBE(deptno, job);
 +--------+-----------+----+---+---+---+
-| DEPTNO | JOB       | C  | D | J | X |
+| deptno | job       | c  | d | j | x |
 +--------+-----------+----+---+---+---+
-|     10 | CLERK     |  1 | 0 | 0 | 0 |
-|     10 | MANAGER   |  1 | 0 | 0 | 0 |
-|     10 | PRESIDENT |  1 | 0 | 0 | 0 |
+|     10 | clerk     |  1 | 0 | 0 | 0 |
+|     10 | manager   |  1 | 0 | 0 | 0 |
+|     10 | president |  1 | 0 | 0 | 0 |
 |     10 |           |  3 | 0 | 1 | 1 |
-|     20 | ANALYST   |  2 | 0 | 0 | 0 |
-|     20 | CLERK     |  2 | 0 | 0 | 0 |
-|     20 | MANAGER   |  1 | 0 | 0 | 0 |
+|     20 | analyst   |  2 | 0 | 0 | 0 |
+|     20 | clerk     |  2 | 0 | 0 | 0 |
+|     20 | manager   |  1 | 0 | 0 | 0 |
 |     20 |           |  5 | 0 | 1 | 1 |
-|     30 | CLERK     |  1 | 0 | 0 | 0 |
-|     30 | MANAGER   |  1 | 0 | 0 | 0 |
-|     30 | SALESMAN  |  4 | 0 | 0 | 0 |
+|     30 | clerk     |  1 | 0 | 0 | 0 |
+|     30 | manager   |  1 | 0 | 0 | 0 |
+|     30 | salesman  |  4 | 0 | 0 | 0 |
 |     30 |           |  6 | 0 | 1 | 1 |
-|        | ANALYST   |  2 | 1 | 0 | 2 |
-|        | CLERK     |  4 | 1 | 0 | 2 |
-|        | MANAGER   |  3 | 1 | 0 | 2 |
-|        | PRESIDENT |  1 | 1 | 0 | 2 |
-|        | SALESMAN  |  4 | 1 | 0 | 2 |
+|        | analyst   |  2 | 1 | 0 | 2 |
+|        | clerk     |  4 | 1 | 0 | 2 |
+|        | manager   |  3 | 1 | 0 | 2 |
+|        | president |  1 | 1 | 0 | 2 |
+|        | salesman  |  4 | 1 | 0 | 2 |
 |        |           | 14 | 1 | 1 | 3 |
 +--------+-----------+----+---+---+---+
 ```
@@ -712,6 +719,14 @@ windowRange
 Where `agg` is a window aggregate function as described in the [section
 on aggregation](aggregates.md#window-aggregate-functions).
 
+Window aggregates generally do not support `DISTINCT` qualifiers, e.g.:
+`SELECT COUNT(DISTINCT x) OVER (PARTITION BY p ORDER BY ts RANGE BETWEEN
+INTERVAL 1 HOUR PRECEDING AND CURRENT ROW)` is rejected.
+However, for the following aggregate functions the result is the same with or
+without the `DISTINCT` qualifier, and thus the compiler accepts them
+in even in a window with `DISTINCT`: `MIN`, `MAX`, `BIT_AND`, `BIT_OR`, `EVERY`,
+`SOME`, `BOOL_AND`, `BOOL_OR`, `LOGICAL_AND`, and `LOGICAL_OR`.
+
 Currently we require window ranges to have constant values.  This
 precludes ranges such as `INTERVAL 1 YEAR`, which have variable sizes.
 The window bounds must be non-negative constant values.
@@ -743,8 +758,8 @@ the right table are null-padded.
 
 ```sql
 SELECT *
-FROM left_table LEFT ASOF JOIN right_table
-MATCH_CONDITION ( left_table.timecol >= right_table.timecol )
+FROM left_table LEFT asof JOIN right_table
+match_condition ( left_table.timecol >= right_table.timecol )
 ON left_table.col = right_table.col
 ```
 
@@ -818,14 +833,98 @@ generate code using the new feature of "star joins", which are a
 simple form of multi-joins.  We expect that option will be removed in
 the near future.
 
-`FELDERA_FLAT_VARIANT` if set to `ON`, the pipeline uses a new, faster
-runtime representation for values of type
-[`VARIANT`](/sql/json/#the-variant-type): a flat, contiguous buffer instead of
-a tree of nested allocations, which speeds up parsing JSON into
-`VARIANT` values and most `VARIANT` operations.  This option is
-currently experimental; the plan is to make the new representation the
-default in a future release.  The storage formats of the two
-representations are not compatible: changing the option modifies the
-circuit and therefore forces the pipeline to rebuild its state from
-scratch, so switching back and forth is not recommended.
+If `FELDERA_FLAT_VARIANT` is set to `OFF`, the pipeline reverts to the
+previous runtime representation for values of type
+[`VARIANT`](/sql/json/#the-variant-type).
+The previous representation will be
+removed in a future release.  A user-defined
+function that takes or returns a `VARIANT` must be written against the
+representation the option selects; see
+[`feldera_sqllib::SqlVariant`](/sql/udf).
 
+The storage formats of the two representations are not compatible.
+A pipeline that starts with the other representation does not find its
+checkpointed state; it reports the tables and views this affects and waits
+for approval before rebuilding them.
+
+To continue running a pipeline created with the legacy format
+from an old checkpoint, add the setting `SET FELDERA_FLAT_VARIANT = OFF;`
+to the SQL program before restarting.  This will enable the program to correctly
+read the old checkpoint representation.  Add it before the pipeline runs with
+the new representation: once the pipeline checkpoints, the old checkpoint is
+superseded, and setting the option no longer recovers that state.
+
+
+`FELDERA_LAZY_UPSERT` if set to `ON`, the pipeline uses an optimized
+implementation for tables with a primary key.  This implementation
+does not support partial updates (JSON
+[`update` events](/formats/json#the-insertdelete-format)).  Do not
+enable this option if you need partial updates.  The default is `OFF`.
+A change of this option can make the pipeline re-ingest its input data
+(see [Bootstrapping](/pipelines/modifying#bootstrapping)).
+
+`FELDERA_WINDOW_SHARING_THRESHOLD` how windows formed by temporal
+filters share inputs.  Two temporal filters that share an input keep
+a single copy of the data.  This settings is the number of temporal
+filters that are required to share a source in order to enable sharing.
+The default is 10; setting the option to 0
+disables the optimization.  This option is currently experimental.
+
+## Reserved keywords
+
+A reserved keyword can name a table, view, column, function, or alias
+only when it is written as a [quoted identifier](identifiers.md), as in
+`"select"`.  The following words are reserved:
+
+| Initial | Reserved keywords |
+|---|---|
+| A | `ANY`, `ASOF` |
+| C | `CALL`, `CASE`, `CREATE`, `CROSS`, `CURRENT`, `CURSOR` |
+| D | `DATE`, `DATEADD`, `DATEDIFF`, `DATEPART`, `DATETIME`, `DATE_PART`, `DEFAULT`, `DEFINE`, `DELETE`, `DESCRIBE`, `DISTINCT`, `DROP` |
+| E | `END-EXEC`, `EXCEPT`, `EXPLAIN` |
+| F | `FETCH`, `FOREIGN`, `FRIDAY`, `FROM`, `FULL` |
+| G | `GROUP`, `GROUPING` |
+| H | `HAVING` |
+| I | `IN`, `INDEX`, `INNER`, `INSERT`, `INTERNED`, `INTERSECT`, `INTERVAL`, `INTO` |
+| J | `JOIN` |
+| L | `LATENESS`, `LATERAL`, `LEFT`, `LIMIT` |
+| M | `MATCH_CONDITION`, `MATCH_RECOGNIZE`, `MATERIALIZED`, `MEASURE`, `MERGE`, `MINUS`, `MONDAY` |
+| N | `NATURAL`, `NEW`, `NEXT`, `NULL` |
+| O | `OFFSET`, `ON`, `ORDER`, `ORDINAL`, `OUTER`, `OVER` |
+| P | `PARTITION`, `PATTERN`, `PRIMARY` |
+| Q | `QUALIFY` |
+| R | `RANGE`, `REMOVE`, `RIGHT`, `ROLLUP`, `ROW`, `ROWS` |
+| S | `SAFE_CAST`, `SAFE_OFFSET`, `SAFE_ORDINAL`, `SATURDAY`, `SELECT`, `SEMI`, `SET`, `SKIP`, `SOME`, `STREAM`, `SUNDAY` |
+| T | `TABLE`, `TABLESAMPLE`, `THEN`, `THURSDAY`, `TIME`, `TIMESTAMP`, `TRY_CAST`, `TUESDAY` |
+| U | `UNION`, `UNNEST`, `UNSIGNED`, `UPDATE`, `USING`, `UUID` |
+| V | `VALUES`, `VARIANT` |
+| W | `WEDNESDAY`, `WHEN`, `WHERE`, `WINDOW`, `WITH` |
+
+Feldera reserves far fewer words than the SQL standard does; `AND`,
+`CAST`, `COUNT`, `SUM`, `VARCHAR`, and several hundred other standard
+keywords are legal unquoted identifiers.  A few of these words are
+still unusable as unquoted column references:
+
+- `ALL`, `EXISTS`, `NOT`, and `UNIQUE` begin an expression, so the
+  parser rejects them where it expects an identifier.
+
+- `FALSE`, `TRUE`, and `UNKNOWN` are literals, and `CURRENT_CATALOG`,
+  `CURRENT_DATE`, `CURRENT_PATH`, `CURRENT_ROLE`, `CURRENT_SCHEMA`,
+  `CURRENT_TIME`, `CURRENT_TIMESTAMP`, `CURRENT_USER`, `LOCALTIME`,
+  `LOCALTIMESTAMP`, `SESSION_USER`, `SYSTEM_USER`, and `USER` are
+  functions that SQL calls without parentheses.  A column can carry
+  such a name, but a bare reference to it is the literal or the
+  function call.  Qualify the column with the name of its table, as in
+  `t.user`, or quote it, as in `"user"`.
+
+  Feldera does not support any of the functions in this list.
+  Each such name is therefore unusable on its own, although none of them
+  is a reserved keyword.  For the date and time functions use
+  [`NOW()`](datetime.md#now), as in `CAST(NOW() AS DATE)` for `CURRENT_DATE`.
+
+### Names of predefined objects
+
+A table cannot take the name of a predefined function:
+`CREATE TABLE abs(...)`, `CREATE TABLE now(...)`,
+and `CREATE TABLE user(...)` are rejected.  Quoting the name does not
+help; `CREATE TABLE "abs"(...)` is rejected too.  Choose a different name.

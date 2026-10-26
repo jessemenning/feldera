@@ -96,7 +96,7 @@ public class Regression2Tests extends SqlIoTest {
                 HashString hash = OperatorHash.getHash(operator, true);
                 Utilities.enforce(hash != null);
                 Utilities.enforce(hash.toString()
-                        .equals("1f3808fdce7cee3559c13945ba24280abf22b777542af1bac25aa7d57cf29892"));
+                        .equals("2fe2fc9849c1570862393e7c86f5d2e4df1842a08c7c074ee0b886854b0fece9"));
             }
 
             @Override
@@ -253,6 +253,17 @@ public class Regression2Tests extends SqlIoTest {
                 CREATE VIEW v AS SELECT
                 str SIMILAR TO '(abc|def)%' AS str
                 FROM tbl;""", "Function 'SIMILAR TO' not yet implemented");
+    }
+
+    @Test
+    public void constantSimilarTo() {
+        // Calcite can evaluate SIMILAR TO when both operands are constant
+        this.statementsFailingInCompilation(
+                "CREATE VIEW v AS SELECT 'abc' SIMILAR TO 'a%' AS b;",
+                "Function 'SIMILAR TO' not yet implemented");
+        this.statementsFailingInCompilation(
+                "CREATE VIEW v AS SELECT 'abc' NOT SIMILAR TO '(b|c)%' AS b;",
+                "Function 'SIMILAR TO' not yet implemented");
     }
 
     @Test
@@ -432,7 +443,7 @@ public class Regression2Tests extends SqlIoTest {
         System.setErr(saved);
         TestUtil.assertMessagesContain(compiler, """
                 warning: Inefficient pattern: NOW() expression is used in a pattern that could require expensive computations
-                See https://docs.feldera.com/sql/datetime/#now
+                See https://docs.feldera.com/sql/datetime#now
                     6|SELECT ts > NOW()
                                   ^^^^^
                     7|FROM transactions;""");
@@ -458,7 +469,7 @@ public class Regression2Tests extends SqlIoTest {
         System.setErr(saved);
         TestUtil.assertMessagesContain(compiler, """
                 warning: Inefficient pattern: NOW() expression is used in a pattern that could require expensive computations
-                See https://docs.feldera.com/sql/datetime/#now
+                See https://docs.feldera.com/sql/datetime#now
                     7|FROM transactions
                     8|WHERE LEAST(ts, NOW()) < ts - INTERVAL 1 DAY;
                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^""");
@@ -501,7 +512,7 @@ public class Regression2Tests extends SqlIoTest {
     @Test
     public void issue2234() {
         var ccs = this.getCCS("""
-                CREATE TABLE transaction_with_customer(id INT, amt INT64, cc_num VARCHAR, unix_time INT64);
+                CREATE TABLE transaction_with_customer(id INT, amt INT64, cc_num VARCHAR, unix_time INT64 NOT NULL);
                 CREATE VIEW FEATURE AS
                 SELECT
                     id,
@@ -1005,7 +1016,8 @@ public class Regression2Tests extends SqlIoTest {
     public void issue5927() {
         var ccs = this.getCCS("""
                 CREATE TABLE T(g VARCHAR, x INT);
-                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE 0 END) FROM T GROUP BY g;""");
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE 0 END) FROM T GROUP BY g;""")
+                .withStringTrim();
         // Validated on Postgres
         ccs.stepWeightOne("", """
                  g | max
@@ -1013,11 +1025,11 @@ public class Regression2Tests extends SqlIoTest {
         ccs.stepWeightOne("INSERT INTO T VALUES ('a', 1), ('b', 3), ('c', 3), ('c', 5), ('d', 1), ('d', 5), ('e', NULL);", """
                  g | max
                 ---------
-                 a| 0
-                 b| 1
-                 c| 1
-                 d| 1
-                 e| 0""");
+                 a | 0
+                 b | 1
+                 c | 1
+                 d | 1
+                 e | 0""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 
@@ -1047,7 +1059,8 @@ public class Regression2Tests extends SqlIoTest {
     public void issue5927a() {
         var ccs = this.getCCS("""
                 CREATE TABLE T(g VARCHAR, x INT);
-                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x = 1 THEN 0 ELSE 1 END) FROM T GROUP BY g;""");
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x = 1 THEN 0 ELSE 1 END) FROM T GROUP BY g;""")
+                .withStringTrim();
         // Validated on Postgres
         ccs.stepWeightOne("", """
                  g | max
@@ -1066,10 +1079,10 @@ public class Regression2Tests extends SqlIoTest {
                 """, """
                  g | max
                 ---------
-                 a| 1
-                 b| 0
-                 c| 1
-                 d| 1""");
+                 a | 1
+                 b | 0
+                 c | 1
+                 d | 1""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 
@@ -1078,7 +1091,8 @@ public class Regression2Tests extends SqlIoTest {
         // MAX(CASE WHEN cond THEN 1 ELSE NULL END) — ELSE NULL variant
         var ccs = this.getCCS("""
                 CREATE TABLE T(g VARCHAR, x INT);
-                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE NULL END) FROM T GROUP BY g;""");
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE NULL END) FROM T GROUP BY g;""")
+                .withStringTrim();
         // Validated on Postgres: NULL when no row satisfies cond, 1 otherwise.
         ccs.stepWeightOne("", """
                  g | max
@@ -1089,11 +1103,11 @@ public class Regression2Tests extends SqlIoTest {
                     """, """
                  g | max
                 ---------
-                 a| NULL
-                 b| 1
-                 c| 1
-                 d| 1
-                 e| NULL""");
+                 a | NULL
+                 b | 1
+                 c | 1
+                 d | 1
+                 e | NULL""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 
@@ -1102,7 +1116,8 @@ public class Regression2Tests extends SqlIoTest {
         // MAX(CASE WHEN cond THEN 1 END) — no ELSE clause (equivalent to ELSE NULL)
         var ccs = this.getCCS("""
                 CREATE TABLE T(g VARCHAR, x INT);
-                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 END) FROM T GROUP BY g;""");
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 END) FROM T GROUP BY g;""")
+                .withStringTrim();
         // Validated on Postgres: NULL when no row satisfies cond, 1 otherwise.
         ccs.stepWeightOne("", """
                  g | max
@@ -1114,11 +1129,11 @@ public class Regression2Tests extends SqlIoTest {
                     """, """
                  g | max
                 ---------
-                 a| NULL
-                 b| 1
-                 c| 1
-                 d| 1
-                 e| NULL""");
+                 a | NULL
+                 b | 1
+                 c | 1
+                 d | 1
+                 e | NULL""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 
@@ -1128,7 +1143,8 @@ public class Regression2Tests extends SqlIoTest {
         // Exercises the post-project index path for untransformed aggregate calls.
         var ccs = this.getCCS("""
                 CREATE TABLE T(g VARCHAR, x INT);
-                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE 0 END), SUM(x) FROM T GROUP BY g;""");
+                CREATE VIEW V AS SELECT g, MAX(CASE WHEN x > 2 THEN 1 ELSE 0 END), SUM(x) FROM T GROUP BY g;""")
+                .withStringTrim();
         // Validated on Postgres
         ccs.stepWeightOne("", """
                  g | max | sum
@@ -1139,12 +1155,12 @@ public class Regression2Tests extends SqlIoTest {
                         ('e', NULL);
                     """, """
                  g | max | sum
-                --------------
-                 a| 0| 1
-                 b| 1| 3
-                 c| 1| 8
-                 d| 1| 6
-                 e| 0| NULL""");
+                ----------------
+                 a | 0   | 1
+                 b | 1   | 3
+                 c | 1   | 8
+                 d | 1   | 6
+                 e | 0   | NULL""");
         ccs.visit(this.findLinear(ccs.compiler));
     }
 

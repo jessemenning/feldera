@@ -54,7 +54,7 @@ public class DBSPFold extends DBSPAggregator {
         return this.semigroup.sameType(o.semigroup) &&
                 context.equivalent(this.zero, o.zero) &&
                 context.equivalent(this.increment, o.increment) &&
-                context.equivalent(this.postProcess, o.increment);
+                context.equivalent(this.postProcess, o.postProcess);
     }
 
     @Override
@@ -96,7 +96,7 @@ public class DBSPFold extends DBSPAggregator {
 
     @SuppressWarnings("unused")
     public static DBSPFold fromJson(JsonNode node, JsonDecoder decoder) {
-        DBSPTypeSemigroup semigroup = fromJsonInner(node, "semigroup", decoder, DBSPTypeSemigroup.class);
+        DBSPTypeUser semigroup = fromJsonInner(node, "semigroup", decoder, DBSPTypeUser.class);
         DBSPExpression zero = fromJsonInner(node, "zero", decoder, DBSPExpression.class);
         DBSPClosureExpression increment = fromJsonInner(node, "increment", decoder, DBSPClosureExpression.class);
         DBSPClosureExpression postProcess = fromJsonInner(

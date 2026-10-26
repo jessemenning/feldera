@@ -1,0 +1,316 @@
+package org.dbsp.sqlCompiler.compiler.visitors.outer.keys;
+
+import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAntiJoinOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamJoinOperator;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
+import org.dbsp.sqlCompiler.compiler.sql.tools.SqlIoTest;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitTransform;
+import org.junit.Assert;
+import org.junit.Test;
+
+import javax.annotation.Nullable;
+import java.util.List;
+import java.util.Objects;
+
+/** Tests for {@link KeyAnalysis}.  Each test compiles a program with a pass hooked into the
+ * optimizer before {@link LeftJoinChains}. */
+public class KeyAnalysisTests extends SqlIoTest {
+    static final String TABLES = """
+            CREATE TABLE t(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b));
+            CREATE TABLE s(x INT NOT NULL, y INT, PRIMARY KEY (x));
+            CREATE TABLE m(a INT NOT NULL, b INT, c INT);
+            """;
+
+    /** A pass that analyzes the keys of the circuit it receives and keeps the circuit */
+    static class Analyzed implements CircuitTransform {
+        final KeyAnalysis keys;
+        @Nullable
+        DBSPCircuit circuit = null;
+
+        Analyzed(DBSPCompiler compiler) {
+            this.keys = new KeyAnalysis(compiler);
+        }
+
+        @Override
+        public DBSPCircuit apply(DBSPCircuit circuit) {
+            this.keys.apply(circuit);
+            this.circuit = circuit;
+            return circuit;
+        }
+
+        @Override
+        public String getName() {
+            return "AnalyzeKeys";
+        }
+
+        /** The keys of view {@code v}, as printed */
+        String viewKeys() {
+            DBSPSinkOperator sink = Objects.requireNonNull(this.circuit).getSink(new ProgramIdentifier("v"));
+            Assert.assertNotNull("View v not found", sink);
+            return this.keys.getKeys(sink.input()).toString();
+        }
+
+        /** The keys of the only operator of class {@code clazz}, as printed */
+        <T extends DBSPSimpleOperator> String keysOf(Class<T> clazz) {
+            List<DBSPOperator> found = Objects.requireNonNull(this.circuit)
+                    .allOperators.stream().filter(clazz::isInstance).toList();
+            Assert.assertEquals("Operators of class " + clazz.getSimpleName(), 1, found.size());
+            return this.keys.getKeys(clazz.cast(found.get(0)).outputPort()).toString();
+        }
+    }
+
+    /** Compile the program and analyze its circuit as {@link LeftJoinChains} sees it */
+    private Analyzed analyze(String view) {
+        DBSPCompiler compiler = this.testCompiler();
+        Analyzed analyzed = new Analyzed(compiler);
+        compiler.optimizerHook = optimizer -> optimizer.insertBefore(LeftJoinChains.class, analyzed);
+        compiler.submitStatementsForCompilation(TABLES + view);
+        Assert.assertNotNull(compiler.getFinalCircuit(false));
+        Assert.assertNotNull("The optimizer did not reach LeftJoinChains", analyzed.circuit);
+        return analyzed;
+    }
+
+    private void assertKeys(String view, String expected) {
+        Assert.assertEquals(expected, this.analyze(view).viewKeys());
+    }
+
+    private void assertNoKeys(String view) {
+        this.assertKeys(view, "[]");
+    }
+
+    /////////////////////////////////////////////////////////////
+    // What the analysis derives for each SQL construct
+
+    @Test
+    public void primaryKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT * FROM t;", "[[0, 1]]");
+    }
+
+    @Test
+    public void tableWithoutKey() {
+        this.assertNoKeys("CREATE VIEW v AS SELECT * FROM m;");
+    }
+
+    @Test
+    public void projectionRenamesKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT c, b, a FROM t;", "[[1, 2]]");
+    }
+
+    @Test
+    public void projectionDroppingKeyColumn() {
+        this.assertNoKeys("CREATE VIEW v AS SELECT a, c FROM t;");
+    }
+
+    /** a + 1 is injective, but the analysis only follows plain copies. */
+    @Test
+    public void computedColumnBreaksKey() {
+        this.assertNoKeys("CREATE VIEW v AS SELECT a + 1 AS a1, b FROM t;");
+    }
+
+    @Test
+    public void filterKeepsKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT * FROM t WHERE c > 0;", "[[0, 1]]");
+    }
+
+    /** b is the same on every remaining row, so a alone identifies the row. */
+    @Test
+    public void filterFixingKeyColumn() {
+        this.assertKeys("CREATE VIEW v AS SELECT a, b, c FROM t WHERE b = 3;", "[[0]]");
+    }
+
+    /** Same through a nullable comparison, on a key that comes from a TOP-1. */
+    @Test
+    public void filterFixingNullableKeyColumn() {
+        this.assertKeys("""
+                CREATE LOCAL VIEW w AS SELECT a, b, c FROM m
+                QUALIFY row_number() OVER (PARTITION BY a, b ORDER BY c) = 1;
+                CREATE VIEW v AS SELECT a, b, c FROM w WHERE b = 2;""", "[[0]]");
+    }
+
+    /** Only top-level conjuncts fix a column. */
+    @Test
+    public void filterWithOrFixesNothing() {
+        this.assertKeys("CREATE VIEW v AS SELECT a, b, c FROM t WHERE b = 3 OR c = 1;", "[[0, 1]]");
+    }
+
+    @Test
+    public void distinctIsKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT DISTINCT b, c FROM m;", "[[0, 1]]");
+    }
+
+    /** A column selected twice holds the same data in both places, so the key a distinct adds
+     * names that data once instead of listing both columns. */
+    @Test
+    public void distinctKeyCollapsesEqualColumns() {
+        this.assertKeys("CREATE VIEW v AS SELECT DISTINCT a, a AS a2, b FROM m;", "[[0=1, 2]]");
+    }
+
+    /** The rows of a distinct are a subset of its input's, so a key of the input still
+     * identifies a row and outlives the longer key over all the columns. */
+    @Test
+    public void distinctKeepsTheSmallerInputKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT DISTINCT a, b, c FROM t;", "[[0, 1]]");
+    }
+
+    @Test
+    public void groupByIsKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT a, COUNT(*) AS cnt FROM m GROUP BY a;", "[[0]]");
+    }
+
+    /** A global aggregate produces a single row, with an empty key. */
+    @Test
+    public void globalAggregateHasOneRow() {
+        this.assertKeys("CREATE VIEW v AS SELECT COUNT(*) AS n, SUM(c) AS total FROM m;", "[[]]");
+    }
+
+    /** The join equates t.a with s.x, and both are group columns, so the key of the
+     * aggregate names that value once instead of listing both columns. */
+    @Test
+    public void groupByEqualColumnsCollapses() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT t.a, s.x, COUNT(*) AS n
+                FROM t JOIN s ON t.a = s.x GROUP BY t.a, s.x;""", "[[0=1]]");
+    }
+
+    @Test
+    public void top1RowNumberIsKey() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT a, b, c FROM m
+                QUALIFY row_number() OVER (PARTITION BY a ORDER BY b) = 1;""", "[[0]]");
+    }
+
+    /** RANK admits ties: several rows per partition -- no key. */
+    @Test
+    public void top1RankIsNotKey() {
+        this.assertNoKeys("""
+                CREATE VIEW v AS SELECT a, b, c FROM m
+                QUALIFY rank() OVER (PARTITION BY a ORDER BY b) = 1;""");
+    }
+
+    @Test
+    public void top2IsNotKey() {
+        this.assertNoKeys("""
+                CREATE VIEW v AS SELECT a, b, c FROM m
+                QUALIFY row_number() OVER (PARTITION BY a ORDER BY b) <= 2;""");
+    }
+
+    /** A column selected twice is a key on each of its copies. */
+    @Test
+    public void top1WithDuplicatedPartitionColumn() {
+        // 0=1 is an equivalence set: both columns carry the same value
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT a, a AS a2, b FROM m
+                QUALIFY row_number() OVER (PARTITION BY a ORDER BY b) = 1;""", "[[0=1]]");
+    }
+
+    /** Both occurrences of the expression "a+b" compute the same
+     * value, which is propagated as a key by the partition key. */
+    @Test
+    public void top1OnComputedColumn() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT a + b AS ab, c FROM m
+                QUALIFY row_number() OVER (PARTITION BY a + b ORDER BY c) = 1;""", "[[0]]");
+    }
+
+    /** Two different computations of the same columns are not known to hold the same value. */
+    @Test
+    public void top1OnOtherComputedColumn() {
+        this.assertNoKeys("""
+                CREATE VIEW v AS SELECT a - b AS ab, c FROM m
+                QUALIFY row_number() OVER (PARTITION BY a + b ORDER BY c) = 1;""");
+    }
+
+    /** Each of the seven key columns is selected twice, so each value of the key is named
+     * by two columns.  Enumerating the namings would produce 2^7 keys, more than
+     * {@code Keys.MAX_KEYS}, so the equivalence sets must stay within one key. */
+    @Test
+    public void wideKeyOfDuplicatedColumnsStaysOneKey() {
+        this.assertKeys("""
+                CREATE TABLE w(c1 INT NOT NULL, c2 INT NOT NULL, c3 INT NOT NULL, c4 INT NOT NULL,
+                               c5 INT NOT NULL, c6 INT NOT NULL, c7 INT NOT NULL, x INT,
+                               PRIMARY KEY (c1, c2, c3, c4, c5, c6, c7));
+                CREATE VIEW v AS SELECT c1, c1 AS d1, c2, c2 AS d2, c3, c3 AS d3, c4, c4 AS d4,
+                                        c5, c5 AS d5, c6, c6 AS d6, c7, c7 AS d7 FROM w;""",
+                "[[0=1, 2=3, 4=5, 6=7, 8=9, 10=11, 12=13]]");
+    }
+
+    /** Two independent keys: the primary key of the table, and the partition column of a
+     * TOP-1, which keeps one row per value of it.  Neither contains the other. */
+    @Test
+    public void twoIndependentKeys() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT a, b, c FROM t
+                QUALIFY row_number() OVER (PARTITION BY c ORDER BY a) = 1;""", "[[2], [0, 1]]");
+    }
+
+    /** The join key covers the key of s: every t row matches at most once. */
+    @Test
+    public void joinOnRightKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT t.a, t.b, t.c, s.y FROM t JOIN s ON t.c = s.x;", "[[0, 1]]");
+    }
+
+    @Test
+    public void leftJoinOnRightKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT t.a, t.b, t.c, s.y FROM t LEFT JOIN s ON t.c = s.x;", "[[0, 1]]");
+    }
+
+    /** Neither side is keyed by the join column: only the pair of keys identifies a row. */
+    @Test
+    public void joinOnNonKey() {
+        this.assertKeys("CREATE VIEW v AS SELECT t.a, t.b, s.x FROM t JOIN s ON t.c = s.y;", "[[0, 1, 2]]");
+    }
+
+    /** The pair rule needs the right key, which is not in the output. */
+    @Test
+    public void joinDroppingRightKey() {
+        this.assertNoKeys("CREATE VIEW v AS SELECT t.a, t.b FROM t JOIN s ON t.c = s.y;");
+    }
+
+    /** Two joins on the same key: each lookup matches at most one row, so the key of the
+     * probing input identifies an output row on its own. */
+    @Test
+    public void joinsOnOneSharedKey() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT t.a, t.b, s.y, u.y AS y2
+                FROM t JOIN s ON t.a = s.x JOIN s AS u ON t.a = u.x;""", "[[0, 1]]");
+    }
+
+    /** The join equates t.a with s.x, and the view names the value a third time, so one set
+     * of the key holds all three columns. */
+    @Test
+    public void joinEqualityWidensASet() {
+        this.assertKeys("""
+                CREATE VIEW v AS SELECT t.a, s.x, s.x AS x2, t.b
+                FROM t JOIN s ON t.a = s.x;""", "[[0=1=2, 3]]");
+    }
+
+    /** An operator can carry an expression that is not a closure, a comparator here, which
+     * the analysis must step over rather than read as a function over rows. */
+    @Test
+    public void orderByLimitIsAnalyzed() {
+        this.assertKeys("CREATE VIEW v AS SELECT a, b, c FROM t ORDER BY c LIMIT 2;", "[[0, 1]]");
+    }
+
+    /** A LEFT JOIN without an equality is expanded into a join and an antijoin whose outputs
+     * are added; the compiler currently cannot recognize the key for this pattern. */
+    @Test
+    public void nonEquiLeftJoinLosesTheKeyAtTheUnion() {
+        String view = """
+                CREATE VIEW v AS SELECT t.a, t.b, g.mx
+                FROM t LEFT JOIN (SELECT MAX(x) AS mx FROM s) g ON t.c < g.mx;""";
+        Analyzed analyzed = this.analyze(view);
+        Assert.assertEquals("[[0, 1]]", analyzed.keysOf(DBSPStreamJoinOperator.class));
+        Assert.assertEquals("[[v0, v1]]", analyzed.keysOf(DBSPStreamAntiJoinOperator.class));
+        Assert.assertEquals("[]", analyzed.viewKeys());
+    }
+
+    @Test
+    public void unionHasNoKey() {
+        this.assertNoKeys("CREATE VIEW v AS SELECT a, b FROM t UNION ALL SELECT x, y FROM s;");
+    }
+}

@@ -1,7 +1,7 @@
+use crate::db::types::role::Role;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Display;
-use std::str::FromStr;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -19,33 +19,19 @@ impl Display for ApiKeyId {
     }
 }
 
-/// Permission types for invoking API endpoints.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
-pub enum ApiPermission {
-    Read,
-    Write,
-}
-
-pub const API_PERMISSION_READ: &str = "read";
-pub const API_PERMISSION_WRITE: &str = "write";
-
-impl FromStr for ApiPermission {
-    type Err = ();
-
-    fn from_str(input: &str) -> Result<ApiPermission, Self::Err> {
-        match input {
-            API_PERMISSION_READ => Ok(ApiPermission::Read),
-            API_PERMISSION_WRITE => Ok(ApiPermission::Write),
-            _ => Err(()),
-        }
-    }
-}
-
+// This doc comment becomes the schema description in the OpenAPI document, and
+// is copied verbatim into the generated clients, so it is written for API
+// consumers and must not use rustdoc intra-doc links: they cannot resolve in the
+// generated crate and fail its `cargo doc -D warnings`.
 /// API key descriptor.
+///
+/// A key carries a single role, `read` or `write`. `admin` and `owner` are
+/// never issuable as API keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ApiKeyDescr {
     pub id: ApiKeyId,
     pub name: String,
-    pub scopes: Vec<ApiPermission>,
+    /// Always `read` or `write` (a key can never carry `admin`/`owner`).
+    #[schema(value_type = MintableKeyRole)]
+    pub role: Role,
 }

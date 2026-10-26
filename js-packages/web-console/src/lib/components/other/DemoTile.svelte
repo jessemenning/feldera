@@ -1,22 +1,31 @@
 <script lang="ts">
+  import { usePipelineList } from '$lib/compositions/pipelines/usePipelineList.svelte'
   import { useTryPipeline } from '$lib/compositions/pipelines/useTryPipeline'
+  import { usePermission } from '$lib/compositions/usePermission.svelte'
   import type { Demo } from '$lib/services/pipelineManager'
 
-  let { demo, triggerLocation }: { demo: Demo | null; triggerLocation?: string } = $props()
+  let { demo, placement }: { demo: Demo | null; placement?: string } = $props()
   const tryPipeline = useTryPipeline()
+  const canCreate = usePermission('write:pipeline')
+  const list = usePipelineList()
+  // A read-only caller may open a demo only when its pipeline already exists
+  // (the tile then navigates to it); creating one from a demo needs write access.
+  const exists = $derived(!!demo && !!list.pipelines?.some((p) => p.name === demo.name))
+  const enabled = $derived(exists || canCreate.allowed)
 </script>
 
 {#if demo}
-  <div class="flex flex-col card border border-surface-100-900 p-4">
+  <button
+    class="flex flex-col card border border-surface-200-800 p-4 text-left transition-colors hover:preset-tonal-surface disabled:pointer-events-none disabled:opacity-50"
+    disabled={!enabled}
+    onclick={() => tryPipeline(demo, placement)}
+  >
     <div class="text-sm text-surface-700-300">{demo.type}</div>
-    <button class="text-left" onclick={() => tryPipeline(demo, triggerLocation)}>
-      <span class="py-2 font-semibold">{demo.title}</span>
-      <!-- <span class="fd fd-arrow-right inline-block w-2 text-[20px]"></span> -->
-    </button>
-    <span class="text-left text-surface-700-300">{demo.description}</span>
-  </div>
+    <span class="py-2 font-semibold">{demo.title}</span>
+    <span class="text-surface-700-300">{demo.description}</span>
+  </button>
 {:else}
-  <div class="flex flex-col card border border-surface-100-900 p-4">
+  <div class="flex flex-col card border border-surface-200-800 p-4">
     <div class="flex flex-col gap-1">
       <div class="placeholder w-16 animate-pulse"></div>
       <span class="placeholder w-48 animate-pulse bg-surface-700-300"></span>

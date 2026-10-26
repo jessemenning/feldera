@@ -2,27 +2,28 @@ use crate::api::support_data_collector::SupportBundleData;
 use crate::db::error::DBError;
 use crate::db::operations::pipeline_monitor::new_pipeline_monitor_event;
 use crate::db::operations::pipeline_parsing::{
+    PIPELINE_COLUMNS_ALL, PIPELINE_COLUMNS_EVENT_INFO, PIPELINE_COLUMNS_MONITORING,
     parse_pipeline_row_all, parse_pipeline_row_event_info, parse_pipeline_row_monitoring,
-    serialize_error_response, serialize_program_error, PIPELINE_COLUMNS_ALL,
-    PIPELINE_COLUMNS_EVENT_INFO, PIPELINE_COLUMNS_MONITORING,
+    serialize_error_response, serialize_program_error,
 };
 use crate::db::operations::utils::{
     maybe_tenant_id_foreign_key_constraint_err, maybe_unique_violation,
 };
+use crate::db::types::deployment::merge_deployment_config_on_edit;
 use crate::db::types::pipeline::{
-    bootstrap_config_to_string, runtime_desired_status_to_string, runtime_status_to_string,
     ExtendedPipelineDescr, ExtendedPipelineDescrEventInfo, ExtendedPipelineDescrMonitoring,
-    PatchClientMetadata, PipelineDescr, PipelineId,
+    PatchClientMetadata, PipelineDescr, PipelineId, bootstrap_config_to_string,
+    runtime_desired_status_to_string, runtime_status_to_string,
 };
 use crate::db::types::program::{
-    validate_program_status_transition, ProgramError, ProgramStatus, RustCompilationInfo,
-    SqlCompilationInfo,
+    PipelineProgramArtifacts, ProgramError, ProgramStatus, RustCompilationInfo, SqlCompilationInfo,
+    validate_program_status_transition,
 };
 use crate::db::types::resources_status::{
-    validate_resources_desired_status_transition, validate_resources_status_transition,
-    ResourcesDesiredStatus, ResourcesStatus,
+    ResourcesDesiredStatus, ResourcesStatus, validate_resources_desired_status_transition,
+    validate_resources_status_transition,
 };
-use crate::db::types::storage::{validate_storage_status_transition, StorageStatus};
+use crate::db::types::storage::{StorageStatus, validate_storage_status_transition};
 use crate::db::types::tenant::TenantId;
 use crate::db::types::utils::{
     validate_deployment_config, validate_pipeline_name, validate_program_config,
@@ -30,13 +31,70 @@ use crate::db::types::utils::{
 };
 use crate::db::types::version::Version;
 use deadpool_postgres::Transaction;
+use feldera_types::config::FtConfig;
+use feldera_types::config::ResourceConfig;
 use feldera_types::error::ErrorResponse;
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
+use feldera_types::size::ConfigSize;
 use rmp_serde::{from_slice, to_vec};
 use serde_json::json;
 use tokio_postgres::Row;
 use tracing::warn;
 use uuid::Uuid;
+
+/// Reports whether a storage size of `resources` differs between two runtime
+/// configurations.
+///
+/// The comparison is on meaning rather than on text, because one setting
+/// carries two spellings: `storage_mb_max: 1000` and `storage_max: "1G"` are
+/// one value, and rewriting the deprecated spelling as the current one must
+/// not be refused as a storage change. Values that do not deserialize fall
+/// back to comparing the raw JSON of `key`, which is what the caller did
+/// before.
+fn storage_size_differs(
+    new: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
+    size: fn(&ResourceConfig) -> Option<ConfigSize>,
+    key: &str,
+) -> bool {
+    fn parse(value: Option<&serde_json::Value>) -> Option<ResourceConfig> {
+        match value {
+            None => Some(ResourceConfig::default()),
+            Some(value) => serde_json::from_value(value.clone()).ok(),
+        }
+    }
+    match (parse(new), parse(current)) {
+        (Some(new), Some(current)) => size(&new) != size(&current),
+        _ => new.map(|v| v.get(key)) != current.map(|v| v.get(key)),
+    }
+}
+
+/// Reports whether two `fault_tolerance` values describe different pipelines.
+///
+/// The comparison is on meaning rather than on text, because one setting
+/// carries two spellings: `checkpoint_interval_secs` and the duration field
+/// that supersedes it. A user who rewrites the deprecated spelling as the
+/// current one changes nothing about the pipeline, so the edit must not be
+/// refused as a fault tolerance change. Values that do not deserialize fall
+/// back to comparing the raw JSON, which is what the caller did before.
+fn fault_tolerance_differs(
+    new: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
+) -> bool {
+    fn parse(value: Option<&serde_json::Value>) -> Option<FtConfig> {
+        match value {
+            None => Some(FtConfig::default()),
+            Some(value) => serde_json::from_value(value.clone()).ok(),
+        }
+    }
+
+    match (parse(new), parse(current)) {
+        (Some(new), Some(current)) => {
+            new.model != current.model || new.checkpoint_interval() != current.checkpoint_interval()
+        }
+        _ => new != current,
+    }
+}
 
 /// This expression converts the first 8 bytes of the pipeline UUID to a BIGINT,
 /// and takes its absolute value. It is used to determine which compiler server
@@ -574,20 +632,27 @@ pub(crate) async fn update_pipeline(
             {
                 not_allowed.push("`runtime_config.hosts`");
             }
-            if runtime_config.get("fault_tolerance")
-                != current.runtime_config.get("fault_tolerance")
-            {
+            if fault_tolerance_differs(
+                runtime_config.get("fault_tolerance"),
+                current.runtime_config.get("fault_tolerance"),
+            ) {
                 not_allowed.push("`runtime_config.fault_tolerance`");
             }
-            if runtime_config
-                .get("resources")
-                .map(|v| v.get("storage_mb_max"))
-                != current
-                    .runtime_config
-                    .get("resources")
-                    .map(|v| v.get("storage_mb_max"))
-            {
-                not_allowed.push("`runtime_config.resources.storage_mb_max`");
+            if storage_size_differs(
+                runtime_config.get("resources"),
+                current.runtime_config.get("resources"),
+                |resources| resources.storage_max,
+                "storage_max",
+            ) {
+                not_allowed.push("`runtime_config.resources.storage_max`");
+            }
+            if storage_size_differs(
+                runtime_config.get("resources"),
+                current.runtime_config.get("resources"),
+                |resources| resources.storage_min,
+                "storage_min",
+            ) {
+                not_allowed.push("`runtime_config.resources.storage_min`");
             }
             if runtime_config.get("resources").map(|v| v.get("namespace"))
                 != current
@@ -699,7 +764,8 @@ pub(crate) async fn update_pipeline(
                      program_status_since = now(),
                      program_error = $2,
                      program_binary_source_checksum = NULL,
-                     program_binary_integrity_checksum = NULL
+                     program_binary_integrity_checksum = NULL,
+                     program_info_integrity_checksum = NULL
                  WHERE tenant_id = $3 AND name = $4",
             )
             .await?;
@@ -719,6 +785,22 @@ pub(crate) async fn update_pipeline(
             )
             .await?;
         assert_eq!(rows_affected, 1); // The row must exist as it has been retrieved before
+    }
+
+    // A CPU or memory edit replaces a resize, which otherwise lasts across restarts.
+    if let Some(runtime_config) = &runtime_config
+        && let Some(deployment_config) = &current.deployment_config
+        && let Some(edited) = merge_deployment_config_on_edit(
+            deployment_config,
+            &current.runtime_config,
+            runtime_config,
+        )
+    {
+        let stmt = txn
+            .prepare_cached("UPDATE pipeline SET deployment_config = $1 WHERE id = $2")
+            .await?;
+        txn.execute(&stmt, &[&edited.to_string(), &current.id.0])
+            .await?;
     }
 
     new_pipeline_monitor_event(txn, tenant_id, current.id, Uuid::now_v7()).await?;
@@ -870,20 +952,28 @@ pub(crate) async fn set_program_status(
             )
         }
         ProgramStatus::Success => {
+            // Two shapes reach Success. A pipeline arrives from CompilingRust, where its
+            // program info and SQL log are already stored, and delivers a binary plus a
+            // Rust log; for a Gen-2 pipeline with Rust UDFs, the binary checksums describe
+            // its UDF library. A Gen-2 pipeline without Rust UDFs arrives
+            // straight from CompilingSql, so it carries its program info and SQL log here
+            // and delivers no binary and no Rust log. The Rust log is therefore present
+            // exactly when a binary was built, and a half-delivered binary is a bug.
             assert!(
-                new_program_error_sql_compilation.is_none()
-                    && new_program_error_rust_compilation.is_some()
-                    && new_program_error_system_error.is_none()
-                    && new_program_info.is_none()
-                    && new_program_binary_source_checksum.is_some()
-                    && new_program_binary_integrity_checksum.is_some()
+                new_program_error_system_error.is_none()
                     && new_program_info_integrity_checksum.is_some()
+                    && (new_program_binary_source_checksum.is_some()
+                        == new_program_binary_integrity_checksum.is_some())
+                    && (new_program_error_rust_compilation.is_some()
+                        == new_program_binary_source_checksum.is_some())
             );
             (
-                current.program_error.sql_compilation,
+                new_program_error_sql_compilation
+                    .clone()
+                    .or(current.program_error.sql_compilation),
                 new_program_error_rust_compilation.clone(),
                 None,
-                current.program_info,
+                new_program_info.clone().or(current.program_info),
                 new_program_binary_source_checksum.clone(),
                 new_program_binary_integrity_checksum.clone(),
                 new_program_info_integrity_checksum.clone(),
@@ -1128,21 +1218,19 @@ pub(crate) async fn set_deployment_resources_desired_status(
     };
 
     // If the current initial desired runtime status is already set, it cannot be changed
-    if let Some(current_initial) = current.deployment_initial {
-        if let Some(new_initial) = final_deployment_initial {
-            if current_initial != new_initial {
-                return Err(DBError::InitialImmutableUnlessStopped);
-            }
-        }
+    if let Some(current_initial) = current.deployment_initial
+        && let Some(new_initial) = final_deployment_initial
+        && current_initial != new_initial
+    {
+        return Err(DBError::InitialImmutableUnlessStopped);
     }
 
     // If the current bootstrap policy is already set, it cannot be changed
-    if let Some(current_bootstrap_config) = current.bootstrap_policy {
-        if let Some(new_bootstrap_config) = final_bootstrap_config {
-            if current_bootstrap_config != new_bootstrap_config {
-                return Err(DBError::BootstrapPolicyImmutableUnlessStopped);
-            }
-        }
+    if let Some(current_bootstrap_config) = current.bootstrap_policy
+        && let Some(new_bootstrap_config) = final_bootstrap_config
+        && current_bootstrap_config != new_bootstrap_config
+    {
+        return Err(DBError::BootstrapPolicyImmutableUnlessStopped);
     }
 
     // Desired status cannot be set to standby if no file backend is configured
@@ -1297,7 +1385,7 @@ pub(crate) async fn set_deployment_resources_status_stopped(
         None,
         current.deployment_error,
         None,
-        None,
+        current.deployment_config,
         None,
         None,
         None,
@@ -1322,6 +1410,7 @@ pub(crate) async fn remain_deployment_resources_status_stopped(
         true,
     )
     .await?;
+    let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
         txn,
@@ -1334,7 +1423,7 @@ pub(crate) async fn remain_deployment_resources_status_stopped(
         None,
         Some(deployment_error),
         None,
-        None,
+        current.deployment_config,
         None,
         None,
         None,
@@ -1360,6 +1449,12 @@ pub(crate) async fn set_deployment_resources_status_provisioning(
         false,
     )
     .await?;
+    validate_deployment_config(&new_deployment_config).map_err(|error| {
+        DBError::InvalidDeploymentConfig {
+            value: new_deployment_config.clone(),
+            error,
+        }
+    })?;
     let current = get_pipeline_by_id(txn, tenant_id, pipeline_id, true).await?;
 
     set_deployment_resources_status(
@@ -1582,16 +1677,6 @@ async fn set_deployment_resources_status(
     final_deployment_initial: Option<RuntimeDesiredStatus>,
     final_bootstrap_config: Option<BootstrapConfig>,
 ) -> Result<(), DBError> {
-    // Validate that the new or existing deployment configuration is valid
-    if let Some(deployment_config) = &final_deployment_config {
-        let _ = validate_deployment_config(deployment_config).map_err(|error| {
-            DBError::InvalidDeploymentConfig {
-                value: deployment_config.clone(),
-                error,
-            }
-        })?;
-    }
-
     // Validate that the new storage status details is valid
     if let Some(storage_status_details) = &new_storage_status_details {
         let _ = validate_storage_status_details(storage_status_details).map_err(|error| {
@@ -1859,6 +1944,7 @@ pub(crate) async fn list_pipelines_across_all_tenants_needing_sql_compilation_cl
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Vec<(TenantId, ExtendedPipelineDescrMonitoring)>, DBError> {
+    // Predicate changes must be mirrored in count_pipelines_needing_compilation.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_MONITORING}
@@ -1908,6 +1994,7 @@ pub(crate) async fn list_pipelines_across_all_tenants_needing_rust_compilation_c
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Vec<(TenantId, ExtendedPipelineDescrMonitoring)>, DBError> {
+    // Predicate changes must be mirrored in count_pipelines_needing_compilation.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_MONITORING}
@@ -1952,6 +2039,7 @@ pub(crate) async fn get_next_sql_compilation(
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
+    // Predicate changes must be mirrored in count_pipelines_needing_compilation.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_ALL}
@@ -1992,6 +2080,7 @@ pub(crate) async fn get_next_rust_compilation(
     worker_id: usize,
     total_workers: usize,
 ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
+    // Predicate changes must be mirrored in count_pipelines_needing_compilation.
     let stmt = txn
         .prepare_cached(&format!(
             "SELECT p.tenant_id, {PIPELINE_COLUMNS_ALL}
@@ -2024,43 +2113,73 @@ pub(crate) async fn get_next_rust_compilation(
     }
 }
 
-/// Retrieves the list of successfully compiled pipeline programs (pipeline identifier, program version,
-/// program binary source checksum, program binary integrity checksum, program info integrity checksum) AND pipeline programs that
-/// are currently being compiled (pipeline identifier, program version) across all tenants.
-pub(crate) async fn list_pipeline_programs_across_all_tenants(
+/// Counts pipelines with outstanding compilation work.
+///
+/// The predicate must remain the union of the predicates of the four worker
+/// queries above (the two `_needing_*_compilation_clear` lists and the two
+/// `get_next_*_compilation` pickers) across all shards and platform versions:
+/// the count is greater than zero if and only if some compiler worker would
+/// act. It drives compiler autoscaling in the enterprise runner.
+pub(crate) async fn count_pipelines_needing_compilation(
     txn: &Transaction<'_>,
-) -> Result<
-    Vec<(
-        PipelineId,
-        Version,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>,
-    DBError,
-> {
+) -> Result<u64, DBError> {
     let stmt = txn
         .prepare_cached(
-            "SELECT p.id, p.program_version, p.program_binary_source_checksum, p.program_binary_integrity_checksum, p.program_info_integrity_checksum
+            "SELECT COUNT(*)
              FROM pipeline AS p
-             WHERE p.program_status = 'success' OR p.program_status = 'compiling_rust'
+             WHERE p.deployment_resources_status = 'stopped'
+                   AND p.program_status IN ('pending', 'compiling_sql', 'sql_compiled', 'compiling_rust')
+            ",
+        )
+        .await?;
+    let row = txn.query_one(&stmt, &[]).await?;
+    let count: i64 = row.get(0);
+    Ok(count as u64)
+}
+
+/// Retrieves every pipeline program whose artifacts must be retained, across all tenants:
+/// those fully compiled, and those still compiling.
+///
+/// Both compiling statuses are included because each one covers a window in which an
+/// artifact is already on disk while the checksum naming it is not yet in the row.
+/// `CompilingRust` covers the binary and program info a legacy program delivers, and the
+/// UDF library and program info a Gen-2 program with Rust UDFs delivers; `CompilingSql`
+/// covers the program info a Gen-2 program without them delivers. Either is written before
+/// the row moves to `Success`.
+pub(crate) async fn list_pipeline_programs_across_all_tenants(
+    txn: &Transaction<'_>,
+) -> Result<Vec<PipelineProgramArtifacts>, DBError> {
+    let stmt = txn
+        .prepare_cached(
+            "SELECT p.id, p.program_version, p.program_binary_source_checksum, p.program_binary_integrity_checksum, p.program_info_integrity_checksum, p.program_config, p.program_status
+             FROM pipeline AS p
+             WHERE p.program_status = 'success' OR p.program_status = 'compiling_rust' OR p.program_status = 'compiling_sql'
              ORDER BY p.id ASC
             ",
         )
         .await?;
     let rows = txn.query(&stmt, &[]).await?;
-    Ok(rows
-        .iter()
+    rows.iter()
         .map(|row| {
-            (
-                PipelineId(row.get(0)),
-                Version(row.get(1)),
-                row.get::<_, Option<String>>(2),
-                row.get::<_, Option<String>>(3),
-                row.get::<_, Option<String>>(4),
-            )
+            Ok(PipelineProgramArtifacts {
+                pipeline_id: PipelineId(row.get(0)),
+                program_version: Version(row.get(1)),
+                program_status: row.get::<_, String>(6).try_into()?,
+                program_binary_source_checksum: row.get::<_, Option<String>>(2),
+                program_binary_integrity_checksum: row.get::<_, Option<String>>(3),
+                program_info_integrity_checksum: row.get::<_, Option<String>>(4),
+                // Derived from the parsed configuration rather than a SQL comparison against the
+                // literal `gen2`, so what selects the engine stays defined in one place.
+                // `program_config` is a VARCHAR holding JSON text, as the other readers of this
+                // column treat it.
+                is_gen2: serde_json::from_str::<serde_json::Value>(row.get::<_, &str>(5))
+                    .ok()
+                    .and_then(|config| validate_program_config(&config, true).ok())
+                    .map(|config| config.runtime_version().is_gen2())
+                    .unwrap_or(false),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Store a support data collection entry
@@ -2161,4 +2280,58 @@ pub(crate) async fn get_support_bundle_data(
     }
 
     Ok(bundles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fault_tolerance_differs;
+    use serde_json::json;
+
+    /// Rewriting the deprecated `checkpoint_interval_secs` as the duration
+    /// field that replaces it describes the same pipeline, so the edit must not
+    /// be refused as a fault tolerance change.
+    #[test]
+    fn rewriting_a_deprecated_checkpoint_interval_is_not_a_change() {
+        let deprecated = json!({"model": "at_least_once", "checkpoint_interval_secs": 60});
+        let current = json!({"model": "at_least_once", "checkpoint_interval": "60s"});
+        assert!(!fault_tolerance_differs(Some(&current), Some(&deprecated)));
+        assert!(!fault_tolerance_differs(Some(&deprecated), Some(&current)));
+    }
+
+    /// A different interval, a different model, or disabling the periodic
+    /// checkpoint are all real changes.
+    #[test]
+    fn a_different_setting_is_a_change() {
+        let base = json!({"model": "at_least_once", "checkpoint_interval": "60s"});
+        for other in [
+            json!({"model": "at_least_once", "checkpoint_interval": "90s"}),
+            json!({"model": "exactly_once", "checkpoint_interval": "60s"}),
+            json!({"model": "at_least_once", "checkpoint_interval": null}),
+            json!({"model": null, "checkpoint_interval": "60s"}),
+        ] {
+            assert!(
+                fault_tolerance_differs(Some(&base), Some(&other)),
+                "{other} should differ from {base}"
+            );
+        }
+    }
+
+    /// An absent section means the default, so adding the default explicitly is
+    /// not a change either.
+    #[test]
+    fn an_absent_section_equals_the_default() {
+        let default = serde_json::to_value(feldera_types::config::FtConfig::default()).unwrap();
+        assert!(!fault_tolerance_differs(None, Some(&default)));
+        assert!(!fault_tolerance_differs(None, None));
+    }
+
+    /// A value that does not deserialize falls back to comparing the text, so a
+    /// malformed section is never waved through as unchanged.
+    #[test]
+    fn unparsable_values_fall_back_to_comparing_the_text() {
+        let malformed = json!("not an object");
+        let other = json!("also not an object");
+        assert!(fault_tolerance_differs(Some(&malformed), Some(&other)));
+        assert!(!fault_tolerance_differs(Some(&malformed), Some(&malformed)));
+    }
 }

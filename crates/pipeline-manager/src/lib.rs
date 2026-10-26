@@ -5,6 +5,7 @@ use tracing::{debug, warn};
 
 mod auth;
 
+pub mod all_in_one;
 pub mod api;
 pub mod cluster_monitor;
 pub mod common_error;
@@ -15,8 +16,20 @@ pub mod error;
 pub mod events_cleaner;
 pub mod license;
 pub mod logging;
+pub mod oidc;
 pub mod pipeline_env;
 pub mod runner;
+
+/// Edition reported by `/config` and the startup banner.
+pub fn edition() -> &'static str {
+    if cfg!(feature = "feldera-enterprise-dev") {
+        "EnterpriseDev"
+    } else if cfg!(feature = "feldera-enterprise") {
+        "Enterprise"
+    } else {
+        "Open source"
+    }
+}
 
 /// Feature gate for new/unstable features that aren't rolled out or will change
 /// substantially in the future.
@@ -34,7 +47,9 @@ pub fn platform_enable_unstable(requested_features: &str) {
         if let Some(supported_feature) = all_features.get(requested_feature) {
             enabled.insert(*supported_feature);
         } else {
-            warn!("Requested unstable feature '{requested_feature}' is not supported by the platform.");
+            warn!(
+                "Requested unstable feature '{requested_feature}' is not supported by the platform."
+            );
         }
     }
     UNSTABLE_FEATURES
@@ -44,6 +59,18 @@ pub fn platform_enable_unstable(requested_features: &str) {
 
 pub fn unstable_features() -> Option<&'static HashSet<&'static str>> {
     UNSTABLE_FEATURES.get()
+}
+
+/// Enables the unstable features the test suite depends on. `UNSTABLE_FEATURES` is a
+/// process-wide `OnceLock`, so every test that needs a gate must request the same set:
+/// whichever test runs first then enables it for the whole binary, whatever the order.
+///
+/// The set is installed with a discarded `set`, not a check-then-act: cargo runs tests on
+/// parallel threads, so two callers can both observe an empty lock and the loser of the
+/// race would panic on the second `set`.
+#[cfg(test)]
+pub(crate) fn enable_test_unstable_features() {
+    let _ = UNSTABLE_FEATURES.set(HashSet::from_iter(["runtime_version", "testing"]));
 }
 
 /// To query whether the platform enabled a certain unstable feature.

@@ -2,36 +2,51 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use std::fmt::Display;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 use crate::make_client;
 use feldera_rest_api::types::{
-    ClusterMonitorEventFieldSelector, CompilationProfile, PipelineMonitorEventFieldSelector,
+    ClusterMonitorEventFieldSelector, CompilationProfile, MemberRole,
+    PipelineMonitorEventFieldSelector,
 };
 
 /// Autocompletion for pipeline names by trying to fetch them from the server.
 fn pipeline_names(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let mut completions = vec![];
-    // We parse FELDERA_HOST and FELDERA_API_KEY from the environment
-    // using the `try_parse_from` method.
-    let cli = Cli::try_parse_from(["fda", "pipelines"]);
-    if let Ok(cli) = cli {
-        let client =
-            make_client(cli.host, cli.insecure, cli.tls_cert, cli.auth, cli.timeout).unwrap();
+    // Parse FELDERA_HOST / FELDERA_API_KEY from the environment.
+    let Ok(cli) = Cli::try_parse_from(["fda", "pipelines"]) else {
+        return completions;
+    };
+    // Both credentials are cheap to resolve on every Tab press: a static key
+    // and a file read. A failed or anonymous list returns nothing rather
+    // than panicking.
+    let Ok(client) = make_client(crate::ClientOpts {
+        host: cli.host,
+        insecure: cli.insecure,
+        tls_cert: cli.tls_cert,
+        auth: cli.auth,
+        oidc_token_file: cli.oidc_token_file,
+        headers: cli.headers,
+        timeout_secs: cli.timeout,
+        tenant: cli.tenant,
+        retries: cli.retries,
+    }) else {
+        return completions;
+    };
 
-        let r = futures::executor::block_on(async {
-            client
-                .list_pipelines()
-                .send()
-                .await
-                .map(|r| r.into_inner())
-                .unwrap_or_else(|_| vec![])
-        });
+    let r = futures::executor::block_on(async {
+        client
+            .list_pipelines()
+            .send()
+            .await
+            .map(|r| r.into_inner())
+            .unwrap_or_default()
+    });
 
-        let current = current.to_string_lossy();
-        for pipeline in r {
-            if pipeline.name.starts_with(current.as_ref()) {
-                completions.push(CompletionCandidate::new(pipeline.name));
-            }
+    let current = current.to_string_lossy();
+    for pipeline in r {
+        if pipeline.name.starts_with(current.as_ref()) {
+            completions.push(CompletionCandidate::new(pipeline.name));
         }
     }
 
@@ -109,6 +124,51 @@ pub struct Cli {
         help_heading = "Global Options"
     )]
     pub auth: Option<String>,
+    /// File holding a bearer token, typically an OIDC identity token.
+    ///
+    /// Read once per `fda` invocation; the trimmed contents become the
+    /// `Authorization: Bearer <token>` header for every request that
+    /// invocation makes. Use for workload-identity flows with short-lived
+    /// tokens: whatever keeps the file current (a Kubernetes projected
+    /// volume, `feldera/oidc-auth-action` in GitHub Actions) rotates the
+    /// credential without `fda` holding a copy. Conflicts with `--auth`.
+    ///
+    /// Examples:
+    ///
+    /// Kubernetes projected service-account token:
+    /// `--oidc-token-file /var/run/secrets/kubernetes.io/serviceaccount/token`
+    ///
+    /// AWS EKS, IAM roles for service accounts:
+    /// `--oidc-token-file "$AWS_WEB_IDENTITY_TOKEN_FILE"`
+    #[arg(
+        long,
+        env = "FELDERA_OIDC_TOKEN_FILE",
+        value_hint = ValueHint::FilePath,
+        global = true,
+        help_heading = "Global Options",
+        conflicts_with = "auth"
+    )]
+    pub oidc_token_file: Option<PathBuf>,
+    /// Extra HTTP header to send with every request, spelled `Name: Value`.
+    ///
+    /// Repeat the flag to send several headers. A header given here replaces
+    /// the one fda would otherwise send under that name, so
+    /// `--header 'Authorization: Bearer ...'` overrides `--auth`. Each name
+    /// carries one value: naming it twice sends the later value.
+    ///
+    /// Use it to reach a deployment behind an authenticating proxy, which
+    /// admits a request by its own session cookie rather than by a Feldera API
+    /// key:
+    ///
+    /// `--header "Cookie: $ALB_COOKIE"`
+    #[arg(
+        short = 'H',
+        long = "header",
+        value_name = "NAME: VALUE",
+        global = true,
+        help_heading = "Global Options"
+    )]
+    pub headers: Vec<String>,
     /// The client timeout for requests in seconds.
     ///
     /// In almost all cases you should not need to set this value, but it can
@@ -123,6 +183,36 @@ pub struct Cli {
         help_heading = "Global Options"
     )]
     pub timeout: Option<u64>,
+    /// How many times to retry requests that fail transiently (connection
+    /// failures, timeouts, HTTP 408/429/502/503/504) before giving up.
+    ///
+    /// Waits between attempts start at 2 seconds and double per retry. On a
+    /// 502 the client probes cluster health to decide between an immediate
+    /// retry and a longer wait (e.g. while an upgrade is in progress).
+    /// Requests that are unsafe to repeat (e.g. `clock-advance`, whose first
+    /// attempt may already have been applied) retry only when the request
+    /// provably never reached its target. Set to 0 to disable retrying.
+    #[arg(
+        long,
+        env = "FELDERA_RETRIES",
+        global = true,
+        help_heading = "Global Options",
+        default_value_t = 3
+    )]
+    pub retries: u32,
+    /// The tenant to act in, by name or id, sent as the `Feldera-Tenant`
+    /// header on every request.
+    ///
+    /// Needed when the credential may act in several tenants: a platform
+    /// owner, or a user who belongs to more than one tenant. An API key is
+    /// tenant-scoped and needs no selection.
+    #[arg(
+        long,
+        env = "FELDERA_TENANT",
+        global = true,
+        help_heading = "Global Options"
+    )]
+    pub tenant: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
@@ -205,6 +295,24 @@ pub enum Commands {
         #[command(subcommand)]
         action: ApiKeyActions,
     },
+    /// Manage OIDC trust relationships (workload identity federation).
+    OidcTrust {
+        #[command(subcommand)]
+        action: OidcTrustActions,
+    },
+    /// Manage tenants across the installation (platform owner only).
+    Tenant {
+        #[command(subcommand)]
+        action: TenantActions,
+    },
+    /// Manage the members of the acting tenant and their roles.
+    ///
+    /// Acts in the tenant named by `--tenant`, or in the one your credential
+    /// resolves to without it.
+    Member {
+        #[command(subcommand)]
+        action: MemberActions,
+    },
     /// Cluster information and status.
     Cluster {
         #[command(subcommand)]
@@ -225,12 +333,182 @@ pub enum ApiKeyActions {
     Create {
         /// The name of the API key to create
         name: String,
+        /// Role the key carries: `read` (default) or `write`. The role may not
+        /// exceed the caller's own role.
+        #[arg(long, default_value = "read")]
+        role: ApiKeyRole,
     },
     /// Delete an existing API key
     #[clap(aliases = &["del"])]
     Delete {
         /// The name of the API key to delete
         name: String,
+    },
+}
+
+/// The roles an API key may carry.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ApiKeyRole {
+    Read,
+    Write,
+}
+
+#[derive(Subcommand)]
+pub enum OidcTrustActions {
+    /// List configured OIDC trust relationships.
+    List,
+    /// Register a new OIDC trust relationship.
+    ///
+    /// JWTs from `--issuer` whose `sub` claim matches `--subject` and (if
+    /// specified) `aud` claim matches `--audience` are authorized as the
+    /// current tenant. `*` is a wildcard.
+    Create {
+        /// Unique name for the trust relationship.
+        name: String,
+        /// OIDC issuer URL (must match the `iss` claim exactly).
+        #[arg(long)]
+        issuer: String,
+        /// Pattern for the `sub` claim. `*` matches any sequence.
+        #[arg(long)]
+        subject: String,
+        /// Pattern for the `aud` claim. `*` matches any sequence. Optional.
+        #[arg(long)]
+        audience: Option<String>,
+        /// What this trust is for, e.g. the workload or CI job it authorizes.
+        /// Shown when listing trust relationships.
+        #[arg(long)]
+        description: Option<String>,
+        /// Role granted to a matching token: `read` (default), `write` or
+        /// `admin`, capped at the caller's role.
+        #[arg(long)]
+        role: Option<TrustRole>,
+    },
+    /// Delete an OIDC trust relationship.
+    #[clap(aliases = &["del"])]
+    Delete {
+        /// Name of the trust relationship to delete.
+        name: String,
+    },
+}
+
+/// The roles an OIDC trust relationship may grant.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum TrustRole {
+    Read,
+    Write,
+    Admin,
+}
+
+/// The roles a tenant membership may carry. `owner` is platform-wide rather
+/// than a membership, so it is configured at deploy time and never assigned
+/// here, which is why this cannot be a total mapping from the API's role type.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum TenantMemberRole {
+    Read,
+    Write,
+    Admin,
+}
+
+impl From<TenantMemberRole> for MemberRole {
+    fn from(role: TenantMemberRole) -> Self {
+        match role {
+            TenantMemberRole::Read => MemberRole::Read,
+            TenantMemberRole::Write => MemberRole::Write,
+            TenantMemberRole::Admin => MemberRole::Admin,
+        }
+    }
+}
+
+/// Spelled as the API spells it, so printed output matches what the server
+/// stores and what `fda member list` reads back.
+impl Display for TenantMemberRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TenantMemberRole::Read => "read",
+            TenantMemberRole::Write => "write",
+            TenantMemberRole::Admin => "admin",
+        })
+    }
+}
+
+#[derive(Subcommand)]
+pub enum MemberActions {
+    /// List the members of the acting tenant and their roles.
+    List,
+    /// Grant a user access to the acting tenant, by identity.
+    ///
+    /// Works before the user's first login: the membership authorizes as soon
+    /// as that identity authenticates through the platform's identity
+    /// provider. The role is capped at your own.
+    Add {
+        /// OIDC subject of the user, matching the `sub` claim their identity
+        /// provider issues.
+        subject: String,
+        /// Role to grant: `read`, `write` or `admin`.
+        #[arg(long)]
+        role: TenantMemberRole,
+        /// Email, shown in the member list. Optional.
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Change a member's role in the acting tenant.
+    SetRole {
+        /// Identifier of the user, as shown by `fda member list`.
+        user_id: Uuid,
+        /// New role: `read`, `write` or `admin`.
+        role: TenantMemberRole,
+    },
+    /// Remove a member from the acting tenant.
+    ///
+    /// Whether this alone revokes access depends on the deployment: where a
+    /// login provisions memberships, the user is re-added at the default role
+    /// on their next login unless their identity provider stops resolving this
+    /// tenant for them.
+    #[clap(aliases = &["rm"])]
+    Remove {
+        /// Identifier of the user, as shown by `fda member list`.
+        user_id: Uuid,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TenantActions {
+    /// List every tenant in the installation.
+    List,
+    /// Retrieve a single tenant by name or identifier.
+    Get {
+        /// The tenant's name, or its identifier as shown by `fda tenant list`.
+        tenant: String,
+    },
+    /// Create a tenant, or return it if one with this name already exists.
+    ///
+    /// A login resolves its tenant by name, so a user whose identity provider
+    /// asserts this name lands in the tenant created here.
+    Create {
+        /// The name of the tenant.
+        name: String,
+    },
+    /// Rename a tenant.
+    ///
+    /// A login resolves its tenant by name, so the new name decides which users
+    /// arrive in this tenant.
+    Rename {
+        /// Identifier of the tenant to rename, as shown by `fda tenant list`.
+        tenant_id: Uuid,
+        /// The new name.
+        name: String,
+        /// Take the name from the tenant that currently holds it, which is
+        /// renamed to `<name> (<id>)` and keeps everything it had. Makes the
+        /// rename atomic, so no request handled in between can re-create the
+        /// name as a new tenant.
+        #[arg(long)]
+        displace_existing: bool,
+    },
+    /// Delete a tenant that holds no pipelines, API keys or OIDC trusts.
+    #[clap(aliases = &["del"])]
+    Delete {
+        /// Identifier of the tenant to delete, as shown by `fda tenant list`.
+        tenant_id: Uuid,
     },
 }
 
@@ -247,6 +525,15 @@ pub enum ClusterAction {
         #[arg(default_value = "status")]
         selector: ClusterMonitorEventFieldSelector,
     },
+
+    /// Check the health of the cluster services.
+    ///
+    /// Exits with code 0 if all services are healthy, 1 if the health cannot be
+    /// retrieved, and 2 if any service is unhealthy.
+    Health,
+
+    /// Retrieve the platform configuration (edition, version, license, build information).
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -287,20 +574,43 @@ pub enum RuntimeConfigKey {
     Workers,
     Storage,
     FaultTolerance,
+    /// Takes a duration such as `60s`, or `null` to disable periodic
+    /// checkpoints. A bare number of seconds is deprecated but still accepted.
     CheckpointInterval,
     CpuProfiler,
     Tracing,
     TracingEndpointJaeger,
     MinBatchSizeRecords,
+    /// Deprecated: use `max_buffering_delay`.
     MaxBufferingDelayUsecs,
+    MaxBufferingDelay,
     CpuCoresMin,
     CpuCoresMax,
+    /// Deprecated: use `memory_min`.
     MemoryMbMin,
+    /// Deprecated: use `memory_max`.
     MemoryMbMax,
+    /// Takes a size such as `4Gi` or `16G`.
+    MemoryMin,
+    MemoryMax,
+    /// Deprecated: use `storage_max`.
     StorageMbMax,
+    /// Takes a size such as `400Gi`.
+    StorageMin,
+    StorageMax,
+    /// Takes a size such as `16G`, the memory limit the pipeline process
+    /// applies to itself.
+    MaxRss,
+    DatafusionMemory,
     StorageClass,
+    VolumeAttributesClass,
+    /// Deprecated: use `min_spill_size`.
     MinStorageBytes,
+    /// Takes a size such as `10Mi`.
+    MinSpillSize,
+    /// Deprecated: use `clock_resolution`.
     ClockResolutionUsecs,
+    ClockResolution,
     Logging,
     HttpWorkers,
     IoWorkers,
@@ -645,7 +955,8 @@ pub enum PipelineAction {
         #[arg(long, short = 'f')]
         force: bool,
     },
-    /// Control an input connector belonging to a table of a pipeline.
+    /// Control an input connector of a table, or an output connector of a
+    /// view, in a pipeline.
     Connector {
         /// The name of the pipeline.
         #[arg(value_hint = ValueHint::Other, add = ArgValueCompleter::new(pipeline_names))]
@@ -942,76 +1253,6 @@ pub(crate) struct BenchmarkArgs {
     /// Do not wrap the benchmark in a transaction.
     #[arg(long, default_value_t = false)]
     pub no_transaction: bool,
-
-    /// If set upload results to feldera benchmark host.
-    ///
-    /// For development purposes, you most likely don't want to set this to true.
-    ///
-    /// Requires `benchmark_token` token to be set.
-    #[arg(long, short = 'u', default_value_t = false)]
-    pub upload: bool,
-
-    /// Slug or UUID of the project to add results to when uploading
-    /// (requires: `--upload`).
-    #[arg(long, short = 'p', env = "BENCHER_PROJECT")]
-    pub project: String,
-
-    /// Branch name, slug, or UUID. By default it will be set to `main`
-    /// (requires: `--upload`).
-    #[arg(long, default_value_t = String::from("main"))]
-    pub branch: String,
-
-    /// Use the specified branch name as the start point for `branch`
-    /// (requires: `--upload`).
-    ///
-    /// - If `branch` already exists and the start point is different, a new
-    ///   branch will be created.
-    #[arg(long)]
-    pub start_point: Option<String>,
-
-    /// Use the specified full `git` hash as the start point for `branch`
-    /// (requires: `--start-point` and `--upload`).
-    ///
-    /// - If `start_point` already exists and the start point hash is different,
-    ///   a new branch will be created
-    #[arg(long)]
-    pub start_point_hash: Option<String>,
-
-    /// The maximum number of historical branch versions to include
-    /// (requires: `--start-point` and `--upload`).
-    ///
-    /// Versions beyond this number will be omitted.
-    #[arg(long, default_value_t = 255)]
-    pub start_point_max_versions: u32,
-
-    /// Clone thresholds from the start point branch
-    /// (requires: `--branch-start-point` and `--upload`).
-    #[arg(long)]
-    pub start_point_clone_thresholds: bool,
-
-    /// Reset the branch head to an empty state
-    /// (requires: `--branch-start-point` and `--upload`).
-    ///
-    /// If `start_point` is specified, the new branch head will begin at that start point.
-    /// Otherwise, the branch head will be reset to an empty state
-    #[arg(long)]
-    pub start_point_reset: bool,
-
-    /// Where to upload benchmark results to
-    /// (requires: `--upload`).
-    #[arg(
-        long,
-        short = 'b',
-        env = "BENCHER_HOST",
-        value_hint = ValueHint::Url,
-        default_value_t = String::from("https://benchmarks.feldera.io/")
-    )]
-    pub benchmark_host: String,
-
-    /// Which API key to use for authentication with benchmarks server
-    /// (requires: `--upload`).
-    #[arg(long, short = 't', env = "BENCHER_API_TOKEN", hide_env_values = true)]
-    pub benchmark_token: Option<String>,
 }
 
 #[derive(Subcommand)]

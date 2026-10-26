@@ -13,6 +13,7 @@ import org.dbsp.sqlCompiler.ir.aggregate.DBSPMinMax;
 import org.dbsp.sqlCompiler.ir.aggregate.IAggregate;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregateList;
 import org.dbsp.sqlCompiler.ir.aggregate.LinearAggregate;
+import org.dbsp.sqlCompiler.ir.aggregate.MinMaxAggregate;
 import org.dbsp.sqlCompiler.ir.aggregate.NonLinearAggregate;
 import org.dbsp.sqlCompiler.ir.expression.*;
 import org.dbsp.sqlCompiler.ir.expression.literal.DBSPLiteral;
@@ -32,7 +33,7 @@ import org.dbsp.util.Linq;
 import org.dbsp.util.Utilities;
 
 import javax.annotation.Nullable;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Predicate;
@@ -611,7 +612,7 @@ public class ExpressionTranslator extends TranslateVisitor<IDBSPInnerNode> imple
     public void postorder(DBSPZSetExpression node) {
         if (this.done(node))
             return;
-        Map<DBSPExpression, Long> data = new HashMap<>();
+        Map<DBSPExpression, Long> data = new LinkedHashMap<>();
         for (Map.Entry<DBSPExpression, Long> e : node.data.entrySet()) {
             DBSPExpression key = this.getE(e.getKey());
             if (data.containsKey(key))
@@ -650,6 +651,20 @@ public class ExpressionTranslator extends TranslateVisitor<IDBSPInnerNode> imple
         DBSPExpression emptySetResult = this.getE(node.emptySetResult);
         this.map(node, new NonLinearAggregate(node.getNode(), zero, increment.to(DBSPClosureExpression.class),
                 postProcess != null ? postProcess.to(DBSPClosureExpression.class) : null, emptySetResult, node.semigroup));
+    }
+
+    @Override
+    public void postorder(MinMaxAggregate node) {
+        if (this.done(node))
+            return;
+        DBSPExpression zero = this.getE(node.zero);
+        DBSPExpression increment = this.getE(node.increment);
+        DBSPExpression postProcess = this.getEN(node.postProcess);
+        DBSPExpression emptySetResult = this.getE(node.emptySetResult);
+        DBSPExpression comparedValue = this.getE(node.comparedValue);
+        this.map(node, new MinMaxAggregate(node.getNode(), zero, increment.to(DBSPClosureExpression.class),
+                emptySetResult, node.semigroup, comparedValue.to(DBSPClosureExpression.class),
+                postProcess != null ? postProcess.to(DBSPClosureExpression.class) : null, node.operation));
     }
 
     @Override

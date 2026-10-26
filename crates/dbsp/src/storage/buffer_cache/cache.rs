@@ -16,8 +16,9 @@ use size_of::SizeOf;
 use crate::Runtime;
 use crate::circuit::metadata::{
     CACHE_BACKGROUND_HIT_RATE_PERCENT, CACHE_BACKGROUND_HITS, CACHE_BACKGROUND_MISSES,
-    CACHE_FOREGROUND_HIT_RATE_PERCENT, CACHE_FOREGROUND_HITS, CACHE_FOREGROUND_MISSES, MetaItem,
-    MetricId, MetricReading, OperatorMeta,
+    CACHE_BACKGROUND_PREFETCHES, CACHE_BACKGROUND_WAITS, CACHE_FOREGROUND_HIT_RATE_PERCENT,
+    CACHE_FOREGROUND_HITS, CACHE_FOREGROUND_MISSES, CACHE_FOREGROUND_PREFETCHES,
+    CACHE_FOREGROUND_WAITS, MetaItem, MetricId, MetricReading, OperatorMeta,
 };
 use crate::circuit::runtime::current_thread_type;
 use crate::storage::backend::{BlockLocation, FileId, FileReader};
@@ -172,6 +173,24 @@ impl AtomicCacheStats {
         self.0[thread_type][access].record(duration, location);
     }
 
+    /// Fast path for cache hits: skips the timestamp call. Hits are nearly
+    /// instantaneous (the latency that matters lives on the miss path), so we
+    /// record only count and bytes.
+    pub fn record_hit(&self, location: BlockLocation) {
+        let Some(thread_type) = current_thread_type() else {
+            return;
+        };
+        self.0[thread_type][CacheAccess::Hit].record_untimed(location);
+    }
+
+    /// Records a cache miss with its elapsed time (covers the actual I/O).
+    pub fn record_miss(&self, duration: Duration, location: BlockLocation) {
+        let Some(thread_type) = current_thread_type() else {
+            return;
+        };
+        self.0[thread_type][CacheAccess::Miss].record(duration, location);
+    }
+
     /// Reads out the statistics for processing.
     pub fn read(&self) -> CacheStats {
         CacheStats(EnumMap::from_fn(|thread_type| {
@@ -180,22 +199,35 @@ impl AtomicCacheStats {
     }
 }
 
-/// Whether a cache access was a hit or a miss.
+/// What happened when a block was wanted.
 #[derive(Copy, Clone, Debug, Enum)]
 pub enum CacheAccess {
     /// Cache hit.
     Hit,
 
-    /// Cache miss.
+    /// Cache miss, read from storage on the spot.
     Miss,
+
+    /// The block was asked for ahead of need, to be read in the background.
+    /// Recorded when the read is issued, so the time is zero.
+    Prefetch,
+
+    /// The block was wanted while a read issued ahead of need was still in
+    /// flight, and the caller waited for it rather than reading it again.
+    /// The time is how long it waited.
+    Wait,
 }
 
 fn cache_metric(thread_type: ThreadType, access: CacheAccess) -> MetricId {
     match (thread_type, access) {
         (ThreadType::Foreground, CacheAccess::Hit) => CACHE_FOREGROUND_HITS,
         (ThreadType::Foreground, CacheAccess::Miss) => CACHE_FOREGROUND_MISSES,
+        (ThreadType::Foreground, CacheAccess::Prefetch) => CACHE_FOREGROUND_PREFETCHES,
+        (ThreadType::Foreground, CacheAccess::Wait) => CACHE_FOREGROUND_WAITS,
         (ThreadType::Background, CacheAccess::Hit) => CACHE_BACKGROUND_HITS,
         (ThreadType::Background, CacheAccess::Miss) => CACHE_BACKGROUND_MISSES,
+        (ThreadType::Background, CacheAccess::Prefetch) => CACHE_BACKGROUND_PREFETCHES,
+        (ThreadType::Background, CacheAccess::Wait) => CACHE_BACKGROUND_WAITS,
     }
 }
 
@@ -211,6 +243,8 @@ impl Display for CacheAccess {
         match self {
             Self::Hit => write!(f, "hits"),
             Self::Miss => write!(f, "misses"),
+            Self::Prefetch => write!(f, "prefetches"),
+            Self::Wait => write!(f, "waits"),
         }
     }
 }
@@ -235,6 +269,15 @@ impl AtomicCacheCounts {
             .fetch_add(location.size as u64, Ordering::Relaxed);
         self.elapsed_ns
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Records an access without timing. Used on the cache-hit fast path,
+    /// where `Instant::now()` + `elapsed()` would dominate the work; hits
+    /// are nanoseconds anyway so the timing has no useful meaning.
+    pub fn record_untimed(&self, location: BlockLocation) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes
+            .fetch_add(location.size as u64, Ordering::Relaxed);
     }
 
     /// Reads out the counts for processing.
@@ -264,13 +307,16 @@ impl CacheStats {
                     )
                 }));
 
-                let hits = accesses[CacheAccess::Hit].count;
+                // A wait ends in a hit on a block read ahead of need, and a
+                // prefetch is not an access at all, so the rate counts waits
+                // with the hits and leaves prefetches out.
+                let hits = accesses[CacheAccess::Hit].count + accesses[CacheAccess::Wait].count;
                 let misses = accesses[CacheAccess::Miss].count;
                 meta.extend([MetricReading::new(
                     cache_hit_rate_metric(thread_type),
                     Vec::new(),
                     MetaItem::Percent {
-                        numerator: hits,
+                        numerator: hits as i64,
                         denominator: hits + misses,
                     },
                 )]);

@@ -14,9 +14,9 @@ import javax.annotation.Nullable;
 import java.util.List;
 
 public final class DBSPPositiveOperator extends DBSPUnaryOperator
-        implements IContainsIntegrator, IIncremental {
+        implements IHasInputIntegrator, IIncremental {
     public DBSPPositiveOperator(CalciteRelNode node, OutputPort input) {
-        super(node, "positive", null, input.outputType(), false, input);
+        super(node, "positive", null, input.outputType(), input.isMultiset(), input);
     }
 
     @Override

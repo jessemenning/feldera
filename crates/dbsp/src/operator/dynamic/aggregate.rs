@@ -462,42 +462,40 @@ where
         O: IndexedZSet<Key = Z::Key, Val = Out>,
     {
         let circuit = self.circuit();
-        circuit
-            .region("aggregate", || {
-                // We construct the following circuit.  See `AggregateIncremental` documentation
-                // for details.
-                //
-                // ```
-                //                        ┌────────────────────────────────────────┐
-                //                        │                                        │
-                //                        │                                        ▼
-                // stream ┌────────────┐  │     ┌─────┐  stream.trace()  ┌────────────────────┐      ┌──────┐
-                // ──────►│accumulate  ├──┴────►┤trace├─────────────────►│AggregateIncremental├─────►│upsert├──────►
-                //        └────────────┘        └─────┘                  └────────────────────┘      └──────┘
-                // ```
+        circuit.region("aggregate", || {
+            // We construct the following circuit.  See `AggregateIncremental` documentation
+            // for details.
+            //
+            // ```
+            //                        ┌────────────────────────────────────────┐
+            //                        │                                        │
+            //                        │                                        ▼
+            // stream ┌────────────┐  │     ┌─────┐  stream.trace()  ┌────────────────────┐      ┌──────┐
+            // ──────►│accumulate  ├──┴────►┤trace├─────────────────►│AggregateIncremental├─────►│upsert├──────►
+            //        └────────────┘        └─────┘                  └────────────────────┘      └──────┘
+            // ```
 
-                circuit
-                    .add_binary_operator(
-                        StreamingBinaryWrapper::new(AggregateIncremental::new(
-                            factories.keys_factory,
-                            factories.output_pair_factory,
-                            factories.output_pairs_factory,
-                            aggregator,
-                            circuit.clone(),
-                        )),
-                        &self
-                            .dyn_shard_accumulate(&factories.input_factories)
-                            .into_enabled_stream(),
-                        &self.dyn_shard_accumulate_trace(
-                            &factories.trace_factories,
-                            &factories.input_factories,
-                        ),
-                    )
-                    .mark_sharded()
-                    .upsert::<O>(persistent_id, &factories.upsert_factories)
-                    .mark_sharded()
-            })
-            .clone()
+            circuit
+                .add_binary_operator(
+                    StreamingBinaryWrapper::new(AggregateIncremental::new(
+                        factories.keys_factory,
+                        factories.output_pair_factory,
+                        factories.output_pairs_factory,
+                        aggregator,
+                        circuit.clone(),
+                    )),
+                    &self
+                        .dyn_shard_accumulate(&factories.input_factories)
+                        .into_enabled_stream(),
+                    &self.dyn_shard_accumulate_trace(
+                        &factories.trace_factories,
+                        &factories.input_factories,
+                    ),
+                )
+                .mark_sharded()
+                .upsert::<O>(persistent_id, &factories.upsert_factories)
+                .mark_sharded()
+        })
     }
 
     /// See [`Stream::aggregate_linear`].
@@ -532,26 +530,24 @@ where
         O: IndexedZSet<Key = Z::Key>,
         A: WeightTrait + ?Sized,
     {
-        self.circuit()
-            .region("aggregate_linear", || {
-                self.dyn_weigh(&factories.aggregate_factories.input_factories, agg_func)
-                    .set_persistent_id(
-                        persistent_id
-                            .map(|name| format!("{name}-weighted"))
-                            .as_deref(),
-                    )
-                    .dyn_aggregate_generic(
-                        persistent_id,
-                        &factories.aggregate_factories,
-                        &WeightedCount::new(
-                            factories.out_factory,
-                            factories.agg_factory,
-                            factories.option_agg_factory,
-                            out_func,
-                        ),
-                    )
-            })
-            .clone()
+        self.circuit().region("aggregate_linear", || {
+            self.dyn_weigh(&factories.aggregate_factories.input_factories, agg_func)
+                .set_persistent_id(
+                    persistent_id
+                        .map(|name| format!("{name}-weighted"))
+                        .as_deref(),
+                )
+                .dyn_aggregate_generic(
+                    persistent_id,
+                    &factories.aggregate_factories,
+                    &WeightedCount::new(
+                        factories.out_factory,
+                        factories.agg_factory,
+                        factories.option_agg_factory,
+                        out_func,
+                    ),
+                )
+        })
     }
 
     /// See [`Stream::weigh`].
@@ -588,8 +584,8 @@ where
 
                 let mut delta = <O::Builder>::with_capacity(
                     &output_factories,
-                    batch.key_count(),
-                    batch.key_count(),
+                    batch.key_count_upper_bound(),
+                    batch.key_count_upper_bound(),
                 );
                 let mut cursor = batch.cursor();
                 while cursor.key_valid() {
@@ -662,30 +658,28 @@ where
         TS: DataTrait + ?Sized,
         Box<TS>: Clone,
     {
-        self.circuit()
-            .region("aggregate_linear_retain_keys", || {
-                let weighted =
-                    self.dyn_weigh(&factories.aggregate_factories.input_factories, agg_func);
-                weighted.dyn_integrate_trace_retain_keys(waterline, retain_key_func);
+        self.circuit().region("aggregate_linear_retain_keys", || {
+            let weighted = self.dyn_weigh(&factories.aggregate_factories.input_factories, agg_func);
+            // The aggregate reads the accumulate trace of `weighted`, which has bounds of its own
+            weighted.dyn_accumulate_integrate_trace_retain_keys(waterline, retain_key_func);
 
-                weighted
-                    .set_persistent_id(
-                        persistent_id
-                            .map(|name| format!("{name}-weighted"))
-                            .as_deref(),
-                    )
-                    .dyn_aggregate_generic(
-                        persistent_id,
-                        &factories.aggregate_factories,
-                        &WeightedCount::new(
-                            factories.out_factory,
-                            factories.agg_factory,
-                            factories.option_agg_factory,
-                            out_func,
-                        ),
-                    )
-            })
-            .clone()
+            weighted
+                .set_persistent_id(
+                    persistent_id
+                        .map(|name| format!("{name}-weighted"))
+                        .as_deref(),
+                )
+                .dyn_aggregate_generic(
+                    persistent_id,
+                    &factories.aggregate_factories,
+                    &WeightedCount::new(
+                        factories.out_factory,
+                        factories.agg_factory,
+                        factories.option_agg_factory,
+                        out_func,
+                    ),
+                )
+        })
     }
 }
 
@@ -743,7 +737,7 @@ where
     Acc: DataTrait + ?Sized,
 {
     async fn eval(&mut self, i: &Z) -> O {
-        let n = i.key_count();
+        let n = i.key_count_upper_bound();
         let mut builder = O::Builder::with_capacity(&self.factories, n, n);
         let mut agg = self.option_output_factory.default_box();
 
@@ -1032,15 +1026,15 @@ impl<Z, IT, Acc, Out, Clk>
 where
     Clk: WithClock<Time = <IT::Batch as BatchReader>::Time> + 'static,
     Z: Batch<Time = ()>,
-    IT: WithSnapshot + 'static,
+    IT: WithSnapshot + Clone + 'static,
     IT::Batch: BatchReader<Key = Z::Key, Val = Z::Val, R = Z::R>,
     Acc: DataTrait + ?Sized,
     Out: DataTrait + ?Sized,
 {
     fn eval(
         self: Rc<Self>,
-        delta: &Option<Spine<Z>>,
-        input_trace: &IT,
+        delta: Cow<'_, Option<Spine<Z>>>,
+        input_trace: Cow<'_, IT>,
     ) -> impl AsyncStream<Item = (Box<DynPairs<Z::Key, DynOpt<Out>>>, bool, Option<Position>)> + 'static
     {
         let chunk_size = splitter_output_chunk_size();
@@ -1049,7 +1043,7 @@ where
         //     "{}: AggregateIncremental::eval({delta:?})",
         //     Runtime::worker_index()
         // );
-        let delta = delta.as_ref().map(|b| b.ro_snapshot());
+        let delta = (*delta).as_ref().map(|b| b.ro_snapshot());
 
         // We assume that delta.is_some() implies that the operator is being flushed,
         // since the integral is always flushed in same step as delta.
@@ -1066,7 +1060,7 @@ where
                 return;
             };
 
-            self.input_batch_stats.borrow_mut().add_batch(delta.len());
+            self.input_batch_stats.borrow_mut().add_batch(delta.len_upper_bound());
 
             // println!(
             //     "{}: AggregateIncremental::eval @{:?}\ndelta:{delta}",
@@ -1209,6 +1203,7 @@ pub mod test {
 
     use std::{cell::RefCell, rc::Rc};
 
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
         Circuit, RootCircuit, Runtime, Stream,
         algebra::DefaultSemigroup,
@@ -1384,6 +1379,8 @@ pub mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn proptest_aggregate_test_st(inputs in test_input()) {
             let iterations = inputs.len();
@@ -1706,6 +1703,63 @@ pub mod test {
         aggregate_linear_postprocess_test(true)
     }
 
+    /// Issue 7415: the key filter of `aggregate_linear_postprocess_retain_keys` applies to the
+    /// trace the aggregate reads.  One new key per step with a waterline ten keys behind: after
+    /// each half of the stream the traces hold a few dozen records, against the 1000 keys of the
+    /// half; without the filter they hold every key.
+    #[test]
+    fn aggregate_linear_retain_keys_prunes_input() {
+        let (mut dbsp, (input_handle, waterline_handle, output_handle)) =
+            Runtime::init_circuit(CircuitConfig::from(2), |circuit| {
+                let (input, input_handle) = circuit.add_input_zset::<Tup2<i32, i32>>();
+                let (waterline, waterline_handle) = circuit.add_input_stream::<i32>();
+                let sum = input
+                    .map_index(|Tup2(k, v)| (*k, *v))
+                    .aggregate_linear_postprocess_retain_keys(
+                        &waterline.typed_box(),
+                        |k, ts| k >= ts,
+                        |v: &i32| *v as i64,
+                        |sum: i64| sum,
+                    );
+                // The output trace is retained the same way, as the SQL compiler does
+                sum.accumulate_integrate_trace_retain_keys(&waterline.typed_box(), |k, ts| k >= ts);
+                Ok((input_handle, waterline_handle, sum.accumulate_output()))
+            })
+            .unwrap();
+
+        /// The records in the traces of the circuit after compaction.
+        fn state(dbsp: &mut crate::DBSPHandle) -> usize {
+            dbsp.start_compaction().unwrap();
+            dbsp.wait_for_compaction(std::time::Duration::from_secs(60))
+                .unwrap();
+            let profile = dbsp.retrieve_profile().unwrap();
+            profile
+                .attribute_total_as_count(&crate::circuit::metadata::STATE_RECORDS_COUNT)
+                .unwrap()
+        }
+
+        const KEYS: i32 = 1000;
+        let mut sizes = Vec::new();
+        for half in 0..2 {
+            for k in half * KEYS..(half + 1) * KEYS {
+                input_handle.append(&mut vec![Tup2(Tup2(k, 1), 1)]);
+                waterline_handle.set_for_all(k - 10);
+                dbsp.transaction().unwrap();
+                output_handle.take_from_all();
+            }
+            sizes.push(state(&mut dbsp));
+        }
+        // A merge applies the filter it reads when it starts, and a slot with one batch is pushed
+        // up unmerged, so the traces hold the live keys plus the keys since the last merge
+        for size in sizes {
+            assert!(
+                size < KEYS as usize,
+                "the input trace of the aggregate kept its keys: {size} records"
+            );
+        }
+        dbsp.kill().unwrap();
+    }
+
     fn aggregate_linear_postprocess_test(transaction: bool) {
         // Aggregation function that returns a 3-tuple including:
         // 1. Number of elements in the group.
@@ -2006,6 +2060,7 @@ pub mod test {
     mod retain_values_test {
         use proptest::{collection, prelude::*};
 
+        use crate::utils::test::CIRCUIT_CASES;
         use crate::{Runtime, ZWeight, circuit::CircuitConfig, operator::Max, utils::Tup2};
 
         const LATENESS: u32 = 10;
@@ -2097,9 +2152,9 @@ pub mod test {
             )
             .unwrap();
 
-            for i in 0..inputs.len() {
-                // println!("input: {:?}", inputs[i]);
-                input_handle.append(&mut inputs[i].clone());
+            for input in &inputs {
+                // println!("input: {:?}", input);
+                input_handle.append(&mut input.clone());
                 dbsp.transaction().unwrap();
                 assert_eq!(
                     max_handle.concat().consolidate(),
@@ -2148,6 +2203,8 @@ pub mod test {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
             #[test]
             fn proptest_max_retain_values_test(inputs in inputs(100, 100, 20)) {
                 max_retain_values_test(inputs);

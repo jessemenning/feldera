@@ -14,6 +14,7 @@
     swapActions,
     children
   }: {
+    /** If neither content.onSuccess nor content.onError are provided the footer is not rendered.  */
     content: GlobalDialogContent
     danger?: boolean
     disabled?: boolean
@@ -39,12 +40,12 @@
   <div class="flex flex-nowrap justify-between">
     <div class="h5" data-testid="box-dialog-title">{content.title}</div>
     {#if !noclose}
-      <button onclick={cancel} class="fd fd-x -m-4 btn-icon text-[24px]" aria-label="Close dialog"
+      <button onclick={cancel} class="fd fd-x -m-4 btn-icon text-[20px]" aria-label="Close dialog"
       ></button>
     {/if}
   </div>
   <div
-    class="-mr-4 scrollbar flex max-h-[calc(90vh-96px)] flex-col gap-4 overflow-visible pr-4 sm:-mr-8"
+    class="-mr-4 scrollbar flex max-h-[calc(90vh-116px)] flex-col gap-4 overflow-visible pr-4 sm:-mr-8 sm:pr-8"
   >
     {#if content.description}
       <span class="whitespace-pre-wrap" data-testid="box-dialog-description">
@@ -61,11 +62,8 @@
     {/if}
     {@render children?.()}
   </div>
-  {#if content.onSuccess}
-    <div
-      class="flex w-full flex-col-reverse gap-4 sm:flex-row sm:justify-end"
-      data-testid="box-dialog-actions"
-    >
+  {#if content.onSuccess || content.onCancel}
+    <div class="flex w-full flex-nowrap justify-end gap-4" data-testid="box-dialog-actions">
       <button
         onclick={() => cancel()}
         class="btn preset-filled-surface-50-950 px-4"
@@ -74,20 +72,22 @@
       >
         {content.onCancel?.name ?? 'Cancel'}
       </button>
-      <div class:order-first={swapActions}>
-        <button
-          {disabled}
-          onclick={content.onSuccess.callback}
-          class="btn px-4 {danger
-            ? 'preset-filled-error-500 font-semibold'
-            : 'preset-filled-primary-500'}"
-          data-testid={content.onSuccess['data-testid']}
-        >
-          {content.onSuccess.name}
-        </button>
-      </div>
-      {#if disabled && content.onSuccess.disabledMessage}
-        <Tooltip class="z-20 w-64" placement="top">{content.onSuccess.disabledMessage}</Tooltip>
+      {#if content.onSuccess}
+        <div class:order-first={swapActions}>
+          <button
+            {disabled}
+            onclick={content.onSuccess.callback}
+            class="btn px-4 {danger
+              ? 'preset-filled-error-500 font-semibold'
+              : 'preset-filled-primary-500'}"
+            data-testid={content.onSuccess['data-testid']}
+          >
+            {content.onSuccess.name}
+          </button>
+        </div>
+        {#if disabled && content.onSuccess.disabledMessage}
+          <Tooltip class="z-20 w-64" placement="top">{content.onSuccess.disabledMessage}</Tooltip>
+        {/if}
       {/if}
     </div>
   {/if}

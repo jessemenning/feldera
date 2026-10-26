@@ -38,6 +38,7 @@ use crate::{
         checkpoint::{CheckpointInputEndpointMetrics, CheckpointOutputEndpointMetrics},
         journal::{InputChecksums, InputLog},
     },
+    util::truncate_ellipse_middle,
 };
 use anyhow::Error as AnyError;
 use anyhow::anyhow;
@@ -51,15 +52,17 @@ use feldera_adapterlib::{
     errors::journal::ControllerError,
     format::{BufferSize, ParseError},
     metrics::ConnectorMetrics,
+    preprocess::PreprocessorWatchdog,
     transport::{InputReader, Resume, Step, Watermark},
 };
 use feldera_samply::Event;
+use feldera_storage::disk::DiskUsage;
 use feldera_storage::histogram::SlidingHistogram;
 use feldera_types::{
     adapter_stats::{
-        CompletedWatermark, ConnectorError, ConnectorHealth, ExternalInputEndpointMetrics,
-        ExternalInputEndpointStatus, ExternalOutputEndpointMetrics, ExternalOutputEndpointStatus,
-        ShortEndpointConfig,
+        CompletedWatermark, ConnectorError, ConnectorHealth, ConnectorHealthStatus,
+        ExternalInputEndpointMetrics, ExternalInputEndpointStatus, ExternalOutputEndpointMetrics,
+        ExternalOutputEndpointStatus, ShortEndpointConfig,
     },
     checkpoint::CheckpointActivity,
     config::{FtModel, PipelineConfig},
@@ -73,7 +76,7 @@ use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
 use size_of::HumanBytes;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt::Display,
     sync::{
         Arc, Mutex,
@@ -81,7 +84,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -91,19 +94,18 @@ use utoipa::ToSchema;
 /// There are separate counters for parse and transport errors and for every tag.
 pub(crate) const MAX_CONNECTOR_ERRORS: usize = 100;
 
-/// Kind of input buffered by an endpoint.
+/// Maximum length of an error message stored as part of the endpoint status.
 ///
-/// Used by [ControllerStatus::input_batch_global] to decide whether input
-/// buffering should wake the circuit thread.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum BufferedInput {
-    /// Regular input buffering, with no special wakeup reason.
-    Normal,
-
-    /// Input was buffered for an endpoint currently blocking checkpoint or
-    /// suspend on a barrier.
-    Barrier,
-}
+/// An endpoint reports up to `MAX_CONNECTOR_ERRORS` messages per tag, so without
+/// a per-message bound a connector that quotes its payload in an error message
+/// can grow `/stats` and `/output_endpoints/{name}/stats` past the size limit
+/// the pipeline manager applies while proxying the response, which turns the
+/// whole request into an error. A connector is expected to bound the data it
+/// quotes; this cap is the backstop for when it does not.
+///
+/// The bound is generous enough that a message describing a single record, its
+/// error chain and a backtrace survives intact.
+pub(crate) const MAX_CONNECTOR_ERROR_LEN: usize = 8 * 1024;
 
 /// Completion token.
 ///
@@ -264,6 +266,16 @@ pub struct GlobalControllerMetrics {
     /// may still be buffered by output connectors.
     pub total_processed_bytes: AtomicU64,
 
+    /// Total number of input records committed by the DBSP engine.
+    ///
+    /// Equal to `total_processed_records` as of the last step that ended outside
+    /// a transaction: records ingested inside an open transaction are in the
+    /// circuit but are not committed until the transaction ends.
+    ///
+    /// This is the ceiling on `total_completed_records`, which additionally
+    /// waits for the output connectors.
+    pub total_committed_records: AtomicU64,
+
     /// Total number of input records processed to completion.
     ///
     /// A record is processed to completion if it has been processed by the DBSP engine and
@@ -287,6 +299,16 @@ pub struct GlobalControllerMetrics {
     /// `total_initiated_steps - 1` has been started and all steps previous to
     /// that have been completely processed by the circuit.
     pub total_initiated_steps: Atomic<Step>,
+
+    /// Number of steps committed by the DBSP engine.
+    ///
+    /// A step is committed once the circuit has evaluated it and it ended
+    /// outside a transaction. Counted the same way as `total_initiated_steps`,
+    /// so during a step this is `total_initiated_steps - 1`.
+    ///
+    /// This is the ceiling on `total_completed_steps`, which additionally waits
+    /// for the output connectors.
+    pub total_committed_steps: Atomic<Step>,
 
     /// Number of steps whose input records have been processed to completion.
     ///
@@ -337,11 +359,13 @@ impl GlobalControllerMetrics {
             total_circuit_input_bytes: AtomicU64::new(0),
             total_processed_records: AtomicU64::new(processed_records),
             total_processed_bytes: AtomicU64::new(0),
+            total_committed_records: AtomicU64::new(processed_records),
             total_completed_records: AtomicU64::new(processed_records),
             output_stall_start: Mutex::new(None),
             accumulated_output_stall: Mutex::new(Duration::ZERO),
             step_requested: AtomicBool::new(false),
             total_initiated_steps: Atomic::new(0),
+            total_committed_steps: Atomic::new(0),
             total_completed_steps: Atomic::new(0),
         }
     }
@@ -424,6 +448,14 @@ impl GlobalControllerMetrics {
 
     pub fn total_initiated_steps(&self) -> Step {
         self.total_initiated_steps.load(Ordering::Acquire)
+    }
+
+    pub fn num_total_committed_records(&self) -> u64 {
+        self.total_committed_records.load(Ordering::Acquire)
+    }
+
+    pub fn total_committed_steps(&self) -> Step {
+        self.total_committed_steps.load(Ordering::Acquire)
     }
 
     pub fn total_completed_steps(&self) -> Step {
@@ -532,6 +564,25 @@ pub struct ControllerStatus {
 
     /// Output endpoint configs and metrics.
     outputs: OutputsStatus,
+
+    /// Input that reached the circuit but has no endpoint left to report it.
+    ///
+    /// An endpoint hands records to the circuit with [`Self::extended`], which
+    /// parks their size in the endpoint's own status entry for the circuit
+    /// thread to pick up and count as processed. Removing the endpoint takes
+    /// that entry with it, and an endpoint can be removed at any point: an ad
+    /// hoc `INSERT` disconnects its endpoint as soon as the queue drains. The
+    /// records are in the circuit either way, so their size is stashed here
+    /// instead and credited by the next step. Otherwise
+    /// `total_processed_records` would stay permanently below
+    /// `total_input_records`, and a client waiting for the pipeline to catch up
+    /// with an ad hoc write would wait forever.
+    orphaned_input: Mutex<BufferSize>,
+
+    /// Notified when an input endpoint finishes (see
+    /// [InputEndpointStatus::finished]), so that the labels that
+    /// [Self::incomplete_labels] reports may have changed.
+    pub(crate) input_completion_notify: Arc<Notify>,
 }
 
 /// Context needed by [`ControllerStatus::to_api_type`] to build the public
@@ -544,6 +595,9 @@ pub struct ControllerStatusContext {
     pub transaction_info: TransactionInfo,
     pub memory_pressure: MemoryPressure,
     pub memory_pressure_epoch: u64,
+    /// Usage of the disk holding the pipeline's storage, or `None` when there
+    /// is no local disk or it cannot be read.
+    pub disk_usage: Option<DiskUsage>,
     /// When `true`, per-endpoint error messages are serialized alongside
     /// the counters. Set by the support-bundle collector via the
     /// `?include_connector_errors=true` query parameter on `/stats`.
@@ -573,6 +627,8 @@ impl ControllerStatus {
             checkpoint_notifier,
             inputs: RwLock::new(BTreeMap::new()),
             outputs: RwLock::new(BTreeMap::new()),
+            orphaned_input: Mutex::new(BufferSize::empty()),
+            input_completion_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -584,6 +640,11 @@ impl ControllerStatus {
     ///
     /// Setting the state to [PipelineState::Terminated] is permanent; the state
     /// can't be re-set to any other state after that.
+    /// Sets the pipeline state.
+    ///
+    /// Use `ControllerInner::set_terminated` for
+    /// [PipelineState::Terminated]: the controller pairs that state with a
+    /// [tokio_util::sync::CancellationToken] and the two must not disagree.
     pub fn set_state(&self, desired: PipelineState) {
         if desired == PipelineState::Terminated {
             self.global_metrics.state.store(desired, Ordering::Relaxed);
@@ -661,10 +722,65 @@ impl ControllerStatus {
         Some(self.input_status().get(endpoint)?.is_paused_by_user())
     }
 
+    /// Sets `endpoint`'s paused state to `paused` and returns whether it was
+    /// previously paused.
+    pub fn set_output_endpoint_paused(&self, endpoint: &EndpointId, paused: bool) -> Option<bool> {
+        Some(
+            self.output_status()
+                .get(endpoint)?
+                .set_paused_by_user(paused),
+        )
+    }
+
+    pub fn is_output_endpoint_paused(&self, endpoint: &EndpointId) -> Option<bool> {
+        Some(self.output_status().get(endpoint)?.is_paused_by_user())
+    }
+
+    /// The output endpoints that are paused right now.
+    ///
+    /// The user can pause or start a connector at any moment, including
+    /// between the point where a step records what its connectors were doing
+    /// and the point where it acts on them. The circuit thread therefore reads
+    /// this once per step and both use the result, so that what a step records
+    /// and what it does cannot disagree.
+    pub fn paused_output_endpoints(&self) -> HashSet<EndpointId> {
+        self.output_status()
+            .iter()
+            .filter(|(_, endpoint_stats)| endpoint_stats.is_paused_by_user())
+            .map(|(endpoint_id, _)| *endpoint_id)
+            .collect()
+    }
+
+    /// Returns the labels of the input endpoints that have not finished (see
+    /// `InputEndpointStatus::finished`).  An endpoint that waits for these
+    /// labels with `start_after` may not start yet.
+    ///
+    /// An endpoint that has reached the end of its input may still have
+    /// buffered records, for example records held back until a transaction
+    /// opens, so this also waits for those to reach the circuit.
+    pub fn incomplete_labels(&self) -> HashSet<String> {
+        self.input_status()
+            .values()
+            .filter(|status| !status.finished())
+            .flat_map(|status| status.config.connector_config.labels.iter().cloned())
+            .collect()
+    }
+
     /// Invoked when one of the input endpoints has finished processing
     /// to check if any paused endpoints have all their 'start_after'
     /// dependencies satisfied and can be started.
+    ///
+    /// In a multihost pipeline, this only notifies
+    /// `input_completion_notify`, because the labels must be complete
+    /// on every host, not only on this one.  The coordinator starts the
+    /// endpoints instead, when [Self::incomplete_labels] on every host says
+    /// so.
     pub fn start_dependencies(&self, backpressure_thread_unparker: &Unparker) {
+        self.input_completion_notify.notify_waiters();
+        if self.pipeline_config.multihost.is_some() {
+            return;
+        }
+
         let mut endpoints_to_start: Vec<EndpointId> = Vec::new();
 
         let inputs = self.input_status();
@@ -704,8 +820,39 @@ impl ControllerStatus {
         }
     }
 
-    pub fn remove_input(&self, endpoint_id: &EndpointId) -> Option<InputEndpointStatus> {
-        self.inputs.write().remove(endpoint_id)
+    pub fn remove_input(
+        &self,
+        endpoint_id: &EndpointId,
+        circuit_thread_unparker: &Unparker,
+    ) -> Option<InputEndpointStatus> {
+        let endpoint = self.inputs.write().remove(endpoint_id)?;
+
+        // The endpoint may have handed records to the circuit that the circuit
+        // thread has not counted yet. That result dies with the endpoint, so
+        // keep its size and request the step that credits it; see
+        // `orphaned_input`.
+        if let Some(results) = endpoint.progress.lock().unwrap().take() {
+            self.orphan_input(results.amt, circuit_thread_unparker);
+        }
+
+        Some(endpoint)
+    }
+
+    /// Stashes input that the circuit received from an endpoint that is no
+    /// longer registered, and requests the step that credits it; see
+    /// [`Self::orphaned_input`].
+    fn orphan_input(&self, amt: BufferSize, circuit_thread_unparker: &Unparker) {
+        if amt.is_empty() {
+            return;
+        }
+        *self.orphaned_input.lock().unwrap() += amt;
+        self.request_step(circuit_thread_unparker);
+    }
+
+    /// Takes the input stashed by [`Self::orphan_input`], for the caller to
+    /// count as processed by the step it is about to run.
+    pub(super) fn take_orphaned_input(&self) -> BufferSize {
+        std::mem::take(&mut *self.orphaned_input.lock().unwrap())
     }
 
     pub fn remove_output(&self, endpoint_id: &EndpointId) {
@@ -718,7 +865,7 @@ impl ControllerStatus {
         // already have. Republish the counters now, since the only other
         // refresh happens on a step or an output batch, and an idle pipeline
         // produces neither.
-        self.update_total_completed_records(None);
+        self.update_total_completed_records();
     }
 
     /// Initialize stats for a new output endpoint.
@@ -736,26 +883,26 @@ impl ControllerStatus {
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
         caught_up: bool,
     ) {
-        // Seeding `total_processed_input_records` to `total_processed_records` claims the
-        // endpoint has already delivered the output derived from those records. That holds
-        // only for an endpoint that is caught up. An endpoint still owed output starts at
-        // zero and reaches `total_processed_records` once it has processed the batch
-        // carrying that output, keeping the counter from running ahead of the sink.
-        let total_processed_records = if caught_up {
-            self.global_metrics
-                .total_processed_records
-                .load(Ordering::Acquire)
+        // A caught-up endpoint owes nothing for what the circuit has already committed, so it
+        // starts out claiming exactly that, records and steps alike. Claiming fewer steps would
+        // hold `total_completed_steps` at the count this endpoint was added at until the endpoint
+        // delivers its first batch, even once every other endpoint has delivered. An endpoint
+        // still owed output starts at zero instead and reaches the committed figures once it has
+        // processed the batch carrying that output, keeping its counters from running ahead of
+        // the sink.
+        //
+        // An endpoint registered between the circuit committing a step and `push_output`
+        // distributing it claims that step and then receives its output anyway, so the frontier
+        // can count the step before this endpoint delivers it. That window is the one the record
+        // count has always had, and it closes as soon as the endpoint delivers the batch.
+        let committed = if caught_up {
+            self.committed()
         } else {
-            0
+            ProcessedRecords::default()
         };
         self.outputs.write().insert(
             *endpoint_id,
-            OutputEndpointStatus::new(
-                endpoint_name,
-                config,
-                total_processed_records,
-                initial_statistics,
-            ),
+            OutputEndpointStatus::new(endpoint_name, config, committed, initial_statistics),
         );
     }
 
@@ -789,6 +936,32 @@ impl ControllerStatus {
 
     pub fn num_total_processed_bytes(&self) -> u64 {
         self.global_metrics.num_total_processed_bytes()
+    }
+
+    /// What the circuit has processed to completion.
+    ///
+    /// This is the ceiling on the completion frontier, and what an output connector that owes
+    /// nothing claims for itself. It is not `total_processed_records`, which counts records an
+    /// open transaction has not committed, nor `total_completed_steps`, which is the frontier
+    /// itself and so is held back by whichever connector is furthest behind.
+    pub fn committed(&self) -> ProcessedRecords {
+        ProcessedRecords {
+            total_processed_input_records: self.global_metrics.num_total_committed_records(),
+            total_processed_steps: self.global_metrics.total_committed_steps(),
+        }
+    }
+
+    /// Record what the circuit has committed.
+    ///
+    /// The circuit thread calls this after a step that ends outside a
+    /// transaction, with the same figures it hands to the output connectors.
+    pub fn set_committed(&self, committed: ProcessedRecords) {
+        self.global_metrics
+            .total_committed_records
+            .fetch_max(committed.total_processed_input_records, Ordering::SeqCst);
+        self.global_metrics
+            .total_committed_steps
+            .fetch_max(committed.total_processed_steps, Ordering::SeqCst);
     }
 
     pub fn processed_data(&self, amt: BufferSize) -> u64 {
@@ -936,42 +1109,36 @@ impl ControllerStatus {
 
     /// Update `global_metrics.total_completed_records` and `global_metrics.total_completed_steps`.
     ///
-    /// Must be invoked any time this metric can change, i.e., after every output
-    /// produced by an output connector as well as after each step.
+    /// Must be invoked any time these metrics can change: after every output
+    /// produced by an output connector, after each step, and when an output
+    /// connector is removed.
     ///
-    /// The `transaction_state` parameter indicates the state of the current transaction when the
-    /// function is invoked after a step. Otherwise, if it is invoked by an output connector, it is None.
-    ///
-    /// Computes `total_completed_records` as the minimum `total_processed_input_records` across
-    /// all output connectors. In case there are no output connectors attached to the pipeline,
-    /// and the transaction state is None, it returns `total_processed_records`. Otherwise, it there
-    /// is currently a transaction in progress, it returns `total_completed_records`.
+    /// What the circuit has committed is the ceiling, and each output connector
+    /// lowers it to what that connector has delivered. Reading the ceiling from
+    /// `total_committed_*` rather than from `total_processed_records` and
+    /// `total_initiated_steps` is what makes the result independent of when this
+    /// runs: the latter two count a step the circuit is still evaluating and
+    /// records an open transaction has not committed, which a pipeline with no
+    /// output connector left would then report as complete (issue 7169).
     ///
     /// Also updates watermark trackers in input endpoints.
-    pub fn update_total_completed_records(&self, transaction_state: Option<TransactionState>) {
-        // Compute new `total_completed_records` atomically, protected by the output status lock.
-        // However we don't want to call `watermarks_update_completed` while holding the lock, as that
-        // will take the input status lock. This is not necessarily a bug, but it will complicate
-        // reasoning about potential deadlocks.
+    pub fn update_total_completed_records(&self) {
+        // The output status lock holds the set of endpoints still, so the loop below sees each
+        // endpoint exactly once. It does not make the whole computation atomic: it is a read lock,
+        // so other callers compute their own minimum at the same time, and the ceiling is read
+        // before the lock is taken.
         //
-        // So we call `watermarks_update_completed` outside the atomic section, but use compare_exchange to
-        // ensure that the biggest value wins among multiple writers (`total_completed_records` increases
-        // monotonically).
+        // What makes that safe is that every input grows monotonically, so a stale read can only
+        // produce a smaller result, and `fetch_max` below discards it. The caller that wrote the
+        // input always computes again afterwards, so no change goes unpublished.
+        //
+        // `watermarks_update_completed` runs after the lock is dropped because it takes the input
+        // status lock, and holding both would complicate reasoning about deadlocks.
+
+        let mut total_completed_records = self.global_metrics.num_total_committed_records();
+        let mut total_completed_steps = self.global_metrics.total_committed_steps();
 
         let output_status = self.output_status();
-
-        let (mut total_completed_records, mut total_completed_steps) =
-            if transaction_state == Some(TransactionState::None) || transaction_state.is_none() {
-                (
-                    self.num_total_processed_records(),
-                    self.global_metrics.total_initiated_steps(),
-                )
-            } else {
-                (
-                    self.num_total_completed_records(),
-                    self.global_metrics.total_completed_steps(),
-                )
-            };
 
         for output_ep in output_status.values() {
             total_completed_records =
@@ -991,20 +1158,27 @@ impl ControllerStatus {
             self.watermarks_update_completed(total_completed_records);
         }
 
-        let old_steps = self
-            .global_metrics
+        self.global_metrics
             .total_completed_steps
             .fetch_max(total_completed_steps, Ordering::SeqCst);
-        if total_completed_steps >= old_steps {
-            self.completion_notifier.send_if_modified(|state| {
-                if state.total_completed_steps != total_completed_steps {
-                    state.total_completed_steps = total_completed_steps;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
+        self.publish_completed_steps(total_completed_steps);
+    }
+
+    /// Announce `total_completed_steps` to the completion watchers.
+    ///
+    /// Only a larger count is announced. Callers race between publishing their count and
+    /// announcing it, so the thread with the smaller count can announce last; watchers act on
+    /// what they read here, and the Postgres CDC connector acknowledges a write one step early
+    /// if it reads a count below the steps that are really complete.
+    pub(super) fn publish_completed_steps(&self, total_completed_steps: Step) {
+        self.completion_notifier.send_if_modified(|state| {
+            if state.total_completed_steps < total_completed_steps {
+                state.total_completed_steps = total_completed_steps;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Notify input adapters that a checkpoint covering `step` steps has
@@ -1039,10 +1213,7 @@ impl ControllerStatus {
         endpoint_id: EndpointId,
     ) -> Result<CompletionToken, ControllerError> {
         if let Some(endpoint_stats) = self.input_status().get(&endpoint_id) {
-            let num_input_records = endpoint_stats.completion_token(
-                self.global_metrics.total_initiated_steps(),
-                self.global_metrics.total_completed_steps(),
-            );
+            let num_input_records = endpoint_stats.completion_token(&self.global_metrics);
             Ok(CompletionToken::new(
                 self.global_metrics.incarnation_uuid,
                 endpoint_id,
@@ -1065,7 +1236,7 @@ impl ControllerStatus {
         if completion_token.incarnation != self.global_metrics.incarnation_uuid {
             return Err(ControllerError::pipeline_restarted(&format!(
                 "Completion token was created by a previous incarnation of the pipeline (incarnation uuid: {}) and is not valid for the current incarnation ({}). This indicates that the pipeline was suspended and resumed from a checkpoint or restarted after a failure.",
-                &completion_token.incarnation, &self.global_metrics.incarnation_uuid
+                completion_token.incarnation, self.global_metrics.incarnation_uuid
             )));
         }
 
@@ -1082,24 +1253,12 @@ impl ControllerStatus {
     ///
     /// This method is used for all input batches, including inserts that don't
     /// belong to an endpoint, e.g., happen by executing an ad-hoc INSERT query.
-    pub(super) fn input_batch_global(
-        &self,
-        amt: BufferSize,
-        buffered_input: BufferedInput,
-        circuit_thread_unparker: &Unparker,
-    ) {
-        let num_records = amt.records as u64;
-        // Increment buffered_records; unpark circuit thread once
-        // `min_batch_size_records` is exceeded.
-        let old = self.global_metrics.input_batch(amt);
+    pub(super) fn input_batch_global(&self, amt: BufferSize, circuit_thread_unparker: &Unparker) {
+        self.global_metrics.input_batch(amt);
 
-        if old == 0
-            || (old <= self.pipeline_config.global.min_batch_size_records
-                && old + num_records > self.pipeline_config.global.min_batch_size_records)
-            || buffered_input == BufferedInput::Barrier
-        {
-            circuit_thread_unparker.unpark();
-        }
+        // Wake the circuit thread for every batch and let [StepTrigger] decide
+        // whether to step.
+        circuit_thread_unparker.unpark();
     }
 
     /// Update counters after receiving a new input batch.
@@ -1110,30 +1269,18 @@ impl ControllerStatus {
     /// * `amt` - number of bytes and records in the batch.
     /// * `backpressure_thread_unparker` - unparker used to wake up the
     ///   backpressure thread if the endpoint is full.
-    ///
-    /// Returns the kind of input that was buffered, used by
-    /// [Self::input_batch_global] to decide whether to wake the circuit thread.
     pub(super) fn input_batch_from_endpoint(
         &self,
         endpoint_id: EndpointId,
         amt: BufferSize,
         backpressure_thread_unparker: &Unparker,
-    ) -> BufferedInput {
+    ) {
         // There is a potential race condition if the endpoint is currently
         // being removed. In this case, it's safe to ignore this operation.
         if !amt.is_empty() {
             let inputs = self.input_status();
             if let Some(endpoint_stats) = inputs.get(&endpoint_id) {
                 let old = endpoint_stats.add_buffered(amt);
-                // Barrier endpoints must wake the circuit thread even if they
-                // already had buffered input. Otherwise the generic wake rules
-                // can ignore an old > 0 batch, leaving a suspend request parked
-                // even though this batch may make the endpoint checkpointable.
-                let buffered_input = if endpoint_stats.is_barrier() {
-                    BufferedInput::Barrier
-                } else {
-                    BufferedInput::Normal
-                };
                 let threshold = BufferSize {
                     records: endpoint_stats.config.connector_config.max_queued_records() as usize,
                     bytes: endpoint_stats.config.connector_config.max_queued_bytes() as usize,
@@ -1148,11 +1295,8 @@ impl ControllerStatus {
                 {
                     backpressure_thread_unparker.unpark();
                 }
-                return buffered_input;
             }
         }
-
-        BufferedInput::Normal
     }
 
     /// Update counters after receiving an end-of-input event on an input
@@ -1202,11 +1346,12 @@ impl ControllerStatus {
         endpoint_id: EndpointId,
         step_results: StepResults,
         watermarks: Vec<Watermark>,
+        circuit_thread_unparker: &Unparker,
         backpressure_thread_unparker: &Unparker,
     ) {
         let inputs = self.input_status();
-        self.global_metrics
-            .consume_buffered_inputs(step_results.amt);
+        let amt = step_results.amt;
+        self.global_metrics.consume_buffered_inputs(amt);
 
         let mut finished = false;
 
@@ -1219,7 +1364,11 @@ impl ControllerStatus {
                 self.global_metrics.total_completed_steps(),
             );
             finished = endpoint_stats.finished();
-        };
+        } else {
+            // The endpoint was removed before it reported this input: the step
+            // that would have counted these records has already moved on.
+            self.orphan_input(amt, circuit_thread_unparker);
+        }
 
         drop(inputs);
 
@@ -1270,7 +1419,7 @@ impl ControllerStatus {
                 circuit_thread_unparker.unpark();
             }
         };
-        self.update_total_completed_records(None);
+        self.update_total_completed_records();
     }
 
     pub fn update_output_memory(&self, endpoint_id: EndpointId, memory: usize) {
@@ -1286,13 +1435,43 @@ impl ControllerStatus {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
             endpoint_stats.output_buffered_batches(processed);
         }
-        self.update_total_completed_records(None);
+        self.update_total_completed_records();
     }
 
     pub fn output_buffer(&self, endpoint_id: EndpointId, num_bytes: usize, num_records: usize) {
         if let Some(endpoint_stats) = self.output_status().get(&endpoint_id) {
             endpoint_stats.output_buffer(num_bytes, num_records);
         };
+    }
+
+    /// Ask every output endpoint to record what it has transmitted once it has
+    /// transmitted everything derived from the first `threshold` records the
+    /// pipeline ingested.
+    ///
+    /// Call from the circuit thread when a checkpoint starts;
+    /// [`Self::take_output_checkpoint_totals`] collects the readings once the
+    /// endpoints have got there.
+    pub fn arm_output_checkpoint(&self, threshold: u64) {
+        for endpoint_stats in self.output_status().values() {
+            endpoint_stats.arm_checkpoint(threshold);
+        }
+    }
+
+    /// Collect what each output endpoint transmitted for the armed checkpoint,
+    /// keyed by endpoint name, and disarm them all.
+    ///
+    /// An endpoint that never caught up, because it was removed first, is
+    /// absent from the result.
+    pub fn take_output_checkpoint_totals(&self) -> HashMap<String, TransmittedTotals> {
+        self.output_status()
+            .values()
+            .filter_map(|endpoint_stats| {
+                Some((
+                    endpoint_stats.endpoint_name.clone(),
+                    endpoint_stats.take_checkpoint_totals()?,
+                ))
+            })
+            .collect()
     }
 
     pub fn output_buffers_full(&self) -> bool {
@@ -1462,6 +1641,8 @@ impl ControllerStatus {
             initial_start_time: self.global_metrics.initial_start_time,
             storage_bytes: self.global_metrics.storage_bytes.load(Ordering::Relaxed),
             storage_mb_secs: self.global_metrics.storage_mb_secs.load(Ordering::Relaxed),
+            disk_total_bytes: ctx.disk_usage.map(|usage| usage.total_bytes),
+            disk_available_bytes: ctx.disk_usage.map(|usage| usage.available_bytes),
             uptime_msecs: (Utc::now() - self.global_metrics.start_time)
                 .num_milliseconds()
                 .try_into()
@@ -1517,6 +1698,15 @@ impl ControllerStatus {
             total_initiated_steps: self.global_metrics.total_initiated_steps(),
             total_completed_steps: self.global_metrics.total_completed_steps(),
             pipeline_complete: ctx.pipeline_complete,
+            platform_version: option_env!("FELDERA_PLATFORM_VERSION")
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string(),
+            // A pipeline-manager older than FELDERA_RUNTIME_VERSION still sets the
+            // override, which holds the resolved git SHA of the selected runtime.
+            runtime_version: option_env!("FELDERA_RUNTIME_VERSION")
+                .or(option_env!("FELDERA_RUNTIME_OVERRIDE"))
+                .unwrap_or(env!("CARGO_PKG_VERSION"))
+                .to_string(),
         };
 
         // Convert input endpoints and sort by endpoint_name to match serialize_inputs behavior
@@ -1542,6 +1732,51 @@ impl ControllerStatus {
             permanent_checkpoint_errors: ctx.permanent_checkpoint_errors,
             inputs,
             outputs,
+            host_metrics: Vec::new(),
+        }
+    }
+
+    /// Inserts `(endpoint_id, endpoint)` into `self.inputs`, then calls
+    /// `open()` and assigns the reader that it returns into the newly inserted
+    /// entry.
+    ///
+    /// Returns an error if the new endpoint would have a duplicate name or if
+    /// `open()` returns an error.  In either case, the final state is that the
+    /// endpoint is not inserted.
+    pub fn insert_input_endpoint<F>(
+        &self,
+        endpoint_id: u64,
+        endpoint: InputEndpointStatus,
+        open: F,
+    ) -> Result<(), ControllerError>
+    where
+        F: FnOnce() -> Result<Box<dyn InputReader>, AnyError>,
+    {
+        let endpoint_name = endpoint.endpoint_name.clone();
+
+        // Register the endpoint, so that if the the `open` call below signals
+        // `eoi` to the controller, the eoi status is recorded and not dropped
+        // on the floor.
+        let mut status = self.inputs.write();
+        if status.values().any(|ep| ep.endpoint_name == endpoint_name) {
+            return Err(ControllerError::duplicate_input_endpoint(endpoint_name));
+        }
+        status.insert(endpoint_id, endpoint);
+        drop(status);
+
+        match open() {
+            Ok(reader) => {
+                self.inputs.write().get_mut(&endpoint_id).unwrap().reader = Some(Arc::from(reader));
+                Ok(())
+            }
+            Err(e) => {
+                self.inputs.write().remove(&endpoint_id);
+                Err(ControllerError::input_transport_error(
+                    &endpoint_name,
+                    true,
+                    e,
+                ))
+            }
         }
     }
 }
@@ -1611,7 +1846,20 @@ impl InputEndpointMetrics {
             num_transport_errors: self.num_transport_errors.load(Ordering::Relaxed),
             num_parse_errors: self.num_parse_errors.load(Ordering::Relaxed),
             end_of_input: self.end_of_input.load(Ordering::Relaxed),
+            processing_latency_p99_micros: self.processing_latency_p99_micros(),
         }
+    }
+
+    /// 99th percentile processing latency in microseconds over the sliding
+    /// histogram's window, or `None` if the endpoint has no samples. See
+    /// [`ExternalInputEndpointMetrics::processing_latency_p99_micros`] for what
+    /// the window covers.
+    fn processing_latency_p99_micros(&self) -> Option<u64> {
+        self.processing_latency_micros_histogram
+            .lock()
+            .ok()?
+            .snapshot()
+            .quantile(0.99)
     }
 }
 
@@ -1933,7 +2181,11 @@ const MAX_TRACKED_WATERMARKS: usize = 10_000;
 
 #[derive(Debug)]
 struct WatermarkTrackerInner {
-    /// The last `total_completed_records` value reported by the controller.
+    /// The furthest `total_completed_records` value reported by the controller.
+    ///
+    /// Whichever thread recomputes the completion frontier reports it, so reports arrive out of
+    /// order and this keeps the furthest one. Nothing reads the field except the derived `Debug`
+    /// that [`WatermarkTracker::debug`] prints, so this doc is its whole contract.
     total_completed_records: u64,
 
     /// The last `total_processed_records` value reported by the controller.
@@ -2017,6 +2269,10 @@ impl WatermarkTrackerInner {
         ts: DateTime<Utc>,
         metrics: &InputEndpointMetrics,
     ) {
+        // Callers race, so this can arrive out of order. Work from the furthest count reached, so
+        // that the queues below and the count this reports describe the same frontier. Popping
+        // against a stale smaller count would pop nothing the larger call had not already popped.
+        let completed_records = self.total_completed_records.max(completed_records);
         self.total_completed_records = completed_records;
 
         while let Some(entry) = self.watermark_list.front() {
@@ -2107,6 +2363,15 @@ pub struct InputEndpointStatus {
     /// Health status of the connector.
     pub health: Mutex<Option<ConnectorHealth>>,
 
+    /// Watches the calls to the endpoint's preprocessor, if it has one.
+    pub preprocessor_watchdog: Option<PreprocessorWatchdog>,
+
+    /// A description of the preprocessor calls of the endpoint that are in
+    /// progress for more than the maximum allowed call duration, for example
+    /// `preprocessor 'decrypt': 3 of 4 instances have a call in progress for
+    /// more than 10s`.  `None` if no call is late.
+    pub preprocessor_stall: Mutex<Option<String>>,
+
     /// Progress within the latest step.
     pub progress: Mutex<Option<StepResults>>,
 
@@ -2143,7 +2408,14 @@ pub struct InputEndpointStatus {
     completion_tokens: TokenList,
 
     pub(crate) completed_frontier: WatermarkTracker,
+
+    /// Runs inside [Self::completion_token] just before the token is added.
+    #[cfg(test)]
+    completion_token_hook: Mutex<Option<CompletionTokenHook>>,
 }
+
+#[cfg(test)]
+type CompletionTokenHook = Box<dyn FnOnce(&InputEndpointStatus) + Send>;
 
 impl InputEndpointStatus {
     /// Convert the endpoint status to the API type.
@@ -2173,11 +2445,31 @@ impl InputEndpointStatus {
             } else {
                 None
             },
-            health: self.health.lock().unwrap().clone(),
+            health: self.health(),
             paused: self.is_paused_by_user(),
             barrier: self.is_barrier(),
             completed_frontier: self.completed_frontier.completed_watermark(),
         }
+    }
+
+    /// Combines the health that the connector reports with the preprocessor
+    /// stall information.
+    pub fn health(&self) -> Option<ConnectorHealth> {
+        // The stall is stored apart from `health`, so a late preprocessor call
+        // does not overwrite the health that the connector reports.
+        let health = self.health.lock().unwrap().clone();
+        let Some(stall) = self.preprocessor_stall.lock().unwrap().clone() else {
+            return health;
+        };
+        // An unhealthy connector keeps its own description, after the stall.
+        let description = match health {
+            Some(ConnectorHealth {
+                status: ConnectorHealthStatus::Unhealthy,
+                description: Some(description),
+            }) => format!("{stall}; {description}"),
+            _ => stall,
+        };
+        Some(ConnectorHealth::unhealthy(&description))
     }
 }
 
@@ -2187,6 +2479,7 @@ impl InputEndpointStatus {
         config: InputEndpointConfig,
         fault_tolerance: Option<FtModel>,
         initial_statistics: Option<&CheckpointInputEndpointMetrics>,
+        preprocessor_watchdog: Option<PreprocessorWatchdog>,
     ) -> Self {
         let paused_by_user =
             config.connector_config.paused || config.connector_config.start_after.is_some();
@@ -2211,6 +2504,8 @@ impl InputEndpointStatus {
             transport_errors: Mutex::new(transport_errors),
             parse_errors: Mutex::new(parse_errors),
             health: Mutex::new(None),
+            preprocessor_watchdog,
+            preprocessor_stall: Mutex::new(None),
             progress: Mutex::new(None),
             paused: AtomicBool::new(paused_by_user),
             barrier: AtomicBool::new(false),
@@ -2219,6 +2514,8 @@ impl InputEndpointStatus {
             custom_metrics: None,
             completion_tokens: TokenList::new(),
             completed_frontier: WatermarkTracker::new(),
+            #[cfg(test)]
+            completion_token_hook: Mutex::new(None),
         }
     }
 
@@ -2287,7 +2584,7 @@ impl InputEndpointStatus {
         if fatal {
             let mut fatal_error = self.fatal_error.lock().unwrap();
             if fatal_error.is_none() {
-                *fatal_error = Some(error.to_string());
+                *fatal_error = Some(bound_error_message(&error.to_string()));
             }
         }
     }
@@ -2352,7 +2649,7 @@ impl InputEndpointStatus {
                 .with_tooltip(|| {
                     format!(
                         "{} submitted {num_records} records ({} bytes) for step {total_initiated_steps}",
-                        &self.endpoint_name,
+                        self.endpoint_name,
                         HumanBytes::from(num_bytes)
                     )
                 })
@@ -2385,8 +2682,13 @@ impl InputEndpointStatus {
     /// `completion_tokens` queue.
     ///
     /// Returns the input offset that can be used to build `CompletionToken`.
-    fn completion_token(&self, total_initiated_steps: Step, total_completed_steps: Step) -> u64 {
+    fn completion_token(&self, global_metrics: &GlobalControllerMetrics) -> u64 {
         let token_input_records = self.metrics.total_records.load(Ordering::Acquire);
+
+        #[cfg(test)]
+        if let Some(hook) = self.completion_token_hook.lock().unwrap().take() {
+            hook(self);
+        }
 
         // To avoid a race, we add a token _before_ reading the circuit_input_records
         // metric and using it to update the token list.
@@ -2395,10 +2697,13 @@ impl InputEndpointStatus {
         let connector_circuit_input_records =
             self.metrics.circuit_input_records.load(Ordering::Acquire);
 
+        // Read the step count only _after_ `circuit_input_records`.  The step
+        // that ingested those records stored its number before it ingested
+        // them, so an earlier read could label the token one step early.
         self.completion_tokens.update(
             connector_circuit_input_records,
-            total_initiated_steps,
-            total_completed_steps,
+            global_metrics.total_initiated_steps(),
+            global_metrics.total_completed_steps(),
         );
         token_input_records
     }
@@ -2509,7 +2814,7 @@ pub struct OutputEndpointMetrics {
 
 impl OutputEndpointMetrics {
     fn new(
-        total_processed_input_records: u64,
+        committed: ProcessedRecords,
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
     ) -> Self {
         let initial_statistics = initial_statistics.cloned().unwrap_or_default();
@@ -2522,8 +2827,8 @@ impl OutputEndpointMetrics {
             buffered_batches: AtomicU64::new(0),
             num_encode_errors: AtomicU64::new(initial_statistics.num_encode_errors),
             num_transport_errors: AtomicU64::new(initial_statistics.num_transport_errors),
-            total_processed_input_records: AtomicU64::new(total_processed_input_records),
-            total_processed_steps: Atomic::new(0),
+            total_processed_input_records: AtomicU64::new(committed.total_processed_input_records),
+            total_processed_steps: Atomic::new(committed.total_processed_steps),
             memory: AtomicU64::new(0),
             batch_records_written: None,
         }
@@ -2591,6 +2896,16 @@ pub struct ProcessedRecords {
     pub total_processed_steps: Step,
 }
 
+/// Caps an error message at [`MAX_CONNECTOR_ERROR_LEN`] before it is stored in
+/// the endpoint status.
+///
+/// The middle is what gets dropped: a message built from an `anyhow` error chain
+/// leads with the outermost context and ends with the root cause, so keeping
+/// both ends preserves the diagnosis.
+pub(crate) fn bound_error_message(message: &str) -> String {
+    truncate_ellipse_middle(message, MAX_CONNECTOR_ERROR_LEN).into_owned()
+}
+
 /// Recent connector errors.
 ///
 /// Stores up to MAX_CONNECTOR_ERRORS most recent errors for each tag.
@@ -2619,9 +2934,9 @@ impl ConnectorErrorList {
 
         entry.push_back(ConnectorError {
             timestamp: Utc::now(),
-            tag: tag.map(|tag| tag.to_string()),
+            tag,
             index,
-            message: error.to_string(),
+            message: bound_error_message(&error.to_string()),
         });
         if entry.len() > MAX_CONNECTOR_ERRORS {
             entry.pop_front();
@@ -2631,8 +2946,8 @@ impl ConnectorErrorList {
     pub fn to_api_type(&self) -> Vec<ConnectorError> {
         let mut errors = self
             .errors
-            .iter()
-            .flat_map(|(_tag, errors)| errors.iter().cloned())
+            .values()
+            .flat_map(|errors| errors.iter().cloned())
             .collect::<Vec<_>>();
         errors.sort_by_key(|error| error.index);
         errors
@@ -2649,16 +2964,19 @@ impl ConnectorErrorList {
     /// `OutputEndpointStatus::encode_error` / `transport_error`). Do not
     /// renumber on restore.
     ///
-    /// The per-tag [`MAX_CONNECTOR_ERRORS`] bound is re-enforced so that
-    /// a malformed checkpoint cannot make a list grow unbounded. If the
-    /// input exceeds the bound for any tag, the excess oldest entries
-    /// are dropped and a warning is logged.
+    /// The per-tag [`MAX_CONNECTOR_ERRORS`] bound and the
+    /// [`MAX_CONNECTOR_ERROR_LEN`] message bound are both re-enforced so
+    /// that a malformed checkpoint, or one written by a build that lacked
+    /// either bound, cannot make a list grow unbounded. If the input
+    /// exceeds the count bound for any tag, the excess oldest entries are
+    /// dropped and a warning is logged.
     pub fn from_api_type(errors: Vec<ConnectorError>) -> Self {
         let mut list = Self::new();
         let mut dropped: usize = 0;
-        for error in errors {
+        for mut error in errors {
             let entry: &mut VecDeque<ConnectorError> =
                 list.errors.entry(error.tag.clone()).or_default();
+            error.message = bound_error_message(&error.message);
             entry.push_back(error);
             if entry.len() > MAX_CONNECTOR_ERRORS {
                 entry.pop_front();
@@ -2702,6 +3020,53 @@ pub struct OutputEndpointStatus {
 
     /// Connector-specific metrics for Prometheus export.
     pub custom_metrics: Option<Arc<dyn ConnectorMetrics>>,
+
+    /// Endpoint has been paused by the user.
+    ///
+    /// When `true`, the endpoint discards the output it receives instead of
+    /// sending it to its sink, even when the pipeline is running.
+    ///
+    /// This flag is set to `true` on startup if the `paused` flag in the
+    /// endpoint configuration is `true`. At runtime, the value of the flag is
+    /// controlled via the `/views/<view_name>/connectors/<connector_name>/start`
+    /// and `/views/<view_name>/connectors/<connector_name>/pause` endpoints.
+    pub paused: AtomicBool,
+
+    /// The checkpoint waiting on this endpoint, if one is in progress.
+    ///
+    /// A checkpoint needs each endpoint's [`Self::transmitted_records`] as of
+    /// the moment the endpoint has transmitted the output the checkpoint
+    /// covers, since that is the state the pipeline resumes from. The circuit
+    /// thread cannot read it at that moment: it takes the checkpoint while the endpoints
+    /// are still working, and it must not block waiting for them. So it arms
+    /// this latch instead, and the endpoint takes the reading itself the
+    /// moment it gets there.
+    checkpoint_latch: Mutex<Option<CheckpointLatch>>,
+}
+
+/// What an output endpoint had put on the transport at a particular moment.
+#[derive(Clone, Copy, Debug)]
+pub struct TransmittedTotals {
+    pub records: u64,
+    pub bytes: u64,
+}
+
+/// A checkpoint waiting for an output endpoint to catch up with it.
+struct CheckpointLatch {
+    /// Pipeline records the checkpoint covers. The endpoint has caught up once
+    /// its [`OutputEndpointMetrics::total_processed_input_records`] reaches
+    /// this, i.e., the endpoint has transmitted every batch derived from
+    /// `threshold` records.
+    ///
+    /// The endpoint lands on this figure exactly, because the circuit hands it
+    /// one batch per step and the checkpoint covers whole steps. The exception
+    /// is output buffering: a flush can span the checkpoint, carrying the
+    /// counter past it in one write, and the reading then covers the whole
+    /// flush.
+    threshold: u64,
+
+    /// What the endpoint had transmitted when it caught up, once it does.
+    transmitted_totals: Option<TransmittedTotals>,
 }
 
 impl OutputEndpointStatus {
@@ -2733,6 +3098,7 @@ impl OutputEndpointStatus {
                 None
             },
             health: self.health.lock().unwrap().clone(),
+            paused: self.is_paused_by_user(),
         }
     }
 
@@ -2756,13 +3122,61 @@ impl OutputEndpointStatus {
     pub fn transmitted_records(&self) -> u64 {
         self.metrics.transmitted_records.load(Ordering::Acquire)
     }
+
+    /// What this endpoint has put on the transport so far.
+    fn transmitted_totals(&self) -> TransmittedTotals {
+        TransmittedTotals {
+            records: self.metrics.transmitted_records.load(Ordering::Acquire),
+            bytes: self.metrics.transmitted_bytes.load(Ordering::Acquire),
+        }
+    }
+
+    /// Ask this endpoint to record what it has transmitted once it has
+    /// transmitted everything derived from the first `threshold` records the
+    /// pipeline ingested. See [`Self::checkpoint_latch`].
+    ///
+    /// An endpoint that is already there records it now: nothing more will
+    /// reach it on an idle pipeline, so it would never take the reading
+    /// otherwise.
+    fn arm_checkpoint(&self, threshold: u64) {
+        let mut latch = self.checkpoint_latch.lock().unwrap();
+        let transmitted_totals = (self.num_total_processed_input_records() >= threshold)
+            .then(|| self.transmitted_totals());
+        *latch = Some(CheckpointLatch {
+            threshold,
+            transmitted_totals,
+        });
+    }
+
+    /// Record what this endpoint has transmitted if it has just caught up with
+    /// the checkpoint waiting on it. Call after advancing
+    /// [`OutputEndpointMetrics::total_processed_input_records`].
+    fn note_checkpoint_progress(&self) {
+        let mut latch = self.checkpoint_latch.lock().unwrap();
+        if let Some(latch) = latch.as_mut()
+            && latch.transmitted_totals.is_none()
+            && self.num_total_processed_input_records() >= latch.threshold
+        {
+            latch.transmitted_totals = Some(self.transmitted_totals());
+        }
+    }
+
+    /// Take the reading this endpoint recorded for the checkpoint waiting on
+    /// it, and disarm. `None` if it never caught up.
+    fn take_checkpoint_totals(&self) -> Option<TransmittedTotals> {
+        self.checkpoint_latch
+            .lock()
+            .unwrap()
+            .take()?
+            .transmitted_totals
+    }
 }
 
 impl OutputEndpointStatus {
     fn new(
         endpoint_name: &str,
         config: &OutputEndpointConfig,
-        total_processed_records: u64,
+        committed: ProcessedRecords,
         initial_statistics: Option<&CheckpointOutputEndpointMetrics>,
     ) -> Self {
         // error lists are restored from the checkpoint if present, empty otherwise
@@ -2776,13 +3190,25 @@ impl OutputEndpointStatus {
         Self {
             endpoint_name: endpoint_name.to_string(),
             config: config.clone(),
-            metrics: OutputEndpointMetrics::new(total_processed_records, initial_statistics),
+            metrics: OutputEndpointMetrics::new(committed, initial_statistics),
             fatal_error: Mutex::new(None),
             encode_errors: Mutex::new(encode_errors),
             transport_errors: Mutex::new(transport_errors),
             health: Mutex::new(None),
             custom_metrics: None,
+            paused: AtomicBool::new(config.connector_config.paused),
+            checkpoint_latch: Mutex::new(None),
         }
+    }
+
+    /// True if the endpoint's `paused_by_user` flag is set to `true`.
+    pub fn is_paused_by_user(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Sets the paused-by-user flag to `paused` and returns the previous value.
+    pub fn set_paused_by_user(&self, paused: bool) -> bool {
+        self.paused.swap(paused, Ordering::Release)
     }
 
     fn enqueue_batch(&self, num_records: usize) {
@@ -2802,6 +3228,7 @@ impl OutputEndpointStatus {
             self.metrics
                 .total_processed_steps
                 .store(processed.total_processed_steps, Ordering::Release);
+            self.note_checkpoint_progress();
         }
 
         let old = self
@@ -2848,8 +3275,11 @@ impl OutputEndpointStatus {
         self.metrics
             .total_processed_steps
             .store(processed.total_processed_steps, Ordering::Release);
+        self.note_checkpoint_progress();
     }
 
+    /// A chunk of the batch the endpoint is transmitting has reached the
+    /// transport.
     fn output_buffer(&self, num_bytes: usize, num_records: usize) {
         self.metrics
             .transmitted_bytes
@@ -2888,7 +3318,7 @@ impl OutputEndpointStatus {
         if fatal {
             let mut fatal_error = self.fatal_error.lock().unwrap();
             if fatal_error.is_none() {
-                *fatal_error = Some(error.to_string());
+                *fatal_error = Some(bound_error_message(&error.to_string()));
             }
         }
     }
@@ -2905,5 +3335,307 @@ impl OutputEndpointStatus {
 
     fn num_total_processed_steps(&self) -> u64 {
         self.metrics.total_processed_steps.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{
+        ConnectorError, ConnectorErrorList, ControllerStatus, GlobalControllerMetrics,
+        InputEndpointMetrics, InputEndpointStatus, MAX_CONNECTOR_ERROR_LEN, StepResults,
+        bound_error_message,
+    };
+    use crate::format::BufferSize;
+    use anyhow::anyhow;
+    use chrono::Utc;
+    use crossbeam::sync::Parker;
+    use feldera_types::config::InputEndpointConfig;
+    use feldera_types::config::PipelineConfig;
+    use serde_json::json;
+    use std::sync::{Arc, atomic::Ordering};
+    use uuid::Uuid;
+
+    /// A completion token must be labeled with the step that ingests its
+    /// records, even when that step starts while the token is being created.
+    #[test]
+    fn completion_token_is_not_labeled_before_its_step() {
+        let global = Arc::new(GlobalControllerMetrics::new(0, None, Uuid::nil()));
+
+        // Steps 0 through 4 are complete and no step is running.
+        global.total_initiated_steps.store(5, Ordering::Release);
+        global.total_completed_steps.store(5, Ordering::Release);
+
+        let config: InputEndpointConfig = serde_json::from_value(json!({
+            "stream": "test_input",
+            "transport": { "name": "file_input", "config": { "path": "unused" } },
+        }))
+        .unwrap();
+        let endpoint = InputEndpointStatus::new("test_endpoint", config, None, None, None);
+
+        // The connector buffers a request's 3 records.
+        let amt = BufferSize {
+            records: 3,
+            bytes: 30,
+        };
+        endpoint.add_buffered(amt);
+
+        // Step 5 starts and ingests the records just before the token is
+        // added, so the step cannot label the token itself.
+        *endpoint.completion_token_hook.lock().unwrap() = Some(Box::new({
+            let global = global.clone();
+            move |endpoint: &InputEndpointStatus| {
+                global.total_initiated_steps.store(6, Ordering::Release);
+                endpoint.extended(StepResults { amt, resume: None }, Vec::new(), 3, 6, 5);
+            }
+        }));
+
+        let token = endpoint.completion_token(&global);
+        assert_eq!(token, 3);
+
+        // The records are in step 5, so the token completes only once
+        // `total_completed_steps` reaches 6.
+        assert_eq!(endpoint.completion_status(token), Some(6));
+    }
+
+    /// Returns true if endpoint `waits`, which starts after label `backfill`,
+    /// starts when endpoint `labeled`, the only one with that label, reaches the
+    /// end of its input on this host.
+    fn starts_after_local_eoi(pipeline_config: serde_json::Value) -> bool {
+        let status = ControllerStatus::new(
+            serde_json::from_value::<PipelineConfig>(pipeline_config).unwrap(),
+            0,
+            None,
+            Uuid::nil(),
+        );
+        for (id, name, endpoint) in [
+            (0, "labeled", json!({"labels": ["backfill"]})),
+            (1, "waits", json!({"start_after": "backfill"})),
+        ] {
+            let mut config = json!({"stream": "t", "transport": {"name": "datagen", "config": {}}});
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(endpoint.as_object().unwrap().clone());
+            let config = serde_json::from_value(config).unwrap();
+            status
+                .inputs
+                .write()
+                .insert(id, InputEndpointStatus::new(name, config, None, None, None));
+        }
+        let parker = Parker::new();
+        status.eoi(0, parker.unparker(), parker.unparker());
+        !status.input_status()[&1].is_paused_by_user()
+    }
+
+    /// A label stays incomplete until every endpoint with it has finished: it
+    /// reached the end of its input, and its buffered records reached the
+    /// circuit.  The controller notifies when an endpoint finishes, so that a
+    /// multihost host reports its labels to the coordinator again.
+    #[test]
+    fn label_completes_when_buffered_records_reach_the_circuit() {
+        use super::StepResults;
+        use feldera_adapterlib::format::BufferSize;
+        use futures::FutureExt;
+
+        for config in [
+            json!({"name": "test"}),
+            json!({"name": "test", "multihost": {"hosts": 2}}),
+        ] {
+            let status = ControllerStatus::new(
+                serde_json::from_value::<PipelineConfig>(config).unwrap(),
+                0,
+                None,
+                Uuid::nil(),
+            );
+            let input_config = serde_json::from_value(json!({
+                "stream": "t",
+                "transport": {"name": "datagen", "config": {}},
+                "labels": ["backfill"],
+            }))
+            .unwrap();
+            status.inputs.write().insert(
+                0,
+                InputEndpointStatus::new("labeled", input_config, None, None, None),
+            );
+            let parker = Parker::new();
+            let unparker = parker.unparker();
+            let notify = status.input_completion_notify.clone();
+            let mut notified = std::pin::pin!(notify.notified());
+            notified.as_mut().enable();
+            let backfill = || std::collections::HashSet::from(["backfill".to_string()]);
+            let amt = BufferSize {
+                records: 3,
+                bytes: 30,
+            };
+
+            // At the end of its input, the endpoint still has buffered records.
+            status.input_batch_from_endpoint(0, amt, unparker);
+            status.eoi(0, unparker, unparker);
+            assert_eq!(status.incomplete_labels(), backfill());
+            assert!(notified.as_mut().now_or_never().is_none());
+
+            // Once they reach the circuit, the endpoint has finished.
+            status.extended(
+                0,
+                StepResults { amt, resume: None },
+                Vec::new(),
+                unparker,
+                unparker,
+            );
+            assert!(status.incomplete_labels().is_empty());
+            assert!(notified.now_or_never().is_some());
+        }
+    }
+
+    /// In a multihost pipeline, a host does not start an endpoint when its own
+    /// part of a label completes, because other hosts may still be reading
+    /// theirs.  The coordinator starts it once the label completes on every
+    /// host.
+    #[test]
+    fn multihost_start_after_waits_for_coordinator() {
+        assert!(starts_after_local_eoi(json!({"name": "test"})));
+        assert!(!starts_after_local_eoi(
+            json!({"name": "test", "multihost": {"hosts": 2}})
+        ));
+    }
+
+    #[test]
+    fn latency_p99_absent_without_samples() {
+        let metrics = InputEndpointMetrics::default();
+        assert_eq!(metrics.to_api_type().processing_latency_p99_micros, None);
+    }
+
+    #[test]
+    fn latency_p99_reports_uniform_bucket() {
+        let metrics = InputEndpointMetrics::default();
+        {
+            let mut histogram = metrics.processing_latency_micros_histogram.lock().unwrap();
+            for _ in 0..100 {
+                histogram.record(1_500u64);
+            }
+        }
+        // Bucket [1000, 1999] holds 1_500, and `quantile` reports its lower bound.
+        assert_eq!(
+            metrics.to_api_type().processing_latency_p99_micros,
+            Some(1_000)
+        );
+    }
+
+    /// Guards against reporting the median, which hides the slow tail the
+    /// column exists to surface.
+    #[test]
+    fn latency_p99_reports_slow_tail_not_median() {
+        let metrics = InputEndpointMetrics::default();
+        {
+            let mut histogram = metrics.processing_latency_micros_histogram.lock().unwrap();
+            // 90 fast samples against 10 slow ones: the median sits in the fast
+            // band, rank 99 (ceil(0.99 * 100)) lands in the slow one.
+            for _ in 0..90 {
+                histogram.record(1_500u64);
+            }
+            for _ in 0..10 {
+                histogram.record(250_000u64);
+            }
+        }
+        // Bucket [200000, 299999] holds 250_000, and `quantile` reports its
+        // lower bound. A median would report 1_000 here.
+        assert_eq!(
+            metrics.to_api_type().processing_latency_p99_micros,
+            Some(200_000)
+        );
+    }
+
+    /// Documents the known limit of a percentile over few samples: one slow
+    /// batch in a hundred stays below rank 99.
+    #[test]
+    fn latency_p99_misses_lone_outlier() {
+        let metrics = InputEndpointMetrics::default();
+        {
+            let mut histogram = metrics.processing_latency_micros_histogram.lock().unwrap();
+            for _ in 0..99 {
+                histogram.record(1_500u64);
+            }
+            histogram.record(250_000u64);
+        }
+        assert_eq!(
+            metrics.to_api_type().processing_latency_p99_micros,
+            Some(1_000)
+        );
+    }
+
+    /// Guards against reporting the completion histogram, which tracks a
+    /// different span and would silently change the column's meaning.
+    #[test]
+    fn latency_p99_ignores_completion_histogram() {
+        let metrics = InputEndpointMetrics::default();
+        metrics
+            .completion_latency_micros_histogram
+            .lock()
+            .unwrap()
+            .record(750_000u64);
+        assert_eq!(metrics.to_api_type().processing_latency_p99_micros, None);
+    }
+
+    /// An error message the size of a Postgres output batch, shaped like the
+    /// `anyhow` chain the connector produces: context first, root cause last.
+    fn oversized_error() -> String {
+        format!(
+            "while executing insert statement: [{}]\n\nCaused by:\n    \
+             null value in column \"freshness_timestamp\" violates not-null constraint",
+            "{\"a\":1},".repeat(150_000)
+        )
+    }
+
+    #[test]
+    fn add_error_bounds_the_message() {
+        let error = oversized_error();
+        assert!(error.len() > 1024 * 1024, "test needs an oversized message");
+
+        let mut list = ConnectorErrorList::new();
+        list.add_error(Some("pg_exec"), anyhow!("{error}"), 1);
+
+        let stored = list.to_api_type();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].message.len() <= MAX_CONNECTOR_ERROR_LEN + 64,
+            "stored message is {} bytes",
+            stored[0].message.len()
+        );
+    }
+
+    /// Truncation must keep the root cause, which sits at the end of the chain.
+    #[test]
+    fn bounding_keeps_both_ends_of_the_message() {
+        let bounded = bound_error_message(&oversized_error());
+
+        assert!(bounded.starts_with("while executing insert statement:"));
+        assert!(bounded.ends_with("violates not-null constraint"));
+        assert!(bounded.contains("bytes elided"));
+    }
+
+    #[test]
+    fn bounding_leaves_a_normal_message_intact() {
+        let error = "postgres error: permanent: SqlState: Some(SqlState(E23502))";
+        assert_eq!(bound_error_message(error), error);
+    }
+
+    /// A checkpoint written before the bound existed must not reintroduce an
+    /// unbounded message on restore.
+    #[test]
+    fn from_api_type_bounds_restored_messages() {
+        let restored = ConnectorErrorList::from_api_type(vec![ConnectorError {
+            timestamp: Utc::now(),
+            index: 1,
+            tag: Some("pg_exec".to_string()),
+            message: oversized_error(),
+        }]);
+
+        let stored = restored.to_api_type();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].message.len() <= MAX_CONNECTOR_ERROR_LEN + 64,
+            "restored message is {} bytes",
+            stored[0].message.len()
+        );
     }
 }

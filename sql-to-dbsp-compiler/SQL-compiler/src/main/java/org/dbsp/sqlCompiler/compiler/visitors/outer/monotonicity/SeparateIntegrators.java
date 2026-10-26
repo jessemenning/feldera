@@ -1,28 +1,15 @@
 package org.dbsp.sqlCompiler.compiler.visitors.outer.monotonicity;
 
-import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPChainAggregateOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPDistinctOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPIndexedTopKOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPLagOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPNoopOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPPositiveOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPRankOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPRowNumberOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSimpleOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPPartitionedRollingAggregateWithWaterlineOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceMultisetOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStreamAggregateOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.circuit.operator.IHasInputIntegrator;
+import org.dbsp.sqlCompiler.circuit.operator.IHasPostIntegrator;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 import org.dbsp.sqlCompiler.compiler.errors.InternalCompilerError;
 import org.dbsp.sqlCompiler.compiler.frontend.parser.SqlCreateView;
@@ -43,39 +30,27 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
         super(compiler, graphs);
     }
 
-    public static boolean hasPostIntegrator(DBSPSimpleOperator operator) {
-        return operator.is(DBSPAggregateOperator.class) ||
-                operator.is(DBSPChainAggregateOperator.class) ||
-                operator.is(DBSPAggregateLinearPostprocessOperator.class) ||
-                operator.is(DBSPPartitionedRollingAggregateWithWaterlineOperator.class) ||
-                operator.is(DBSPPartitionedRollingAggregateOperator.class) ||
-                operator.is(DBSPIntegrateOperator.class) ||
-                operator.is(DBSPLagOperator.class) ||
-                operator.is(DBSPIndexedTopKOperator.class) ||
-                operator.is(DBSPRankOperator.class) ||
-                operator.is(DBSPRowNumberOperator.class) ||
+    /** True when a consumer that integrates the output of {@code operator} reads the
+     * integrator that {@code operator} keeps.  Such a consumer needs a noop to integrate
+     * on its own, so that a Retain operator applies to one integrator only. */
+    private static boolean hasPostIntegrator(DBSPSimpleOperator operator) {
+        // A source keeps an integrator of its contents only when the table is materialized
+        return (operator.is(IHasPostIntegrator.class) &&
+                operator.to(IHasPostIntegrator.class).integratorHoldsOutput()) ||
                 (operator.is(DBSPSourceMultisetOperator.class) &&
                         operator.to(DBSPSourceMultisetOperator.class).metadata.materialized) ||
                 (operator.is(DBSPSourceMapOperator.class) &&
                         operator.to(DBSPSourceMapOperator.class).metadata.materialized);
     }
 
-    public static boolean hasPreIntegrator(OutputPort port) {
-        DBSPOperator operator = port.node();
-        int input = port.port();
-        return operator.is(DBSPJoinBaseOperator.class) ||
-                operator.is(DBSPStarJoinBaseOperator.class) ||
-                (operator.is(DBSPWindowOperator.class) && input == 0) ||
-                operator.is(DBSPPartitionedRollingAggregateOperator.class) ||
-                operator.is(DBSPDistinctOperator.class) ||
-                operator.is(DBSPPositiveOperator.class) ||
-                operator.is(DBSPAggregateOperator.class) ||
-                operator.is(DBSPIntegrateOperator.class) ||
-                operator.is(DBSPLagOperator.class) ||
-                operator.is(DBSPIndexedTopKOperator.class) ||
-                (operator.is(DBSPSinkOperator.class) &&
-                        operator.to(DBSPSinkOperator.class).metadata.viewKind ==
-                                SqlCreateView.ViewKind.MATERIALIZED);
+    /** True when {@code consumer} keeps an integral of the stream it reads on input {@code inputIndex}. */
+    static boolean hasPreIntegrator(DBSPOperator consumer, int inputIndex) {
+        // A sink keeps an integrator of the view contents only when the view is materialized
+        if (consumer.is(DBSPSinkOperator.class))
+            return consumer.to(DBSPSinkOperator.class).metadata.viewKind ==
+                    SqlCreateView.ViewKind.MATERIALIZED;
+        return consumer.is(IHasInputIntegrator.class) &&
+                consumer.to(IHasInputIntegrator.class).hasInputIntegrator(inputIndex);
     }
 
     @Override
@@ -87,19 +62,19 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
     @Override
     public void replace(DBSPSimpleOperator operator) {
         List<OutputPort> sources = new ArrayList<>(operator.inputs.size());
-        int index = 0;
-        for (OutputPort input: operator.inputs) {
-            OutputPort port = new OutputPort(operator, index++);
-            boolean addBuffer = false;
-            if (hasPreIntegrator(port)) {
+        for (int inputIndex = 0; inputIndex < operator.inputs.size(); inputIndex++) {
+            OutputPort input = operator.inputs.get(inputIndex);
+            boolean needsOwnTrace = false;
+            if (hasPreIntegrator(operator, inputIndex)) {
                 if (input.isSimpleNode() && hasPostIntegrator(input.simpleNode())) {
-                    addBuffer = true;
+                    needsOwnTrace = true;
                 } else {
-                    for (Port<DBSPOperator> dest : this.getGraph().getSuccessors(input.node())) {
-                        if (dest.node() == operator)
+                    for (Port<DBSPOperator> otherConsumer : this.getGraph().getSuccessors(input.node())) {
+                        // Another input of the same operator, as in a self-join, is a separate consumer
+                        if (otherConsumer.node() == operator && otherConsumer.port() == inputIndex)
                             continue;
-                        if (hasPreIntegrator(new OutputPort(dest))) {
-                            addBuffer = true;
+                        if (hasPreIntegrator(otherConsumer.node(), otherConsumer.port())) {
+                            needsOwnTrace = true;
                             break;
                         }
                     }
@@ -107,7 +82,7 @@ public class SeparateIntegrators extends CircuitCloneWithGraphsVisitor {
             }
 
             OutputPort source = this.mapped(input);
-            if (addBuffer) {
+            if (needsOwnTrace) {
                 DBSPNoopOperator noop = new DBSPNoopOperator(operator.getRelNode(), source);
                 this.addOperator(noop);
                 sources.add(noop.outputPort());

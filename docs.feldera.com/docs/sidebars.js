@@ -66,12 +66,14 @@ const installation = {
                         id: 'get-started/enterprise/authentication/index',
                     },
                     items: [
+                        'get-started/enterprise/authentication/roles',
                         'get-started/enterprise/authentication/aws-cognito',
                         'get-started/enterprise/authentication/okta-sso',
                     ]
                 },
                 'get-started/enterprise/https',
                 'get-started/enterprise/parallel-compilation',
+                'get-started/enterprise/private-cargo-registry',
             ]
         }
     ]
@@ -130,6 +132,11 @@ const guides = {
             label: 'Real-time Fraud Detection',
         },
         {
+            type: 'doc',
+            id: 'use_cases/model_scoring/model_scoring',
+            label: 'Keeping an ML Model in the Loop',
+        },
+        {
             type: 'category',
             label: 'Real-time Web Applications',
             items: [
@@ -139,6 +146,7 @@ const guides = {
             ]
         },
         'tutorials/time-series',
+        'tutorials/testing',
         {
             type: 'category',
             label: 'Fine-Grained Authorization',
@@ -378,6 +386,11 @@ const connectors = {
                 },
                 {
                     type: 'doc',
+                    id: 'connectors/sinks/nats',
+                    label: 'NATS'
+                },
+                {
+                    type: 'doc',
                     id: 'connectors/sinks/postgresql',
                     label: 'PostgreSQL'
                 },
@@ -508,6 +521,8 @@ const operations = {
         'operations/json-logging',
         'operations/visualizing-profiles',
         'operations/required-domains',
+        'operations/best_practices/best_practices',
+        'operations/telemetry'
     ]
 };
 

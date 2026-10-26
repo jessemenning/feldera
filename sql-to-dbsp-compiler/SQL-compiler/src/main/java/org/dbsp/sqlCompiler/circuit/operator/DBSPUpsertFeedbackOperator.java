@@ -3,7 +3,6 @@ package org.dbsp.sqlCompiler.circuit.operator;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.dbsp.sqlCompiler.circuit.OutputPort;
 import org.dbsp.sqlCompiler.compiler.backend.JsonDecoder;
-import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteRelNode;
 import org.dbsp.sqlCompiler.compiler.visitors.VisitDecision;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitVisitor;
@@ -13,13 +12,15 @@ import org.dbsp.sqlCompiler.ir.type.DBSPType;
 
 import javax.annotation.Nullable;
 import java.util.List;
+import org.dbsp.sqlCompiler.compiler.frontend.calciteObject.CalciteEmptyRel;
 
 /** This operator operates only on IndexedZSets.
  * It contains an integrator inside.  It takes a positive update
  * to the indexed collection and produces a corresponding retraction
- * for the pre-existing key. */
+ * for the pre-existing key.  It exists only in the expansion circuit that the
+ * monotonicity analysis (DeltaExpandOperators) builds. */
 @NonCoreIR
-public final class DBSPUpsertFeedbackOperator extends DBSPUnaryOperator implements IContainsIntegrator {
+public final class DBSPUpsertFeedbackOperator extends DBSPUnaryOperator implements IContainsIntegrator, IIncremental {
     public DBSPUpsertFeedbackOperator(CalciteRelNode node, OutputPort source) {
         super(node, "upsert_feedback", null, source.outputType(), source.isMultiset(), source);
         source.getOutputIndexedZSetType();  // asserts that the type is right

@@ -4,21 +4,25 @@
 use crate::common_error::CommonError;
 use crate::config::{CommonConfig, LocalRunnerConfig};
 use crate::db::types::pipeline::{
-    bootstrap_policy_to_string, runtime_desired_status_to_string, PipelineId,
+    PipelineId, bootstrap_policy_to_string, runtime_desired_status_to_string,
 };
+use crate::db::types::program::RuntimeSelector;
 use crate::db::types::version::Version;
-use crate::error::{source_error, ManagerError};
+use crate::error::{ManagerError, source_error};
 use crate::pipeline_env::validate_pipeline_env;
 use crate::runner::error::RunnerError;
+use crate::runner::pipeline_automata::compiler_binary_url;
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
 use crate::runner::pipeline_logs::{LogMessage, LogsSender};
 use async_trait::async_trait;
 use feldera_observability::system::total_memory_megabyte;
-use feldera_observability::ReqwestTracingExt;
+use feldera_types::config::LegacySpelling;
 use feldera_types::config::{
-    PipelineConfig, PipelineConfigProgramInfo, RuntimeConfig, StorageCacheConfig, StorageConfig,
+    PipelineConfig, PipelineConfigProgramInfo, ProgramIr, RuntimeConfig, StorageCacheConfig,
+    StorageConfig,
 };
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus};
+use feldera_types::size::ConfigSize;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::ffi::OsString;
@@ -37,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio::{fs, fs::create_dir_all, select, spawn};
 use tokio_stream::StreamExt;
-use tracing::{error, info, warn, Level};
+use tracing::{Level, error, info, warn};
 use uuid::Uuid;
 
 /// How many times to attempt to retrieve the pipeline binary.
@@ -98,6 +102,91 @@ const MULTIHOST_LOOPBACK_OCTET: u8 = 100;
 /// shared exchange port therefore does not collide.
 fn multihost_host_ip(ordinal: usize) -> Ipv4Addr {
     Ipv4Addr::new(127, MULTIHOST_LOOPBACK_OCTET, ordinal as u8, 1)
+}
+
+/// Resolves the Gen-2 engine executable, launched for a pipeline that delivers no
+/// binary.
+///
+/// `GEN2_BINARY` is required and has no default. The engine ships from a separate
+/// repository, so the manager cannot know what its executable is called, and a guessed
+/// default goes stale silently the moment that name changes. Requiring the variable
+/// makes the dependency explicit and keeps a bare `PATH` search from picking up an
+/// unrelated program that happens to share the name.
+fn resolve_gen2_binary() -> Result<PathBuf, ManagerError> {
+    gen2_binary_from(std::env::var_os("GEN2_BINARY"), std::env::var_os("PATH")).map_err(Into::into)
+}
+
+/// Refuses a program pinned to a Gen2 engine build (`gen2:<sha>`): the local runner cannot
+/// select one, since it always runs `GEN2_BINARY`.
+fn check_gen2_engine_build_selectable(
+    runtime_selector: &RuntimeSelector,
+) -> Result<(), RunnerError> {
+    if runtime_selector.gen2_engine_sha().is_some() {
+        return Err(RunnerError::Gen2EngineBuildNotSelectable {
+            runtime_version: runtime_selector.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The executable `configured` (`GEN2_BINARY`) names, searched on `path_env` when it is
+/// a bare name. An unset or empty variable is a configuration error, and a name that
+/// resolves to nothing is reported with the value that failed, so neither surfaces as an
+/// opaque process-spawn failure.
+///
+/// Split from [`resolve_gen2_binary`] so the resolution is testable without mutating the
+/// process environment, which no test can do safely while others run.
+fn gen2_binary_from(
+    configured: Option<std::ffi::OsString>,
+    path_env: Option<std::ffi::OsString>,
+) -> Result<PathBuf, RunnerError> {
+    let configured = configured
+        .filter(|value| !value.is_empty())
+        .ok_or(RunnerError::Gen2BinaryNotConfigured)?;
+    resolve_executable(&PathBuf::from(configured), path_env)
+        .map_err(|path| RunnerError::Gen2BinaryNotFound { path })
+}
+
+/// Resolves `configured` to an existing executable file, as the OS would on spawn:
+/// a value with a path separator must point at an existing file, a bare name is
+/// searched on `path_env`. Returns the offending name as the error when missing.
+fn resolve_executable(
+    configured: &Path,
+    path_env: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if configured.is_absolute() || configured.components().count() > 1 {
+        if is_executable_file(configured) {
+            return Ok(configured.to_path_buf());
+        }
+    } else if let Some(paths) = path_env {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(configured);
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(configured.display().to_string())
+}
+
+/// Whether `path` is a file the OS would agree to execute.
+///
+/// A plain existence check is weaker than that: a file whose execute bit is not set passes
+/// it and then fails at spawn with the opaque `EACCES` that resolving up front exists to
+/// avoid. Since the path is operator-supplied, a forgotten `chmod +x` is the likely way
+/// this goes wrong.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 /// Loopback IP the coordinator of a multihost deployment binds.  Uses third
@@ -444,6 +533,37 @@ impl LocalRunner {
         (terminate_sender, join_handle)
     }
 
+    /// Fetches the UDF library that `program_ir` references, if any, into the pipeline
+    /// working directory, and returns where it is.
+    async fn retrieve_udf_library(
+        &self,
+        program_ir: Option<&ProgramIr>,
+        program_version: Version,
+    ) -> Result<Option<PathBuf>, ManagerError> {
+        let Some(udf_library) = program_ir.and_then(|program_ir| program_ir.udf_library.as_ref())
+        else {
+            return Ok(None);
+        };
+        let udf_library_url = compiler_binary_url(
+            &self.common_config,
+            self.pipeline_id,
+            program_version,
+            &udf_library.source_checksum,
+            &udf_library.integrity_checksum,
+        );
+        let udf_library_file_path = self
+            .config
+            .udf_library_file_path(self.pipeline_id, program_version);
+        self.retrieve_pipeline_file(
+            &udf_library_url,
+            "UDF library",
+            &udf_library_file_path,
+            0o660, // User: rw, Group: rw, Others: /
+        )
+        .await?;
+        Ok(Some(udf_library_file_path))
+    }
+
     /// Retrieves the binary executable or program info file of the pipeline from the compiler
     /// server and stores it in the local runner working directory for that pipeline
     /// located at `target_file_path`.
@@ -489,7 +609,7 @@ impl LocalRunner {
         // Perform request
         let mut attempt = 1;
         loop {
-            match self.client.get(file_url).with_sentry_tracing().send().await {
+            match self.client.get(file_url).send().await {
                 Ok(response) => {
                     // Check status code
                     if response.status() != StatusCode::OK {
@@ -648,6 +768,7 @@ impl LocalRunner {
         &self,
         member_dir: &Path,
         base_config: &PipelineConfig,
+        legacy_spelling: LegacySpelling,
     ) -> Result<PathBuf, ManagerError> {
         let mut config = base_config.clone();
         if let Some(storage_config) = &mut config.storage_config {
@@ -666,8 +787,7 @@ impl LocalRunner {
 
         // Both the pipeline (adapters) and the coordinator read `config.json`.
         let config_file_path = self.config.member_config_file_path(member_dir, "json");
-        let json_config =
-            serde_json::to_string_pretty(&config).expect("JSON config serialization failed");
+        let json_config = config_json(&config, legacy_spelling);
         fs::write(&config_file_path, &json_config)
             .await
             .map_err(|e| {
@@ -694,6 +814,8 @@ impl LocalRunner {
         program_binary_url: &str,
         program_info_url: &str,
         program_version: Version,
+        is_gen2: bool,
+        legacy_spelling: LegacySpelling,
     ) -> Result<(), ManagerError> {
         // The coordinator binary must be configured.
         let coordinator_binary = self.config.coordinator_binary.clone().ok_or_else(|| {
@@ -787,6 +909,9 @@ impl LocalRunner {
                 })
             })?;
 
+        let udf_library_file_path = self
+            .retrieve_udf_library(program_info.program_ir.as_ref(), program_version)
+            .await?;
         let mut base_config = deployment_config.clone();
         base_config.inputs = program_info.inputs;
         base_config.outputs = program_info.outputs;
@@ -800,12 +925,19 @@ impl LocalRunner {
         );
 
         // Retrieve the pipeline binary once; every host process runs the same
-        // executable.
-        let binary_file_path = self
-            .config
-            .binary_file_path(self.pipeline_id, program_version);
-        self.retrieve_pipeline_file(program_binary_url, "binary", &binary_file_path, 0o760)
-            .await?;
+        // executable. A Gen-2 pipeline compiled no binary: every host launches
+        // the Gen-2 engine instead, reading the same config. The launch decision
+        // is the explicit Gen-2 configuration, not the presence of a binary.
+        let executable = if is_gen2 {
+            resolve_gen2_binary()?
+        } else {
+            let binary_file_path = self
+                .config
+                .binary_file_path(self.pipeline_id, program_version);
+            self.retrieve_pipeline_file(program_binary_url, "binary", &binary_file_path, 0o760)
+                .await?;
+            binary_file_path
+        };
 
         let host_template = multihost_host_template();
         let tokio_worker_threads = base_config
@@ -832,7 +964,9 @@ impl LocalRunner {
                     e,
                 ))
             })?;
-            let config_file_path = self.write_member_config(&host_dir, &base_config).await?;
+            let config_file_path = self
+                .write_member_config(&host_dir, &base_config, legacy_spelling)
+                .await?;
             let bind_ip = multihost_host_ip(ordinal);
 
             let mut args: Vec<OsString> = vec![
@@ -858,6 +992,10 @@ impl LocalRunner {
                     args.push("--silent-bootstrap".into());
                 }
             }
+            if let Some(udf_library_file_path) = &udf_library_file_path {
+                args.push("--udf-library".into());
+                args.push(udf_library_file_path.clone().into_os_string());
+            }
 
             let mut envs = pipeline_env.clone();
             envs.push((
@@ -867,7 +1005,7 @@ impl LocalRunner {
 
             specs.push(MemberSpec {
                 name: format!("host-{ordinal}"),
-                program: binary_file_path.clone(),
+                program: executable.clone(),
                 cwd: host_dir,
                 args,
                 envs,
@@ -887,7 +1025,7 @@ impl LocalRunner {
                 ))
             })?;
             let config_file_path = self
-                .write_member_config(&coordinator_dir, &base_config)
+                .write_member_config(&coordinator_dir, &base_config, legacy_spelling)
                 .await?;
             let coordinator_ip = multihost_coordinator_ip();
 
@@ -955,6 +1093,32 @@ impl LocalRunner {
     }
 }
 
+/// The configuration a pipeline process reads, translated to the older
+/// spellings the runtime needs when the pipeline runs a runtime other than the
+/// platform's; `None` when no translation is needed.
+///
+/// Only a translated configuration goes through `serde_json::Value`, whose maps
+/// would reorder the keys of the configuration file.
+fn translated_for_runtime(
+    config: &PipelineConfig,
+    legacy_spelling: LegacySpelling,
+) -> Option<serde_json::Value> {
+    legacy_spelling.any().then(|| {
+        let mut value = serde_json::to_value(config).expect("JSON config serialization failed");
+        legacy_spelling.apply(&mut value);
+        value
+    })
+}
+
+/// The pipeline configuration file in JSON, as the pipeline process reads it.
+fn config_json(config: &PipelineConfig, legacy_spelling: LegacySpelling) -> String {
+    match translated_for_runtime(config, legacy_spelling) {
+        Some(value) => serde_json::to_string_pretty(&value),
+        None => serde_json::to_string_pretty(config),
+    }
+    .expect("JSON config serialization failed")
+}
+
 #[async_trait]
 impl PipelineExecutor for LocalRunner {
     type Config = LocalRunnerConfig;
@@ -994,18 +1158,14 @@ impl PipelineExecutor for LocalRunner {
 
     /// The local runner should always be able to manage local processes and the pipeline working
     /// directory irrespective of configuration, hence no checks are performed here.
-    async fn can_provision(
-        &self,
-        _deployment_config: &PipelineConfig,
-        _runtime_config: &serde_json::Value,
-    ) -> Result<(), ManagerError> {
+    async fn can_provision(&self, _deployment_config: &PipelineConfig) -> Result<(), ManagerError> {
         Ok(())
     }
 
     /// Provisions the process deployment.
     /// - Creates pipeline working directory
     /// - Creates pipeline storage directory
-    /// - Writes config.yaml to pipeline working directory
+    /// - Writes config.json to pipeline working directory
     /// - Retrieve and writes executable to pipeline working directory
     /// - Runs executable as process in pipeline working directory
     /// - Switches to operational logging following the stdout/stderr of the process
@@ -1019,8 +1179,11 @@ impl PipelineExecutor for LocalRunner {
         program_binary_url: &str,
         program_info_url: &str,
         program_version: Version,
-        _runtime_config: &serde_json::Value,
+        runtime_selector: &RuntimeSelector,
+        legacy_spelling: LegacySpelling,
     ) -> Result<(), ManagerError> {
+        check_gen2_engine_build_selectable(runtime_selector)?;
+        let is_gen2 = runtime_selector.is_gen2();
         if let Err(e) = validate_pipeline_env(&deployment_config.global.env) {
             return Err(RunnerError::RunnerProvisionError { error: e }.into());
         }
@@ -1038,6 +1201,8 @@ impl PipelineExecutor for LocalRunner {
                     program_binary_url,
                     program_info_url,
                     program_version,
+                    is_gen2,
+                    legacy_spelling,
                 )
                 .await;
         }
@@ -1108,6 +1273,10 @@ impl PipelineExecutor for LocalRunner {
                 })
             })?;
 
+        let udf_library_file_path = self
+            .retrieve_udf_library(program_info.program_ir.as_ref(), program_version)
+            .await?;
+
         // Merge program info into deployment_config
         deployment_config.inputs = program_info.inputs;
         deployment_config.outputs = program_info.outputs;
@@ -1117,48 +1286,51 @@ impl PipelineExecutor for LocalRunner {
         // the pipeline to fall back on, so derive one from this machine.
         apply_default_memory_limit(&mut deployment_config.global, total_memory_megabyte());
 
-        // Write config as YAML and JSON
-        //
-        // Newer pipelines will read the JSON, older ones will read the YAML.
-        let json_config = serde_json::to_string_pretty(&deployment_config)
-            .expect("JSON config serialization failed");
-        let yaml_config =
-            serde_yaml::to_string(&deployment_config).expect("YAML config serialization failed");
-        for (extension, expanded_config) in [("json", json_config), ("yaml", yaml_config)] {
-            let config_file_path = self.config.config_file_path(self.pipeline_id, extension);
-            fs::write(&config_file_path, &expanded_config)
-                .await
-                .map_err(|e| {
-                    ManagerError::from(CommonError::io_error(
-                        format!("write config file '{}'", config_file_path.display()),
-                        e,
-                    ))
-                })?;
-        }
+        // Write the configuration file the pipeline process reads.
+        let config_file_path = self.config.config_file_path(self.pipeline_id, "json");
+        fs::write(
+            &config_file_path,
+            config_json(&deployment_config, legacy_spelling),
+        )
+        .await
+        .map_err(|e| {
+            ManagerError::from(CommonError::io_error(
+                format!("write config file '{}'", config_file_path.display()),
+                e,
+            ))
+        })?;
 
         // Delete port file (which will only exist if we are restarting from a
         // checkpoint).
         let _ = remove_file(&self.config.port_file_path(self.pipeline_id)).await;
 
-        // Retrieve and store executable in pipeline working directory
-        let binary_file_path = self
-            .config
-            .binary_file_path(self.pipeline_id, program_version);
-        self.retrieve_pipeline_file(
-            program_binary_url,
-            "binary",
-            &binary_file_path,
-            0o760, // User: rwx, Group: rw, Others: /
-        )
-        .await?;
+        // Retrieve and store executable in pipeline working directory. A Gen-2
+        // pipeline compiled no binary: launch the Gen-2 engine instead, which
+        // reads the same config.json (carrying the circuit IR). The launch decision
+        // is the explicit Gen-2 configuration, not the presence of a binary.
+        let executable = if is_gen2 {
+            resolve_gen2_binary()?
+        } else {
+            let binary_file_path = self
+                .config
+                .binary_file_path(self.pipeline_id, program_version);
+            self.retrieve_pipeline_file(
+                program_binary_url,
+                "binary",
+                &binary_file_path,
+                0o760, // User: rwx, Group: rw, Others: /
+            )
+            .await?;
+            binary_file_path
+        };
 
         let mut retries = 0..3;
         let mut process = loop {
             // Run executable:
             // - Current directory: pipeline working directory
-            // - Configuration file: path to config.yaml
+            // - Configuration file: path to config.json
             // - Stdout/stderr are piped to follow logs
-            let mut command = Command::new(&binary_file_path);
+            let mut command = Command::new(&executable);
             command
                 .env(
                     "TOKIO_WORKER_THREADS",
@@ -1177,7 +1349,7 @@ impl PipelineExecutor for LocalRunner {
                 )
                 .current_dir(&pipeline_dir)
                 .arg("--config-file")
-                .arg(self.config.config_file_path(self.pipeline_id, "yaml"))
+                .arg(&config_file_path)
                 .arg("--bind-address")
                 .arg(&self.common_config.bind_address)
                 .arg("--initial")
@@ -1212,6 +1384,9 @@ impl PipelineExecutor for LocalRunner {
                     .arg("--https-tls-key-path")
                     .arg(https_tls_key_path);
             }
+            if let Some(udf_library_file_path) = &udf_library_file_path {
+                command.arg("--udf-library").arg(udf_library_file_path);
+            }
             match command.spawn() {
                 Ok(process) => break process,
                 Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && retries.next().is_some() => {
@@ -1226,7 +1401,7 @@ impl PipelineExecutor for LocalRunner {
                     return Err(RunnerError::RunnerProvisionError {
                         error: format!("unable to spawn process due to: {e}"),
                     }
-                    .into())
+                    .into());
                 }
             }
         };
@@ -1258,7 +1433,7 @@ impl PipelineExecutor for LocalRunner {
     /// Process deployment provisioning is completed when the port file is found and read.
     async fn is_provisioned(
         &mut self,
-        _runtime_config: &serde_json::Value,
+        _deployment_config: &serde_json::Value,
     ) -> Result<ProvisionStatus, ManagerError> {
         // Multihost: provisioning is complete once the coordinator's HTTP
         // endpoint accepts connections; the deployment location is the
@@ -1320,7 +1495,7 @@ impl PipelineExecutor for LocalRunner {
     /// - Process status must be checkable and not be exited
     async fn check(
         &mut self,
-        _runtime_config: &serde_json::Value,
+        _deployment_config: &serde_json::Value,
     ) -> Result<serde_json::Value, ManagerError> {
         // Multihost: healthy as long as no member process has fatally exited.
         // (Coordinated restarts, exit code 55, are handled transparently by the
@@ -1356,7 +1531,7 @@ impl PipelineExecutor for LocalRunner {
     }
 
     /// Kills the pipeline process and terminates the thread which follows its stdout and stderr.
-    async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+    async fn stop(&mut self, _deployment_config: &serde_json::Value) -> Result<(), ManagerError> {
         // Multihost: signal every member supervisor to kill its process and
         // wait for them to finish, so this blocks until all processes are gone.
         if let Some(multihost) = self.multihost.take() {
@@ -1385,7 +1560,7 @@ impl PipelineExecutor for LocalRunner {
     }
 
     /// Removes the pipeline working directory.
-    async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+    async fn clear(&mut self, _deployment_config: &serde_json::Value) -> Result<(), ManagerError> {
         if self.config.pipeline_dir(self.pipeline_id).exists() {
             match remove_dir_all(self.config.pipeline_dir(self.pipeline_id)).await {
                 Ok(_) => (),
@@ -1410,17 +1585,18 @@ fn per_host_share(available_mb: Option<u64>, n_hosts: usize) -> Option<u64> {
         .filter(|mb| *mb > 0)
 }
 
-/// Sets `global.resources.memory_mb_max` to `available_mb` when the pipeline
-/// has no memory budget.
+/// Sets `global.resources.memory_max` to `available_mb` megabytes when the
+/// pipeline has no memory budget.
 fn apply_default_memory_limit(global: &mut RuntimeConfig, available_mb: Option<u64>) {
-    if global.effective_memory_mb().is_none() {
-        if let Some(available_mb) = available_mb {
-            info!(
-                "pipeline has no memory limit ('max_rss_mb' or 'resources.memory_mb_max'): \
-defaulting 'resources.memory_mb_max' to {available_mb} MB"
-            );
-            global.resources.memory_mb_max = Some(available_mb);
-        }
+    if global.effective_memory().is_none()
+        && let Some(available_mb) = available_mb
+    {
+        let available = ConfigSize::from_mb(available_mb);
+        info!(
+            "pipeline has no memory limit ('max_rss' or 'resources.memory_max'): \
+defaulting 'resources.memory_max' to {available}"
+        );
+        global.resources.memory_max = Some(available);
     }
 }
 
@@ -1441,8 +1617,8 @@ mod memory_limit_tests {
 #[cfg(test)]
 mod multihost_tests {
     use super::{
-        multihost_coordinator_ip, multihost_host_ip, multihost_host_template, MAX_MULTIHOST_HOSTS,
-        MULTIHOST_LOOPBACK_OCTET,
+        MAX_MULTIHOST_HOSTS, MULTIHOST_LOOPBACK_OCTET, multihost_coordinator_ip, multihost_host_ip,
+        multihost_host_template,
     };
     use std::net::Ipv4Addr;
 
@@ -1496,5 +1672,176 @@ mod multihost_tests {
             // Last octet is never 0 (a `.0` host address).
             assert_ne!(ip.octets()[3], 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod gen2_binary_tests {
+    use super::{check_gen2_engine_build_selectable, gen2_binary_from, resolve_executable};
+    use crate::db::types::program::RuntimeSelector;
+    use crate::runner::error::RunnerError;
+    use std::path::Path;
+
+    /// A pinned engine build is refused; `gen2` and other runtimes pass.
+    #[test]
+    fn pinned_gen2_engine_build_is_refused() {
+        let pinned =
+            RuntimeSelector::try_from("gen2:d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b".to_string())
+                .unwrap();
+        assert!(matches!(
+            check_gen2_engine_build_selectable(&pinned),
+            Err(RunnerError::Gen2EngineBuildNotSelectable { runtime_version })
+                if runtime_version == "gen2:d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b"
+        ));
+        let unpinned = RuntimeSelector::try_from("gen2".to_string()).unwrap();
+        assert!(check_gen2_engine_build_selectable(&unpinned).is_ok());
+        assert!(check_gen2_engine_build_selectable(&RuntimeSelector::default()).is_ok());
+    }
+
+    /// Writes an executable file at `path`.
+    fn write_executable(path: &Path) {
+        std::fs::write(path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A Gen-2 engine executable given as a path must exist; a missing path errors.
+    #[test]
+    fn resolves_existing_path_and_rejects_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("gen2-engine");
+        write_executable(&exe);
+        assert_eq!(resolve_executable(&exe, None).unwrap(), exe);
+        assert!(resolve_executable(Path::new("/nonexistent/gen2-engine-xyz"), None).is_err());
+    }
+
+    /// A bare name is resolved against PATH and errors when it is absent.
+    #[test]
+    fn resolves_bare_name_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("gen2-engine");
+        write_executable(&exe);
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            resolve_executable(Path::new("gen2-engine"), Some(path_env)).unwrap(),
+            exe
+        );
+        assert!(resolve_executable(Path::new("gen2-engine"), None).is_err());
+        let empty = std::env::join_paths(std::iter::empty::<&Path>()).unwrap();
+        assert!(resolve_executable(Path::new("gen2-engine"), Some(empty)).is_err());
+    }
+
+    /// A file without the execute bit is rejected here rather than at spawn, where it would
+    /// surface as the opaque `EACCES` that resolving up front exists to avoid. Both the
+    /// explicit-path and the PATH-search branch check it.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let not_exec = dir.path().join("gen2-engine");
+        std::fs::write(&not_exec, b"").unwrap();
+        std::fs::set_permissions(&not_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            resolve_executable(&not_exec, None).is_err(),
+            "an explicit path without the execute bit is not an executable"
+        );
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+        assert!(
+            resolve_executable(Path::new("gen2-engine"), Some(path_env)).is_err(),
+            "a PATH hit without the execute bit is not an executable"
+        );
+
+        // The same name becomes resolvable once it is executable.
+        std::fs::set_permissions(&not_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_executable(&not_exec, None).unwrap(), not_exec);
+    }
+
+    /// `GEN2_BINARY` is required: unset and empty both report the configuration error
+    /// rather than falling back to a guessed name.
+    #[test]
+    fn an_unset_or_empty_variable_is_a_configuration_error() {
+        for configured in [None, Some(std::ffi::OsString::new())] {
+            assert!(
+                matches!(
+                    gen2_binary_from(configured.clone(), None),
+                    Err(RunnerError::Gen2BinaryNotConfigured)
+                ),
+                "{configured:?} must not resolve to any executable"
+            );
+        }
+    }
+
+    /// A configured value resolves through the same path/PATH rules; one that names
+    /// nothing reports the value that failed.
+    #[test]
+    fn a_configured_variable_resolves_or_reports_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("gen2-engine");
+        write_executable(&exe);
+        assert_eq!(
+            gen2_binary_from(Some(exe.as_os_str().to_owned()), None).unwrap(),
+            exe
+        );
+        let missing = "/nonexistent/gen2-engine-xyz";
+        assert!(matches!(
+            gen2_binary_from(Some(missing.into()), None),
+            Err(RunnerError::Gen2BinaryNotFound { path }) if path == missing
+        ));
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::config_json;
+    use feldera_types::config::{LegacySpelling, PipelineConfig};
+
+    fn config() -> PipelineConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "p", "outputs": {},
+            "inputs": {"t.kafka": {"stream": "t", "transport": {"name": "kafka_input",
+                "config": {"topic": "t", "group_join_timeout": "30s"}}}},
+            "clock_resolution": "250ms",
+            "fault_tolerance": {"model": "at_least_once", "checkpoint_interval": "20s"},
+        }))
+        .unwrap()
+    }
+
+    /// The platform's own runtime reads the current spelling.
+    #[test]
+    fn the_platform_runtime_gets_the_current_spelling() {
+        let text = config_json(&config(), LegacySpelling::NONE);
+        // Untranslated, the file is exactly what the configuration serializes to.
+        assert_eq!(text, serde_json::to_string_pretty(&config()).unwrap());
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["clock_resolution"], "250ms");
+        assert_eq!(value["fault_tolerance"]["checkpoint_interval"], "20s");
+        assert!(value.get("clock_resolution_usecs").is_none());
+    }
+
+    /// A pinned runtime gets the older spelling, in the runtime settings and in
+    /// the connectors alike, and the other fields are left alone.
+    #[test]
+    fn a_pinned_runtime_gets_the_older_spelling() {
+        let value: serde_json::Value = serde_json::from_str(&config_json(
+            &config(),
+            LegacySpelling {
+                durations: true,
+                sizes: true,
+            },
+        ))
+        .unwrap();
+        assert_eq!(value["clock_resolution_usecs"], 250_000);
+        assert_eq!(value["fault_tolerance"]["checkpoint_interval_secs"], 20);
+        assert!(value.get("clock_resolution").is_none());
+        assert_eq!(value["name"], "p");
+        let kafka = &value["inputs"]["t.kafka"]["transport"]["config"];
+        assert_eq!(kafka["group_join_timeout_secs"], 30);
+        assert!(kafka.get("group_join_timeout").is_none());
+        assert_eq!(kafka["topic"], "t");
     }
 }

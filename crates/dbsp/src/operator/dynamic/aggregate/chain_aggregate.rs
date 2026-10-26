@@ -64,35 +64,33 @@ where
 
         let circuit = self.circuit();
 
-        circuit
-            .region("chain_aggregate", || {
-                let bounds = TraceBounds::unbounded();
+        circuit.region("chain_aggregate", || {
+            let bounds = TraceBounds::unbounded();
 
-                let feedback = circuit.add_accumulate_integrate_trace_feedback::<Spine<OZ>>(
-                    persistent_id,
-                    output_factories,
-                    bounds,
-                );
+            let feedback = circuit.add_accumulate_integrate_trace_feedback::<Spine<OZ>>(
+                persistent_id,
+                output_factories,
+                bounds,
+            );
 
-                let output = circuit
-                    .add_binary_operator(
-                        StreamingBinaryWrapper::new(ChainAggregate::new(
-                            output_factories,
-                            finit,
-                            fupdate,
-                        )),
-                        &self
-                            .dyn_shard_accumulate(input_factories)
-                            .into_enabled_stream(),
-                        &feedback.delayed_trace,
-                    )
-                    .mark_sharded();
+            let output = circuit
+                .add_binary_operator(
+                    StreamingBinaryWrapper::new(ChainAggregate::new(
+                        output_factories,
+                        finit,
+                        fupdate,
+                    )),
+                    &self
+                        .dyn_shard_accumulate(input_factories)
+                        .into_enabled_stream(),
+                    &feedback.delayed_trace,
+                )
+                .mark_sharded();
 
-                feedback.connect(&output, output_factories);
+            feedback.connect(&output, output_factories);
 
-                output
-            })
-            .clone()
+            output
+        })
     }
 }
 
@@ -141,18 +139,18 @@ where
 
 impl<Z, OZ> StreamingBinaryOperator<Option<Z>, Spine<OZ>, OZ> for ChainAggregate<Z, OZ>
 where
-    Z: ZBatchReader<Time = ()> + WithSnapshot,
+    Z: ZBatchReader<Time = ()> + WithSnapshot + Clone,
     <Z as WithSnapshot>::Batch: ZBatchReader<Key = Z::Key, Val = Z::Val, Time = ()>,
     OZ: IndexedZSet<Key = Z::Key>,
 {
     fn eval(
         self: Rc<Self>,
-        delta: &Option<Z>,
-        output_trace: &Spine<OZ>,
+        delta: Cow<'_, Option<Z>>,
+        output_trace: Cow<'_, Spine<OZ>>,
     ) -> impl futures::Stream<Item = (OZ, bool, Option<Position>)> + 'static {
         let chunk_size = splitter_output_chunk_size();
 
-        let delta = delta.as_ref().map(|b| b.ro_snapshot());
+        let delta = (*delta).as_ref().map(|b| b.ro_snapshot());
 
         let output_trace = if delta.is_some() {
             Some(output_trace.ro_snapshot())
@@ -252,6 +250,7 @@ where
 mod test {
     use std::cmp::{max, min};
 
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
         OrdIndexedZSet, OutputHandle, RootCircuit, Runtime, ZSetHandle, ZWeight,
         circuit::CircuitConfig, operator::Min, typed_batch::IndexedZSetReader,
@@ -301,6 +300,8 @@ mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn chain_aggregate_min_test(inputs in test_inputs()) {
             let (mut dbsp, (input, aggregate, delta_aggregate)) =

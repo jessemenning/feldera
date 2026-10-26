@@ -1143,6 +1143,14 @@ public class ArrayFunctionsTests extends SqlIoTest {
     }
 
     @Test
+    public void testArrayInsertRuntimeErrors() {
+        this.qf("SELECT array_insert(array[1, 2, 3], 0, 4)",
+                "'ARRAY_INSERT' called with position 0");
+        this.qf("SELECT array_insert(array[1, 2, 3], 2147483647, 4)",
+                "'ARRAY_INSERT' called with position 2147483647");
+    }
+
+    @Test
     public void testExists() {
         this.qst("""
                 SELECT array_EXISTS(array[1, 2, 3], x -> x > 2);
@@ -1373,7 +1381,578 @@ public class ArrayFunctionsTests extends SqlIoTest {
     }
 
     @Test
+    public void testArrayFilter() {
+        this.qst("""
+                SELECT array_filter(array[1, 2, 3], x -> x > 1);
+                result
+                ------
+                 { 2, 3 }
+                (1 row)
+
+                SELECT array_filter(array[3, 1, 2], x -> x <> 1);
+                result
+                ------
+                 { 3, 2 }
+                (1 row)
+
+                SELECT array_filter(array[1, 2, 3], x -> true);
+                result
+                ------
+                 { 1, 2, 3 }
+                (1 row)
+
+                SELECT array_filter(array[1, 2, 3], x -> false);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_filter(array['a', 'bb', 'ccc'], s -> char_length(s) > 1);
+                result
+                ------
+                 { bb, ccc }
+                (1 row)
+
+                SELECT array_filter(CAST(array() AS INT ARRAY), x -> true);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_filter(array[null, 3, 5], x -> x > 4);
+                result
+                ------
+                 { 5 }
+                (1 row)
+
+                SELECT array_filter(array[null, 3], x -> x is null);
+                result
+                ------
+                 { NULL }
+                (1 row)
+
+                SELECT array_filter(array[1, 2], x -> cast(null as boolean));
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_filter(cast(null as integer array), x -> x > 2);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_filter(cast(null as integer array), x -> true);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_filter(null, x -> true);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_filter(array[array[1, 2], array[3]], a -> cardinality(a) > 1);
+                result
+                ------
+                 { { 1, 2} }
+                (1 row)
+
+                SELECT array_filter(array[array[1, 2], array[3]], a -> array_exists(a, b -> b > 2));
+                result
+                ------
+                 { { 3} }
+                (1 row)
+
+                SELECT transform(array[array[1, 2], array[3]], a -> array_filter(a, b -> b > 1));
+                result
+                ------
+                 { { 2}, { 3} }
+                (1 row)
+
+                SELECT array_filter(array[array[1, 2], array[3]], a -> array_filter(a, b -> b > 1) = array[2]);
+                result
+                ------
+                 { { 1, 2} }
+                (1 row)""");
+    }
+
+    @Test
+    public void arrayFilterOnNonArrays() {
+        // Every rejection is a validation error naming the actual argument types
+        String supported = "Supported form(s): ARRAY_FILTER(<ARRAY>, <FUNCTION(ARRAY_ELEMENT_TYPE)->BOOLEAN>)";
+        this.queryFailingInCompilation("SELECT array_filter(1, x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter('abc', x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<CHAR(3)>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(MAP['a', 1], x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<MAP<CHAR(1), INTEGER>>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(ROW(1, 2), x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<ROW(INTEGER EXPR$0, INTEGER EXPR$1)>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(CAST(1 AS VARIANT), x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<VARIANT>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(CAST(NULL AS INTEGER), x -> true)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        // The predicate must be a lambda
+        this.queryFailingInCompilation("SELECT array_filter(array[1], 2)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER ARRAY>, <INTEGER>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(array[1], NULL)",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER ARRAY>, <NULL>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_filter(array[1], x -> NULL)",
+                "Illegal use of 'NULL'");
+        this.queryFailingInCompilation("SELECT array_filter(array[1], x -> true, true)",
+                "Invalid number of arguments to function 'array_filter'. Was expecting 2 arguments");
+        this.queryFailingInCompilation("SELECT array_filter(array[1])",
+                "Invalid number of arguments to function 'array_filter'. Was expecting 2 arguments");
+        // Nested in another lambda
+        this.queryFailingInCompilation(
+                "SELECT transform(array[1], a -> array_filter(a, b -> true))",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation(
+                "SELECT array_filter(array[1], x -> array_filter(x, y -> true))",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER>, <FUNCTION(ANY) -> BOOLEAN>)'. " + supported);
+        this.queryFailingInCompilation(
+                "SELECT transform(array[array[1]], a -> array_filter(a, 5))",
+                "Cannot apply 'array_filter' to arguments of type " +
+                        "'array_filter(<INTEGER ARRAY>, <INTEGER>)'. " + supported);
+    }
+
+    @Test
+    public void testArrayFilterTable() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY);
+                CREATE VIEW V AS SELECT ARRAY_FILTER(x, e -> e % 2 = 0) AS r FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[1, 2, 3, 4])", """
+                  r
+                 ----------
+                  { 2, 4 }""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY())", """
+                  r
+                 -------
+                  {}""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL)", """
+                  r
+                 -------
+                 NULL""");
+    }
+
+    @Test
+    public void testArrayFlatten() {
+        this.qst("""
+                SELECT array_flatten(array[array[1, 2], array[3]]);
+                result
+                ------
+                 { 1, 2, 3 }
+                (1 row)
+
+                SELECT array_flatten(array[array[2, 1], array[1]]);
+                result
+                ------
+                 { 2, 1, 1 }
+                (1 row)
+
+                SELECT array_flatten(array[array['a'], array['bb', 'ccc']]);
+                result
+                ------
+                 { a, bb, ccc }
+                (1 row)
+
+                SELECT array_flatten(CAST(array() AS INT ARRAY ARRAY));
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_flatten(array[CAST(array() AS INT ARRAY), array[1]]);
+                result
+                ------
+                 { 1 }
+                (1 row)
+
+                SELECT array_flatten(array[array[1, null], array[2]]);
+                result
+                ------
+                 { 1, NULL, 2 }
+                (1 row)
+
+                SELECT array_flatten(array[array[1], null]);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_flatten(cast(null as int array array));
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_flatten(null);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_flatten(array[array[array[1]], array[array[2], array[3]]]);
+                result
+                ------
+                 { { 1}, { 2}, { 3} }
+                (1 row)
+
+                SELECT array_flatten(transform(array[1, 2], x -> array[x, x + 10]));
+                result
+                ------
+                 { 1, 11, 2, 12 }
+                (1 row)
+
+                SELECT transform(array[array[array[1], array[2]]], a -> array_flatten(a));
+                result
+                ------
+                 { { 1, 2} }
+                (1 row)""");
+    }
+
+    @Test
+    public void arrayFlattenOnNonArrays() {
+        // Every rejection is a validation error naming the actual argument type
+        String supported = "Supported form(s): ARRAY_FLATTEN(<ANY ARRAY ARRAY>)";
+        this.queryFailingInCompilation("SELECT array_flatten(array[1, 2])",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<INTEGER ARRAY>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(1)",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<INTEGER>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten('abc')",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<CHAR(3)>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(MAP['a', 1])",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<MAP<CHAR(1), INTEGER>>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(ROW(1, 2))",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<ROW(INTEGER EXPR$0, INTEGER EXPR$1)>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(CAST(1 AS VARIANT))",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<VARIANT>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(CAST(NULL AS INTEGER))",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<INTEGER>)'. " + supported);
+        // An empty array constructor has no element type, so it is not known to hold arrays
+        this.queryFailingInCompilation("SELECT array_flatten(array())",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<UNKNOWN ARRAY>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_flatten(array[array[1]], 2)",
+                "Invalid number of arguments to function 'array_flatten'. Was expecting 1 arguments");
+        this.queryFailingInCompilation("SELECT array_flatten()",
+                "Invalid number of arguments to function 'array_flatten'. Was expecting 1 arguments");
+        // Nested in a lambda: the first validation pass sees the enclosing parameter as
+        // ANY, the second one rejects the call with the concrete INTEGER element type
+        this.queryFailingInCompilation("SELECT transform(array[1], a -> array_flatten(a))",
+                "Cannot apply 'array_flatten' to arguments of type " +
+                        "'array_flatten(<INTEGER>)'. " + supported);
+    }
+
+    @Test
+    public void testArrayFlattenTable() {
+        // Column x has nullable inner arrays; the CASE makes only the outer array
+        // nullable, since the literal inner arrays are not
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY ARRAY, y INT);
+                CREATE VIEW V AS SELECT ARRAY_FLATTEN(x) AS r,
+                       ARRAY_FLATTEN(CASE WHEN y > 0 THEN ARRAY[ARRAY[1], ARRAY[2]] END) AS n
+                FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[ARRAY[1, 2], ARRAY[3]], 1)", """
+                  r         | n
+                 -------------------------
+                  { 1, 2, 3 } | { 1, 2 }""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY(), 0)", """
+                  r  | n
+                 -------------
+                  {} |NULL""");
+        // A NULL inner array makes the whole result NULL
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[ARRAY[1], NULL], 1)", """
+                  r    | n
+                 ------------------
+                 NULL  | { 1, 2 }""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL, 1)", """
+                  r    | n
+                 ------------------
+                 NULL  | { 1, 2 }""");
+    }
+
+    @Test
+    public void testArraySlice() {
+        this.qst("""
+                SELECT array_slice(array[1, 2, 3, 4], 2, 2);
+                result
+                ------
+                 { 2, 3 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3, 4], 1, 3);
+                result
+                ------
+                 { 1, 2, 3 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3, 4], -2, 2);
+                result
+                ------
+                 { 3, 4 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3, 4], -4, 1);
+                result
+                ------
+                 { 1 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], 2, 10);
+                result
+                ------
+                 { 2, 3 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], -1, 10);
+                result
+                ------
+                 { 3 }
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], 4, 2);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], -5, 2);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], 2, 0);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_slice(array['a', 'bb', 'ccc'], 2, 2);
+                result
+                ------
+                 { bb, ccc }
+                (1 row)
+
+                SELECT array_slice(array[1, null, 3], 1, 2);
+                result
+                ------
+                 { 1, NULL }
+                (1 row)
+
+                SELECT array_slice(CAST(array() AS INT ARRAY), 1, 2);
+                result
+                ------
+                 {}
+                (1 row)
+
+                SELECT array_slice(cast(null as int array), 1, 2);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], null, 2);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_slice(array[1, 2, 3], 1, null);
+                result
+                ------
+                NULL
+                (1 row)""");
+    }
+
+    @Test
+    public void arraySliceOnWrongArguments() {
+        String supported = "Supported form(s): ARRAY_SLICE(<ARRAY>, <INTEGER>, <INTEGER>)";
+        this.queryFailingInCompilation("SELECT array_slice(1, 1, 1)",
+                "Cannot apply 'array_slice' to arguments of type " +
+                        "'array_slice(<INTEGER>, <INTEGER>, <INTEGER>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_slice(MAP['a', 1], 1, 2)",
+                "Cannot apply 'array_slice' to arguments of type " +
+                        "'array_slice(<MAP<CHAR(1), INTEGER>>, <INTEGER>, <INTEGER>)'. " + supported);
+        this.queryFailingInCompilation("SELECT array_slice(array[1], 1)",
+                "Invalid number of arguments to function 'array_slice'. Was expecting 3 arguments");
+        this.queryFailingInCompilation("SELECT array_slice(array[1], 1, 2, 3)",
+                "Invalid number of arguments to function 'array_slice'. Was expecting 3 arguments");
+    }
+
+    @Test
+    public void testArraySliceRuntimeErrors() {
+        // Position 0 is rejected like ARRAY_INSERT's, since positions start at 1
+        this.qf("SELECT array_slice(array[1, 2, 3], 0, 2)",
+                "'ARRAY_SLICE' called with start 0");
+        this.qf("SELECT array_slice(array[1, 2, 3], 1, -1)",
+                "'ARRAY_SLICE' called with negative length -1");
+    }
+
+    @Test
+    public void testArraySliceTable() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(x INT ARRAY, start INT, len INT);
+                CREATE VIEW V AS SELECT ARRAY_SLICE(x, start, len) AS r FROM T;""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[1, 2, 3, 4], 2, 2)", """
+                  r
+                 ----------
+                  { 2, 3 }""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[1, 2, 3, 4], -2, 9)", """
+                  r
+                 ----------
+                  { 3, 4 }""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(NULL, 1, 2)", """
+                  r
+                 -------
+                 NULL""");
+        ccs.stepWeightOne("INSERT INTO T VALUES(ARRAY[1, 2], 1, NULL)", """
+                  r
+                 -------
+                 NULL""");
+    }
+
+    @Test
+    public void testNestedLambdas() {
+        this.qs("""
+                SELECT transform(array[array[1, 2], array[3]], a -> transform(a, b -> b + 1));
+                result
+                ------
+                 { { 2, 3}, { 4} }
+                (1 row)
+
+                SELECT transform(array[array[1, 2], array[3]], a -> array_exists(a, b -> b > 2));
+                result
+                ------
+                 { false, true }
+                (1 row)
+
+                SELECT array_exists(array[array[1, 2], array[3]], a -> array_exists(a, b -> b > 2));
+                result
+                ------
+                 true
+                (1 row)
+
+                SELECT array_exists(array[array[1, 2]], a -> cardinality(transform(a, b -> b + 1)) > 1);
+                result
+                ------
+                 true
+                (1 row)
+
+                SELECT transform(array[array[array[1]], array[array[2], array[3]]], a -> transform(a, b -> transform(b, c -> c * 2)));
+                result
+                ------
+                 { { { 2} }, { { 4}, { 6} } }
+                (1 row)
+
+                SELECT transform(cast(null as int array array), a -> transform(a, b -> b + 1));
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT transform(array[null, array[1]], a -> transform(a, b -> b + 1));
+                result
+                ------
+                 { NULL, { 2} }
+                (1 row)
+
+                SELECT transform(null, x -> x + 1);
+                result
+                ------
+                NULL
+                (1 row)
+
+                SELECT array_exists(null, x -> x > 2);
+                result
+                ------
+                NULL
+                (1 row)""");
+    }
+
+    @Test
+    public void testLambdaCse() {
+        // Check that a subexpression shared by sibling lambdas must get one CSE variable
+        // per closure
+        this.qs("""
+                SELECT transform(array[3.0e0], e -> e + sqrt(2.5e0) > 5.0e0) AS a,
+                       transform(array[9.0e0], e -> e + sqrt(2.5e0) > 5.0e0) AS b;
+                 a | b
+                -------
+                 { false} | { true}
+                (1 row)""");
+    }
+
+    @Test
+    public void testNestedLambdaStreaming() {
+        // Verifies that the Monotonicity analysis accepts operator functions
+        // that contain nested closures
+        var ccs = this.getCCS("""
+                CREATE TABLE T(ts TIMESTAMP LATENESS INTERVAL 1 HOURS, x INT ARRAY ARRAY);
+                CREATE VIEW V AS SELECT ts, TRANSFORM(x, a -> TRANSFORM(a, b -> b + 1)) AS y
+                FROM T WHERE ts > TIMESTAMP '2020-01-01 00:00:00';""");
+        ccs.stepWeightOne("INSERT INTO T VALUES('2020-01-01 10:00:00', ARRAY[ARRAY[1, 2], ARRAY[3]])",
+                """
+                 ts | y
+                ------------------------------------------
+                 2020-01-01 10:00:00 | { { 2, 3}, { 4} }""");
+    }
+
+    @Test
+    public void testLambdaDuplication() {
+        // Inlining v1's function into v2's, which uses the value twice, deep-copies
+        // the lambda; the copies may not share DBSPParameter objects
+        var ccs = this.getCCS("""
+                CREATE TABLE t(a INT ARRAY);
+                CREATE LOCAL VIEW v1 AS SELECT TRANSFORM(a, e -> ABS(e) + ABS(e)) AS y FROM t;
+                CREATE VIEW v2 AS SELECT y AS y1, y AS y2 FROM v1;""");
+        ccs.stepWeightOne("INSERT INTO t VALUES(ARRAY[1, -2])", """
+                 y1 | y2
+                ------------------
+                 { 2, 4} | { 2, 4}""");
+    }
+
+    @Test
     public void failingLambdaCases() {
+        // Lambda parameters may not shadow parameters of enclosing lambdas
+        this.queryFailingInCompilation(
+                "SELECT transform(array[array[1]], a -> transform(a, a -> a + 1))",
+                "Duplicate lambda parameter 'a'");
+        // The now() value cannot yet be captured inside a lambda
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x BIGINT ARRAY);
+                CREATE VIEW V AS SELECT TRANSFORM(x, e -> e + EXTRACT(EPOCH FROM NOW())) FROM T;""",
+                "NOW() is not supported inside a lambda expression");
+        this.statementsFailingInCompilation("""
+                CREATE TABLE T(x BIGINT ARRAY);
+                CREATE VIEW V AS SELECT * FROM T WHERE ARRAY_EXISTS(x, e -> e > EXTRACT(EPOCH FROM NOW()));""",
+                "NOW() is not supported inside a lambda expression");
+        // A lambda body may not refer to variables from enclosing scopes
+        this.queryFailingInCompilation(
+                "SELECT transform(array[array[1]], a -> transform(a, b -> b + cardinality(a)))",
+                "reference to 'a' from enclosing scope");
         this.queryFailingInCompilation("SELECT array_exists(array(), x -> true)",
                 "Could not infer a type for array elements");
         this.queryFailingInCompilation("SELECT array_exists(array[1], (x, y) -> x AND y)",
@@ -1386,5 +1965,12 @@ public class ArrayFunctionsTests extends SqlIoTest {
                 "Cannot apply 'transform' to arguments of type");
         this.queryFailingInCompilation("SELECT transform(array[1], x -> x AND true)",
                 "Cannot apply 'AND' to arguments of type '<INTEGER> AND <BOOLEAN>'");
+        // The ARRAY_FILTER predicate must return a BOOLEAN
+        this.queryFailingInCompilation("SELECT array_filter(array[1], x -> x + 1)",
+                "Cannot apply 'array_filter' to arguments of type");
+        this.queryFailingInCompilation("SELECT array_filter(array[1], (x, y) -> true)",
+                "Cannot apply 'array_filter' to arguments of type");
+        this.queryFailingInCompilation("SELECT array_filter(array(), x -> true)",
+                "Could not infer a type for array elements");
     }
 }

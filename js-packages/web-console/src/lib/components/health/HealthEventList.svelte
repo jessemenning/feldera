@@ -1,8 +1,8 @@
 <script lang="ts" generics="S extends string, T extends string">
   import { Progress } from '@skeletonlabs/skeleton-svelte'
+  import { formatDateTime, formatDateTimeRange } from 'common-lib/format'
   import { slide } from 'svelte/transition'
   import InlineDropdown from '$lib/components/common/InlineDropdown.svelte'
-  import { formatDateTime, formatDateTimeRange } from '$lib/functions/format'
   import type { HealthEventBucket } from '$lib/functions/pipelines/health'
 
   type Bucket = HealthEventBucket<S, T>
@@ -107,7 +107,7 @@
           {eventParts.title}
         </span>
         <button
-          class="fd fd-x -m-1 ml-auto btn-icon text-[24px]"
+          class="fd fd-x -m-1 ml-auto btn-icon text-[20px]"
           onclick={onClose}
           aria-label="Close event details"
         ></button>

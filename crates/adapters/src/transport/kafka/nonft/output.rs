@@ -1,7 +1,8 @@
 use crate::transport::kafka::{
-    DeferredLogging, MemoryUseReporter, PemToLocation, build_headers, generate_oauthbearer_token,
-    kafka_send, rdkafka_loglevel_from, validate_aws_msk_region,
+    DeferredLogging, OauthbearerAuth, PemToLocation, buffered_bytes, build_headers,
+    generate_oauthbearer_token, kafka_send, rdkafka_loglevel_from, resolve_oauthbearer_auth,
 };
+use crate::util::MemoryUseReporter;
 use crate::{AsyncErrorCallback, OutputEndpoint};
 use anyhow::{Error as AnyError, Result as AnyResult, anyhow, bail};
 use feldera_types::transport::kafka::KafkaOutputConfig;
@@ -14,10 +15,10 @@ use rdkafka::{
     producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer},
     types::RDKafkaErrorCode,
 };
-use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Mutex;
 use std::{sync::RwLock, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::span::EnteredSpan;
 use tracing::{debug, info_span};
 
@@ -36,7 +37,7 @@ struct KafkaOutputContext {
 
     deferred_logging: DeferredLogging,
 
-    oauthbearer_config: HashMap<String, String>,
+    oauthbearer_config: OauthbearerAuth,
 
     memory_use_reporter: Mutex<MemoryUseReporter>,
 
@@ -45,19 +46,18 @@ struct KafkaOutputContext {
 
 impl KafkaOutputContext {
     fn new(kafka_config: &KafkaOutputConfig) -> AnyResult<Self> {
-        let mut oauthbearer_config = HashMap::new();
-        if let Some(region) =
-            validate_aws_msk_region(&kafka_config.kafka_options, kafka_config.region.clone())?
-        {
-            oauthbearer_config.insert("region".to_owned(), region);
-        };
+        let oauthbearer_config = resolve_oauthbearer_auth(
+            &kafka_config.kafka_options,
+            kafka_config.oauth_provider,
+            kafka_config.region.clone(),
+        )?;
 
         Ok(Self {
             oauthbearer_config,
             async_error_callback: RwLock::new(None),
             deferred_logging: DeferredLogging::new(),
             topic: kafka_config.topic.clone(),
-            memory_use_reporter: Mutex::new(MemoryUseReporter::new()),
+            memory_use_reporter: Mutex::new(MemoryUseReporter::new("buffers", 1024 * 1024)),
         })
     }
 }
@@ -92,7 +92,10 @@ impl ClientContext for KafkaOutputContext {
 
     fn stats(&self, statistics: rdkafka::Statistics) {
         let _guard = span(&self.topic);
-        self.memory_use_reporter.lock().unwrap().update(&statistics);
+        self.memory_use_reporter
+            .lock()
+            .unwrap()
+            .update(buffered_bytes(&statistics));
     }
 }
 
@@ -121,6 +124,9 @@ pub struct KafkaOutputEndpoint {
     config: KafkaOutputConfig,
     headers: OwnedHeaders,
     max_message_size: usize,
+    /// `ControllerInner::shutdown_token`, which ends a wait on a full
+    /// producer queue.  See [kafka_send].
+    shutdown: CancellationToken,
 }
 
 fn span(topic: &str) -> EnteredSpan {
@@ -128,7 +134,11 @@ fn span(topic: &str) -> EnteredSpan {
 }
 
 impl KafkaOutputEndpoint {
-    pub fn new(mut config: KafkaOutputConfig, endpoint_name: &str) -> AnyResult<Self> {
+    pub fn new(
+        mut config: KafkaOutputConfig,
+        endpoint_name: &str,
+        shutdown: CancellationToken,
+    ) -> AnyResult<Self> {
         let _guard = span(&config.topic);
         // Create Kafka producer configuration.
         config.validate()?;
@@ -175,6 +185,7 @@ impl KafkaOutputEndpoint {
             config,
             headers,
             max_message_size,
+            shutdown,
         })
     }
 }
@@ -194,13 +205,13 @@ impl OutputEndpoint for KafkaOutputEndpoint {
             .with_deferred_logging(|| {
                 self.kafka_producer.client().fetch_metadata(
                     Some(&self.config.topic),
-                    Duration::from_secs(self.config.initialization_timeout_secs as u64),
+                    Duration::from(self.config.initialization_timeout()),
                 )
             })
             .map_err(|e| {
                 anyhow!(
                     "error retrieving metadata for topic '{}': {e}",
-                    &self.config.topic
+                    self.config.topic
                 )
             })?;
         *self
@@ -221,7 +232,12 @@ impl OutputEndpoint for KafkaOutputEndpoint {
         let record = <BaseRecord<(), [u8], ()>>::to(&self.config.topic)
             .payload(buffer)
             .headers(self.headers.clone());
-        kafka_send(&self.kafka_producer, &self.config.topic, record)
+        kafka_send(
+            &self.kafka_producer,
+            &self.config.topic,
+            record,
+            &self.shutdown,
+        )
     }
 
     fn push_key(
@@ -248,7 +264,12 @@ impl OutputEndpoint for KafkaOutputEndpoint {
         }
 
         record = record.headers(all_headers);
-        kafka_send(&self.kafka_producer, &self.config.topic, record)
+        kafka_send(
+            &self.kafka_producer,
+            &self.config.topic,
+            record,
+            &self.shutdown,
+        )
     }
 
     fn is_fault_tolerant(&self) -> bool {

@@ -2,7 +2,7 @@
 name = "fda"
 description = "A CLI tool for interacting with Feldera"
 readme = "README.md"
-include = ["bench_openapi.json", "/src", "build.rs", "COPYRIGHT", "README.md"]
+include = ["/src", "COPYRIGHT", "README.md"]
 publish = true
 edition = "2024"
 version = { workspace = true }
@@ -19,6 +19,7 @@ clap = { workspace = true, features = ["color"] }
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 progenitor-client = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
+rustls = { workspace = true }
 reqwest-websocket = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std", "process"] }
@@ -27,8 +28,6 @@ feldera-rest-api = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing-log = { workspace = true }
-sentry = { workspace = true }
-feldera-observability = { workspace = true }
 tabled = { workspace = true, features = ["macros", "ansi"] }
 json_to_table = { workspace = true }
 rustyline = { workspace = true, features = ["with-file-history"] }
@@ -45,11 +44,4 @@ chrono = { workspace = true, features = ["serde"] }
 anyhow = { workspace = true }
 ordered-float.workspace = true
 itertools.workspace = true
-rustversion.workspace = true
 zip.workspace = true
-
-[build-dependencies]
-prettyplease = { workspace = true }
-progenitor = { workspace = true }
-serde_json = { workspace = true }
-syn = { workspace = true }

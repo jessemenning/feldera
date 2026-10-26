@@ -24,6 +24,7 @@
 package org.dbsp.sqlCompiler.circuit;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPNestedOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSinkOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPViewDeclarationOperator;
@@ -69,18 +70,23 @@ public final class DBSPCircuit extends DBSPNode
     // Should always be in topological order
     public final List<DBSPOperator> allOperators = new ArrayList<>();
     public final ProgramMetadata metadata;
+    /** True if the inputs and the outputs are deltas; false if every
+     * step carries whole collections. */
+    public final boolean incremental;
     // Used to detect duplicate insertions (always a bug).
     final Set<DBSPOperator> operators = new HashSet<>();
     public String name = "circuit";
 
-    public DBSPCircuit(ProgramMetadata metadata) {
+    public DBSPCircuit(ProgramMetadata metadata, boolean incremental) {
         super(CalciteObject.EMPTY);
         this.declarations = new ArrayList<>();
         this.metadata = metadata;
+        this.incremental = incremental;
     }
 
-    private DBSPCircuit(ProgramMetadata metadata, List<DBSPDeclaration> declarations, List<DBSPOperator> allOperators) {
-        this(metadata);
+    private DBSPCircuit(ProgramMetadata metadata, boolean incremental,
+                        List<DBSPDeclaration> declarations, List<DBSPOperator> allOperators) {
+        this(metadata, incremental);
         for (DBSPDeclaration decl: declarations)
             this.addDeclaration(decl);
         for (DBSPOperator op: allOperators) {
@@ -259,6 +265,8 @@ public final class DBSPCircuit extends DBSPNode
             return true;
         if (!other.is(DBSPCircuit.class))
             return false;
+        if (this.incremental != other.to(DBSPCircuit.class).incremental)
+            return false;
         if (!Linq.same(this.allOperators, other.to(DBSPCircuit.class).allOperators))
             return false;
         return Linq.same(this.declarations, other.to(DBSPCircuit.class).declarations);
@@ -272,6 +280,15 @@ public final class DBSPCircuit extends DBSPNode
     /** Number of operators in the circuit. */
     public int size() {
         return this.allOperators.size();
+    }
+
+    /** The number of operators in the largest nested operator or in this circuit */
+    public int largestComponentSize() {
+        int result = this.allOperators.size();
+        for (DBSPOperator operator : this.allOperators)
+            if (operator.is(DBSPNestedOperator.class))
+                result = Math.max(result, operator.to(DBSPNestedOperator.class).size());
+        return result;
     }
 
     @Override
@@ -296,11 +313,14 @@ public final class DBSPCircuit extends DBSPNode
 
     @SuppressWarnings("unused")
     public static DBSPCircuit fromJson(JsonNode node, JsonDecoder decoder) {
+        // The sources derive their stream kind from the circuit mode, so it is read first
+        boolean incremental = Utilities.getBooleanProperty(node, "incremental");
+        decoder.setIncremental(incremental);
         List<DBSPDeclaration> declarations =
                 fromJsonOuterList(node, "declarations", decoder, DBSPDeclaration.class);
         List<DBSPOperator> operators =
                 fromJsonOuterList(node, "allOperators", decoder, DBSPOperator.class);
         ProgramMetadata metadata = ProgramMetadata.fromJson(Utilities.getProperty(node, "metadata"), decoder.typeFactory);
-        return new DBSPCircuit(metadata, declarations, operators);
+        return new DBSPCircuit(metadata, incremental, declarations, operators);
     }
 }

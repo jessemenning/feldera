@@ -33,6 +33,7 @@ import org.dbsp.sqlCompiler.compiler.visitors.inner.EquivalenceContext;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.Expensive;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.InnerVisitor;
 import org.dbsp.sqlCompiler.compiler.visitors.inner.Projection;
+import org.dbsp.sqlCompiler.compiler.visitors.inner.ResolveReferences;
 import org.dbsp.sqlCompiler.ir.DBSPParameter;
 import org.dbsp.sqlCompiler.ir.IDBSPInnerNode;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
@@ -42,11 +43,40 @@ import org.dbsp.util.IIndentStream;
 import org.dbsp.util.Linq;
 import org.dbsp.util.Maybe;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import static org.dbsp.util.Maybe.*;
 
-/** An expression of the form |param0, param1, ...| body. */
+/** An expression of the form |param0, param1, ...| body.
+ *
+ * <p>Invariants about parameters:
+ * <ul>
+ * <li>Each closure in an expression tree owns its parameter objects: the same
+ * {@link DBSPParameter} object may not appear in two closures of one tree.
+ * Analyses such as CanonicalForm and ValueNumbering key information by
+ * parameter object and rely on this.
+ *
+ * <li>{@link #deepCopy()} shares the parameter objects with the copy.  This is
+ * required when the copy REPLACES the original (see
+ * {@link DBSPExpression#ensureTree}): analyses such as ParameterFieldUse key
+ * results by the parameters of the operator's function.  A caller that instead
+ * inserts a copy into a tree that also contains the original must give the
+ * copies fresh parameters; see FreshenParameters.
+ *
+ * <li>Parameter references in the body resolve by name through lexical scopes
+ * (ResolveReferences).  A parameter of a nested closure never shadows a
+ * declaration of an enclosing scope.
+ *
+ * <li>The closures that the frontend generates for SQL lambdas are pure: 
+ * their bodies reference only their own parameters,
+ * never variables from enclosing scopes.  Before LowerCircuitVisitor these are
+ * the only nested closures, and the analyses that run earlier rely on their
+ * purity.  Lowering DBSPFlatmap generates nested
+ * closures that CAPTURE variables of the enclosing closure, so passes that run
+ * after lowering (InnerCSE, CanonicalForm) may not assume purity.
+ * </ul> */
 public final class DBSPClosureExpression extends DBSPExpression {
     public final DBSPExpression body;
     public final DBSPParameter[] parameters;
@@ -71,6 +101,7 @@ public final class DBSPClosureExpression extends DBSPExpression {
 
     @Override
     public DBSPExpression deepCopy() {
+        // NOTE: The copy shares the parameter objects with this closure.
         return new DBSPClosureExpression(this.getNode(), this.body.deepCopy(), this.parameters);
     }
 
@@ -161,15 +192,32 @@ public final class DBSPClosureExpression extends DBSPExpression {
                 .append(")");
     }
 
+    /** Counts how many times a parameter is referenced within the closure body */
+    int parameterReferences(DBSPCompiler compiler, DBSPParameter param) {
+        ResolveReferences resolver = new ResolveReferences(compiler, true);
+        resolver.apply(this);
+        return resolver.reference.count(param);
+    }
+
     /** True if the composition this(before) can productively inline before */
     public boolean shouldInlineComposition(DBSPCompiler compiler, DBSPClosureExpression before) {
         Projection projection = new Projection(compiler, true, true);
         projection.apply(this);
         if (projection.isProjection && before.body.is(DBSPBaseTupleExpression.class)) {
+            DBSPExpression[] fields = before.body.to(DBSPBaseTupleExpression.class).fields;
+            if (projection.hasIoMap() && this.parameters.length == 1 && fields != null) {
+                // Do not inline a projection that duplicates an expensive field
+                Set<Integer> seen = new HashSet<>();
+                for (int field : projection.getIoMap().getFieldsOfInput(0))
+                    if (!seen.add(field) && Expensive.isExpensive(compiler, fields[field]))
+                        return false;
+            }
             return true;
         } else {
-            // TODO: this could be refined by checking how many times the source expression
-            // is substituted in the result.
+            int refCount = this.parameterReferences(compiler, this.parameters[0]);
+            if (refCount <= 1)
+                // Parameter referenced only once: allow inlining
+                return true;
             return !Expensive.isExpensive(compiler, before);
         }
     }
@@ -207,10 +255,11 @@ public final class DBSPClosureExpression extends DBSPExpression {
 
     @SuppressWarnings("unused")
     public static DBSPClosureExpression fromJson(JsonNode node, JsonDecoder decoder) {
-        // Need to read the type even if we don't use it, to populate the cache
+        // Read in the order accept(InnerVisitor) writes; the type is read only to define the
+        // nodes that the parameters and the body refer to
         fromJsonInner(node, "type", decoder, DBSPType.class);
-        DBSPExpression body = fromJsonInner(node, "body", decoder, DBSPExpression.class);
         List<DBSPParameter> parameters = fromJsonInnerList(node, "parameters", decoder, DBSPParameter.class);
+        DBSPExpression body = fromJsonInner(node, "body", decoder, DBSPExpression.class);
         return new DBSPClosureExpression(CalciteObject.EMPTY, body, parameters.toArray(new DBSPParameter[0]));
     }
 }

@@ -5,9 +5,10 @@
   import { duplicatePipeline, duplicatePipelineTooltip } from '$lib/compositions/duplicatePipeline'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
   import { useUpdatePipelineList } from '$lib/compositions/pipelines/usePipelineList.svelte'
+  import { useIsEnterprise } from '$lib/compositions/useEdition.svelte'
+  import { usePermission } from '$lib/compositions/usePermission.svelte'
   import { getPipelineAction } from '$lib/compositions/usePipelineAction.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
-  import { usePremiumFeatures } from '$lib/compositions/usePremiumFeatures.svelte'
   import { useToast } from '$lib/compositions/useToastNotification'
   import { isPipelineCodeEditable } from '$lib/functions/pipelines/status'
   import type { PipelineThumb } from '$lib/services/pipelineManager'
@@ -30,8 +31,19 @@
   ]
   type AvailableAction = (typeof availableActions)[number]
   type StatusAction = Exclude<AvailableAction, 'duplicate'>
-  const isPremium = usePremiumFeatures()
-  const stop = isPremium.value ? ['stop' as const] : []
+
+  // Bulk lifecycle actions need `exec:pipeline`; duplicate/delete need
+  // `write:pipeline`. A caller lacking a permission never sees the button.
+  const canExec = usePermission('exec:pipeline')
+  const canWrite = usePermission('write:pipeline')
+  const EXEC_BULK = new Set<AvailableAction>(['start', 'resume', 'pause', 'stop', 'kill', 'clear'])
+  const WRITE_BULK = new Set<AvailableAction>(['duplicate', 'delete'])
+  const permittedAction = (action: AvailableAction) =>
+    (EXEC_BULK.has(action) ? canExec.allowed : true) &&
+    (WRITE_BULK.has(action) ? canWrite.allowed : true)
+
+  const isEnterprise = useIsEnterprise()
+  const stop = isEnterprise.value ? ['stop' as const] : []
   const statusActions = ({ status, storageStatus }: (typeof selected)[number]) => {
     const storageAction = storageStatus === 'InUse' ? ['clear' as const] : []
     return match(status)
@@ -87,7 +99,7 @@
       supportedByAny.add('duplicate')
     }
     return availableActions
-      .filter((action) => supportedByAny.has(action))
+      .filter((action) => supportedByAny.has(action) && permittedAction(action))
       .map((action) =>
         match(action)
           .with('duplicate', () => btnDuplicate)
@@ -119,12 +131,9 @@
       if (!isPipelineCodeEditable(pipeline.status)) {
         const { waitFor } = await postPipelineAction(
           pipeline.name,
-          isPremium.value ? 'stop' : 'kill'
+          isEnterprise.value ? 'stop' : 'kill'
         )
-        updatePipeline(pipeline.name, (p) => ({
-          ...p,
-          status: isPremium.value ? 'Stopping' : 'Stopping'
-        }))
+        updatePipeline(pipeline.name, (p) => ({ ...p, status: 'Stopping' }))
         await waitFor().catch(toastError('Waiting for pipeline to stop'))
       }
       if (pipeline.storageStatus !== 'Cleared') {
@@ -154,37 +163,37 @@
 
 {#snippet btnStart()}
   <button class="btn preset-tonal-surface" onclick={() => postPipelinesAction('start')}>
-    <span class="fd fd-play text-[20px]"></span>
+    <span class="fd fd-play"></span>
     Start
   </button>
 {/snippet}
 {#snippet btnResume()}
   <button class="btn preset-tonal-surface" onclick={() => postPipelinesAction('resume')}>
-    <span class="fd fd-play text-[20px]"></span>
+    <span class="fd fd-play"></span>
     Resume
   </button>
 {/snippet}
 {#snippet btnPause()}
   <button class="btn preset-tonal-surface" onclick={() => postPipelinesAction('pause')}>
-    <span class="fd fd-pause text-[20px]"></span>
+    <span class="fd fd-pause"></span>
     Pause
   </button>
 {/snippet}
 {#snippet btnStop()}
   <button class="btn preset-tonal-surface" onclick={() => (globalDialog.dialog = stopDialog)}>
-    <span class="fd fd-square text-[20px]"></span>
+    <span class="fd fd-square"></span>
     Stop
   </button>
 {/snippet}
 {#snippet btnKill()}
   <button class="btn preset-tonal-surface" onclick={() => (globalDialog.dialog = killDialog)}>
-    <span class="fd fd-square-power text-[20px]"></span>
+    <span class="fd fd-square-power"></span>
     Force Stop
   </button>
 {/snippet}
 {#snippet btnDelete()}
   <button class="btn preset-tonal-surface" onclick={() => (globalDialog.dialog = deleteDialog)}>
-    <span class="fd fd-trash-2 text-[20px]"></span>
+    <span class="fd fd-trash-2"></span>
     Delete
   </button>
 {/snippet}
@@ -194,19 +203,19 @@
     title={duplicatePipelineTooltip}
     onclick={() => void duplicateSelectedPipeline()}
   >
-    <span class="fd fd-copy-plus text-[20px]"></span>
+    <span class="fd fd-copy-plus"></span>
     Duplicate
   </button>
 {/snippet}
 {#snippet btnClear()}
   <button class="btn preset-tonal-surface" onclick={() => (globalDialog.dialog = clearDialog)}>
-    <span class="fd fd-eraser text-[20px]"></span>
+    <span class="fd fd-eraser"></span>
     Clear storage
   </button>
 {/snippet}
 
 {#if actions.length}
-  <div class="flex h-9 flex-wrap gap-2">
+  <div class="flex h-8 flex-wrap gap-2">
     {#each actions as action}
       {@render action()}
     {/each}

@@ -1,5 +1,7 @@
 package org.dbsp.sqlCompiler.compiler.sql.simple;
 
+import org.dbsp.sqlCompiler.circuit.OutputPort;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPControlledKeyFilterOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainKeysOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainNValuesOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPIntegrateTraceRetainValuesOperator;
@@ -8,7 +10,6 @@ import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceTableOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinFilterMapOperator;
-import org.dbsp.sqlCompiler.circuit.operator.DBSPStarJoinIndexOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPUnaryOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPWindowOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
@@ -44,8 +45,10 @@ import org.junit.Test;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /** Regression tests that executed in incremental mode */
 public class IncrementalRegressionTests extends SqlIoTest {
@@ -339,7 +342,7 @@ public class IncrementalRegressionTests extends SqlIoTest {
 
                 -- Credit card transactions.
                 CREATE TABLE transaction (
-                    ts TIMESTAMP LATENESS INTERVAL 10 MINUTES,
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 10 MINUTES,
                     amt DOUBLE,
                     customer_id BIGINT NOT NULL,
                     cc_num BIGINT NOT NULL,
@@ -691,6 +694,50 @@ public class IncrementalRegressionTests extends SqlIoTest {
                 AS select 1 as type_path;""");
     }
 
+    /** Two views compute the same non-linear aggregate.  CSE must merge the two
+     * aggregate operators, which otherwise have the same persistent id. */
+    @Test
+    public void duplicatePersistentIds() {
+        this.getCCS("""
+                CREATE TABLE t(r BIGINT, k BIGINT);
+                CREATE VIEW v1 AS SELECT k, MIN(r) AS a FROM t GROUP BY k;
+                CREATE VIEW v2 AS SELECT k, MIN(r) AS a FROM t GROUP BY k;""");
+    }
+
+    /** Two views compute the same fold aggregate.  CSE must merge the two
+     * aggregate operators, which otherwise have the same persistent id. */
+    @Test
+    public void duplicateFoldAggregates() {
+        this.getCCS("""
+                CREATE TABLE t(r BIGINT, k BIGINT);
+                CREATE VIEW v1 AS SELECT k, ARRAY_AGG(r) AS a FROM t GROUP BY k;
+                CREATE VIEW v2 AS SELECT k, ARRAY_AGG(r) AS a FROM t GROUP BY k;""");
+    }
+
+    /** Two views differ only in the strictness of a NOW() bound.  CSE must not
+     * merge their window operators. */
+    @Test
+    public void windowBoundsNotMerged() {
+        var ccs = this.getCCS("""
+                CREATE TABLE t(ts TIMESTAMP NOT NULL, v INT);
+                CREATE VIEW ge AS SELECT v FROM t WHERE ts >= NOW() - INTERVAL 1 HOUR;
+                CREATE VIEW gt AS SELECT v FROM t WHERE ts > NOW() - INTERVAL 1 HOUR;""");
+        // The row with v = 1 is exactly on the lower bound
+        ccs.stepMultiView("""
+                INSERT INTO now VALUES('2024-01-01 12:00:00');
+                INSERT INTO t VALUES('2024-01-01 11:00:00', 1);
+                INSERT INTO t VALUES('2024-01-01 11:30:00', 2);""", Map.of(
+                "ge", """
+                 v | weight
+                ------------
+                 1 | 1
+                 2 | 1""",
+                "gt", """
+                 v | weight
+                ------------
+                 2 | 1"""));
+    }
+
     @Test
     public void cseTest() {
         var ccs = this.getCCS("""
@@ -838,8 +885,8 @@ public class IncrementalRegressionTests extends SqlIoTest {
                 CREATE VIEW V AS SELECT T.x FROM T WHERE T.x < NOW();""");
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             @Override public void postorder(DBSPWindowOperator window) {
-                // only 1 field used by the window
-                Assert.assertEquals(1,
+                // The only field used is the window's key, which is not repeated in the value
+                Assert.assertEquals(0,
                         window.left().getOutputIndexedZSetType().elementType.getToplevelFieldCount());
             }
         });
@@ -1813,24 +1860,171 @@ public class IncrementalRegressionTests extends SqlIoTest {
 
     @Test
     public void windowErrorTest() {
-        this.getCCS("""
+        var ccs = this.getCCS("""
                 CREATE TABLE T (
                     ts TIMESTAMP NOT NULL LATENESS INTERVAL 24 HOURS,
                     p VARCHAR,
                     m DECIMAL(38, 7)
                 );
-                
-                CREATE VIEW V0 AS
+
+                CREATE LOCAL VIEW V0 AS
                 SELECT *
                 FROM T
                 WHERE ts >= NOW() - INTERVAL 1 MINUTE
                 AND p IS NOT NULL
                 AND m > 0;
-                
+
                 CREATE VIEW V1 AS
                 SELECT COUNT(*)
                 FROM V0
                 GROUP BY p;""");
+        ccs.step("""
+                INSERT INTO now VALUES('2024-01-01 12:00:00');
+                INSERT INTO T VALUES('2024-01-01 11:59:30', 'a', 1.0);
+                INSERT INTO T VALUES('2024-01-01 11:59:40', 'a', 2.0);
+                -- outside the 1 minute window
+                INSERT INTO T VALUES('2024-01-01 11:58:00', 'a', 3.0);
+                -- p is NULL
+                INSERT INTO T VALUES('2024-01-01 11:59:50', NULL, 4.0);
+                -- m is not positive
+                INSERT INTO T VALUES('2024-01-01 11:59:50', 'b', 0.0);
+                INSERT INTO T VALUES('2024-01-01 11:59:55', 'b', 5.0);""",
+                """
+                 count | weight
+                ----------------
+                 2     | 1
+                 1     | 1""");
+        // Time advances past the window, so all rows expire.
+        ccs.step("INSERT INTO now VALUES('2024-01-01 12:01:00');",
+                """
+                 count | weight
+                ----------------
+                 2     | -1
+                 1     | -1""");
+        // A row that arrives after the window has moved, but is still inside it.
+        // The second row precedes the window yet is within the 24 hour lateness bound.
+        ccs.step("""
+                INSERT INTO T VALUES('2024-01-01 12:00:50', 'a', 1.0);
+                INSERT INTO T VALUES('2024-01-01 06:00:00', 'a', 1.0);""",
+                """
+                 count | weight
+                ----------------
+                 1     | 1""");
+        ccs.step("REMOVE FROM T VALUES('2024-01-01 12:00:50', 'a', 1.0);",
+                """
+                 count | weight
+                ----------------
+                 1     | -1""");
+    }
+
+    @Test
+    public void windowErrorNullTimestampTest() {
+        // Same as windowErrorTest, but 'ts' is nullable and some rows have a NULL timestamp.
+        var ccs = this.getCCS("""
+                CREATE TABLE T (
+                    ts TIMESTAMP LATENESS INTERVAL 24 HOURS,
+                    p VARCHAR,
+                    m DECIMAL(38, 7)
+                );
+
+                CREATE LOCAL VIEW V0 AS
+                SELECT *
+                FROM T
+                WHERE ts >= NOW() - INTERVAL 1 MINUTE
+                AND p IS NOT NULL
+                AND m > 0;
+
+                CREATE VIEW V1 AS
+                SELECT COUNT(*)
+                FROM V0
+                GROUP BY p;""");
+        // NULL >= NOW() - INTERVAL 1 MINUTE is NULL, so rows with a NULL timestamp never
+        // reach V1, no matter what the other columns hold.
+        ccs.step("""
+                INSERT INTO now VALUES('2024-01-01 12:00:00');
+                INSERT INTO T VALUES('2024-01-01 11:59:30', 'a', 1.0);
+                INSERT INTO T VALUES(NULL, 'a', 2.0);
+                INSERT INTO T VALUES(NULL, NULL, 3.0);
+                INSERT INTO T VALUES(NULL, 'b', 0.0);
+                INSERT INTO T VALUES('2024-01-01 11:59:55', 'b', 5.0);""",
+                """
+                 count | weight
+                ----------------
+                 1     | 2""");
+        // Group 'a' grows to two rows; the new NULL timestamp changes nothing.
+        ccs.step("""
+                INSERT INTO T VALUES('2024-01-01 11:59:59', 'a', 7.0);
+                INSERT INTO T VALUES(NULL, 'c', 9.0);""",
+                """
+                 count | weight
+                ----------------
+                 1     | -1
+                 2     | 1""");
+        // Deleting a NULL timestamp row changes nothing either.
+        ccs.step("REMOVE FROM T VALUES(NULL, 'a', 2.0);",
+                """
+                 count | weight
+                ----------------""");
+        // The window slides to 11:59:45, so 'a's oldest row expires.
+        ccs.step("INSERT INTO now VALUES('2024-01-01 12:00:45');",
+                """
+                 count | weight
+                ----------------
+                 2     | -1
+                 1     | 1""");
+        // The window slides past every timestamp, so both groups disappear.
+        ccs.step("INSERT INTO now VALUES('2024-01-01 12:01:00');",
+                """
+                 count | weight
+                ----------------
+                 1     | -2""");
+    }
+
+    @Test
+    public void windowNullGroupKeyTest() {
+        // A nullable column narrowed by IS NOT NULL, combined with a NOW() filter, and then
+        // used both as a GROUP BY key and as an output column.  The key must stay nullable:
+        // narrowing it would make the aggregate unwrap a NULL key and panic the worker.
+        var ccs = this.getCCS("""
+                CREATE TABLE t (
+                    ts  TIMESTAMP NOT NULL LATENESS INTERVAL 24 HOURS,
+                    k   VARCHAR,
+                    v   DECIMAL(38,7)
+                );
+
+                CREATE LOCAL VIEW filtered AS
+                SELECT * FROM t
+                WHERE ts >= NOW() - INTERVAL 1 MINUTE
+                  AND k IS NOT NULL;
+
+                CREATE VIEW agg AS
+                SELECT k, COUNT(*) FROM filtered GROUP BY k;""").withStringTrim();
+        ccs.step("""
+                INSERT INTO now VALUES('2024-01-01 12:00:00');
+                INSERT INTO t VALUES('2024-01-01 11:59:30', 'a', 1.0);
+                INSERT INTO t VALUES('2024-01-01 11:59:40', NULL, 2.0);""",
+                """
+                 k | count | weight
+                --------------------
+                 a | 1     | 1""");
+        // Retracting a NULL key, as a CDC before-image does.
+        ccs.step("REMOVE FROM t VALUES('2024-01-01 11:59:40', NULL, 2.0);",
+                """
+                 k | count | weight
+                --------------------""");
+        // The window slides past the surviving row.
+        ccs.step("INSERT INTO now VALUES('2024-01-01 12:01:00');",
+                """
+                 k | count | weight
+                --------------------
+                 a | 1     | -1""");
+        // Only NULL keys, so no group ever forms.
+        ccs.step("""
+                INSERT INTO t VALUES('2024-01-01 12:00:50', NULL, 3.0);
+                INSERT INTO t VALUES('2024-01-01 12:00:55', NULL, 4.0);""",
+                """
+                 k | count | weight
+                --------------------""");
     }
 
     // Check that the maximum width in a circuit (except inputs) is less than the specified one.
@@ -2126,7 +2320,7 @@ public class IncrementalRegressionTests extends SqlIoTest {
             int joins = 0;
 
             @Override
-            public void postorder(DBSPStarJoinIndexOperator operator) {
+            public void postorder(DBSPStarJoinFilterMapOperator operator) {
                 this.joins++;
             }
 
@@ -2138,47 +2332,10 @@ public class IncrementalRegressionTests extends SqlIoTest {
     }
 
     @Test
-    public void starJoinFlatmapOptOutTest() {
-        // Test that we can inhibit the use of star joins using options
-        // This test may eventually be removed
-        var ccs = this.getCCS("""
-                SET FELDERA_AVOID_STAR_JOINS = ON;
-                
-                CREATE TABLE T(x INT, y INT);
-                CREATE VIEW V AS SELECT
-                y,
-                MIN(x),
-                MAX(x),
-                STDDEV(x),
-                ARG_MAX(y, x)
-                FROM T GROUP BY y
-                HAVING y > 1;""");
-        ccs.step("INSERT INTO T VALUES(0, 0), (1, 2), (2, 2)", """
-                 y | min | max | stddev | arg_max | weight
-                -------------------------------------------
-                 2 |   1 |   2 |      1 |       2 | 1""");
-        ccs.visit(new CircuitVisitor(ccs.compiler) {
-            int joins = 0;
-
-            @Override
-            public void postorder(DBSPStarJoinFilterMapOperator operator) {
-                this.joins++;
-            }
-
-            @Override
-            public void endVisit() {
-                Assert.assertEquals(0, this.joins);
-            }
-        });
-    }
-
-    @Test
     public void testEmitFinalStarJoin() {
         // Test waterline propagation through star join.
         // This will fail if propagation is not good enough because of the 'emit_final' view annotation.
         this.getCCS("""
-                SET FELDERA_AVOID_STAR_JOINS = ON;
-                
                 CREATE TABLE T (
                   ts TIMESTAMP NOT NULL LATENESS INTERVAL 5 MINUTE,
                   a VARCHAR NOT NULL
@@ -2259,5 +2416,611 @@ public class IncrementalRegressionTests extends SqlIoTest {
                 Assert.assertEquals(1, this.gc);
             }
         });
+    }
+
+    /** A view with LATENESS computed from error_view and with LATENESS.  Its own late rows
+     * are not reported, as documented in docs/sql/system.md. */
+    @Test
+    public void latenessViewOverErrorView() {
+        var cc = this.getCC("""
+                CREATE TABLE err_source(x INT, ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR);
+                CREATE VIEW err_pass AS SELECT * FROM err_source;
+                CREATE VIEW err_late AS
+                SELECT table_or_view_name, message, metadata, CAST(message AS TIMESTAMP) AS ts FROM error_view;
+                LATENESS err_late.ts INTERVAL 1 HOUR;""");
+        cc.visit(new CircuitVisitor(cc.compiler) {
+            int filters = 0;
+            final Set<OutputPort> errorPortsRead = new HashSet<>();
+
+            @Override
+            public void postorder(DBSPOperator operator) {
+                if (operator.is(DBSPControlledKeyFilterOperator.class))
+                    this.filters++;
+                for (OutputPort input : operator.inputs)
+                    if (input.node().is(DBSPControlledKeyFilterOperator.class) && input.port() == 1)
+                        this.errorPortsRead.add(input);
+            }
+
+            @Override
+            public void endVisit() {
+                // One filter for the table, one for the view over error_view
+                Assert.assertEquals(2, this.filters);
+                // Only the table's late rows reach error_view
+                Assert.assertEquals(1, this.errorPortsRead.size());
+            }
+        });
+    }
+
+    /** Run the same steps on the program with and without its LATENESS clause.
+     * No input row is late, so both programs must produce the same outputs. */
+    void runWithAndWithoutLateness(String sql, Consumer<CompilerCircuitStream> steps) {
+        Assert.assertTrue(sql.contains(" LATENESS 10"));
+        for (String program : List.of(sql, sql.replace(" LATENESS 10", ""))) {
+            CompilerCircuitStream ccs = this.getCCS(program).compactAfterEachStep();
+            steps.accept(ccs);
+        }
+    }
+
+    /** A row inserted above the waterline changes the LEAD of its predecessor,
+     * which can be below the waterline.  Expected outputs validated with Postgres. */
+    void checkLeadBelowWaterline(String lead) {
+        String sql = """
+                CREATE TABLE t (ts BIGINT NOT NULL LATENESS 10, v BIGINT NOT NULL);
+                CREATE LOCAL VIEW V AS SELECT ts, LEAD_CALL AS nv FROM t;
+                CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;"""
+                .replace("LEAD_CALL", lead);
+        // Comments show V
+        this.runWithAndWithoutLateness(sql, ccs -> {
+            ccs.step("INSERT INTO t VALUES(10, 1);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(50, 2);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 2
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | -1
+                     10 | 2 | 1
+                     50 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(45, 3);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 3
+                    //  45  | 2
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 2 | -1
+                     10 | 3 | 1
+                     45 | 2 | 1""");
+        });
+    }
+
+    @Test
+    public void issue7236() {
+        // LEAD with ASC and LAG with DESC produce the same result
+        this.checkLeadBelowWaterline("LEAD(v, 1, 0) OVER (ORDER BY ts)");
+        this.checkLeadBelowWaterline("LAG(v, 1, 0) OVER (ORDER BY ts DESC)");
+    }
+
+    /** A row with a NULL sort column is never late.  With LAG and NULLS FIRST, or LEAD and
+     * NULLS LAST, the rows that such a row changes are non-NULL rows, which can be below
+     * the waterline.  Expected outputs validated with Postgres. */
+    void checkNullBelowWaterline(String lag) {
+        String sql = """
+                CREATE TABLE t (ts BIGINT LATENESS 10, v BIGINT NOT NULL);
+                CREATE LOCAL VIEW V AS SELECT ts, LAG_CALL AS nv FROM t;
+                CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;"""
+                .replace("LAG_CALL", lag);
+        // Comments show V
+        this.runWithAndWithoutLateness(sql, ccs -> {
+            ccs.step("INSERT INTO t VALUES(10, 1);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(50, 2);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    //  50  | 1
+                    """
+                     ts | m | weight
+                    -----------------
+                     50 | 1 | 1""");
+            // The NULL row becomes the neighbor of 10, which is below the waterline 40
+            ccs.step("INSERT INTO t VALUES(NULL, 3);",
+                    //  ts  | nv
+                    // ----------
+                    //  NULL| 0
+                    //  10  | 3
+                    //  50  | 1
+                    """
+                     ts  | m | weight
+                    ------------------
+                     10  | 0 | -1
+                     10  | 3 | 1
+                     NULL| 0 | 1""");
+        });
+    }
+
+    @Test
+    public void issue7236NullsFirst() {
+        this.checkNullBelowWaterline("LAG(v, 1, 0) OVER (ORDER BY ts NULLS FIRST)");
+        this.checkNullBelowWaterline("LEAD(v, 1, 0) OVER (ORDER BY ts DESC NULLS LAST)");
+    }
+
+    /** A LAG sorted on a column without LATENESS changes rows with any timestamp.
+     * Expected outputs validated with Postgres. */
+    @Test
+    public void issue7236OtherSortColumn() {
+        String sql = """
+                CREATE TABLE t (ts BIGINT NOT NULL LATENESS 10, v BIGINT NOT NULL);
+                CREATE LOCAL VIEW V AS SELECT ts, LAG(v, 1, 0) OVER (ORDER BY v) AS nv FROM t;
+                CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;""";
+        // Comments show V
+        this.runWithAndWithoutLateness(sql, ccs -> {
+            ccs.step("INSERT INTO t VALUES(10, 5);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(50, 1);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 1
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | -1
+                     10 | 1 | 1
+                     50 | 0 | 1""");
+            // 45 is not late; in the order of v it becomes the predecessor of 10
+            ccs.step("INSERT INTO t VALUES(45, 3);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 3
+                    //  45  | 1
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 1 | -1
+                     10 | 3 | 1
+                     45 | 1 | 1""");
+        });
+    }
+
+    /** Only the first sort column can keep its waterline; here it is v DESC, so ts has none.
+     * Expected outputs validated with Postgres. */
+    @Test
+    public void issue7236MultiColumnSort() {
+        String sql = """
+                CREATE TABLE t (ts BIGINT NOT NULL LATENESS 10, v BIGINT NOT NULL, w BIGINT NOT NULL);
+                CREATE LOCAL VIEW V AS SELECT ts, LAG(w, 1, 0) OVER (ORDER BY v DESC, ts) AS nv FROM t;
+                CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;""";
+        // Comments show V
+        this.runWithAndWithoutLateness(sql, ccs -> {
+            ccs.step("INSERT INTO t VALUES(10, 5, 1);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(50, 9, 2);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 2
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | -1
+                     10 | 2 | 1
+                     50 | 0 | 1""");
+            // 45 is not late; in the order of v DESC it becomes the predecessor of 10
+            ccs.step("INSERT INTO t VALUES(45, 7, 3);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 3
+                    //  45  | 2
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 2 | -1
+                     10 | 3 | 1
+                     45 | 2 | 1""");
+        });
+    }
+
+    /** LEAD within a partition changes the predecessor in the same partition.
+     * Expected outputs validated with Postgres. */
+    @Test
+    public void issue7236Partitioned() {
+        String sql = """
+                CREATE TABLE t (ts BIGINT NOT NULL LATENESS 10, k BIGINT NOT NULL, v BIGINT NOT NULL);
+                CREATE LOCAL VIEW V AS SELECT ts, LEAD(v, 1, 0) OVER (PARTITION BY k ORDER BY ts) AS nv FROM t;
+                CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;""";
+        // Comments show V
+        this.runWithAndWithoutLateness(sql, ccs -> {
+            ccs.step("INSERT INTO t VALUES(10, 1, 1);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(20, 2, 5);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 0
+                    //  20  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     20 | 0 | 1""");
+            ccs.step("INSERT INTO t VALUES(50, 1, 2);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 2
+                    //  20  | 0
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 0 | -1
+                     10 | 2 | 1
+                     50 | 0 | 1""");
+            // 45 is not late; in partition 1 it becomes the successor of 10
+            ccs.step("INSERT INTO t VALUES(45, 1, 3);",
+                    //  ts  | nv
+                    // ----------
+                    //  10  | 3
+                    //  20  | 0
+                    //  45  | 2
+                    //  50  | 0
+                    """
+                     ts | m | weight
+                    -----------------
+                     10 | 2 | -1
+                     10 | 3 | 1
+                     45 | 2 | 1""");
+        });
+    }
+
+    /** LAG and LEAD that change rows on the ascending side of the sort column keep its waterline. */
+    @Test
+    public void issue7236KeepsWaterline() {
+        String[][] cases = {
+                { "NOT NULL", "LAG(v, 1, 0) OVER (ORDER BY ts)" },
+                { "NOT NULL", "LEAD(v, 1, 0) OVER (ORDER BY ts DESC)" },
+                { "", "LAG(v, 1, 0) OVER (ORDER BY ts NULLS LAST)" },
+                { "", "LEAD(v, 1, 0) OVER (ORDER BY ts DESC NULLS FIRST)" },
+        };
+        for (String[] c : cases) {
+            String sql = """
+                    CREATE TABLE t (ts BIGINT NULLABILITY LATENESS 10, v BIGINT NOT NULL);
+                    CREATE LOCAL VIEW V AS SELECT ts, LAG_CALL AS nv FROM t;
+                    CREATE VIEW C AS SELECT ts, MAX(nv) AS m FROM V GROUP BY ts;"""
+                    .replace("NULLABILITY", c[0])
+                    .replace("LAG_CALL", c[1]);
+            CompilerCircuit cc = this.getCC(sql);
+            cc.visit(new CircuitVisitor(cc.compiler) {
+                int retainKeys = 0;
+
+                @Override
+                public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                    this.retainKeys++;
+                }
+
+                @Override
+                public void endVisit() {
+                    // The LAG input and the GROUP BY integral
+                    Assert.assertEquals(c[1], 2, this.retainKeys);
+                }
+            });
+        }
+    }
+
+    /** DATEDIFF(DAY, d, literal) decreases as d grows, so it has no waterline.
+     * The program runs with and without LATENESS; no input row is late. */
+    @Test
+    public void datediffLiteralSecond() {
+        String sql = """
+                CREATE TABLE T (ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR);
+                CREATE VIEW V AS SELECT DATEDIFF(DAY, CAST(ts AS DATE), DATE '2030-01-01') AS d, COUNT(*) AS c
+                FROM T GROUP BY DATEDIFF(DAY, CAST(ts AS DATE), DATE '2030-01-01');""";
+        for (String program : new String[] { sql, sql.replace(" LATENESS INTERVAL 1 HOUR", "") }) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("INSERT INTO T VALUES('2024-01-10 12:00:00');", """
+                     d    | c | weight
+                    ---------------------
+                     2183 | 1 | 1""");
+            ccs.step("INSERT INTO T VALUES('2024-01-20 12:00:00');", """
+                     d    | c | weight
+                    ---------------------
+                     2173 | 1 | 1""");
+            ccs.step("INSERT INTO T VALUES('2024-01-20 13:00:00');", """
+                     d    | c | weight
+                    ---------------------
+                     2173 | 1 | -1
+                     2173 | 2 | 1""");
+        }
+    }
+
+    /** DATEDIFF(unit, constant, d) grows with d, so the GROUP BY keeps a waterline. */
+    @Test
+    public void datediffConstantFirst() {
+        String[][] cases = {
+                { "DAY", "DATE '2000-01-01'" },
+                { "MONTH", "DATE '2000-01-01'" },
+                { "QUARTER", "DATE '2000-01-01'" },
+                { "DAY", "CAST(TIMESTAMP '2000-01-01 00:00:00' AS DATE)" },
+        };
+        for (String[] c : cases) {
+            String unit = c[0] + " " + c[1];
+            String sql = """
+                    CREATE TABLE T (ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 HOUR);
+                    CREATE VIEW V AS SELECT COUNT(*) AS c FROM T
+                    GROUP BY DATEDIFF(UNIT, FIRST, CAST(ts AS DATE));"""
+                    .replace("UNIT", c[0])
+                    .replace("FIRST", c[1]);
+            CompilerCircuit cc = this.getCC(sql);
+            cc.visit(new CircuitVisitor(cc.compiler) {
+                int retainKeys = 0;
+
+                @Override
+                public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                    this.retainKeys++;
+                }
+
+                @Override
+                public void endVisit() {
+                    Assert.assertEquals(unit, 1, this.retainKeys);
+                }
+            });
+        }
+    }
+
+    /** When NOW advances, a temporal filter retracts rows below the data waterline.
+     * No input row is late.
+     * Expected outputs validated with Postgres, with NOW() replaced by each step's value. */
+    @Test
+    public void issue7238() {
+        String sql = """
+                CREATE TABLE T (ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);
+                CREATE LOCAL VIEW V AS SELECT ts FROM T WHERE ts >= NOW() - INTERVAL 20 MINUTES;
+                CREATE VIEW C AS SELECT ts, COUNT(*) AS c FROM V GROUP BY ts;""";
+        String[] programs = {
+                // As written
+                sql,
+                // Without LATENESS
+                sql.replace(" LATENESS INTERVAL 1 MINUTE", ""),
+                // With a nullable timestamp
+                sql.replace(" NOT NULL", "")
+        };
+        for (String program : programs) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("""
+                    INSERT INTO now VALUES('2024-01-01 12:00:00');
+                    INSERT INTO T VALUES('2024-01-01 11:45:00');
+                    INSERT INTO T VALUES('2024-01-01 11:50:00');""",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 11:45:00 | 1 | 1
+                     2024-01-01 11:50:00 | 1 | 1""");
+            ccs.step("INSERT INTO T VALUES('2024-01-01 11:58:00');",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 11:58:00 | 1 | 1""");
+            // The data waterline is 11:57; the window's lower edge moves to 11:50
+            ccs.step("INSERT INTO now VALUES('2024-01-01 12:10:00');",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 11:45:00 | 1 | -1""");
+        }
+    }
+
+    /** A row that leaves a temporal filter's window keeps the value it had in every other
+     * column, which can be below that column's waterline.  The program runs with and without
+     * LATENESS; no input row is late.
+     * Expected outputs validated with Postgres, with NOW() replaced by each step's value. */
+    @Test
+    public void issue7238OtherColumn() {
+        String sql = """
+                CREATE TABLE T (ts TIMESTAMP NOT NULL, x INT NOT NULL LATENESS 5);
+                CREATE LOCAL VIEW V AS SELECT x FROM T WHERE ts >= NOW() - INTERVAL 20 MINUTES;
+                CREATE VIEW C AS SELECT x, COUNT(*) AS c FROM V GROUP BY x;""";
+        for (String program : new String[] { sql, sql.replace(" LATENESS 5", "") }) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("""
+                    INSERT INTO now VALUES('2024-01-01 12:00:00');
+                    INSERT INTO T VALUES('2024-01-01 11:45:00', 1);
+                    INSERT INTO T VALUES('2024-01-01 11:50:00', 100);""",
+                    """
+                     x   | c | weight
+                    -----------------
+                     1   | 1 | 1
+                     100 | 1 | 1""");
+            // The waterline of x is 95; the row with x = 1 leaves the window
+            ccs.step("INSERT INTO now VALUES('2024-01-01 12:10:00');",
+                    """
+                     x   | c | weight
+                    -----------------
+                     1   | 1 | -1""");
+        }
+    }
+
+    /** A temporal filter without a lower bound inserts the rows that enter its window,
+     * which can be below the data waterline.  The program runs with and without LATENESS;
+     * no input row is late.
+     * Expected outputs validated with Postgres, with NOW() replaced by each step's value. */
+    @Test
+    public void issue7238UpperBound() {
+        String sql = """
+                CREATE TABLE T (ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);
+                CREATE LOCAL VIEW V AS SELECT ts FROM T WHERE ts <= NOW();
+                CREATE VIEW C AS SELECT ts, COUNT(*) AS c FROM V GROUP BY ts;""";
+        for (String program : new String[] { sql, sql.replace(" LATENESS INTERVAL 1 MINUTE", "") }) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("""
+                    INSERT INTO now VALUES('2024-01-01 12:00:00');
+                    INSERT INTO T VALUES('2024-01-01 12:30:00');
+                    INSERT INTO T VALUES('2024-01-01 14:00:00');""",
+                    """
+                     ts | c | weight
+                    -----------------""");
+            // The data waterline is 13:59; 12:30 enters the window
+            ccs.step("INSERT INTO now VALUES('2024-01-01 12:45:00');",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 12:30:00 | 1 | 1""");
+        }
+    }
+
+    /** Temporal filters bound their output by the window's bounds. */
+    @Test
+    public void issue7238KeepsWaterline() {
+        String[][] cases = {
+                { "NOT NULL LATENESS INTERVAL 1 MINUTE", "ts >= NOW() - INTERVAL 20 MINUTES" },
+                { "NOT NULL", "ts >= NOW() - INTERVAL 20 MINUTES" },
+                { "LATENESS INTERVAL 1 MINUTE", "ts >= NOW() - INTERVAL 20 MINUTES" },
+                { "NOT NULL LATENESS INTERVAL 1 MINUTE", "ts <= NOW()" },
+        };
+        for (String[] c : cases) {
+            String sql = """
+                    CREATE TABLE T (ts TIMESTAMP COLUMN);
+                    CREATE LOCAL VIEW V AS SELECT ts FROM T WHERE CONDITION;
+                    CREATE VIEW C AS SELECT ts, COUNT(*) AS c FROM V GROUP BY ts;"""
+                    .replace("COLUMN", c[0])
+                    .replace("CONDITION", c[1]);
+            CompilerCircuit cc = this.getCC(sql);
+            cc.visit(new CircuitVisitor(cc.compiler) {
+                int retainKeys = 0;
+
+                @Override
+                public void postorder(DBSPIntegrateTraceRetainKeysOperator operator) {
+                    this.retainKeys++;
+                }
+
+                @Override
+                public void endVisit() {
+                    // The GROUP BY integral
+                    Assert.assertEquals(c[0] + " " + c[1], 1, this.retainKeys);
+                }
+            });
+        }
+    }
+
+    /** The window key is a column in the middle of the row, which RewriteNow rebuilds
+     * after the window.  The program runs with and without LATENESS; no input row is late.
+     * Expected outputs validated with Postgres, with NOW() replaced by each step's value. */
+    @Test
+    public void issue7238MiddleKeyColumn() {
+        String sql = """
+                CREATE TABLE T (a INT NOT NULL, ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE, b INT);
+                CREATE VIEW V AS SELECT a, ts, b FROM T WHERE ts >= NOW() - INTERVAL 20 MINUTES;""";
+        for (String program : new String[] { sql, sql.replace(" LATENESS INTERVAL 1 MINUTE", "") }) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("""
+                    INSERT INTO now VALUES('2024-01-01 12:00:00');
+                    INSERT INTO T VALUES(1, '2024-01-01 11:45:00', 7);
+                    INSERT INTO T VALUES(2, '2024-01-01 11:50:00', NULL);""",
+                    """
+                     a | ts                  | b    | weight
+                    -----------------------------------------
+                     1 | 2024-01-01 11:45:00 | 7    | 1
+                     2 | 2024-01-01 11:50:00 | NULL | 1""");
+            ccs.step("INSERT INTO now VALUES('2024-01-01 12:10:00');",
+                    """
+                     a | ts                  | b | weight
+                    -------------------------------------
+                     1 | 2024-01-01 11:45:00 | 7 | -1""");
+        }
+    }
+
+    /** A window bounded on both sides: rows leave at the lower edge and enter at the upper edge.
+     * The program runs with and without LATENESS; no input row is late.
+     * Expected outputs validated with Postgres, with NOW() replaced by each step's value. */
+    @Test
+    public void issue7238BothBounds() {
+        String sql = """
+                CREATE TABLE T (ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);
+                CREATE LOCAL VIEW V AS SELECT ts FROM T
+                WHERE ts >= NOW() - INTERVAL 20 MINUTES AND ts <= NOW() + INTERVAL 20 MINUTES;
+                CREATE VIEW C AS SELECT ts, COUNT(*) AS c FROM V GROUP BY ts;""";
+        for (String program : new String[] { sql, sql.replace(" LATENESS INTERVAL 1 MINUTE", "") }) {
+            var ccs = this.getCCS(program).compactAfterEachStep();
+            ccs.step("""
+                    INSERT INTO now VALUES('2024-01-01 12:00:00');
+                    INSERT INTO T VALUES('2024-01-01 11:45:00');
+                    INSERT INTO T VALUES('2024-01-01 12:30:00');""",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 11:45:00 | 1 | 1""");
+            // The data waterline is 12:29; the window moves to [11:50, 12:30]
+            ccs.step("INSERT INTO now VALUES('2024-01-01 12:10:00');",
+                    """
+                     ts                  | c | weight
+                    ---------------------------------
+                     2024-01-01 11:45:00 | 1 | -1
+                     2024-01-01 12:30:00 | 1 | 1""");
+        }
+    }
+
+    @Test
+    public void issue7212() {
+        var ccs = this.getCCS("""
+                CREATE TABLE T(k INT NOT NULL, a INT);
+                CREATE TABLE S(k INT NOT NULL, b INT);
+                CREATE VIEW V AS SELECT * FROM T WHERE T.a NOT IN (SELECT S.b FROM S WHERE S.k = T.k);""");
+        // Expected outputs validated with Postgres
+        // k=1: a matches; k=2: no match; k=3: a is NULL; k=4: NULL in S;
+        // k=5 and k=6: no S rows, so NOT IN is TRUE even for a NULL a
+        ccs.step("""
+                INSERT INTO T VALUES (1, 10), (2, 20), (3, NULL), (4, 40), (5, 50), (6, NULL);
+                INSERT INTO S VALUES (1, 10), (1, 20), (2, 30), (3, 30), (4, NULL), (4, 41);""", """
+                 k | a    | weight
+                -------------------
+                 2 | 20   | 1
+                 5 | 50   | 1
+                 6 |NULL  | 1""");
+        ccs.step("INSERT INTO S VALUES (2, 20);", """
+                 k | a  | weight
+                -----------------
+                 2 | 20 | -1""");
+        ccs.step("REMOVE FROM S VALUES (4, NULL);", """
+                 k | a  | weight
+                -----------------
+                 4 | 40 | 1""");
+        ccs.step("INSERT INTO S VALUES (6, 1);", """
+                 k | a    | weight
+                -------------------
+                 6 |NULL  | -1""");
     }
 }

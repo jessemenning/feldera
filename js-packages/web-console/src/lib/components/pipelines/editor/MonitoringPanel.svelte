@@ -11,7 +11,8 @@
 
 <!-- svelte-ignore state_referenced_locally -->
 <script lang="ts">
-  import { Switch } from '@skeletonlabs/skeleton-svelte'
+  import { count } from 'common-lib/array'
+  import CompactSwitch from '$lib/components/common/CompactSwitch.svelte'
   import { useLocalStorage } from '$lib/compositions/localStore.svelte'
   import { useLayoutSettings } from '$lib/compositions/layout/useLayoutSettings.svelte'
   import PanelAdHocQuery from '$lib/components/pipelines/editor/TabAdHocQuery.svelte'
@@ -23,17 +24,27 @@
   import PanelLogs from '$lib/components/pipelines/editor/TabLogs.svelte'
   import type { ExtendedPipeline } from '$lib/services/pipelineManager'
   import type { PipelineMetrics } from '$lib/functions/pipelineMetrics'
-  import { count } from '$lib/functions/common/array'
+  import { statusCounterClass, statusToneColors } from '$lib/functions/pipelineStatusColor'
   import { untrack } from 'svelte'
+  import { usePermission } from '$lib/compositions/usePermission.svelte'
   import { usePipelineActionCallbacks } from '$lib/compositions/pipelines/usePipelineActionCallbacks.svelte'
-  import ClipboardCopyButton from '$lib/components/other/ClipboardCopyButton.svelte'
-  import { Tooltip } from 'common-ui'
+  import { ClipboardCopyButton, Tooltip } from 'common-ui'
   import DownloadSupportBundle from '$lib/components/pipelines/editor/DownloadSupportBundle.svelte'
   import {
     extractProgramErrors,
     numConnectorsWithProblems
   } from '$lib/compositions/health/systemErrors'
-  import { TabsPanel, advanceSearch, emptySearchState, type SearchState } from 'common-ui'
+  import {
+    TabsPanel,
+    SearchBar,
+    advanceSearch,
+    emptySearchState,
+    isFindShortcut,
+    useShortcut,
+    positiveMod,
+    type SearchDirection,
+    type SearchState
+  } from 'common-ui'
 
   let {
     pipeline,
@@ -51,6 +62,12 @@
 
   const pipelineName = $derived(pipeline.current.name)
   const layoutSettings = useLayoutSettings()
+
+  // Ad-Hoc Queries and Changes Stream read/stream live pipeline data; both are
+  // hidden without exec:pipeline_data. `$effect.pre` below then drops a saved
+  // selection that points at a now-hidden tab back to the first visible tab.
+  const canQueryData = usePermission('exec:pipeline_data')
+  const dataTabs: MonitoringTabs[] = ['Ad-Hoc Queries', 'Changes Stream']
 
   let tabs = $derived(
     [
@@ -103,7 +120,9 @@
         keepAlive: true,
         tabBarEnd: TabBarEndLogs
       }
-    ].filter((tab) => !hiddenTabs.includes(tab.id))
+    ].filter(
+      (tab) => !hiddenTabs.includes(tab.id) && (canQueryData.allowed || !dataTabs.includes(tab.id))
+    )
   )
   const currentTabStorage = $derived(
     useLocalStorage<MonitoringTabs>('pipelines/' + pipelineName + '/currentMonitoringTab', 'Errors')
@@ -147,34 +166,56 @@
 
   const runtimeErrorsCount = $derived(connectorsWithErrorsCount + memoryPressureErrorCount)
 
-  // Local input binding. The committed search (what the list actually runs) lives in
-  // `logSearch` and only advances on Enter — so typing doesn't search as-you-type.
+  // Log search lives here, with the toolbar that hosts the search bar. `logSearchInput` is the
+  // text in the box; `logSearch` is the submitted search query.
+  // The two diverge while the user types, because a query takes effect only when submitted,
+  // not as-you-type. The log list reports its match count so the counter
+  // and nav buttons stay in sync.
   let logSearchInput = $state('')
   let logSearch: SearchState = $state(emptySearchState)
-  // Bound to the search <input> so Ctrl-F / Cmd-F inside the log list can focus it.
-  let logSearchInputEl: HTMLInputElement | undefined = $state()
-  const onLogSearchShortcut = () => {
-    logSearchInputEl?.focus()
-    logSearchInputEl?.select()
-  }
+  let logMatchCount = $state(0)
+  let searchBar: ReturnType<typeof SearchBar> | undefined = $state()
+  // Single source of truth for the search bar, derived from the submitted `logSearch`. Nothing
+  // submitted - null (counter hidden, nav disabled, nothing highlighted).
+  const searchResults = $derived.by(() => {
+    if (!logSearch.pattern) return null
+    const total = logMatchCount
+    const current = total > 0 ? positiveMod(logSearch.occurrenceIndex, total) + 1 : 0
+    return { current, total }
+  })
 
-  // Enter on the search input: empty input clears, same pattern cycles to the next match,
-  // new pattern jumps to the first match.
-  const submitLogSearch = () => {
+  // Submit: empty input clears, same pattern steps one match in `direction`, new pattern jumps
+  // to the first match.
+  const submitLogSearch = (direction: SearchDirection = 'next') => {
     logSearch = advanceSearch(
       logSearch,
-      logSearchInput ? { kind: 'substring', query: logSearchInput } : null
+      logSearchInput ? { kind: 'substring', query: logSearchInput } : null,
+      direction
     )
   }
-  // Escape clears the input and the highlight — submitting an empty query resets `logSearch`
-  // to `emptySearchState` (pattern null), which un-highlights the list.
-  const clearLogSearch = () => {
-    logSearchInput = ''
-    submitLogSearch()
+  // Drop the submitted search (highlight + counter). The search bar owns and clears the input
+  // text itself; this only resets what the log list is searching for.
+  const resetLogSearch = () => {
+    logSearch = emptySearchState
   }
 
+  // Ctrl-F / Cmd-F opens (or refocuses) the log search whenever the Logs tab is shown, regardless
+  // of which element holds focus.
+  useShortcut(
+    isFindShortcut,
+    () => searchBar?.activate(),
+    () => currentTab === 'Logs'
+  )
+
   // Updating individual properties in an $effect avoids unnecessary reactive updates within tab components
-  let tabProps = $state({ metrics, pipeline, errors, deleted, logSearch, onLogSearchShortcut })
+  let tabProps = $state({
+    metrics,
+    pipeline,
+    errors,
+    deleted,
+    logSearch,
+    onLogMatchCountChange: (count: number) => (logMatchCount = count)
+  })
   $effect(() => {
     tabProps.metrics = metrics
   })
@@ -195,7 +236,7 @@
 {#snippet TabControlPerformance()}
   {@render TabPerformance.Label()}
   {#if runtimeErrorsCount > 0}
-    <span class="ml-1 inline-block min-w-6 rounded preset-filled-error-50-950 px-1 font-medium">
+    <span class="ml-1 {statusCounterClass} {statusToneColors.error.chip}">
       {runtimeErrorsCount}
     </span>
   {/if}
@@ -206,12 +247,12 @@
   {@const errorCount = errors.length - warningCount}
   <span class="">Compiler</span>
   {#if warningCount !== 0}
-    <span class="ml-1 inline-block min-w-6 rounded preset-filled-warning-200-800 px-1 font-medium">
+    <span class="ml-1 {statusCounterClass} {statusToneColors.warning.chip}">
       {warningCount}
     </span>
   {/if}
   {#if errorCount !== 0}
-    <span class="ml-1 inline-block min-w-6 rounded preset-filled-error-50-950 px-1 font-medium">
+    <span class="ml-1 {statusCounterClass} {statusToneColors.error.chip}">
       {errorCount}
     </span>
   {/if}
@@ -236,35 +277,31 @@
 {/snippet}
 
 {#snippet TabBarEndLogs()}
-  <div class="ml-auto flex gap-2">
-    <input
-      bind:this={logSearchInputEl}
+  <div class="ml-auto flex items-center gap-2">
+    <SearchBar
+      bind:this={searchBar}
       bind:value={logSearchInput}
-      type="text"
       placeholder="Search logs"
-      title="Search within logs (Enter to jump to next match, Esc to clear, Ctrl/Cmd-F to focus from the log list)"
-      onkeydown={(e) => {
-        if (e.key === 'Enter') submitLogSearch()
-        else if (e.key === 'Escape') clearLogSearch()
-      }}
-      class="input ml-auto h-8 w-28 text-sm sm:w-32"
+      title="Search logs (Enter / Shift+Enter to step matches, Esc to clear, Ctrl/Cmd-F to toggle)"
+      results={searchResults}
+      onnext={() => submitLogSearch('next')}
+      onprevious={() => submitLogSearch('prev')}
+      onclear={resetLogSearch}
+      inputClass="h-8 w-40 rounded-[4px] py-0"
     />
     {@render PipelineInfoHeader()}
   </div>
 {/snippet}
 
 {#snippet TabBarEndPipelineInfo()}
-  <div class="ml-auto flex gap-2">
+  <div class="ml-auto flex items-center gap-2">
     {@render PipelineInfoHeader()}
   </div>
 {/snippet}
 
 {#snippet PipelineInfoHeader()}
-  <ClipboardCopyButton
-    value={pipeline.current.id}
-    class="h-4! w-auto! gap-2 preset-tonal-surface px-4"
-  >
-    <span class="text-base font-normal text-surface-950-50"> Pipeline ID </span>
+  <ClipboardCopyButton value={pipeline.current.id} class="preset-tonal-surface btn-sm">
+    <span class="font-normal text-surface-950-50"> Pipeline ID </span>
   </ClipboardCopyButton>
   <Tooltip placement="top">
     {pipeline.current.id}
@@ -283,17 +320,12 @@
     </label>
     <label class="flex cursor-pointer items-center gap-2 rounded">
       Verbatim errors
-      <Switch
+      <CompactSwitch
+        size="sm"
         name="verbatimErrors"
         checked={layoutSettings.verbatimErrors.value}
         onCheckedChange={(e) => (layoutSettings.verbatimErrors.value = e.checked)}
-      >
-        <Switch.Control>
-          <Switch.Thumb />
-        </Switch.Control>
-        <Switch.Label />
-        <Switch.HiddenInput />
-      </Switch>
+      />
     </label>
   </div>
 {/snippet}

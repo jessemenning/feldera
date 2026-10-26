@@ -6,13 +6,13 @@ use crate::db::types::pipeline::ExtendedPipelineDescrMonitoring;
 use crate::db::types::tenant::TenantId;
 use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
+use crate::runner::pipeline_logs::FollowMode;
 use actix_web::http::header::{self, HeaderValue};
-use actix_web::{http::Method, web::Payload, HttpRequest, HttpResponse, HttpResponseBuilder};
+use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, http::Method, web::Payload};
 use actix_ws::{CloseCode, CloseReason};
 use awc::error::{ConnectError, SendRequestError};
 use awc::{ClientRequest, ClientResponse};
 use crossbeam::sync::ShardedLock;
-use feldera_observability::AwcRequestTracingExt;
 use feldera_types::query::{MAX_WS_FRAME_SIZE, WS_SUBPROTOCOL};
 use std::fmt::Display;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -25,9 +25,8 @@ use crate::db::types::resources_status::ResourcesStatus;
 use actix_http::encoding::Decoder;
 use feldera_types::runtime_status::RuntimeStatus;
 
-/// Max non-streaming decompressed HTTP response body size returned by the pipeline.
-/// The awc default is 2MiB, which is not enough to, for example, retrieve
-/// a large circuit profile.
+/// Max non-streaming HTTP response body size returned by the pipeline, counted
+/// as transferred bytes. The awc default is 2MiB.
 const RESPONSE_SIZE_LIMIT: usize = 50 * 1024 * 1024;
 
 /// Pick the subprotocol to echo back on a WebSocket handshake.
@@ -85,32 +84,34 @@ pub(crate) struct CachedPipelineDescr {
 
 impl CachedPipelineDescr {
     const CACHE_TTL: Duration = Duration::from_secs(5);
+}
 
+impl ExtendedPipelineDescrMonitoring {
     /// Return the deployment location only if the pipeline is in the correct
     /// status to be interacted with (i.e., running or paused).
-    fn deployment_location_based_on_status(&self) -> Result<String, ManagerError> {
+    pub(crate) fn deployment_location_based_on_status(&self) -> Result<String, ManagerError> {
         // Interaction with the pipeline is only useful to be attempted if the pipeline has its
         // resources provisioned, and the latest runtime status check did not return indicate even
         // the runner can't interact with it.
-        if self.pipeline.deployment_resources_status == ResourcesStatus::Provisioned {
-            if self.pipeline.deployment_runtime_status == Some(RuntimeStatus::Unavailable) {
+        if self.deployment_resources_status == ResourcesStatus::Provisioned {
+            if self.deployment_runtime_status == Some(RuntimeStatus::Unavailable) {
                 return Err(ManagerError::from(RunnerError::PipelineUnavailable {
-                    pipeline_name: self.pipeline.name.clone(),
+                    pipeline_name: self.name.clone(),
                 }));
             }
         } else {
             return Err(ManagerError::from(
                 RunnerError::PipelineInteractionNotDeployed {
-                    pipeline_name: self.pipeline.name.clone(),
-                    status: self.pipeline.deployment_resources_status,
-                    desired_status: self.pipeline.deployment_resources_desired_status,
+                    pipeline_name: self.name.clone(),
+                    status: self.deployment_resources_status,
+                    desired_status: self.deployment_resources_desired_status,
                 },
             ));
         }
 
-        Ok(match &self.pipeline.deployment_location {
+        Ok(match &self.deployment_location {
             None => Err(RunnerError::PipelineMissingDeploymentLocation {
-                pipeline_name: self.pipeline.name.clone(),
+                pipeline_name: self.name.clone(),
             })?,
             Some(location) => location.clone(),
         })
@@ -223,7 +224,7 @@ impl RunnerInteraction {
             .filter(|entry| entry.instantiated.elapsed() <= CachedPipelineDescr::CACHE_TTL);
         match entry {
             Some(entry) => {
-                let location = entry.deployment_location_based_on_status()?;
+                let location = entry.pipeline.deployment_location_based_on_status()?;
                 Ok((location, true))
             }
             None => {
@@ -235,7 +236,9 @@ impl RunnerInteraction {
                     .get_pipeline_for_monitoring(tenant_id, pipeline_name)
                     .await?;
                 let cached_descriptor: CachedPipelineDescr = pipeline.into();
-                let deployment_location = cached_descriptor.deployment_location_based_on_status();
+                let deployment_location = cached_descriptor
+                    .pipeline
+                    .deployment_location_based_on_status();
                 let mut cache = self.endpoint_cache.write().unwrap();
                 cache.insert((tenant_id, pipeline_name.to_string()), cached_descriptor);
                 let location = deployment_location?;
@@ -245,7 +248,8 @@ impl RunnerInteraction {
     }
 
     /// Makes a new HTTP request without body to the pipeline.
-    /// The response is fully composed before returning including headers.
+    /// The response is fully composed before returning including headers, with
+    /// the body and its `Content-Encoding` as the pipeline sent them.
     ///
     /// This method is static as it is directly provided the pipeline
     /// identifier and location. It thus does not need to retrieve it
@@ -261,6 +265,7 @@ impl RunnerInteraction {
         query_string: &str,
         timeout: Option<Duration>,
         body_size_limit: Option<usize>,
+        accept_encoding: Option<&str>,
     ) -> Result<HttpResponse, ManagerError> {
         // Perform request to the pipeline
         let url = format_pipeline_url(
@@ -274,11 +279,15 @@ impl RunnerInteraction {
             query_string,
         );
         let timeout = timeout.unwrap_or(Self::PIPELINE_HTTP_REQUEST_TIMEOUT);
-        let request = client
+        // `.no_decompress()` also suppresses awc's own `Accept-Encoding` header.
+        let mut request = client
             .request(method, &url)
             .timeout(timeout)
             .force_close()
-            .with_sentry_tracing();
+            .no_decompress();
+        if let Some(accept_encoding) = accept_encoding {
+            request = request.insert_header((header::ACCEPT_ENCODING, accept_encoding));
+        }
         let request_str = Self::format_request(&request);
 
         let mut original_response = request.send().await.map_err(|e| match e {
@@ -316,25 +325,31 @@ impl RunnerInteraction {
         // Add all the same headers as the original response, excluding:
         // - `connection`: hop-by-hop header, must not be forwarded by proxies
         //   (https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives)
-        // - `content-encoding`: awc auto-decompresses the body, so the body we forward is already
-        //   decoded — forwarding the original Content-Encoding would make the caller try to
-        //   decompress an already-plain body.
-        // - `content-length`: after decompression the body size differs from the
-        //   original Content-Length; let actix-web recompute it.
-        for (header_name, header_value) in original_response.headers().iter().filter(|(h, _)| {
-            *h != "connection" && *h != "content-length" && *h != "content-encoding"
-        }) {
+        // - `content-length`: let actix-web recompute it for the body it sends.
+        for (header_name, header_value) in original_response
+            .headers()
+            .iter()
+            .filter(|(h, _)| *h != "connection" && *h != "content-length")
+        {
             response_builder.insert_header((header_name.clone(), header_value.clone()));
         }
 
         // Copy over the original response body
+        let body_size_limit = body_size_limit.unwrap_or(RESPONSE_SIZE_LIMIT);
         let response_body = original_response
             .body()
-            .limit(body_size_limit.unwrap_or(RESPONSE_SIZE_LIMIT))
+            .limit(body_size_limit)
             .await
-            .map_err(|e| RunnerError::PipelineInteractionInvalidResponse {
-                pipeline_name: pipeline_name.to_string(),
-                error: format!("unable to reconstruct response body due to: {e}"),
+            .map_err(|e| {
+                warn!(
+                    pipeline = pipeline_name,
+                    pipeline_id = "N/A",
+                    "Rejected the response body of {request_str} (limit {body_size_limit} bytes): {e}"
+                );
+                RunnerError::PipelineInteractionInvalidResponse {
+                    pipeline_name: pipeline_name.to_string(),
+                    error: format!("unable to reconstruct response body due to: {e}"),
+                }
             })?;
         Ok(response_builder.body(response_body))
     }
@@ -356,6 +371,35 @@ impl RunnerInteraction {
         timeout: Option<Duration>,
         body_size_limit: Option<usize>,
     ) -> Result<HttpResponse, ManagerError> {
+        self.forward_http_request_to_pipeline_by_name_with_accept_encoding(
+            client,
+            tenant_id,
+            pipeline_name,
+            method,
+            endpoint,
+            query_string,
+            timeout,
+            body_size_limit,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::forward_http_request_to_pipeline_by_name`], sending the
+    /// given `Accept-Encoding` so the pipeline may compress the body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn forward_http_request_to_pipeline_by_name_with_accept_encoding(
+        &self,
+        client: &awc::Client,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        method: Method,
+        endpoint: &str,
+        query_string: &str,
+        timeout: Option<Duration>,
+        body_size_limit: Option<usize>,
+        accept_encoding: Option<&str>,
+    ) -> Result<HttpResponse, ManagerError> {
         let (location, cache_hit) = self.check_pipeline(tenant_id, pipeline_name).await?;
         let r = RunnerInteraction::forward_http_request_to_pipeline(
             &self.common_config,
@@ -367,6 +411,7 @@ impl RunnerInteraction {
             query_string,
             timeout,
             body_size_limit,
+            accept_encoding,
         )
         .await;
 
@@ -386,16 +431,19 @@ impl RunnerInteraction {
                     let mut cache = self.endpoint_cache.write().unwrap();
                     cache.remove(&(tenant_id, pipeline_name.to_string()));
                     drop(cache);
-                    Box::pin(self.forward_http_request_to_pipeline_by_name(
-                        client,
-                        tenant_id,
-                        pipeline_name,
-                        method,
-                        endpoint,
-                        query_string,
-                        timeout,
-                        body_size_limit,
-                    ))
+                    Box::pin(
+                        self.forward_http_request_to_pipeline_by_name_with_accept_encoding(
+                            client,
+                            tenant_id,
+                            pipeline_name,
+                            method,
+                            endpoint,
+                            query_string,
+                            timeout,
+                            body_size_limit,
+                            accept_encoding,
+                        ),
+                    )
                     .await
                 }
             }
@@ -560,6 +608,7 @@ impl RunnerInteraction {
         client: &awc::Client,
         tenant_id: TenantId,
         pipeline_name: &str,
+        mode: FollowMode,
     ) -> Result<ClientResponse<Decoder<actix_http::Payload>>, ManagerError> {
         // Retrieve pipeline
         let pipeline = self
@@ -569,9 +618,13 @@ impl RunnerInteraction {
             .get_pipeline_for_monitoring(tenant_id, pipeline_name)
             .await?;
 
-        // Build request to the runner
+        // Build request to the runner. The query string is rendered from the parsed mode
+        // rather than forwarded verbatim, so the URL is well-formed whatever the caller
+        // sent. `Full` renders empty, leaving the URL as it is without a cursor.
+        let query = mode.to_query_string();
+        let separator = if query.is_empty() { "" } else { "?" };
         let url = format!(
-            "{}://{}:{}/logs/{}",
+            "{}://{}:{}/logs/{}{separator}{query}",
             if self.common_config.enable_https {
                 "https"
             } else {
@@ -579,14 +632,13 @@ impl RunnerInteraction {
             },
             self.common_config.runner_host,
             self.common_config.runner_port,
-            pipeline.id
+            pipeline.id,
         );
 
         // Perform request to the runner
         let response = client
             .request(Method::GET, &url)
             .timeout(Self::RUNNER_HTTP_REQUEST_TIMEOUT)
-            .with_sentry_tracing()
             .send()
             .await
             .map_err(|e| match e {
@@ -613,10 +665,11 @@ impl RunnerInteraction {
         client: &awc::Client,
         tenant_id: TenantId,
         pipeline_name: &str,
+        mode: FollowMode,
     ) -> Result<HttpResponse, ManagerError> {
         // Perform request to the runner
         let response = self
-            .get_logs_from_pipeline(client, tenant_id, pipeline_name)
+            .get_logs_from_pipeline(client, tenant_id, pipeline_name, mode)
             .await?;
 
         // Build the HTTP response with the same status, headers and streaming body
@@ -644,8 +697,9 @@ impl RunnerInteraction {
 /// the response back. Extracted from [`RunnerInteraction`] so it can be
 /// unit-tested without a database.
 ///
-/// Strips the client's `Accept-Encoding` and forces `Content-Encoding: identity`
-/// on the response (prevents gzip frame buffering that blocks streaming clients).
+/// The client and the pipeline negotiate compression directly: the client's
+/// `Accept-Encoding` is forwarded and the pipeline's `Content-Encoding` is
+/// relayed unchanged.
 pub(crate) async fn streaming_proxy(
     client: &awc::Client,
     url: &str,
@@ -654,27 +708,25 @@ pub(crate) async fn streaming_proxy(
     body: Payload,
     timeout: Duration,
 ) -> Result<HttpResponse, ManagerError> {
+    // `.no_decompress()` suppresses awc's own `Accept-Encoding` header and keeps the
+    // pipeline's bytes as they are; the manager never decodes a streamed body.
     let mut new_request = client
         .request(request.method().clone(), url)
         .timeout(timeout)
         .force_close()
         .no_decompress();
 
-    // Strip `Accept-Encoding` to prevent compressed responses from the pipeline —
-    // compression causes gzip frame buffering that blocks streaming clients (see the
-    // `Content-Encoding: identity` override below). `.no_decompress()` above suppresses
-    // awc's own `Accept-Encoding` header; here we also strip the client's.
     // `authorization` has already been handled by the API server, and is thus not needed
     // to be forwarded to the pipeline itself.
     for header in request
         .headers()
         .into_iter()
-        .filter(|(h, _)| *h != "connection" && *h != "accept-encoding" && *h != "authorization")
+        .filter(|(h, _)| *h != "connection" && *h != "authorization")
     {
         new_request = new_request.append_header(header);
     }
 
-    let new_request = new_request.with_sentry_tracing();
+    let new_request = new_request;
     let request_str = RunnerInteraction::format_request(&new_request);
 
     // Perform request to the pipeline
@@ -713,8 +765,12 @@ pub(crate) async fn streaming_proxy(
     for header in response.headers().into_iter() {
         builder.append_header(header);
     }
-    // Disable compression to avoid gzip frame buffering that causes clients to block
-    builder.insert_header(actix_http::ContentEncoding::Identity);
+    // An explicit `Content-Encoding` keeps the `Compress` middleware on the manager's
+    // `App` (`api/main.rs`) from encoding the stream, which would buffer a live stream
+    // in gzip frames.
+    if !response.headers().contains_key(header::CONTENT_ENCODING) {
+        builder.insert_header(actix_http::ContentEncoding::Identity);
+    }
     Ok(builder.streaming(response))
 }
 
@@ -723,7 +779,7 @@ mod tests {
     use super::*;
     use actix_web::body::to_bytes;
     use actix_web::test::TestRequest;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn setup() {
@@ -751,45 +807,29 @@ mod tests {
         to_bytes(resp.into_body()).await.unwrap().to_vec()
     }
 
-    /// Test that streaming_proxy strips Accept-Encoding from the forwarded request
-    /// (verified via wiremock expect(0)) and forces Content-Encoding: identity
-    /// on the response.
+    /// The client's `Accept-Encoding` reaches the pipeline; a response without
+    /// `Content-Encoding` is relayed as identity, explicitly, so the manager's
+    /// `Compress` middleware (installed on the `App` in `api/main.rs`) leaves the stream alone.
     #[actix_web::test]
-    async fn test_streaming_proxy() {
+    async fn test_streaming_proxy_forwards_accept_encoding_and_defaults_to_identity() {
         setup();
         let mock_server = MockServer::start().await;
 
         let plain = b"{\"profile\":\"data\"}";
-
-        // Fallback: matches any GET regardless of headers, returns the plain body.
-        // Registered first so wiremock checks it *last*.
         Mock::given(method("GET"))
             .and(path("/dump_json_profile"))
+            .and(header("accept-encoding", "gzip"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(plain.to_vec())
                     .insert_header("content-type", "application/json"),
             )
-            .mount(&mock_server)
-            .await;
-
-        // Registered second so wiremock checks it *first*: if accept-encoding
-        // is present this more-specific mock matches instead of the fallback.
-        // expect(0) makes the test fail if this mock is ever hit — proving the
-        // proxy stripped the header before it reached the upstream.
-        Mock::given(method("GET"))
-            .and(path("/dump_json_profile"))
-            .and(header_exists("accept-encoding"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .named("should-not-receive-accept-encoding")
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let url = format!("{}/dump_json_profile", mock_server.uri());
         let client = awc::Client::default();
-
-        // Even though the original client sends Accept-Encoding, the proxy strips it.
         let (req, payload) = test_get_request(&[("accept-encoding", "gzip")]);
         let resp = streaming_proxy(
             &client,
@@ -803,14 +843,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.status(), 200);
-        assert_eq!(
-            resp.headers().get("content-encoding").unwrap(),
-            "identity",
-            "streaming_proxy must force Content-Encoding: identity"
-        );
-        let body = read_body(resp).await;
-        assert_eq!(body, plain);
-        // Dropping mock_server verifies the expect(0) assertion.
+        assert_eq!(resp.headers().get("content-encoding").unwrap(), "identity");
+        assert_eq!(read_body(resp).await, plain);
+    }
+
+    /// The pipeline's compressed bytes and `Content-Encoding` reach the client
+    /// untouched: the manager neither decodes nor relabels them.
+    #[actix_web::test]
+    async fn test_streaming_proxy_relays_upstream_content_encoding() {
+        setup();
+        let mock_server = MockServer::start().await;
+
+        let compressed = b"\x1f\x8b not really gzip, but the proxy must not care".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/dump_json_profile"))
+            .and(header("accept-encoding", "gzip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(compressed.clone())
+                    .insert_header("content-type", "application/json")
+                    .insert_header("content-encoding", "gzip"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/dump_json_profile", mock_server.uri());
+        let client = awc::Client::default();
+        let (req, payload) = test_get_request(&[("accept-encoding", "gzip")]);
+        let resp = streaming_proxy(
+            &client,
+            &url,
+            "test-pipeline",
+            &req,
+            payload,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+        assert_eq!(read_body(resp).await, compressed);
     }
 
     fn selected_protocol(subprotocols: Option<&str>) -> Option<String> {
@@ -866,7 +940,7 @@ mod tests {
     /// connection), while a client offering none gets no header back.
     #[actix_web::test]
     async fn ws_handshake_echoes_offered_subprotocol() {
-        use actix_web::{web, App};
+        use actix_web::{App, web};
         setup(); // awc's TLS connector needs a rustls CryptoProvider installed.
 
         // Mirrors the production handshake: complete the upgrade, then echo.

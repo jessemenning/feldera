@@ -33,6 +33,15 @@ public class RelAnd extends CalciteRelNode {
     }
 
     @Override
+    public List<SourcePositionRange> getSourcePositions() {
+        List<SourcePositionRange> result = new ArrayList<>();
+        for (LastRel lr: this.nodes) {
+            result.addAll(lr.getSourcePositions());
+        }
+        return result;
+    }
+
+    @Override
     public IIndentStream asJson(IIndentStream stream, Map<RelNode, Integer> idRemap) {
         if (this.nodes.size() == 1) {
             return this.nodes.iterator().next().asJson(stream, idRemap);
@@ -62,9 +71,16 @@ public class RelAnd extends CalciteRelNode {
         Utilities.enforce(rel.relNode instanceof TableScan);
     }
 
+    /** The table reads other than {@code node}; empty when {@code node} was the only one. */
     @Override
     public CalciteRelNode remove(RelNode node) {
-        throw new UnimplementedException("remove " + node);
+        RelAnd result = new RelAnd();
+        for (LastRel last : this.nodes)
+            if (!last.contains(node))
+                result.add(last);
+        if (result.nodes.isEmpty())
+            return CalciteEmptyRel.INSTANCE;
+        return result.addSourcePositions(this.positions);
     }
 
     @Override
@@ -97,5 +113,10 @@ public class RelAnd extends CalciteRelNode {
     @Override
     public long getId() {
         return this.nodes.isEmpty() ? 0 : this.nodes.iterator().next().getId();
+    }
+
+    @Override
+    public List<RelNode> getRelNodes() {
+        return Linq.map(this.sort(), last -> last.relNode);
     }
 }

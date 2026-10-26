@@ -1,9 +1,9 @@
 import { type JSONParserOptions, Tokenizer, TokenParser } from '@streamparser/json'
 import { BigNumber } from 'bignumber.js'
+import { findIndex } from 'common-lib/array'
+import { tuple } from 'common-lib/tuple'
 import invariant from 'tiny-invariant'
 import type { ChangeStreamData, Row } from '$lib/components/pipelines/editor/ChangeStream.svelte'
-import { findIndex } from '$lib/functions/common/array'
-import { tuple } from '$lib/functions/common/tuple'
 import type { XgressEntry } from '$lib/services/pipelineManager'
 
 class BigNumberTokenizer extends Tokenizer {
@@ -104,8 +104,9 @@ const yieldToEventLoop = (): Promise<void> => {
  * that statically, decoders are obtained via a `StreamFormatDecoderFactory`
  * rather than passed directly — the orchestrator calls the factory exactly
  * once. Each decoder also owns its own shedding policy and skip-event
- * reporting: NDJSON keeps a per-flush-window byte budget and reports
- * `onBytesSkipped`; arrow IPC counts admitted rows and reports `onRowsSkipped`.
+ * reporting: the newline decoders keep a per-flush-window byte budget and
+ * report `onSkipped`; arrow IPC counts admitted rows and reports
+ * `onRowsSkipped`.
  */
 export interface StreamFormatDecoder<T> {
   /**
@@ -264,7 +265,7 @@ export const parseStream = <T>(
  *
  * **Load shedding.** Independent of UI flush cadence. The decoder caps the
  * bytes it admits to the orchestrator to `bufferSize` per `bufferWindowMs`;
- * anything past the cap is dropped (and reported via `onBytesSkipped`)
+ * anything past the cap is dropped (and reported via `onSkipped`)
  * instead of parsed. The budget resets on the decoder's own `setInterval`
  * so even parser chunks that produced no admitted items still release their
  * reservation. Failed parses do **not** consume the budget. In steady state,
@@ -282,19 +283,19 @@ export const parseStream = <T>(
  * @param opts.bufferSize Bytes admitted per `bufferWindowMs`; default 1 MB.
  * @param opts.bufferWindowMs Budget reset period; default 100ms. Independent
  *   of the orchestrator's UI flush cadence.
- * @param opts.onBytesSkipped Called when a parser chunk is dropped.
+ * @param opts.onSkipped Called when a parser chunk is dropped.
  */
 export const newlineJsonDecoder = <T>(
   parser: StreamingJsonParser<T>,
   opts?: {
     bufferSize?: number
     bufferWindowMs?: number
-    onBytesSkipped?: (bytes: number) => void
+    onSkipped?: (skipped: { bytes: number }) => void
   }
 ): StreamFormatDecoderFactory<T> => {
   const maxPendingBytes = opts?.bufferSize ?? 1_000_000
   const bufferWindowMs = opts?.bufferWindowMs ?? 100
-  const onBytesSkipped = opts?.onBytesSkipped ?? (() => {})
+  const onSkipped = opts?.onSkipped ?? (() => {})
 
   return () => {
     let pendingBytes = 0
@@ -354,7 +355,7 @@ export const newlineJsonDecoder = <T>(
               const end = nl + 1
               const parserChunkLen = end - cursor
               if (pendingBytes + parserChunkLen > maxPendingBytes) {
-                onBytesSkipped(parserChunkLen)
+                onSkipped({ bytes: parserChunkLen })
               } else {
                 const parserChunk = text.slice(cursor, end)
                 try {
@@ -365,7 +366,7 @@ export const newlineJsonDecoder = <T>(
                   pendingBytes += parserChunkLen
                 } catch {
                   parser.reset()
-                  onBytesSkipped(parserChunkLen)
+                  onSkipped({ bytes: parserChunkLen })
                 }
               }
               cursor = end
@@ -378,7 +379,7 @@ export const newlineJsonDecoder = <T>(
             // Cap the leftover: accepting unbounded leftovers would let a
             // runaway record without any terminator exhaust browser memory.
             if (leftover.length > MAX_LINE_SIZE) {
-              onBytesSkipped(leftover.length)
+              onSkipped({ bytes: leftover.length })
               leftover = ''
             }
           }
@@ -402,24 +403,29 @@ export const newlineJsonDecoder = <T>(
  *
  * Shedding granularity is the parser chunk, not the individual line: when the
  * budget is exhausted, the whole parser chunk's worth of lines is dropped and
- * its byte count is reported via `onBytesSkipped`. Dropping at line
- * granularity would be possible but produces visually scattered gaps; the
- * parser-chunk strategy keeps dropped regions contiguous.
+ * reported via `onSkipped`. Dropping at line granularity would be possible but
+ * produces visually scattered gaps; the parser-chunk strategy keeps dropped
+ * regions contiguous.
+ *
+ * `onSkipped` reports how many lines went with those bytes, not just the byte
+ * count, so a caller that counts lines to keep its place in the stream can skip
+ * over them and carry on. Lines emitted plus lines reported skipped always adds
+ * up to the number of lines in the input.
  *
  * @param opts.bufferSize Bytes admitted per `bufferWindowMs`; default 1 MB.
  * @param opts.bufferWindowMs Budget reset period; default 100ms. Independent
  *   of the orchestrator's UI flush cadence.
- * @param opts.onBytesSkipped Called when a parser chunk is dropped, or when
- *   a runaway record (no newline within `MAX_LINE_SIZE` bytes) is purged.
+ * @param opts.onSkipped Called when a parser chunk is dropped, or when a
+ *   runaway record (no newline within `MAX_LINE_SIZE` bytes) is purged.
  */
 export const newlineTextDecoder = (opts?: {
   bufferSize?: number
   bufferWindowMs?: number
-  onBytesSkipped?: (bytes: number) => void
+  onSkipped?: (skipped: { bytes: number; lines: number }) => void
 }): StreamFormatDecoderFactory<string> => {
   const maxPendingBytes = opts?.bufferSize ?? 1_000_000
   const bufferWindowMs = opts?.bufferWindowMs ?? 100
-  const onBytesSkipped = opts?.onBytesSkipped ?? (() => {})
+  const onSkipped = opts?.onSkipped ?? (() => {})
 
   return () => {
     let pendingBytes = 0
@@ -478,7 +484,7 @@ export const newlineTextDecoder = (opts?: {
               const parserChunkEnd = lineEnds[lineEnds.length - 1]
               const parserChunkLen = parserChunkEnd - cursor
               if (pendingBytes + parserChunkLen > maxPendingBytes) {
-                onBytesSkipped(parserChunkLen)
+                onSkipped({ bytes: parserChunkLen, lines: lineEnds.length })
               } else {
                 let lineStart = cursor
                 for (const lineEnd of lineEnds) {
@@ -495,7 +501,9 @@ export const newlineTextDecoder = (opts?: {
             }
             leftover = text.slice(cursor)
             if (leftover.length > MAX_LINE_SIZE) {
-              onBytesSkipped(leftover.length)
+              // No line is lost here. The record has no newline yet, so whatever tail
+              // finally arrives with one is still emitted as the single line it was.
+              onSkipped({ bytes: leftover.length, lines: 0 })
               leftover = ''
             }
           }

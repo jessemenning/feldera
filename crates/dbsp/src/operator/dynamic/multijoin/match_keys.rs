@@ -10,6 +10,7 @@ use crate::{
             OUTPUT_REDUNDANCY_PERCENT, OperatorMeta, PREFIX_BATCHES_STATS, SHARED_MEMORY_BYTES,
             STATE_RECORDS_COUNT, USED_MEMORY_BYTES,
         },
+        operator_traits::OperatorCheckpoint,
         splitter_output_chunk_size,
     },
     dynamic::{
@@ -17,17 +18,17 @@ use crate::{
     },
     trace::{
         BatchFactories, BatchReader, BatchReaderFactories, Batcher, Cursor, Spine, SpineSnapshot,
-        Trace, WeightedItem, WithSnapshot, cursor::SaturatingCursor,
+        Trace, TraceRole, WeightedItem, WithSnapshot, cursor::SaturatingCursor,
     },
     utils::Tup2,
 };
 use async_stream::stream;
-use feldera_storage::{FileCommitter, StoragePath};
+use feldera_storage::StoragePath;
 use futures::{Stream as AsyncStream, StreamExt};
 use size_of::{Context, SizeOf};
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap},
     marker::PhantomData,
     ops::Deref,
     pin::Pin,
@@ -279,11 +280,11 @@ impl MatchStats {
     }
 
     pub fn add_output_batch<Z: ZBatch>(&mut self, batch: &Z) {
-        self.output_batch_stats.add_batch(batch.len())
+        self.output_batch_stats.add_batch(batch.len_upper_bound())
     }
 
     pub fn add_prefix_batch<Z: BatchReader>(&mut self, batch: &Z) {
-        self.prefix_batch_stats.add_batch(batch.len())
+        self.prefix_batch_stats.add_batch(batch.len_upper_bound())
     }
 }
 
@@ -330,9 +331,13 @@ where
         let smallest_snapshot_index = snapshots
             .iter()
             .enumerate()
-            .min_by_key(
-                |(_, (s, _factory, saturate))| if *saturate { usize::MAX } else { s.key_count() },
-            )
+            .min_by_key(|(_, (s, _factory, saturate))| {
+                if *saturate {
+                    usize::MAX
+                } else {
+                    s.key_count_upper_bound()
+                }
+            })
             .unwrap()
             .0;
 
@@ -344,7 +349,8 @@ where
             .collect::<Vec<_>>();
 
         let smallest_trace_cursor = if !snapshots[smallest_snapshot_index].2
-            && snapshots[smallest_snapshot_index].0.key_count() < prefix.key_count()
+            && snapshots[smallest_snapshot_index].0.key_count_upper_bound()
+                < prefix.key_count_upper_bound()
         {
             Some(smallest_snapshot_index)
         } else {
@@ -492,7 +498,7 @@ where
 
         stream! {
             self.stats.borrow_mut().add_prefix_batch(&prefix);
-            self.stats.borrow_mut().trace_sizes = snapshots.iter().map(|(s, _factories, _saturate)| s.len()).collect();
+            self.stats.borrow_mut().trace_sizes = snapshots.iter().map(|(s, _factories, _saturate)| s.len_upper_bound()).collect();
 
             self.empty_input.set(prefix.is_empty());
             self.empty_output.set(true);
@@ -558,11 +564,23 @@ where
 
                     start += run_length;
 
-                    if let Entry::Vacant(vacant) = self.future_outputs.borrow_mut().entry(batch_time) {
-                        let mut spine = <Spine<O> as Trace>::new(&self.output_factories, self.name.clone());
-                        spine.insert(O::dyn_from_tuples(&self.output_factories, (), &mut batch)).await;
-                        vacant.insert(spine);
-                    }
+                    // An earlier clock cycle may already have computed updates
+                    // for `batch_time`; add these to them.
+                    let updates = O::dyn_from_tuples(&self.output_factories, (), &mut batch);
+                    self.future_outputs
+                        .borrow_mut()
+                        .entry(batch_time)
+                        .or_insert_with(|| {
+                            // Nothing searches this spine until it is output by
+                            // the operator, so it merges as an accumulator does.
+                            <Spine<O> as Trace>::new(
+                                &self.output_factories,
+                                self.name.clone(),
+                                TraceRole::Accumulator,
+                            )
+                        })
+                        .insert(updates)
+                        .await;
                     batch.clear();
                 }
 
@@ -748,7 +766,7 @@ where
             .future_outputs
             .borrow()
             .values()
-            .map(|spine| spine.len())
+            .map(|spine| spine.len_upper_bound())
             .sum();
 
         // let batch_sizes = MetaItem::Array(
@@ -781,7 +799,7 @@ where
 
         // Find the percentage of consolidated outputs
         let output_redundancy = MetaItem::Percent {
-            numerator: (stats.output_tuples - stats.output_batch_stats.total_size()) as u64,
+            numerator: stats.output_tuples as i64 - stats.output_batch_stats.total_size() as i64,
             denominator: stats.output_tuples as u64,
         };
 
@@ -853,12 +871,8 @@ where
         self
     }
 
-    fn checkpoint(
-        &mut self,
-        _base: &StoragePath,
-        _files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), crate::Error> {
-        Ok(())
+    fn checkpoint(&mut self) -> Result<Option<Box<dyn OperatorCheckpoint>>, crate::Error> {
+        Ok(None)
     }
 
     fn restore(&mut self, _base: &StoragePath) -> Result<(), crate::Error> {

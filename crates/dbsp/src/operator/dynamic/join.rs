@@ -11,7 +11,7 @@ use crate::operator::async_stream_operators::{StreamingBinaryOperator, Streaming
 use crate::operator::dynamic::concat::dyn_concat_accumulated;
 use crate::trace::cursor::SaturatingCursor;
 use crate::trace::spine_async::WithSnapshot;
-use crate::trace::{Spine, SpineSnapshot, Trace};
+use crate::trace::{Spine, SpineSnapshot, Trace, TraceRole};
 use crate::{
     DBData, ZWeight,
     algebra::{
@@ -37,12 +37,13 @@ use crate::{
 };
 use crate::{DynZWeight, NestedCircuit, Position, Runtime};
 use async_stream::stream;
+use rand::thread_rng;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::{
     borrow::Cow,
     cmp::{Ordering, min},
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     marker::PhantomData,
     ops::Deref,
     panic::Location,
@@ -1090,7 +1091,7 @@ where
 
         // Choose capacity heuristically.
         let mut batch = self.output_factories.weighted_items_factory().default_box();
-        batch.reserve(min(i1.len(), i2.len()));
+        batch.reserve(min(i1.len_upper_bound(), i2.len_upper_bound()));
 
         while cursor1.key_valid() && cursor2.key_valid() {
             match cursor1.key().cmp(cursor2.key()) {
@@ -1196,8 +1197,8 @@ where
         // Choose capacity heuristically.
         let mut builder = Z::Builder::with_capacity(
             &self.output_factories,
-            min(i1.key_count(), i2.key_count()),
-            min(i1.len(), i2.len()),
+            min(i1.key_count_upper_bound(), i2.key_count_upper_bound()),
+            min(i1.len_upper_bound(), i2.len_upper_bound()),
         );
 
         let mut output = output_key_factory.default_box();
@@ -1261,7 +1262,7 @@ impl JoinStats {
     }
 
     pub fn add_output_batch<Z: ZBatch>(&mut self, batch: &Z) {
-        self.output_batch_stats.add_batch(batch.len())
+        self.output_batch_stats.add_batch(batch.len_upper_bound())
     }
 }
 
@@ -1432,7 +1433,7 @@ where
 
         // Find the percentage of consolidated outputs
         let output_redundancy = MetaItem::Percent {
-            numerator: (stats.output_tuples - stats.output_batch_stats.total_size()) as u64,
+            numerator: stats.output_tuples as i64 - stats.output_batch_stats.total_size() as i64,
             denominator: stats.output_tuples as u64,
         };
 
@@ -1467,6 +1468,73 @@ where
                 .keys()
                 .all(|time| !time.less_equal(&epoch_end))
     }
+}
+
+/// Number of keys sampled when estimating a join input's key count.
+const KEY_COUNT_SAMPLE_SIZE: usize = 100;
+
+/// Inputs smaller than this are not sampled, since the cost of sampling can be high
+/// relative to the gain from it.
+const MIN_KEYS_TO_SAMPLE: usize = 10_000;
+
+/// Estimates the number of keys a cursor over `input` will surface.
+///
+/// [`BatchReader::sample_keys`] returns only keys that are present with a
+/// non-zero weight, so the fraction of the sample that survives estimates the
+/// fraction of `key_count` the cursor will yield. The draws are apportioned
+/// across the input's batches so that they sum to exactly
+/// [`KEY_COUNT_SAMPLE_SIZE`], which is what makes it the right denominator.
+fn sampled_key_count<B>(input: &B, key_count: usize) -> usize
+where
+    B: BatchReader,
+{
+    let mut sample = input.factories().keys_factory().default_box();
+    input.sample_keys(&mut thread_rng(), KEY_COUNT_SAMPLE_SIZE, sample.as_mut());
+
+    (key_count as u128 * sample.len() as u128 / KEY_COUNT_SAMPLE_SIZE as u128) as usize
+}
+
+/// Estimates the key counts used to choose which side the joint cursor drives.
+///
+/// [`BatchReader::key_count_upper_bound`] reports the sum of key counts across all batches,
+/// which overstates what a cursor yields in two ways: a key held by several
+/// batches is counted once per batch, and keys whose weights add up to zero are
+/// counted even though the cursor skips them.
+///
+/// Sampling corrects the second of those. It does not correct the first: a
+/// duplicated key collapses only when two draws happen to land on it, which
+/// needs a sample near the square root of the distinct key count rather than
+/// [`KEY_COUNT_SAMPLE_SIZE`]. Such a key is still counted once per batch that
+/// holds it, so the estimate remains an upper bound on what the cursor will
+/// yield, overstated by at most the number of batches.
+///
+/// Sampling is skipped when the smaller input is below [`MIN_KEYS_TO_SAMPLE`]:
+/// at that size neither side is expensive to drive.
+///
+/// # Arguments
+///
+/// * `delta` - this step's delta, the smaller input in the usual case.
+/// * `trace` - the trace to join it against.
+///
+/// # Returns
+///
+/// An upper bound on the keys each cursor will yield, `delta` first.
+fn estimate_input_key_counts<D, T>(delta: &D, trace: &T) -> (usize, usize)
+where
+    D: BatchReader,
+    T: BatchReader,
+{
+    let delta_key_count = delta.key_count_upper_bound();
+    let trace_key_count = trace.key_count_upper_bound();
+
+    if min(delta_key_count, trace_key_count) < MIN_KEYS_TO_SAMPLE {
+        return (delta_key_count, trace_key_count);
+    }
+
+    (
+        sampled_key_count(delta, delta_key_count),
+        sampled_key_count(trace, trace_key_count),
+    )
 }
 
 /// A cursor that iterates over matching keys in two cursors.
@@ -1554,10 +1622,10 @@ where
 
 impl<I, B, T, Z, Clk> StreamingBinaryOperator<Option<I>, T, Z> for JoinTrace<I, B, T, Z, Clk>
 where
-    I: WithSnapshot + 'static,
+    I: WithSnapshot + Clone + 'static,
     I::Batch: ZBatchReader<Time = ()>,
     B: ZBatch<Key = <<I as WithSnapshot>::Batch as BatchReader>::Key>,
-    T: ZBatchReader<Key = B::Key, Val = B::Val, Time = B::Time> + WithSnapshot<Batch = B>,
+    T: ZBatchReader<Key = B::Key, Val = B::Val, Time = B::Time> + WithSnapshot<Batch = B> + Clone,
     Z: IndexedZSet,
     Clk: WithClock<Time = T::Time> + 'static,
 {
@@ -1566,12 +1634,12 @@ where
     #[allow(clippy::await_holding_refcell_ref)]
     fn eval(
         self: Rc<Self>,
-        delta: &Option<I>,
-        trace: &T,
+        delta: Cow<'_, Option<I>>,
+        trace: Cow<'_, T>,
     ) -> impl futures::Stream<Item = (Z, bool, Option<Position>)> + 'static {
         let chunk_size = splitter_output_chunk_size();
 
-        let delta = delta.as_ref().map(|b| b.ro_snapshot());
+        let delta = (*delta).as_ref().map(|b| b.ro_snapshot());
 
         let trace = if self.flush.get() {
             Some(trace.ro_snapshot())
@@ -1592,20 +1660,32 @@ where
             }
 
             let delta = self.delta.borrow_mut().take().expect("no input delta provided before flush");
-            let delta_key_count = delta.key_count();
-
             let trace = trace.unwrap();
-            let trace_key_count = if self.saturate { usize::MAX } else { trace.key_count() };
 
             self.empty_input.set(delta.is_empty());
             self.empty_output.set(true);
-            self.stats.borrow_mut().lhs_tuples += delta.len();
-            self.stats.borrow_mut().rhs_tuples = trace.len();
+            self.stats.borrow_mut().lhs_tuples += delta.len_upper_bound();
+            self.stats.borrow_mut().rhs_tuples = trace.len_upper_bound();
 
             let fetched = if Runtime::with_dev_tweaks(|dev_tweaks| dev_tweaks.fetch_join == Some(true)) {
                 trace.fetch(&delta).await
             } else {
                 None
+            };
+
+            // Which side the joint cursor drives. Driving a side costs a full
+            // pass over it, so getting this wrong can be expensive. Estimating
+            // the key counts is not free either: it samples both inputs, which
+            // seeks into a spilled trace. `fetch` has already narrowed the trace
+            // to the delta's keys, and a saturating join synthesizes values for
+            // trace keys the delta does not hold, so both force the delta to
+            // drive and neither needs the estimate.
+            let swap = if fetched.is_some() || self.saturate {
+                false
+            } else {
+                let (delta_key_count, trace_key_count) =
+                    estimate_input_key_counts(&delta, &trace);
+                delta_key_count > trace_key_count
             };
 
             let delta_cursor = delta.cursor();
@@ -1625,8 +1705,7 @@ where
 
             let mut val = self.right_factories.val_factory().default_box();
 
-            let mut joint_cursor =
-                JointKeyCursor::new(delta_cursor, trace_cursor, fetched.is_none() && (delta_key_count > trace_key_count));
+            let mut joint_cursor = JointKeyCursor::new(delta_cursor, trace_cursor, swap);
 
             let batch = if size_of::<T::Time>() != 0 {
                 let time = self.clock.time();
@@ -1702,11 +1781,23 @@ where
 
                     start += run_length;
 
-                    if let Entry::Vacant(vacant) = self.future_outputs.borrow_mut().entry(batch_time) {
-                        let mut spine = <Spine<Z> as Trace>::new(&self.output_factories, self.name.get());
-                        spine.insert(Z::dyn_from_tuples(&self.output_factories, (), &mut batch)).await;
-                        vacant.insert(spine);
-                    };
+                    // An earlier clock cycle may already have computed updates
+                    // for `batch_time`; add these to them.
+                    let updates = Z::dyn_from_tuples(&self.output_factories, (), &mut batch);
+                    self.future_outputs
+                        .borrow_mut()
+                        .entry(batch_time)
+                        .or_insert_with(|| {
+                            // Nothing searches this spine until it is output by
+                            // the operator, so it merges as an accumulator does.
+                            <Spine<Z> as Trace>::new(
+                                &self.output_factories,
+                                self.name.get(),
+                                TraceRole::Accumulator,
+                            )
+                        })
+                        .insert(updates)
+                        .await;
                     batch.clear();
                 }
 
@@ -1802,12 +1893,167 @@ where
 }
 
 #[cfg(test)]
-pub(crate) mod test {
+mod key_count_estimate_test {
+    use super::{MIN_KEYS_TO_SAMPLE, estimate_input_key_counts};
     use crate::{
-        DBData, Runtime, Stream, ZWeight,
+        ZWeight,
+        dynamic::DynData,
+        trace::{BatchReader, BatchReaderFactories, SpineSnapshot},
+        typed_batch::{DynOrdIndexedZSet, OrdIndexedZSet},
+        utils::Tup2,
+    };
+    use std::sync::Arc;
+
+    type Batch = DynOrdIndexedZSet<DynData, DynData>;
+
+    /// Builds a snapshot over `batches`, each a list of (key, value, weight).
+    fn snapshot(batches: Vec<Vec<(u64, u64, ZWeight)>>) -> SpineSnapshot<Batch> {
+        let factories: <Batch as BatchReader>::Factories =
+            BatchReaderFactories::new::<u64, u64, ZWeight>();
+        let batches = batches
+            .into_iter()
+            .map(|rows| {
+                let tuples = rows
+                    .into_iter()
+                    .map(|(k, v, w)| Tup2(Tup2(k, v), w))
+                    .collect();
+                Arc::new(OrdIndexedZSet::<u64, u64>::from_tuples((), tuples).into_inner())
+            })
+            .collect();
+
+        SpineSnapshot::with_batches(&factories, batches)
+    }
+
+    fn rows(keys: std::ops::Range<u64>, weight: ZWeight) -> Vec<(u64, u64, ZWeight)> {
+        keys.map(|k| (k, k, weight)).collect()
+    }
+
+    /// Asserts a sampled estimate against a band. Cases whose draw count and
+    /// survival are both fixed are deterministic; assert those with `assert_eq!`
+    /// rather than a zero-width band.
+    #[track_caller]
+    fn assert_within(actual: usize, expected: usize, tolerance_percent: usize) {
+        assert!(tolerance_percent > 0, "use assert_eq! for exact cases");
+
+        let tolerance = expected * tolerance_percent / 100;
+        assert!(
+            actual.abs_diff(expected) <= tolerance,
+            "estimate {actual} is not within {tolerance} of {expected}"
+        );
+    }
+
+    const N: u64 = MIN_KEYS_TO_SAMPLE as u64 * 2;
+
+    /// An input that fully retracts and re-inserts the same rows stores twice
+    /// the row count and yields nothing. `key_count()` reports the stored count,
+    /// which is the error that makes the join drive the wrong side.
+    #[test]
+    fn cancelling_keys_are_not_counted() {
+        let delta = snapshot(vec![rows(0..N, -1), rows(0..N, 1)]);
+        let trace = snapshot(vec![rows(0..N, 1)]);
+
+        assert_eq!(delta.key_count_upper_bound(), 2 * N as usize);
+
+        let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+        assert_eq!(delta_keys, 0);
+    }
+
+    /// Keys that survive are counted, whether or not the input also holds
+    /// cancelling ones.
+    ///
+    /// Only a third of this input's key slots survive, which is the regime where
+    /// a 100-key sample is noisiest: single draws were measured spanning 6,900
+    /// to 13,500 around a mean of 9,955. The test averages draws rather than
+    /// widening the band, so it still fails if the mean moves. Do not replace it
+    /// with a single draw.
+    #[test]
+    fn surviving_share_of_a_mixed_input_is_counted() {
+        // Keys 0..N/2 cancel; keys N/2..N are inserted once and survive.
+        let delta = snapshot(vec![rows(0..N / 2, -1), rows(0..N, 1)]);
+        let trace = snapshot(vec![rows(0..N, 1)]);
+
+        // Two thirds of the stored key slots belong to keys that cancel.
+        assert_eq!(delta.key_count_upper_bound(), (N + N / 2) as usize);
+
+        const DRAWS: usize = 50;
+        let mean = (0..DRAWS)
+            .map(|_| estimate_input_key_counts(&delta, &trace).0)
+            .sum::<usize>()
+            / DRAWS;
+
+        assert_within(mean, (N / 2) as usize, 10);
+    }
+
+    /// The estimate must not depend on how the spine happens to be split into
+    /// batches. Flooring each batch's share of the sample independently used to
+    /// make it collapse as the batch count grew (40 batches read 16,000 of
+    /// 20,000 keys, 200 batches read none at all), and the trace is normally the
+    /// side with more batches, so the bias drove the join onto it.
+    #[test]
+    fn many_batches_do_not_shrink_the_estimate() {
+        let trace = snapshot(vec![rows(0..N, 1)]);
+
+        for batch_count in [1u64, 10, 40, 200] {
+            let per_batch = N / batch_count;
+            let delta = snapshot(
+                (0..batch_count)
+                    .map(|batch| rows(batch * per_batch..(batch + 1) * per_batch, 1))
+                    .collect(),
+            );
+
+            assert_eq!(delta.key_count_upper_bound(), N as usize);
+
+            let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+            assert_eq!(delta_keys, N as usize, "batch_count={batch_count}");
+        }
+    }
+
+    /// Sampling corrects for cancellation, not for duplication. A key held by
+    /// several batches with a non-zero net weight is collapsed only when two
+    /// draws land on it, which a 100-key sample almost never does, so it still
+    /// counts once per batch.
+    ///
+    /// This pins the limitation rather than the behavior we would want. Replace
+    /// it if the estimator ever learns to count distinct keys.
+    #[test]
+    fn duplication_across_batches_is_not_corrected() {
+        let trace = snapshot(vec![rows(0..N, 1)]);
+
+        for batch_count in [2usize, 20, 200] {
+            // Every batch holds the same live keys, so the cursor yields N / 2.
+            let delta = snapshot(vec![rows(0..N / 2, 1); batch_count]);
+
+            let key_count = delta.key_count_upper_bound();
+            assert_eq!(key_count, batch_count * (N / 2) as usize);
+
+            let (delta_keys, _) = estimate_input_key_counts(&delta, &trace);
+            assert_within(delta_keys, key_count, 5);
+        }
+    }
+
+    /// The estimate must not shrink an input that has nothing to cancel.
+    ///
+    /// One batch of distinct live keys draws the whole sample and every draw
+    /// survives, so both counts come back exactly.
+    #[test]
+    fn insert_only_input_keeps_its_count() {
+        let delta = snapshot(vec![rows(0..N, 1)]);
+        let trace = snapshot(vec![rows(0..N, 1)]);
+
+        let (delta_keys, trace_keys) = estimate_input_key_counts(&delta, &trace);
+        assert_eq!(delta_keys, N as usize);
+        assert_eq!(trace_keys, N as usize);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use crate::utils::test::CIRCUIT_CASES;
+    use crate::{
+        DBData, NestedCircuit, Runtime, Stream, ZWeight,
         circuit::CircuitConfig,
         indexed_zset,
-        typed_batch::{OrdZSet, TypedBatch},
+        typed_batch::{OrdIndexedZSet, OrdZSet, TypedBatch},
         utils::Tup2,
         zset,
     };
@@ -2165,6 +2411,104 @@ pub(crate) mod test {
         }
     }
 
+    /// A level of a seed in [`check_join_across_iterations`]: `(seed, level)`.
+    pub(crate) type Level = Tup2<u64, u64>;
+
+    /// Checks that a join in a recursive scope keeps every update it computes
+    /// for a later iteration, including updates that several iterations
+    /// compute for the same one.
+    ///
+    /// Each seed derives its level `n` in iteration `n`, and the recursion
+    /// pairs up all levels with `join`.  In the second transaction, every
+    /// level of the new seed meets the levels that the first transaction
+    /// derived in later iterations, so consecutive iterations compute pairs
+    /// for the same later iterations.
+    ///
+    /// # Arguments
+    ///
+    /// * `join` - joins a stream of levels, all under the same key, with
+    ///   itself, returning every pair of levels.
+    pub(crate) fn check_join_across_iterations<F>(join: F)
+    where
+        F: Fn(
+                &Stream<NestedCircuit, OrdIndexedZSet<u64, Level>>,
+            ) -> Stream<NestedCircuit, OrdZSet<Tup2<Level, Level>>>
+            + Clone
+            + Send
+            + 'static,
+    {
+        const MAX_LEVEL: u64 = 3;
+
+        for workers in [1, 4] {
+            let join = join.clone();
+            let (mut circuit, (seeds_handle, pairs_handle)) =
+                Runtime::init_circuit(workers, move |circuit| {
+                    let (seeds, seeds_handle) = circuit.add_input_zset::<u64>();
+
+                    let (_levels, pairs) = circuit
+                        .recursive(
+                            |child,
+                             (levels, _pairs): (
+                                Stream<_, OrdZSet<Level>>,
+                                Stream<_, OrdZSet<Tup2<Level, Level>>>,
+                            )| {
+                                let seeds = seeds.delta0(child);
+
+                                let next_levels = seeds.map(|seed| Tup2(*seed, 0)).plus(
+                                    &levels.flat_map(|Tup2(seed, level)| {
+                                        (*level < MAX_LEVEL).then(|| Tup2(*seed, level + 1))
+                                    }),
+                                );
+
+                                // A single key, so that every level meets
+                                // every other level.
+                                let pairs = join(&levels.map_index(|level| (0, *level)));
+
+                                Ok((next_levels, pairs))
+                            },
+                        )
+                        .unwrap();
+
+                    Ok((
+                        seeds_handle,
+                        pairs.accumulate_integrate().accumulate_output(),
+                    ))
+                })
+                .unwrap();
+
+            for seeds in 1..=2 {
+                seeds_handle.push(seeds, 1);
+                circuit.transaction().unwrap();
+
+                let levels = (1..=seeds)
+                    .flat_map(|seed| (0..=MAX_LEVEL).map(move |level| Tup2(seed, level)))
+                    .collect::<Vec<_>>();
+                let expected = levels
+                    .iter()
+                    .flat_map(|level1| {
+                        levels
+                            .iter()
+                            .map(move |level2| Tup2(Tup2(*level1, *level2), 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pairs_handle.concat().consolidate(),
+                    OrdZSet::from_keys((), expected),
+                    "workers: {workers}, seeds: {seeds}"
+                );
+            }
+
+            circuit.kill().unwrap();
+        }
+    }
+
+    #[test]
+    fn join_trace_accumulates_future_updates() {
+        check_join_across_iterations(|levels| {
+            levels.join(levels, |_key, level1, level2| Tup2(*level1, *level2))
+        });
+    }
+
     fn antijoin_test(transaction: bool) {
         let inputs1 = [
             vec![
@@ -2438,6 +2782,8 @@ pub(crate) mod test {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn proptest_antijoin_big_step(inputs in generate_antijoin_test_data(10, 5, 3, 100)) {
             proptest_antijoin(inputs.0, inputs.1, true);

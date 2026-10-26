@@ -47,11 +47,14 @@ import org.dbsp.util.Logger;
 import org.dbsp.util.Utilities;
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.rules.TestName;
+import org.junit.rules.TestRule;
 import org.junit.rules.TestWatcher;
 import org.junit.runner.Description;
+import org.junit.runners.model.Statement;
 
 import java.io.File;
 import java.io.IOException;
@@ -196,17 +199,23 @@ public class BaseSQLTests {
         this.statementsFailingInCompilation(statements, substring, false);
     }
 
+    /** Cargo features that make the optional dependencies of the 'temp' crate available. */
+    static final String OPTIONAL_FEATURES = "catalog,adapterlib";
+
     public static void compileAndTestRust(boolean quiet) throws IOException, InterruptedException {
+        assumeRustBackend();
         if (!BaseSQLTests.skipRust) {
             BaseSQLTests.setupCargoLock();
-            Utilities.compileAndTestRust(BaseSQLTests.RUST_DIRECTORY, quiet);
+            Utilities.compileAndTestRust(
+                    BaseSQLTests.RUST_DIRECTORY, quiet, "--features", OPTIONAL_FEATURES);
         }
     }
 
     public static void compileAndCheckRust(boolean quiet) throws IOException, InterruptedException {
+        assumeRustBackend();
         if (!BaseSQLTests.skipRust) {
             BaseSQLTests.setupCargoLock();
-            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, quiet);
+            Utilities.compileAndCheckRust(BaseSQLTests.RUST_DIRECTORY, quiet, OPTIONAL_FEATURES);
         }
     }
 
@@ -240,6 +249,26 @@ public class BaseSQLTests {
             BaseSQLTests.this.currentTestInformation  = className + "#" + methodName;
         }
     };
+
+    /** The cases the running test registered for the Gen-2 engine. */
+    final List<TestCase> gen2Cases = new ArrayList<>();
+
+    /** Runs the test's Gen-2 cases once its body has passed: the body adds a case's steps
+     * after it registers the case. */
+    @Rule
+    public final TestRule gen2Run = (base, description) -> new Statement() {
+        @Override
+        public void evaluate() throws Throwable {
+            base.evaluate();
+            for (TestCase testCase : BaseSQLTests.this.gen2Cases)
+                Gen2Runner.run(testCase);
+        }
+    };
+
+    /** Skips the calling test under the Gen-2 runner, which runs no Rust code. */
+    public static void assumeRustBackend() {
+        Assume.assumeFalse("The Gen-2 runner runs no Rust code", Gen2Runner.isEnabled());
+    }
 
     public static final String PROJECT_DIRECTORY = "..";
     public static final String RUST_DIRECTORY = PROJECT_DIRECTORY + "/temp/src";
@@ -317,6 +346,7 @@ public class BaseSQLTests {
             executionDirectory = ".";
             stubsDir = Paths.get(directory);
             createEmptyStubs();
+            Utilities.createEmptyFile(Paths.get(directory, DBSPCompiler.UDF_FILE_NAME));
         } else {
             directory = RUST_MULTI_DIRECTORY;
             executionDirectory = "../..";
@@ -365,30 +395,41 @@ public class BaseSQLTests {
             } else {
                 BaseSQLTests.setupCargoLock();
             }
+            boolean catalogFeature = !multiCrates && !compiler.options.ioOptions.emitHandles;
+            String features = catalogFeature ? "catalog" : "";
             if (check) {
-                Utilities.compileAndCheckRust(directory, true, testCrate);
+                Utilities.compileAndCheckRust(directory, true, features, testCrate);
             } else {
-                String[] extraArgs;
-                if (testCrate.isEmpty())
-                    extraArgs = new String[] {};
-                else {
-                    extraArgs = new String[2];
-                    extraArgs[0] = "--package";
-                    extraArgs[1] = testCrate;
+                List<String> extraArgs = new ArrayList<>();
+                if (!features.isEmpty()) {
+                    extraArgs.add("--features");
+                    extraArgs.add(features);
                 }
-                Utilities.compileAndTestRust(directory, true, extraArgs);
+                if (!testCrate.isEmpty()) {
+                    extraArgs.add("--package");
+                    extraArgs.add(testCrate);
+                }
+                Utilities.compileAndTestRust(directory, true, extraArgs.toArray(new String[0]));
             }
         }
 
         return testNumber;
     }
 
-    void addRustTestCase(CompilerCircuitStream ccs) {
+    void runOneTestCase(CompilerCircuitStream ccs) {
         ccs.compiler.messages.show(System.err);
         if (ccs.compiler.messages.exitCode != 0)
             throw new RuntimeException("Compilation failed");
-        TestCase test = new TestCase(this.currentTestInformation, this.currentTestInformation, ccs, null);
-        testsToRun.add(test);
+        this.runOneTestCase(new TestCase(this.currentTestInformation, this.currentTestInformation, ccs, null));
+    }
+
+    /** Runs the case on the Gen-2 engine when {@code GEN2_PATH} is set, after the test's body;
+     * otherwise it joins the class's Rust test crate. */
+    void runOneTestCase(TestCase test) {
+        if (Gen2Runner.isEnabled())
+            this.gen2Cases.add(test);
+        else
+            testsToRun.add(test);
     }
 
     /** Add a test case without inputs */
@@ -398,13 +439,12 @@ public class BaseSQLTests {
 
     protected void addFailingRustTestCase(String message, CompilerCircuitStream ccs) {
         ccs.showErrors();
-        TestCase test = new TestCase(this.currentTestInformation, this.currentTestInformation, ccs, message);
-        testsToRun.add(test);
+        this.runOneTestCase(new TestCase(this.currentTestInformation, this.currentTestInformation, ccs, message));
     }
 
     void ciOptions(CompilerOptions options) {
-        if (Utilities.inCI())
-            // Set to compile to multiple crates
+        // Set to compile to multiple crates; the Gen-2 engine runs the circuit IR, which has none.
+        if (Utilities.inCI() && !Gen2Runner.isEnabled())
             options.ioOptions.crates = "x";
     }
 
@@ -428,11 +468,12 @@ public class BaseSQLTests {
     /** Return the default compiler used for testing. */
     public final DBSPCompiler testCompiler() {
         CompilerOptions options = this.testOptions();
+        Gen2Runner.adjustOptions(options);
         return new DBSPCompiler(options);
     }
 
     public static DBSPCircuit getCircuit(DBSPCompiler compiler) {
-        DBSPCircuit circuit = compiler.getFinalCircuit(false);
+        DBSPCircuit circuit = Gen2Runner.getFinalCircuit(compiler);
         if (circuit == null) {
             compiler.showErrors(System.err);
             throw new RuntimeException("No circuit produced");
@@ -448,6 +489,7 @@ public class BaseSQLTests {
     protected void runtimeFail(String query, String message, InputOutputChangeStream data) {
         query = "CREATE VIEW V AS " + query;
         DBSPCompiler compiler = this.testCompiler();
+        this.prepareInputs(compiler);
         compiler.submitStatementForCompilation(query);
         new CompilerCircuitStream(compiler, data, this, message);
     }

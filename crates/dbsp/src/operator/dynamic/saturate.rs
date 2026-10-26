@@ -79,44 +79,42 @@ where
 
         self.circuit()
             .cache_get_or_insert_with(SaturateId::new(self.stream_id()), || {
-                self.circuit()
-                    .region("saturate", || {
-                        let delayed_trace = self
-                            .dyn_shard_accumulate_trace(factories, factories)
-                            .accumulate_delay_trace();
+                self.circuit().region("saturate", || {
+                    let delayed_trace = self
+                        .dyn_shard_accumulate_trace(factories, factories)
+                        .accumulate_delay_trace();
 
-                        let ghost = self.circuit().add_binary_operator(
-                            StreamingBinaryWrapper::new(Saturate::new(factories)),
-                            &self.dyn_shard_accumulate(factories).into_enabled_stream(),
-                            &delayed_trace,
-                        );
+                    let ghost = self.circuit().add_binary_operator(
+                        StreamingBinaryWrapper::new(Saturate::new(factories)),
+                        &self.dyn_shard_accumulate(factories).into_enabled_stream(),
+                        &delayed_trace,
+                    );
 
-                        ghost.mark_sharded();
+                    ghost.mark_sharded();
 
-                        let output_factories = factories.clone();
+                    let output_factories = factories.clone();
 
-                        // Plus
-                        let result = self.circuit().add_binary_operator(
-                            AccumulateApply2::new(
-                                move |stream, saturation| {
-                                    SpineSnapshot::concat(
-                                        output_factories.clone(),
-                                        vec![&stream, &saturation],
-                                    )
-                                },
-                                Location::caller(),
-                            ),
-                            &self.dyn_shard_accumulate(factories).into_enabled_stream(),
-                            &ghost.dyn_accumulate(factories).into_enabled_stream(),
-                        );
+                    // Plus
+                    let result = self.circuit().add_binary_operator(
+                        AccumulateApply2::new(
+                            move |stream, saturation| {
+                                SpineSnapshot::concat(
+                                    output_factories.clone(),
+                                    vec![&stream, &saturation],
+                                )
+                            },
+                            Location::caller(),
+                        ),
+                        &self.dyn_shard_accumulate(factories).into_enabled_stream(),
+                        &ghost.dyn_accumulate(factories).into_enabled_stream(),
+                    );
 
-                        // `result` is also the saturated version of the sharded stream.
-                        self.circuit()
-                            .cache_insert(SaturateId::new(self.stream_id()), result.clone());
-                        result.mark_sharded();
-                        result
-                    })
-                    .clone()
+                    // `result` is also the saturated version of the sharded stream.
+                    self.circuit()
+                        .cache_insert(SaturateId::new(self.stream_id()), result.clone());
+                    result.mark_sharded();
+                    result
+                })
             })
             .clone()
     }
@@ -127,46 +125,44 @@ where
     ) -> Stream<RootCircuit, Option<SpineSnapshot<OrdIndexedZSet<K, V>>>> {
         self.circuit()
             .cache_get_or_insert_with(BalancedSaturateId::new(self.stream_id()), || {
-                self.circuit()
-                    .region("saturate_balanced", || {
-                        // let stream = self.dyn_shard(&factories.batch_factories);
+                self.circuit().region("saturate_balanced", || {
+                    // let stream = self.dyn_shard(&factories.batch_factories);
 
-                        // let delayed_trace = stream
-                        //     .dyn_accumulate_trace(
-                        //         &factories.trace_factories,
-                        //         &factories.batch_factories,
-                        //     )
-                        //     .accumulate_delay_trace();
+                    // let delayed_trace = stream
+                    //     .dyn_accumulate_trace(
+                    //         &factories.trace_factories,
+                    //         &factories.batch_factories,
+                    //     )
+                    //     .accumulate_delay_trace();
 
-                        let (accumulator, trace) =
-                            self.dyn_accumulate_trace_balanced(factories, factories);
+                    let (accumulator, trace) =
+                        self.dyn_accumulate_trace_balanced(factories, factories);
 
-                        let delayed_trace = trace.accumulate_delay_trace();
+                    let delayed_trace = trace.accumulate_delay_trace();
 
-                        let ghost = self.circuit().add_binary_operator(
-                            StreamingBinaryWrapper::new(Saturate::new(factories)),
-                            &accumulator,
-                            &delayed_trace,
-                        );
+                    let ghost = self.circuit().add_binary_operator(
+                        StreamingBinaryWrapper::new(Saturate::new(factories)),
+                        &accumulator,
+                        &delayed_trace,
+                    );
 
-                        let output_factories = factories.clone();
+                    let output_factories = factories.clone();
 
-                        // Plus
-                        self.circuit().add_binary_operator(
-                            AccumulateApply2::new(
-                                move |stream, saturation| {
-                                    SpineSnapshot::concat(
-                                        output_factories.clone(),
-                                        vec![&stream, &saturation],
-                                    )
-                                },
-                                Location::caller(),
-                            ),
-                            &accumulator,
-                            &ghost.dyn_accumulate(factories).into_enabled_stream(),
-                        )
-                    })
-                    .clone()
+                    // Plus
+                    self.circuit().add_binary_operator(
+                        AccumulateApply2::new(
+                            move |stream, saturation| {
+                                SpineSnapshot::concat(
+                                    output_factories.clone(),
+                                    vec![&stream, &saturation],
+                                )
+                            },
+                            Location::caller(),
+                        ),
+                        &accumulator,
+                        &ghost.dyn_accumulate(factories).into_enabled_stream(),
+                    )
+                })
             })
             .clone()
     }
@@ -261,13 +257,13 @@ where
 {
     fn eval(
         self: Rc<Self>,
-        delta: &Option<Spine<OrdIndexedZSet<K, V>>>,
-        delayed_trace: &SpineSnapshot<OrdIndexedZSet<K, V>>,
+        delta: Cow<'_, Option<Spine<OrdIndexedZSet<K, V>>>>,
+        delayed_trace: Cow<'_, SpineSnapshot<OrdIndexedZSet<K, V>>>,
     ) -> impl AsyncStream<Item = (OrdIndexedZSet<K, V>, bool, Option<Position>)> + 'static {
         //println!("Saturate: eval: delta: {:?}, trace: {:?}", delta, trace);
         let chunk_size = splitter_output_chunk_size();
 
-        let delta = delta.as_ref().map(|b| b.ro_snapshot());
+        let delta = (*delta).as_ref().map(|b| b.ro_snapshot());
 
         // We assume that delta.is_some() implies that the operator is being flushed,
         // since the integral is always flushed in same step as delta.
@@ -323,7 +319,7 @@ where
                     );
 
                     let result = builder.done();
-                    self.output_batch_stats.borrow_mut().add_batch(result.len());
+                    self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
 
                     yield (result, false, delta_cursor.position())
                 }
@@ -332,7 +328,7 @@ where
             }
 
             let result = builder.done();
-            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
 
             yield (result, true, delta_cursor.position())
         }

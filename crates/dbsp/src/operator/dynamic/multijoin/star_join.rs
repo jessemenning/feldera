@@ -387,7 +387,7 @@ where
         }
     }
 
-    /// Initialize weight_times[current_index]
+    /// Initialize `weight_times[current_index]`
     fn init_weight_times(&mut self) {
         self.weight_times[self.current_index].0.clear();
         let (previous_weight, previous_time) = self.previous_weight_time();
@@ -397,9 +397,7 @@ where
                 let weight = **weight * previous_weight;
                 let time = time.join(&previous_time);
 
-                self.weight_times[self.current_index]
-                    .0
-                    .push((weight, time.clone()));
+                self.weight_times[self.current_index].0.push((weight, time));
             });
         } else {
             let weight =
@@ -412,8 +410,8 @@ where
         self.weight_times[self.current_index].1 = 0;
     }
 
-    /// Increment weight_times[current_index].1 by 1. If it reaches the end of the vector,
-    /// advance trace_cursors[current_index] to the next value.
+    /// Increment `weight_times[current_index].1` by 1. If it reaches the end of the
+    /// vector, advance `trace_cursors[current_index]` to the next value.
     fn advance_weight_times(&mut self) {
         if self.weight_times[self.current_index].1
             == self.weight_times[self.current_index].0.len() - 1
@@ -724,19 +722,24 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::operator::dynamic::join::test::check_join_across_iterations;
+    use crate::utils::test::CIRCUIT_CASES;
     use crate::{
-        OrdIndexedZSet, OrdZSet, Runtime, Stream, ZWeight,
+        OrdIndexedZSet, OrdZSet, OutputHandle, RootCircuit, Runtime, Stream, ZSetHandle, ZWeight,
         algebra::F64,
-        circuit::CircuitConfig,
+        circuit::{CircuitConfig, CircuitStorageConfig, Mode, StorageConfig},
         define_inner_star_join, define_inner_star_join_flatmap, define_inner_star_join_index,
         define_star_join, define_star_join_flatmap, define_star_join_index,
+        typed_batch::SpineSnapshot,
         utils::{Tup2, Tup3, Tup4},
     };
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     define_star_join_index!(4);
     define_star_join!(4);
     define_star_join_flatmap!(4);
+    define_inner_star_join!(2);
     define_inner_star_join!(3);
     define_inner_star_join!(4);
     define_inner_star_join_index!(4);
@@ -834,7 +837,7 @@ mod tests {
 
                 let inner_join_expected_output = stream1
                     .join(&stream2, |k, v1, v2| Tup2(*k, Tup2(*v1, *v2)))
-                    .map_index(|Tup2(k, v)| (*k, v.clone()))
+                    .map_index(|Tup2(k, v)| (*k, *v))
                     .join(&stream3, |k, Tup2(v1, v2), v3| {
                         Tup2(*k, Tup3(*v1, *v2, v3.clone()))
                     })
@@ -864,7 +867,7 @@ mod tests {
 
                 let inner_join_flatmap_expected_output = stream1
                     .join(&stream2, |k, v1, v2| Tup2(*k, Tup2(*v1, *v2)))
-                    .map_index(|Tup2(k, v)| (*k, v.clone()))
+                    .map_index(|Tup2(k, v)| (*k, *v))
                     .join(&stream3, |k, Tup2(v1, v2), v3| {
                         Tup2(*k, Tup3(*v1, *v2, v3.clone()))
                     })
@@ -941,12 +944,11 @@ mod tests {
             dbsp.start_transaction().unwrap();
         }
 
-        for step in 0..input_data.len() {
-            // println!("step: {}", step);
-            stream1.append(&mut input_data[step].0.clone());
-            stream2.append(&mut input_data[step].1.clone());
-            stream3.append(&mut input_data[step].2.clone());
-            stream4.append(&mut input_data[step].3.clone());
+        for step_data in &input_data {
+            stream1.append(&mut step_data.0.clone());
+            stream2.append(&mut step_data.1.clone());
+            stream3.append(&mut step_data.2.clone());
+            stream4.append(&mut step_data.3.clone());
 
             if !transaction {
                 dbsp.transaction().unwrap();
@@ -1020,100 +1022,198 @@ mod tests {
         }
     }
 
-    /// Compute paths in a directed graph such that all inner points of a path belong to the set of key points.
-    /// (This key points constraint  justifies the use of the multiway join operator).
+    /// Builds the circuit used by [`recursive_star_join_run`]: paths in a
+    /// directed graph whose inner points all belong to the set of key points.
+    /// (This key points constraint justifies the use of the multiway join
+    /// operator.)
     ///
-    /// `input_data` includes edges and key points to be added/removed at each step.
-    fn recursive_star_join_test(
-        input_data: Vec<(Vec<Tup2<Tup2<u32, u32>, ZWeight>>, Vec<Tup2<u32, ZWeight>>)>,
-        transaction: bool,
+    /// `paths` computes the relation with the multiway join and
+    /// `expected_paths` with a chain of binary joins; the two must agree.
+    ///
+    /// The streams carry persistent ids, which checkpointing the recursive
+    /// scope requires; see [`ChildCircuit::recursive`](crate::ChildCircuit::recursive).
+    #[allow(clippy::type_complexity)]
+    fn recursive_star_join_circuit(
+        circuit: &mut RootCircuit,
+    ) -> (
+        ZSetHandle<Tup2<u32, u32>>,
+        ZSetHandle<u32>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup2<u32, u32>>>>,
+        OutputHandle<SpineSnapshot<OrdZSet<Tup2<u32, u32>>>>,
     ) {
-        let (mut dbsp, (edges_handle, key_points_handle, paths, expected_paths)) =
-            Runtime::init_circuit(
-                CircuitConfig::from(4).with_splitter_chunk_size_records(2),
-                move |circuit| {
-                    let (edges, edges_handle) = circuit.add_input_zset::<Tup2<u32, u32>>();
-                    let (key_points, key_points_handle) = circuit.add_input_zset::<u32>();
+        let (edges, edges_handle) = circuit.add_input_zset::<Tup2<u32, u32>>();
+        edges.set_persistent_id(Some("edges"));
+        let (key_points, key_points_handle) = circuit.add_input_zset::<u32>();
+        key_points.set_persistent_id(Some("key_points"));
 
-                    let edges = edges.distinct();
-                    let key_points = key_points.distinct();
+        let edges = edges.distinct().set_persistent_id(Some("edges_distinct"));
+        let key_points = key_points
+            .distinct()
+            .set_persistent_id(Some("key_points_distinct"));
 
-                    let (paths, expected_paths) = circuit
-                        .recursive(
-                            |child,
-                             (paths_delayed, expected_paths_delayed): (
-                                Stream<_, OrdZSet<Tup2<u32, u32>>>,
-                                Stream<_, OrdZSet<Tup2<u32, u32>>>,
-                            )| {
-                                let edges = edges.delta0(child);
-                                let key_points = key_points.delta0(child).map_index(|x| (*x, ()));
+        let (paths, expected_paths) = circuit
+            .recursive(
+                |child,
+                 (paths_delayed, expected_paths_delayed): (
+                    Stream<_, OrdZSet<Tup2<u32, u32>>>,
+                    Stream<_, OrdZSet<Tup2<u32, u32>>>,
+                )| {
+                    paths_delayed.set_persistent_id(Some("paths_delayed"));
+                    expected_paths_delayed.set_persistent_id(Some("expected_paths_delayed"));
 
-                                let paths_inverted_indexed: Stream<_, OrdIndexedZSet<u32, u32>> =
-                                    paths_delayed.map_index(|&Tup2(x, y)| (y, x));
+                    let edges = edges.delta0(child);
+                    let key_points = key_points
+                        .delta0(child)
+                        .map_index(|x| (*x, ()))
+                        .set_persistent_id(Some("key_points_indexed"));
 
-                                let paths_inverted_indexed_expected: Stream<
-                                    _,
-                                    OrdIndexedZSet<u32, u32>,
-                                > = expected_paths_delayed.map_index(|&Tup2(x, y)| (y, x));
+                    let paths_inverted_indexed: Stream<_, OrdIndexedZSet<u32, u32>> = paths_delayed
+                        .map_index(|&Tup2(x, y)| (y, x))
+                        .set_persistent_id(Some("paths_inverted_indexed"));
 
-                                let edges_indexed = edges.map_index(|Tup2(k, v)| (*k, *v));
+                    let paths_inverted_indexed_expected: Stream<_, OrdIndexedZSet<u32, u32>> =
+                        expected_paths_delayed
+                            .map_index(|&Tup2(x, y)| (y, x))
+                            .set_persistent_id(Some("expected_paths_inverted_indexed"));
 
-                                let paths = edges.plus(&inner_star_join3_nested(
-                                    &paths_inverted_indexed,
-                                    &edges_indexed,
-                                    &key_points,
-                                    |_via, from, to, &()| Tup2(*from, *to),
-                                ));
+                    let edges_indexed = edges
+                        .map_index(|Tup2(k, v)| (*k, *v))
+                        .set_persistent_id(Some("edges_indexed"));
 
-                                let expected_paths = edges.plus(
-                                    &paths_inverted_indexed_expected
-                                        .join_index(&edges_indexed, |via, from, to| {
-                                            Some((*via, Tup2(*from, *to)))
-                                        })
-                                        .join(&key_points, |_via, &Tup2(from, to), &()| {
-                                            Tup2(from, to)
-                                        }),
-                                );
+                    let paths = edges.plus(&inner_star_join3_nested(
+                        &paths_inverted_indexed,
+                        &edges_indexed,
+                        &key_points,
+                        |_via, from, to, &()| Tup2(*from, *to),
+                    ));
+                    paths.set_persistent_id(Some("paths_step"));
 
-                                Ok((paths, expected_paths))
-                            },
-                        )
-                        .unwrap();
+                    // The second join integrates this, so it needs a name of its own.
+                    let expected_paths_via = paths_inverted_indexed_expected
+                        .join_index(&edges_indexed, |via, from, to| {
+                            Some((*via, Tup2(*from, *to)))
+                        })
+                        .set_persistent_id(Some("expected_paths_via"));
 
-                    let paths_output = paths.accumulate_output();
-                    let expected_paths_output = expected_paths.accumulate_output();
+                    let expected_paths = edges.plus(
+                        &expected_paths_via
+                            .join(&key_points, |_via, &Tup2(from, to), &()| Tup2(from, to)),
+                    );
+                    expected_paths.set_persistent_id(Some("expected_paths_step"));
 
-                    Ok((
-                        edges_handle,
-                        key_points_handle,
-                        paths_output,
-                        expected_paths_output,
-                    ))
+                    Ok((paths, expected_paths))
                 },
             )
+            .unwrap();
+
+        (
+            edges_handle,
+            key_points_handle,
+            paths.accumulate_output_persistent(Some("paths")),
+            expected_paths.accumulate_output_persistent(Some("expected_paths")),
+        )
+    }
+
+    /// Feeds `input_data` to [`recursive_star_join_circuit`], checking at every
+    /// output that the multiway join agrees with the chain of binary joins, and
+    /// returns each output.
+    ///
+    /// With `restart_after` set, the circuit is checkpointed after that many
+    /// transactions, killed, and restarted from the checkpoint.  The paths
+    /// relation is maintained inside a `recursive()` scope, so the rest of the
+    /// run is correct only if the restart brings that state back; comparing the
+    /// returned outputs against a run that was never interrupted catches a
+    /// scope that came back empty or without its clock.  The agreement check
+    /// alone would not: both relations live in the same scope and would be
+    /// wrong together.
+    fn recursive_star_join_run(
+        input_data: &[(Vec<Tup2<Tup2<u32, u32>, ZWeight>>, Vec<Tup2<u32, ZWeight>>)],
+        transaction: bool,
+        restart_after: Option<usize>,
+    ) -> Vec<OrdZSet<Tup2<u32, u32>>> {
+        // A checkpoint is taken between transactions, so a restart needs
+        // transaction boundaries to happen at.
+        assert!(restart_after.is_none() || !transaction);
+
+        let storage = restart_after.map(|_| tempfile::tempdir().unwrap().keep());
+        let config = |init_checkpoint: Option<Uuid>| {
+            let config = CircuitConfig::from(4).with_splitter_chunk_size_records(2);
+            match &storage {
+                None => config,
+                Some(path) => config.with_mode(Mode::Persistent).with_storage(Some(
+                    CircuitStorageConfig::for_config(
+                        StorageConfig {
+                            path: path.to_string_lossy().into_owned(),
+                            cache: Default::default(),
+                        },
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .with_init_checkpoint(init_checkpoint),
+                )),
+            }
+        };
+
+        let (mut dbsp, (mut edges_handle, mut key_points_handle, mut paths, mut expected_paths)) =
+            Runtime::init_circuit(config(None), |circuit| {
+                Ok(recursive_star_join_circuit(circuit))
+            })
             .unwrap();
 
         if transaction {
             dbsp.start_transaction().unwrap();
         }
 
-        for step in 0..input_data.len() {
-            edges_handle.append(&mut input_data[step].0.clone());
-            key_points_handle.append(&mut input_data[step].1.clone());
+        let mut outputs = Vec::new();
+        let collect = |paths: &OutputHandle<SpineSnapshot<OrdZSet<Tup2<u32, u32>>>>,
+                       expected_paths: &OutputHandle<SpineSnapshot<OrdZSet<Tup2<u32, u32>>>>,
+                       outputs: &mut Vec<OrdZSet<Tup2<u32, u32>>>| {
+            let paths_output = paths.concat().consolidate();
+            let expected_paths_output = expected_paths.concat().consolidate();
+            assert_eq!(paths_output, expected_paths_output);
+            outputs.push(paths_output);
+        };
+
+        for (step, (edges_data, key_points_data)) in input_data.iter().enumerate() {
+            edges_handle.append(&mut edges_data.clone());
+            key_points_handle.append(&mut key_points_data.clone());
             if !transaction {
                 dbsp.transaction().unwrap();
-                let paths_output = paths.concat().consolidate();
-                let expected_paths_output = expected_paths.concat().consolidate();
-                assert_eq!(paths_output, expected_paths_output);
+                collect(&paths, &expected_paths, &mut outputs);
+            }
+
+            if Some(step + 1) == restart_after {
+                let checkpoint = dbsp.checkpoint().run().unwrap();
+                dbsp.kill().unwrap();
+
+                let restarted = Runtime::init_circuit(config(Some(checkpoint.uuid)), |circuit| {
+                    Ok(recursive_star_join_circuit(circuit))
+                })
+                .unwrap();
+                dbsp = restarted.0;
+                (edges_handle, key_points_handle, paths, expected_paths) = restarted.1;
+
+                // The circuit did not change, so nothing may be backfilled: a
+                // backfill would rebuild the scope from replayed input and
+                // leave the checkpoint untested.
+                assert!(!dbsp.bootstrap_in_progress());
             }
         }
 
         if transaction {
             dbsp.commit_transaction().unwrap();
-            let paths_output = paths.concat().consolidate();
-            let expected_paths_output = expected_paths.concat().consolidate();
-            assert_eq!(paths_output, expected_paths_output);
+            collect(&paths, &expected_paths, &mut outputs);
         }
+
+        dbsp.kill().unwrap();
+        outputs
+    }
+
+    fn recursive_star_join_test(
+        input_data: Vec<(Vec<Tup2<Tup2<u32, u32>, ZWeight>>, Vec<Tup2<u32, ZWeight>>)>,
+        transaction: bool,
+    ) {
+        recursive_star_join_run(&input_data, transaction, None);
     }
 
     #[test]
@@ -1164,7 +1264,21 @@ mod tests {
             (vec![Tup2(Tup2(8, 2), -1)], vec![Tup2(7, -1)]),
         ];
 
-        recursive_star_join_test(input_data, false);
+        // Half way through, checkpoint the circuit, kill it, and restart it from
+        // the checkpoint.  The restarted run must produce what an uninterrupted
+        // run produces.
+        let reference = recursive_star_join_run(&input_data, false, None);
+        let restarted = recursive_star_join_run(&input_data, false, Some(input_data.len() / 2));
+        assert_eq!(reference, restarted);
+    }
+
+    #[test]
+    fn recursive_star_join_accumulates_future_updates() {
+        check_join_across_iterations(|levels| {
+            inner_star_join2_nested(levels, levels, |_key, level1, level2| {
+                Tup2(*level1, *level2)
+            })
+        });
     }
 
     fn weighted_vec_u32(
@@ -1267,6 +1381,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CIRCUIT_CASES))]
+
         #[test]
         fn proptest_star_join_index4_small_steps(
             input_data in prop::collection::vec(input_step_strategy(5, 10, 2, 5), 0..15),

@@ -12,12 +12,36 @@ The Kafka output connector supports [fault tolerance](/pipelines/fault-tolerance
 | `bootstrap.servers` (required) | string           |         | A comma separated list of Kafka brokers to connect to. |
 | `headers`                      | array of objects |         | Kafka headers to be added to each message produced by this connector. A header specifies a key and, optionally, a value. The value must be a string or an array of bytes, e.g., `[{"key": "key1", "value": "val1"}, {"key": "key2", "value": [1,2,3,4,5]}, {"key": "key3"}]`|
 | `log_level`                    | string           |         | The log level for the Kafka client. |
-| `initialization_timeout_secs`  | seconds          | 60      | Maximum timeout in seconds to wait for the connector to connect to a Kafka broker. |
+| `initialization_timeout` | duration | `60s` | Maximum time to wait for the connector to connect to a Kafka broker, for example `60s`. Replaces the deprecated `initialization_timeout_secs`. |
 | `kafka_service`                | string           |         | If specified, this service is used to provide defaults for the Kafka options. |
 | `region`                       | string           |         | The AWS region to use while connecting to AWS Managed Streaming for Kafka (MSK). |
+| `fault_tolerance`              | object           |         | librdkafka options the connector uses when the pipeline runs with [exactly-once fault tolerance](/pipelines/fault-tolerance). See [Fault tolerance options](#fault-tolerance-options). |
 
 The connector passes additional options directly to [**librdkafka**](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md).
 See [relevant options for producers](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md).
+
+### Fault tolerance options
+
+A pipeline configured for exactly-once
+[fault tolerance](/pipelines/fault-tolerance) writes to Kafka through
+transactions, which needs a consumer as well as a producer. `fault_tolerance`
+adds librdkafka settings for those two clients:
+
+| Property           | Type   | Default | Description |
+|--------------------|--------|---------|-------------|
+| `consumer_options` | object | `{}`    | Options passed to librdkafka for consumers only, overriding the connector's other Kafka options. |
+| `producer_options` | object | `{}`    | Options passed to librdkafka for producers only, overriding the connector's other Kafka options. |
+
+`fault_tolerance` does not turn transactional writes on or off; the pipeline's
+fault tolerance model does. Omitting `fault_tolerance` leaves the consumer and
+producer with the connector's other Kafka options and the librdkafka defaults.
+
+```json
+"fault_tolerance": {
+  "consumer_options": {"fetch.max.bytes": "10485760"},
+  "producer_options": {"compression.type": "lz4"}
+}
+```
 
 ## Example usage
 
@@ -25,7 +49,7 @@ We will create a Kafka output connector named `total-sales`.
 Kafka broker is located at `example.com:9092` and the topic is `total-sales`.
 
 ```sql
-CREATE VIEW V
+CREATE VIEW v
 WITH (
    'connectors' = '[
     {
@@ -116,7 +140,7 @@ Other protocols and mechanisms aren't supported.
 
 ```sql
 
-CREATE VIEW OUTPUT
+CREATE VIEW output
 WITH (
    'connectors' = '[
     {
@@ -139,7 +163,55 @@ WITH (
       }
    }
    ]'
-) as select * from INPUT;
+) AS SELECT * FROM input;
+```
+
+Example of writing data to GCP Managed Service for Apache Kafka with OAUTHBEARER.
+
+:::important
+- Ensure that the defined output topic either exists in GCP Managed Service for Apache Kafka or automatic
+  topic creation is enabled.
+- `sasl.mechanism` must be set to `OAUTHBEARER`.
+- `security.protocol` must be set to `SASL_SSL`.
+- `oauth_provider` must be set to `gcp`.
+- Google credentials are resolved from Application Default Credentials: a service account key or user
+  credentials file (e.g., as set up by `gcloud auth application-default login`), or, on GKE with Workload
+  Identity configured, the metadata server.
+- GCP Managed Kafka authenticates a named principal, which Feldera takes from the service account email
+  in the credentials, or from the metadata server. Credentials that name no principal, including the user
+  credentials written by `gcloud auth application-default login`, require the principal in the
+  `GOOGLE_MANAGED_KAFKA_AUTH_PRINCIPAL` environment variable. Setting that variable also overrides the
+  principal derived from the credentials.
+
+Other protocols and mechanisms aren't supported.
+:::
+
+```sql
+
+CREATE VIEW output
+WITH (
+   'connectors' = '[
+    {
+      "transport": {
+          "name": "kafka_output",
+          "config": {
+              "bootstrap.servers": "bootstrap.<CLUSTER>.<REGION>.managedkafka.<PROJECT>.cloud.goog:9092",
+              "sasl.mechanism": "OAUTHBEARER",
+              "security.protocol": "SASL_SSL",
+              "oauth_provider": "gcp",
+              "topic": "<TOPIC>"
+          }
+      },
+      "format": {
+          "name": "json",
+          "config": {
+              "update_format": "insert_delete",
+              "array": false
+          }
+      }
+   }
+   ]'
+) AS SELECT * FROM input;
 ```
 
 ## Additional resources

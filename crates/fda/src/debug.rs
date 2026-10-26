@@ -1,3 +1,4 @@
+use progenitor_client::ClientInfo;
 use std::{
     collections::BTreeMap,
     fmt::Write,
@@ -206,7 +207,7 @@ async fn unbundle_support_bundle(
 
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
-        let filename = file.name().to_string();
+        let filename = file.name()?.to_string();
         drop(file); // Drop the file reference before getting it again
 
         if let Some((_, base)) = filename.rsplit_once('/')
@@ -373,6 +374,7 @@ async fn unbundle_support_bundle(
                 let res = client
                     .get_pipeline()
                     .pipeline_name(pipeline_name.clone())
+                    .selector(PipelineFieldSelector::Status)
                     .send()
                     .await;
                 if res.is_ok() {
@@ -398,11 +400,12 @@ async fn unbundle_support_bundle(
                     udf_toml,
                     program_config,
                     runtime_config,
+                    deployment_config: None,
                 })
                 .send()
                 .await
                 .map_err(handle_errors_fatal(
-                    client.baseurl().clone(),
+                    client.baseurl().to_string(),
                     format!("Unable to create pipeline {pipeline_name}").leak(),
                     1,
                 ))

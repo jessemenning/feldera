@@ -6,31 +6,43 @@ use crate::db::operations;
 #[cfg(feature = "postgresql_embedded")]
 use crate::db::pg_setup;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
-use crate::db::types::api_key::{ApiKeyDescr, ApiPermission};
+use crate::db::transaction;
+use crate::db::types::api_key::ApiKeyDescr;
+use crate::db::types::deployment::{
+    PipelineDeploymentConfig, patch_deployment_config, running_deployment_config,
+};
 use crate::db::types::monitor::{
     ClusterMonitorEvent, ClusterMonitorEventId, ExtendedClusterMonitorEvent,
     ExtendedPipelineMonitorEvent, NewClusterMonitorEvent, PipelineMonitorEvent,
     PipelineMonitorEventId,
 };
+use crate::db::types::oidc_trust::OidcTrustDescr;
 use crate::db::types::pipeline::{
     ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PatchClientMetadata, PipelineDescr,
     PipelineId,
 };
 use crate::db::types::program::{
-    ProgramConfig, ProgramInfo, ProgramStatus, RustCompilationInfo, SqlCompilationInfo,
+    PipelineProgramArtifacts, ProgramConfig, ProgramInfo, ProgramStatus, RustCompilationInfo,
+    SqlCompilationInfo,
 };
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
+use crate::db::types::role::{MintableKeyRole, Role};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
+use crate::db::types::user::{
+    MembershipOrigin, TenantInfo, TenantMember, UserId, UserMembership, UserProfile,
+};
 use crate::db::types::version::Version;
 use crate::is_supported_runtime;
+use crate::oidc::destination::TenantIssuerPolicy;
 use crate::{auth::TenantRecord, config::DatabaseConfig};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, Pool, RecyclingMethod};
 use feldera_types::config::{PipelineConfig, RuntimeConfig};
 use feldera_types::error::ErrorResponse;
 use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
-use tokio_postgres::{IsolationLevel, Row};
+use tokio_postgres::Row;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -86,7 +98,7 @@ pub struct StoragePostgres {
 impl Storage for StoragePostgres {
     async fn check_connection(&self) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::connectivity::check_connection(&txn).await?;
         txn.commit().await?;
         Ok(())
@@ -99,7 +111,7 @@ impl Storage for StoragePostgres {
         provider: String,
     ) -> Result<TenantId, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let tenant_id =
             operations::tenant::get_or_create_tenant_id(&txn, new_id, name, provider).await?;
         txn.commit().await?;
@@ -108,15 +120,257 @@ impl Storage for StoragePostgres {
 
     async fn get_tenant_name(&self, tenant_id: TenantId) -> Result<String, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let tenant_name = operations::tenant::get_tenant_name(&txn, tenant_id).await?;
         txn.commit().await?;
         Ok(tenant_name)
     }
 
+    async fn resolve_tenant_selector(&self, selector: &str) -> Result<TenantId, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::tenant::resolve_tenant_selector(&txn, selector).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn get_tenant(&self, selector: &str) -> Result<TenantInfo, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::tenant::get_tenant(&txn, selector).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn find_tenant_id_by_name(&self, name: &str) -> Result<Option<TenantId>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::tenant::find_tenant_id_by_name(&txn, name).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn get_or_create_tenant(
+        &self,
+        new_id: Uuid,
+        name: &str,
+        provider: &str,
+    ) -> Result<(TenantInfo, bool), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::tenant::get_or_create_tenant(&txn, new_id, name, provider).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn delete_tenant(&self, tenant_id: TenantId) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::tenant::delete_tenant(&txn, tenant_id).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn rename_tenant(
+        &self,
+        tenant_id: TenantId,
+        new_name: &str,
+        displace_existing: bool,
+    ) -> Result<Option<TenantInfo>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let displaced =
+            operations::tenant::rename_tenant(&txn, tenant_id, new_name, displace_existing).await?;
+        txn.commit().await?;
+        Ok(displaced)
+    }
+
+    async fn list_tenants(&self) -> Result<Vec<TenantInfo>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::tenant::list_tenants(&txn).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_login(
+        &self,
+        new_tenant_id: Uuid,
+        new_user_id: Uuid,
+        tenant_name: String,
+        provider: String,
+        subject: String,
+        email: Option<String>,
+        default_role: Role,
+        first_user_role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(TenantId, UserId, Role), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::user::resolve_login(
+            &txn,
+            new_tenant_id,
+            new_user_id,
+            tenant_name,
+            provider,
+            subject,
+            email,
+            default_role,
+            first_user_role,
+            origin,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn list_user_memberships(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(Vec<UserMembership>, Option<DateTime<Utc>>), DBError> {
+        // One read-only statement needs no transaction.
+        let client = self.pool.get().await?;
+        operations::user::list_user_memberships(&client, provider, subject).await
+    }
+
+    async fn enroll_in_existing_tenants(
+        &self,
+        new_user_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        names: &[String],
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::user::enroll_in_existing_tenants(
+            &txn,
+            new_user_id,
+            provider,
+            subject,
+            email,
+            names,
+            role,
+            origin,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn get_or_create_user(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> Result<UserId, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result =
+            operations::user::get_or_create_user(&txn, new_id, provider, subject, email).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn claim_profile_refresh(
+        &self,
+        new_id: Uuid,
+        provider: &str,
+        subject: &str,
+        auth_time: Option<i64>,
+        ttl_seconds: i64,
+    ) -> Result<bool, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::user::claim_profile_refresh(
+            &txn,
+            new_id,
+            provider,
+            subject,
+            auth_time,
+            ttl_seconds,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn store_user_profile(
+        &self,
+        provider: &str,
+        subject: &str,
+        profile: &UserProfile,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::user::store_user_profile(&txn, provider, subject, profile).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn list_tenant_members(&self, tenant_id: TenantId) -> Result<Vec<TenantMember>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::user::list_tenant_members(&txn, tenant_id).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn upsert_member_role(
+        &self,
+        tenant_id: TenantId,
+        user_id: UserId,
+        role: Role,
+        origin: MembershipOrigin,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::user::upsert_member_role(&txn, tenant_id, user_id, role, origin).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn preprovision_member(
+        &self,
+        new_user_id: Uuid,
+        tenant_id: TenantId,
+        provider: &str,
+        subject: &str,
+        email: Option<&str>,
+        role: Role,
+    ) -> Result<UserId, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::user::preprovision_member(
+            &txn,
+            new_user_id,
+            tenant_id,
+            provider,
+            subject,
+            email,
+            role,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn remove_member(&self, tenant_id: TenantId, user_id: UserId) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::user::remove_member(&txn, tenant_id, user_id).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     async fn list_api_keys(&self, tenant_id: TenantId) -> Result<Vec<ApiKeyDescr>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let api_keys = operations::api_key::list_api_keys(&txn, tenant_id).await?;
         txn.commit().await?;
         Ok(api_keys)
@@ -124,7 +378,7 @@ impl Storage for StoragePostgres {
 
     async fn get_api_key(&self, tenant_id: TenantId, name: &str) -> Result<ApiKeyDescr, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let api_key = operations::api_key::get_api_key(&txn, tenant_id, name).await?;
         txn.commit().await?;
         Ok(api_key)
@@ -132,7 +386,7 @@ impl Storage for StoragePostgres {
 
     async fn delete_api_key(&self, tenant_id: TenantId, name: &str) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let result = operations::api_key::delete_api_key(&txn, tenant_id, name).await?;
         txn.commit().await?;
         Ok(result)
@@ -144,21 +398,101 @@ impl Storage for StoragePostgres {
         id: Uuid,
         name: &str,
         key: &str,
-        permissions: Vec<ApiPermission>,
+        role: MintableKeyRole,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let result =
-            operations::api_key::store_api_key_hash(&txn, tenant_id, id, name, key, permissions)
-                .await?;
+            operations::api_key::store_api_key_hash(&txn, tenant_id, id, name, key, role).await?;
         txn.commit().await?;
         Ok(result)
     }
 
-    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Vec<ApiPermission>), DBError> {
+    async fn validate_api_key(&self, key: &str) -> Result<(TenantId, Role), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let result = operations::api_key::validate_api_key(&txn, key).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn list_oidc_trust(&self, tenant_id: TenantId) -> Result<Vec<OidcTrustDescr>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::oidc_trust::list_oidc_trust(&txn, tenant_id).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn get_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        name: &str,
+    ) -> Result<OidcTrustDescr, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::oidc_trust::get_oidc_trust(&txn, tenant_id, name).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn delete_oidc_trust(&self, tenant_id: TenantId, name: &str) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::oidc_trust::delete_oidc_trust(&txn, tenant_id, name).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn create_oidc_trust(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        issuer: &str,
+        subject: &str,
+        audience: Option<&str>,
+        role: Role,
+        issuer_policy: TenantIssuerPolicy,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::oidc_trust::create_oidc_trust(
+            &txn,
+            tenant_id,
+            id,
+            name,
+            description,
+            issuer,
+            subject,
+            audience,
+            role,
+            issuer_policy,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn is_trusted_issuer(&self, issuer: &str) -> Result<bool, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result = operations::oidc_trust::is_trusted_issuer(&txn, issuer).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    async fn match_oidc_trust(
+        &self,
+        issuer: &str,
+        subject: &str,
+        audiences: &[String],
+    ) -> Result<Vec<(TenantId, Role)>, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let result =
+            operations::oidc_trust::match_oidc_trust(&txn, issuer, subject, audiences).await?;
         txn.commit().await?;
         Ok(result)
     }
@@ -168,7 +502,7 @@ impl Storage for StoragePostgres {
         tenant_id: TenantId,
     ) -> Result<Vec<ExtendedPipelineDescr>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipelines = operations::pipeline::list_pipelines(&txn, tenant_id).await?;
         txn.commit().await?;
         Ok(pipelines)
@@ -179,7 +513,7 @@ impl Storage for StoragePostgres {
         tenant_id: TenantId,
     ) -> Result<Vec<ExtendedPipelineDescrMonitoring>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipelines =
             operations::pipeline::list_pipelines_for_monitoring(&txn, tenant_id).await?;
         txn.commit().await?;
@@ -192,7 +526,7 @@ impl Storage for StoragePostgres {
         name: &str,
     ) -> Result<ExtendedPipelineDescr, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline = operations::pipeline::get_pipeline(&txn, tenant_id, name, false).await?;
         txn.commit().await?;
         Ok(pipeline)
@@ -204,7 +538,7 @@ impl Storage for StoragePostgres {
         name: &str,
     ) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline =
             operations::pipeline::get_pipeline_for_monitoring(&txn, tenant_id, name, false).await?;
         txn.commit().await?;
@@ -217,7 +551,7 @@ impl Storage for StoragePostgres {
         pipeline_id: PipelineId,
     ) -> Result<ExtendedPipelineDescr, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline =
             operations::pipeline::get_pipeline_by_id(&txn, tenant_id, pipeline_id, false).await?;
         txn.commit().await?;
@@ -230,7 +564,7 @@ impl Storage for StoragePostgres {
         pipeline_id: PipelineId,
     ) -> Result<ExtendedPipelineDescrMonitoring, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline = operations::pipeline::get_pipeline_by_id_for_monitoring(
             &txn,
             tenant_id,
@@ -250,12 +584,7 @@ impl Storage for StoragePostgres {
         provision_called: bool,
     ) -> Result<ExtendedPipelineDescrRunner, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let pipeline_monitoring = operations::pipeline::get_pipeline_by_id_for_monitoring(
             &txn,
             tenant_id,
@@ -303,7 +632,7 @@ impl Storage for StoragePostgres {
         pipeline: PipelineDescr,
     ) -> Result<ExtendedPipelineDescr, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
 
         // Create new pipeline
         operations::pipeline::new_pipeline(
@@ -333,7 +662,7 @@ impl Storage for StoragePostgres {
         pipeline: PipelineDescr,
     ) -> Result<(bool, ExtendedPipelineDescr), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
 
         // Check if pipeline exists
         let current =
@@ -402,7 +731,7 @@ impl Storage for StoragePostgres {
         platform_version: &str,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
 
         // Check if pipeline exists
         let current =
@@ -443,6 +772,36 @@ impl Storage for StoragePostgres {
         Ok(())
     }
 
+    async fn patch_pipeline_deployment(
+        &self,
+        tenant_id: TenantId,
+        pipeline_name: &str,
+        patch: &PipelineDeploymentConfig,
+    ) -> Result<ExtendedPipelineDescr, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let current =
+            operations::pipeline::get_pipeline(&txn, tenant_id, pipeline_name, true).await?;
+        let patched = patch_deployment_config(running_deployment_config(&current)?, patch)?;
+
+        let stmt = txn
+            .prepare_cached(
+                "UPDATE pipeline
+                     SET deployment_config = $1,
+                         refresh_version = refresh_version + 1
+                     WHERE tenant_id = $2 AND id = $3",
+            )
+            .await?;
+        let rows_affected = txn
+            .execute(&stmt, &[&patched.to_string(), &tenant_id.0, &current.id.0])
+            .await?;
+        assert_eq!(rows_affected, 1);
+        let pipeline =
+            operations::pipeline::get_pipeline(&txn, tenant_id, pipeline_name, true).await?;
+        txn.commit().await?;
+        Ok(pipeline)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn update_pipeline(
         &self,
@@ -459,7 +818,7 @@ impl Storage for StoragePostgres {
         program_config: &Option<serde_json::Value>,
     ) -> Result<ExtendedPipelineDescr, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
 
         // Update existing pipeline
         operations::pipeline::update_pipeline(
@@ -496,7 +855,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<PipelineId, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline_id =
             operations::pipeline::delete_pipeline(&txn, tenant_id, pipeline_name).await?;
         txn.commit().await?;
@@ -510,7 +869,7 @@ impl Storage for StoragePostgres {
         program_version_guard: Version,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -537,7 +896,7 @@ impl Storage for StoragePostgres {
         program_version_guard: Version,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -566,7 +925,7 @@ impl Storage for StoragePostgres {
         program_info: &serde_json::Value,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -593,7 +952,7 @@ impl Storage for StoragePostgres {
         program_version_guard: Version,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -624,7 +983,7 @@ impl Storage for StoragePostgres {
         program_info_integrity_checksum: &str,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -644,6 +1003,36 @@ impl Storage for StoragePostgres {
         Ok(())
     }
 
+    async fn transit_program_status_to_success_no_binary(
+        &self,
+        tenant_id: TenantId,
+        pipeline_id: PipelineId,
+        program_version_guard: Version,
+        sql_compilation: &SqlCompilationInfo,
+        program_info: &serde_json::Value,
+        program_info_integrity_checksum: &str,
+    ) -> Result<(), DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::pipeline::set_program_status(
+            &txn,
+            tenant_id,
+            pipeline_id,
+            program_version_guard,
+            &ProgramStatus::Success,
+            &Some(sql_compilation.clone()),
+            &None,
+            &None,
+            &Some(program_info.clone()),
+            &None,
+            &None,
+            &Some(program_info_integrity_checksum.to_string()),
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
     async fn transit_program_status_to_sql_error(
         &self,
         tenant_id: TenantId,
@@ -652,7 +1041,7 @@ impl Storage for StoragePostgres {
         sql_compilation: &SqlCompilationInfo,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -680,7 +1069,7 @@ impl Storage for StoragePostgres {
         rust_compilation: &RustCompilationInfo,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -708,7 +1097,7 @@ impl Storage for StoragePostgres {
         system_error: &str,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_program_status(
             &txn,
             tenant_id,
@@ -734,7 +1123,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::dismiss_deployment_error(&txn, tenant_id, pipeline_name).await?;
         txn.commit().await?;
         Ok(())
@@ -749,7 +1138,7 @@ impl Storage for StoragePostgres {
         dismiss_error: bool,
     ) -> Result<PipelineId, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline_id = operations::pipeline::set_deployment_resources_desired_status(
             &txn,
             tenant_id,
@@ -770,7 +1159,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<PipelineId, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline_id = operations::pipeline::set_deployment_resources_desired_status(
             &txn,
             tenant_id,
@@ -791,7 +1180,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<(bool, PipelineId), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline =
             operations::pipeline::get_pipeline_for_monitoring(&txn, tenant_id, pipeline_name, true)
                 .await?;
@@ -823,7 +1212,7 @@ impl Storage for StoragePostgres {
         deployment_config: serde_json::Value,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         // If the pipeline currently is already Stopped and is desired to be Stopped,
         // then there is no need to transition to Provisioning
         let pipeline = operations::pipeline::get_pipeline_by_id_for_monitoring(
@@ -870,7 +1259,7 @@ impl Storage for StoragePostgres {
         deployment_resources_status_details: serde_json::Value,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::remain_deployment_resources_status_provisioning(
             &txn,
             tenant_id,
@@ -895,7 +1284,7 @@ impl Storage for StoragePostgres {
         deployment_runtime_desired_status: RuntimeDesiredStatus,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_deployment_resources_status_provisioned(
             &txn,
             tenant_id,
@@ -924,7 +1313,7 @@ impl Storage for StoragePostgres {
         storage_status_details: Option<serde_json::Value>,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::remain_deployment_resources_status_provisioned(
             &txn,
             tenant_id,
@@ -950,7 +1339,7 @@ impl Storage for StoragePostgres {
         storage_status_details: Option<serde_json::Value>,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline = operations::pipeline::get_pipeline_by_id_for_monitoring(
             &txn,
             tenant_id,
@@ -1001,7 +1390,7 @@ impl Storage for StoragePostgres {
         deployment_resources_status_details: serde_json::Value,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::remain_deployment_resources_status_stopping(
             &txn,
             tenant_id,
@@ -1022,7 +1411,7 @@ impl Storage for StoragePostgres {
         version_guard: Version,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_deployment_resources_status_stopped(
             &txn,
             tenant_id,
@@ -1042,7 +1431,7 @@ impl Storage for StoragePostgres {
         deployment_error: ErrorResponse,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline = operations::pipeline::get_pipeline_by_id_for_monitoring(
             &txn,
             tenant_id,
@@ -1078,7 +1467,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<PipelineId, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline =
             operations::pipeline::get_pipeline_for_monitoring(&txn, tenant_id, pipeline_name, true)
                 .await?;
@@ -1102,7 +1491,7 @@ impl Storage for StoragePostgres {
         pipeline_id: PipelineId,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::set_storage_status(
             &txn,
             tenant_id,
@@ -1121,7 +1510,7 @@ impl Storage for StoragePostgres {
         pipeline_name: &str,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::pipeline::increment_notify_counter(&txn, tenant_id, pipeline_name).await?;
         txn.commit().await?;
         Ok(())
@@ -1131,7 +1520,7 @@ impl Storage for StoragePostgres {
         &self,
     ) -> Result<Vec<(TenantId, PipelineId)>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline_ids = operations::pipeline::list_pipeline_ids_across_all_tenants(&txn).await?;
         txn.commit().await?;
         Ok(pipeline_ids)
@@ -1141,7 +1530,7 @@ impl Storage for StoragePostgres {
         &self,
     ) -> Result<Vec<(TenantId, ExtendedPipelineDescrMonitoring)>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipelines =
             operations::pipeline::list_pipelines_across_all_tenants_for_monitoring(&txn).await?;
         txn.commit().await?;
@@ -1155,7 +1544,7 @@ impl Storage for StoragePostgres {
         total_workers: usize,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipelines =
             operations::pipeline::list_pipelines_across_all_tenants_needing_sql_compilation_clear(
                 &txn,
@@ -1213,7 +1602,7 @@ impl Storage for StoragePostgres {
         total_workers: usize,
     ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let next_pipeline_program = operations::pipeline::get_next_sql_compilation(
             &txn,
             platform_version,
@@ -1232,7 +1621,7 @@ impl Storage for StoragePostgres {
         total_workers: usize,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipelines =
             operations::pipeline::list_pipelines_across_all_tenants_needing_rust_compilation_clear(
                 &txn,
@@ -1296,7 +1685,7 @@ impl Storage for StoragePostgres {
         total_workers: usize,
     ) -> Result<Option<(TenantId, ExtendedPipelineDescr)>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let next_pipeline_program = operations::pipeline::get_next_rust_compilation(
             &txn,
             platform_version,
@@ -1308,20 +1697,19 @@ impl Storage for StoragePostgres {
         Ok(next_pipeline_program)
     }
 
+    async fn count_pipelines_needing_compilation(&self) -> Result<u64, DBError> {
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        let count = operations::pipeline::count_pipelines_needing_compilation(&txn).await?;
+        txn.commit().await?;
+        Ok(count)
+    }
+
     async fn list_pipeline_programs_across_all_tenants(
         &self,
-    ) -> Result<
-        Vec<(
-            PipelineId,
-            Version,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )>,
-        DBError,
-    > {
+    ) -> Result<Vec<PipelineProgramArtifacts>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let pipeline_programs =
             operations::pipeline::list_pipeline_programs_across_all_tenants(&txn).await?;
         txn.commit().await?;
@@ -1335,12 +1723,7 @@ impl Storage for StoragePostgres {
         how_many: u64,
     ) -> Result<(ExtendedPipelineDescrMonitoring, Vec<SupportBundleData>), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let pipeline = operations::pipeline::get_pipeline_for_monitoring(
             &txn,
             tenant_id,
@@ -1356,7 +1739,7 @@ impl Storage for StoragePostgres {
 
     async fn list_cluster_monitor_events(&self) -> Result<Vec<ClusterMonitorEvent>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let events = operations::cluster_monitor::list_cluster_monitor_events_short(&txn).await?;
         txn.commit().await?;
         Ok(events)
@@ -1367,7 +1750,7 @@ impl Storage for StoragePostgres {
         event_id: ClusterMonitorEventId,
     ) -> Result<ClusterMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let event =
             operations::cluster_monitor::get_cluster_monitor_event_short(&txn, event_id).await?;
         txn.commit().await?;
@@ -1379,7 +1762,7 @@ impl Storage for StoragePostgres {
         event_id: ClusterMonitorEventId,
     ) -> Result<ExtendedClusterMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let event =
             operations::cluster_monitor::get_cluster_monitor_event_extended(&txn, event_id).await?;
         txn.commit().await?;
@@ -1388,7 +1771,7 @@ impl Storage for StoragePostgres {
 
     async fn get_latest_cluster_monitor_event_short(&self) -> Result<ClusterMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let event =
             operations::cluster_monitor::get_latest_cluster_monitor_event_short(&txn).await?;
         txn.commit().await?;
@@ -1399,7 +1782,7 @@ impl Storage for StoragePostgres {
         &self,
     ) -> Result<ExtendedClusterMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let event =
             operations::cluster_monitor::get_latest_cluster_monitor_event_extended(&txn).await?;
         txn.commit().await?;
@@ -1412,7 +1795,7 @@ impl Storage for StoragePostgres {
         event_descr: NewClusterMonitorEvent,
     ) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         operations::cluster_monitor::new_cluster_monitor_event(&txn, new_id, event_descr).await?;
         txn.commit().await?;
         Ok(())
@@ -1424,7 +1807,7 @@ impl Storage for StoragePostgres {
         retention_num: u16,
     ) -> Result<(u64, u64), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let (num_deleted_due_to_timestamp, num_deleted_due_to_limit) =
             operations::cluster_monitor::delete_cluster_monitor_events_beyond_retention(
                 &txn,
@@ -1442,12 +1825,7 @@ impl Storage for StoragePostgres {
         pipeline_name: String,
     ) -> Result<Vec<PipelineMonitorEvent>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let events = operations::pipeline_monitor::list_pipeline_monitor_events_short(
             &txn,
             tenant_id,
@@ -1464,12 +1842,7 @@ impl Storage for StoragePostgres {
         pipeline_name: String,
     ) -> Result<Vec<ExtendedPipelineMonitorEvent>, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let events = operations::pipeline_monitor::list_pipeline_monitor_events_extended(
             &txn,
             tenant_id,
@@ -1487,12 +1860,7 @@ impl Storage for StoragePostgres {
         event_id: PipelineMonitorEventId,
     ) -> Result<PipelineMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let event = operations::pipeline_monitor::get_pipeline_monitor_event_short(
             &txn,
             tenant_id,
@@ -1511,12 +1879,7 @@ impl Storage for StoragePostgres {
         event_id: PipelineMonitorEventId,
     ) -> Result<ExtendedPipelineMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let event = operations::pipeline_monitor::get_pipeline_monitor_event_extended(
             &txn,
             tenant_id,
@@ -1534,12 +1897,7 @@ impl Storage for StoragePostgres {
         pipeline_name: String,
     ) -> Result<PipelineMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let event = operations::pipeline_monitor::get_latest_pipeline_monitor_event_short(
             &txn,
             tenant_id,
@@ -1556,12 +1914,7 @@ impl Storage for StoragePostgres {
         pipeline_name: String,
     ) -> Result<ExtendedPipelineMonitorEvent, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
+        let txn = transaction::begin_read_only(&mut client).await?;
         let event = operations::pipeline_monitor::get_latest_pipeline_monitor_event_extended(
             &txn,
             tenant_id,
@@ -1577,7 +1930,7 @@ impl Storage for StoragePostgres {
         retention_num: u32,
     ) -> Result<u64, DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let num_deleted =
             operations::pipeline_monitor::delete_pipeline_monitor_events_exceeding_retention(
                 &txn,
@@ -1590,6 +1943,13 @@ impl Storage for StoragePostgres {
 }
 
 impl StoragePostgres {
+    /// Public mirror of the `Storage::count_pipelines_needing_compilation`
+    /// trait method: the enterprise runner derives compiler autoscaling demand
+    /// from it but cannot name the crate-private `Storage` trait.
+    pub async fn count_pipelines_needing_compilation(&self) -> Result<u64, DBError> {
+        <Self as Storage>::count_pipelines_needing_compilation(self).await
+    }
+
     pub async fn connect(
         db_config: &DatabaseConfig,
         #[cfg(feature = "postgresql_embedded")] pg_embed_config: PgEmbedConfig,
@@ -1597,7 +1957,18 @@ impl StoragePostgres {
         #[cfg(feature = "postgresql_embedded")]
         if db_config.uses_postgres_embed() {
             let database_dir = pg_embed_config.pg_embed_data_dir();
-            let pg_inst = pg_setup::install(database_dir, true, Some(8082)).await?;
+            let port = pg_embed_config.pg_embed_port;
+            let pg_inst = pg_setup::install(database_dir, true, Some(port))
+                .await
+                .inspect_err(|_| {
+                    // Postgres only reports that it could not start; name the
+                    // common cause, which is otherwise hidden in its own log.
+                    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                        tracing::error!(
+                            "Embedded Postgres could not start because port {port} is already in use; choose another port with --pg-embed-port"
+                        );
+                    }
+                })?;
             let db_name = "postgres";
             if !pg_inst.database_exists(db_name).await? {
                 pg_inst.create_database(db_name).await?;
@@ -1620,13 +1991,15 @@ impl StoragePostgres {
         db_config: &DatabaseConfig,
         #[cfg(feature = "postgresql_embedded")] pg_inst: Option<postgresql_embedded::PostgreSQL>,
     ) -> Result<Self, DBError> {
-        let mut config = db_config.tokio_postgres_config()?;
-        let new_options = if let Some(options) = config.get_options() {
-            format!("{options} -c lock_timeout=10000")
-        } else {
-            "-c lock_timeout=10000".to_string()
-        };
-        config.options(new_options);
+        // The connection deliberately carries no `options` startup parameter:
+        // a pooler in between rejects parameters it does not know. The lock
+        // timeout the manager needs is set per transaction instead, by
+        // `db::transaction` (which explains the trade-off in detail). Note that
+        // this leaves the transactions refinery runs for the migrations without
+        // a lock timeout, which is what a rolling upgrade wants: an instance
+        // starting up waits for the migration of another one to finish rather
+        // than failing to start.
+        let config = db_config.tokio_postgres_config()?;
         debug!(
             "Opening Postgres connection with configuration: {:?}",
             config
@@ -1656,6 +2029,22 @@ impl StoragePostgres {
     pub async fn run_migrations(&self) -> Result<(), DBError> {
         debug!("Applying database migrations if needed...");
         let mut client = self.pool.get().await?;
+
+        // Expose the configured OIDC issuer to migrations that need it, as a
+        // session setting on the connection refinery is about to use. Passing it
+        // this way rather than generating the SQL keeps each migration's text
+        // fixed: refinery checksums that text and refuses to start on a mismatch,
+        // so a migration whose text varied with the environment would abort
+        // startup the day someone changed the issuer. Empty when auth is off,
+        // which reads back as NULL through `current_setting(.., true)`.
+        let configured_issuer = std::env::var("FELDERA_AUTH_ISSUER").unwrap_or_default();
+        client
+            .execute(
+                "SELECT set_config('feldera.auth_issuer', $1, false)",
+                &[&configured_issuer],
+            )
+            .await?;
+
         let report = embedded::migrations::runner()
             .run_async(&mut **client)
             .await?;
@@ -1674,20 +2063,30 @@ impl StoragePostgres {
         // YAML -> JSON migration
         self.perform_yaml_to_json_migration().await?;
 
+        self.ensure_default_tenant().await?;
+        Ok(())
+    }
+
+    /// Creates the default tenant if this installation does not have it yet.
+    pub(crate) async fn ensure_default_tenant(&self) -> Result<(), DBError> {
         let default_tenant = TenantRecord::default();
-        self.get_or_create_tenant_id(
+        let mut client = self.pool.get().await?;
+        let txn = transaction::begin(&mut client).await?;
+        operations::tenant::ensure_default_tenant(
+            &txn,
             default_tenant.id.0,
-            default_tenant.tenant,
-            default_tenant.provider,
+            &default_tenant.tenant,
+            &default_tenant.initial_provider,
         )
         .await?;
+        txn.commit().await?;
         Ok(())
     }
 
     /// Performs the conversion of the pipeline table fields which are YAML to become JSON.
     async fn perform_yaml_to_json_migration(&self) -> Result<(), DBError> {
         let mut client = self.pool.get().await?;
-        let txn = client.transaction().await?;
+        let txn = transaction::begin(&mut client).await?;
         let stmt = txn
             .prepare_cached(
                 "SELECT p.id, p.runtime_config, p.program_config, p.program_info, p.deployment_error, p.deployment_config

@@ -110,15 +110,19 @@ if you'd like to experiment with Kafka and other auxiliary services.
 To run Feldera from sources, ensure at least 6 GB of free space in the sources directory and an additional 7 GB in your home directory, then install the required dependencies:
 
 - [Rust tool chain](https://www.rust-lang.org/tools/install)
+- C and C++ compiler toolchain (e.g., gcc, g++)
 - cmake
 - libssl-dev
 - libsasl2-dev
-- golang-go (required to build aws-lc-fips-sys when using rustls FIPS)
-- pkg-config
+- zlib1g-dev
 - libzstd-dev
+- golang-go (only to build with `--features fips`, which compiles aws-lc-fips-sys from source; a default build does not need it)
+- pkg-config
 - clang
+- graphviz
 - Java Development Kit (JDK), version 19 or newer (21 is recommended)
 - maven
+- Python 3.10 (for the [Python SDK](https://docs.feldera.com/python/) and integration tests)
 - [Bun](https://bun.sh/docs/installation)
 - [nodejs v20](https://github.com/nodesource/distributions/blob/master/DEV_README.md)
 
@@ -128,9 +132,17 @@ xcode-select --install
 ```
 for Xcode tools that includes clang, and
 ```
-brew install cmake openssl cyrus-sasl go pkg-config zstd openjdk@21 maven oven-sh/bun/bun node@20
+brew install cmake openssl cyrus-sasl zlib zstd go pkg-config graphviz openjdk@21 maven python@3.10 oven-sh/bun/bun node@20
 ```
 for the rest.
+
+The Kafka connectors link librdkafka dynamically, so it has to be installed before the workspace will build:
+
+```
+./scripts/install-librdkafka.sh
+```
+
+The script builds librdkafka against AWS-LC, which is what keeps Kafka TLS on the same cryptographic implementation as the rest of the system. Distribution packages are built against OpenSSL and are usually older than the version the `rdkafka-sys` crate requires, so installing one of those is not equivalent. Run the script again after a `rdkafka` version bump; it reads the version it needs from `Cargo.lock`. Set `PREFIX` to install somewhere other than `/usr/local`, in which case `PKG_CONFIG_PATH` has to point at `$PREFIX/lib/pkgconfig`.
 
 After that, the first step is to build the SQL compiler:
 
@@ -167,7 +179,7 @@ Feldera is generally [faster and uses less memory](https://www.feldera.com/blog/
 than systems like stream processors.
 
 <p float="left" align="middle">
-  <img src="https://www.feldera.com/_next/image?url=https://cdn.sanity.io/images/nlte859i/production/c80a9d592fb6f6e4cf2c7a665add24da65998123-1740x493.png?D75&fit=clip&auto=format&w=1920&q=100" width="100%">
+  <img alt="Nexmark throughput in events per second by query, comparing Feldera in-memory, Feldera with storage, and Flink" src="https://cdn.sanity.io/images/nlte859i/production/c80a9d592fb6f6e4cf2c7a665add24da65998123-1740x493.png?auto=format&fit=max&w=1740" width="100%">
 </p>
 
 ## 👍 Contributing

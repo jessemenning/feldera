@@ -24,7 +24,19 @@ An operation with a `NaN` input yields `NaN`.  The only exception
 is when the operation's output does not depend on the `NaN` value:
 an example is `NaN` raised to the zero power yields one.
 
-In sorting order `NaN` is considered greater than all other values.
+Unlike IEEE 754, which leaves `NaN` unordered, Feldera SQL orders all
+floating point values, both when sorting and when comparing them with
+`=`, `<`, `>`, and the other comparison operators.  This is the same
+order as in PostgreSQL:
+
+- `-Infinity` is smaller than every other value.
+- `NaN` is greater than every other value, including `Infinity`.
+- All `NaN` values are equal to each other: `NaN = NaN` is `true`.
+- `-0e0` and `0e0` are equal.
+
+Rounding makes floating point values unreliable operands for equality
+tests, `GROUP BY`, and `DISTINCT`; the compiler warns about such uses.
+See [comparing floating point values](/sql/comparisons#comparing-floating-point-values).
 
 The legal operations are `+` (plus, unary and binary), `-` (minus,
 unary and binary), `*` (multiplication), `/` (division), `%`
@@ -60,10 +72,22 @@ digits`.`digits[`e`[`+-`]digits]
 
 Alternatively, you can use an explicit cast:
 
-```SQL
+```sql
 REAL '1.23'  -- string style
 1.23::REAL   -- PostgreSQL style
 ```
+
+## Differences from IEEE 754
+
+Feldera has only one zero and only one `NaN` value.  An operation
+whose IEEE 754 result is a negative zero produces `0e0`: for example
+`-x` when `x` is zero, `0e0 * -1e0`, or `CAST('-0' AS DOUBLE)`.
+Some results differ from the results that IEEE 754 specifies:
+
+- `1e0 / -0e0` is `Infinity`; IEEE 754 specifies `-Infinity`.
+- `POWER(-0e0, -1e0)` is `Infinity`; IEEE 754 specifies `-Infinity`.
+- `ATAN2(0e0, -0e0)` is `0`; IEEE 754 specifies pi.
+- A zero converted to a string never has a minus sign.
 
 ## Predefined functions on Floating-point Values
 
@@ -186,7 +210,7 @@ REAL '1.23'  -- string style
   <tr>
     <td><a id="is_nan"></a><code>IS_NAN(value)</code></td>
     <td><code>REAL</code>, <code>DOUBLE</code></td>
-    <td>Returns true if the value is NaN. Note that two NaN values may not be equal.</td>
+    <td>Returns true if the value is NaN.</td>
   </tr>
   <tr>
     <td><a id="ln"></a><code>LN(value)</code></td>

@@ -1,25 +1,26 @@
+use crate::db::types::oidc_trust::claim_matches;
 use crate::db::types::program::CompilationProfile;
+use crate::db::types::role::Role;
 use crate::db::types::version::Version;
 use crate::db::{error::DBError, types::pipeline::PipelineId};
 use crate::has_unstable_feature;
+use crate::oidc::destination::TenantIssuerPolicy;
+use actix_web::dev::ServiceRequest;
 use actix_web::http::header;
-use anyhow::{Error as AnyError, Result as AnyResult};
+use anyhow::{Context, Error as AnyError, Result as AnyResult};
 use clap::Parser;
-use openssl::asn1::Asn1Time;
-use openssl::bn::{BigNum, MsbOption};
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
-use openssl::x509::extension::SubjectAlternativeName;
-use openssl::x509::{X509NameBuilder, X509};
-use postgres_openssl::MakeTlsConnector;
 use reqwest::Certificate;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore};
-use serde::Deserialize;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
+use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     env,
@@ -28,6 +29,8 @@ use std::{
     sync::Once,
     thread,
 };
+use time::{Duration, OffsetDateTime};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::warn;
 
 /// The default `platform_version` is formed using three compilation environment variables:
@@ -35,15 +38,22 @@ use tracing::warn;
 /// - `FELDERA_PLATFORM_VERSION_SUFFIX` set by the custom `build.rs` script,
 ///   which is determined using the similarly named environment variable
 ///
-/// ... and whether the `feldera-enterprise` feature is enabled.
+/// ... and whether the `feldera-enterprise` or `feldera-enterprise-dev` feature is enabled.
 fn default_platform_version() -> String {
     let suffix = env!("FELDERA_PLATFORM_VERSION_SUFFIX").to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
-    if cfg!(feature = "feldera-enterprise") {
+    let enterprise_build = if cfg!(feature = "feldera-enterprise-dev") {
+        Some("enterprise-dev")
+    } else if cfg!(feature = "feldera-enterprise") {
+        Some("enterprise")
+    } else {
+        None
+    };
+    if let Some(enterprise_build) = enterprise_build {
         if suffix.is_empty() {
-            format!("{version}+enterprise")
+            format!("{version}+{enterprise_build}")
         } else {
-            format!("{version}+enterprise.{suffix}")
+            format!("{version}+{enterprise_build}.{suffix}")
         }
     } else if suffix.is_empty() {
         version
@@ -66,6 +76,10 @@ fn default_pg_embed_working_directory() -> String {
         .into_os_string()
         .into_string()
         .unwrap()
+}
+
+fn default_pg_embed_port() -> u16 {
+    8082
 }
 
 /// Default compiler working directory: ~/.feldera/compiler
@@ -106,9 +120,48 @@ fn default_individual_tenant() -> bool {
     true
 }
 
+/// Default value for provision_on_login flag.
+fn default_provision_on_login() -> bool {
+    true
+}
+
 /// Default audience claim value for OIDC authentication.
 fn default_auth_audience() -> String {
     "feldera-api".to_string()
+}
+
+/// Default role for an authenticated user with no explicit tenant membership.
+fn default_default_role() -> Role {
+    Role::Read
+}
+
+/// Parse the configured default role, restricting it to `read` or `write`
+/// (a tenant `admin`/`owner` is never granted implicitly).
+fn parse_default_role(s: &str) -> Result<Role, String> {
+    match Role::from_str(s) {
+        Ok(role @ (Role::Read | Role::Write)) => Ok(role),
+        Ok(other) => Err(format!(
+            "default role must be 'read' or 'write', not '{other}'"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Default role granted to the login that first creates a tenant.
+fn default_first_user_role() -> Role {
+    Role::Admin
+}
+
+/// Parse the configured first-user role, restricting it to `read`, `write`, or
+/// `admin` (`owner` is platform-wide, never a tenant membership).
+fn parse_first_user_role(s: &str) -> Result<Role, String> {
+    match Role::from_str(s) {
+        Ok(role @ (Role::Read | Role::Write | Role::Admin)) => Ok(role),
+        Ok(other) => Err(format!(
+            "first user role must be 'read', 'write', or 'admin', not '{other}'"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Default number of monitor events that are retained for each pipeline.
@@ -141,6 +194,9 @@ fn default_dbsp_override_path() -> String {
 fn default_sql_compiler_path() -> String {
     "sql-to-dbsp-compiler/SQL-compiler/target/sql2dbsp-jar-with-dependencies.jar".to_string()
 }
+
+/// The `feldera-udf` release that Gen2 UDFs build against by default.
+const DEFAULT_GEN2_UDF_SDK_VERSION: &str = "0.0.1";
 
 /// Default location of the Rust compilation `Cargo.lock`.
 fn default_compilation_cargo_lock_path() -> String {
@@ -273,7 +329,7 @@ pub struct CommonConfig {
     /// - `runtime_version`: Allows to override the runtime version of a pipeline on the platform.
     /// - `testing`
     /// - `rust_compiler_full_cleanup`: the Rust compiler fully cleans up the target directory if the
-    ///   disk space usage is approaching its limit.
+    ///   disk space usage is approaching its limit, and the one of the Gen-2 UDF workspace too.
     #[arg(verbatim_doc_comment, long, env = "FELDERA_UNSTABLE_FEATURES")]
     pub unstable_features: Option<String>,
 
@@ -353,34 +409,24 @@ impl CommonConfig {
             return Ok(());
         }
 
-        let private_key = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = {
+            let mut name = rcgen::DistinguishedName::new();
+            name.push(rcgen::DnType::CommonName, "localhost");
+            name
+        };
+        params.subject_alt_names = vec![
+            rcgen::SanType::DnsName("localhost".try_into()?),
+            rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ];
+        params.not_before = OffsetDateTime::now_utc();
+        params.not_after = params.not_before + Duration::days(30);
 
-        let mut name_builder = X509NameBuilder::new()?;
-        name_builder.append_entry_by_nid(Nid::COMMONNAME, "localhost")?;
-        let name = name_builder.build();
+        let key_pair = rcgen::KeyPair::generate()?;
+        let certificate = params.self_signed(&key_pair)?;
 
-        let mut certificate_builder = X509::builder()?;
-        certificate_builder.set_version(2)?;
-        let mut serial = BigNum::new()?;
-        serial.rand(128, MsbOption::MAYBE_ZERO, false)?;
-        let serial = serial.to_asn1_integer()?;
-        certificate_builder.set_serial_number(&serial)?;
-        certificate_builder.set_subject_name(&name)?;
-        certificate_builder.set_issuer_name(&name)?;
-        certificate_builder.set_pubkey(&private_key)?;
-        let not_before = Asn1Time::days_from_now(0)?;
-        let not_after = Asn1Time::days_from_now(30)?;
-        certificate_builder.set_not_before(not_before.as_ref())?;
-        certificate_builder.set_not_after(not_after.as_ref())?;
-        let san = SubjectAlternativeName::new()
-            .dns("localhost")
-            .ip("127.0.0.1")
-            .build(&certificate_builder.x509v3_context(None, None))?;
-        certificate_builder.append_extension(san)?;
-        certificate_builder.sign(&private_key, MessageDigest::sha256())?;
-
-        let cert_pem = certificate_builder.build().to_pem()?;
-        let key_pem = private_key.private_key_to_pem_pkcs8()?;
+        let cert_pem = certificate.pem().into_bytes();
+        let key_pem = key_pair.serialize_pem().into_bytes();
 
         let dir = env::temp_dir().join("feldera-testing-https");
         create_dir_all(&dir)?;
@@ -490,6 +536,27 @@ impl CommonConfig {
             paths.push(private_ca_cert_path);
         }
         paths
+    }
+
+    /// The roots this deployment configured, for a client that must keep
+    /// trusting the public web PKI as well.
+    ///
+    /// [`Self::reqwest_client`] replaces the root store outright, which suits a
+    /// call that only ever reaches this deployment. An OIDC fetch is different:
+    /// it may reach a public provider or one sitting behind these certificates,
+    /// so it adds them to the platform's roots rather than replacing them.
+    pub async fn configured_root_certificates(&self) -> AnyResult<Vec<Certificate>> {
+        let mut roots = Vec::new();
+        for path in self.ca_cert_paths() {
+            let pem = tokio::fs::read(path)
+                .await
+                .with_context(|| format!("reading CA certificate '{path}'"))?;
+            roots.extend(
+                Certificate::from_pem_bundle(&pem)
+                    .with_context(|| format!("parsing CA certificate '{path}'"))?,
+            );
+        }
+        Ok(roots)
     }
 
     /// Creates `awc` client.
@@ -627,6 +694,11 @@ pub struct PgEmbedConfig {
     #[serde(default = "default_pg_embed_working_directory")]
     #[arg(long, default_value_t = default_pg_embed_working_directory())]
     pub pg_embed_working_directory: String,
+
+    /// Port the embedded Postgres instance listens on.
+    #[serde(default = "default_pg_embed_port")]
+    #[arg(long, default_value_t = default_pg_embed_port(), env = "FELDERA_PG_EMBED_PORT")]
+    pub pg_embed_port: u16,
 }
 
 impl PgEmbedConfig {
@@ -657,7 +729,8 @@ pub struct DatabaseConfig {
 
     /// Create a TLS connector by loading a certificate from the path specified argument.
     ///
-    /// If the argument is not set, tries to connect without TLS.
+    /// If the argument is not set, the connector still negotiates TLS when the
+    /// server offers it and verifies the server against the system trust roots.
     #[arg(long, env = "FELDERA_DB_TLS_CERT_PATH")]
     pub db_tls_certificate_path: Option<String>,
 
@@ -716,51 +789,157 @@ impl DatabaseConfig {
         }
     }
 
-    pub(crate) fn tls_connector(&self) -> Result<MakeTlsConnector, DBError> {
-        let mut builder =
-            SslConnector::builder(SslMethod::tls()).map_err(|e| DBError::TlsConnection {
-                hint: "Unable to build TLS Connector to connect to PostgreSQL".to_string(),
-                openssl_error: Some(e),
+    pub(crate) fn tls_connector(&self) -> Result<MakeRustlsConnect, DBError> {
+        let mut roots = RootCertStore::empty();
+        if let Some(ca_path) = &self.db_tls_certificate_path {
+            let pem = std::fs::read(ca_path).map_err(|e| DBError::TlsConnection {
+                hint: format!("Unable to read TLS certificate at {ca_path:?}"),
+                error: Some(e.to_string()),
             })?;
+            let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem.as_slice()).collect();
+            let certs = certs.map_err(|e| DBError::TlsConnection {
+                hint: format!("Unable to parse TLS certificate at {ca_path:?}"),
+                error: Some(e.to_string()),
+            })?;
+            for cert in certs {
+                roots.add(cert).map_err(|e| DBError::TlsConnection {
+                    hint: format!("Unable to trust TLS certificate at {ca_path:?}"),
+                    error: Some(e.to_string()),
+                })?;
+            }
+        } else {
+            // use the system trust store.
+            let native =
+                rustls_native_certs::load_native_certs().map_err(|e| DBError::TlsConnection {
+                    hint: "Unable to load the system TLS trust store".to_string(),
+                    error: Some(e.to_string()),
+                })?;
+            for cert in native {
+                let _ = roots.add(cert);
+            }
+        }
 
-        if self.disable_tls_verify {
+        let builder = ClientConfig::builder();
+        let config = if self.disable_tls_verify {
             static ONCE: Once = Once::new();
             ONCE.call_once(|| {
                 warn!("PostgreSQL TLS verification is disabled -- not recommended for production environments.");
             });
-            builder.set_verify(SslVerifyMode::NONE);
-        }
-
-        if let Some(ca_path) = &self.db_tls_certificate_path {
             builder
-                .set_ca_file(ca_path)
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                .with_no_client_auth()
+        } else if self.disable_tls_hostname_verify {
+            warn!(
+                "PostgreSQL TLS hostname verification is disabled. The PostgreSQL server's hostname may not match the one specified in the SSL certificate."
+            );
+            let inner = WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
                 .map_err(|e| DBError::TlsConnection {
-                    hint: format!(
-                        "Unable to find TLS certificate at {:?}",
-                        self.db_tls_certificate_path
-                    ),
-                    openssl_error: Some(e),
+                    hint: "Unable to build TLS Connector to connect to PostgreSQL".to_string(),
+                    error: Some(e.to_string()),
                 })?;
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipHostnameVerification(inner)))
+                .with_no_client_auth()
         } else {
-            builder
-                .set_default_verify_paths()
-                .map_err(|e| DBError::TlsConnection {
-                    hint: "Unable to configure default TLS paths".to_string(),
-                    openssl_error: Some(e),
-                })?;
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+
+        Ok(MakeRustlsConnect::new(config))
+    }
+}
+
+/// Accepts any server certificate. Used only when TLS verification is disabled
+/// explicitly, which the connector warns about.
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::CryptoProvider::get_default()
+            .expect("a default crypto provider is installed at startup")
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Verifies the certificate chain but tolerates a name mismatch, matching the
+/// behaviour of the `disable_tls_hostname_verify` option.
+#[derive(Debug)]
+struct SkipHostnameVerification(Arc<WebPkiServerVerifier>);
+
+impl ServerCertVerifier for SkipHostnameVerification {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(rustls::Error::InvalidCertificate(CertificateError::NotValidForName))
+            | Err(rustls::Error::InvalidCertificate(CertificateError::NotValidForNameContext {
+                ..
+            })) => Ok(ServerCertVerified::assertion()),
+            other => other,
         }
+    }
 
-        let mut connector = MakeTlsConnector::new(builder.build());
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
 
-        if self.disable_tls_hostname_verify {
-            warn!("PostgreSQL TLS hostname verification is disabled. The PostgreSQL server's hostname may not match the one specified in the SSL certificate.");
-            connector.set_callback(|ctx, _| {
-                ctx.set_verify_hostname(false);
-                Ok(())
-            });
-        }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
 
-        Ok(connector)
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
     }
 }
 
@@ -941,9 +1120,206 @@ pub struct ApiServerConfig {
     #[serde(default = "default_auth_audience")]
     #[arg(long, default_value = "feldera-api", env = "FELDERA_AUTH_AUDIENCE")]
     pub auth_audience: String,
+
+    /// Identities granted the platform-wide `owner` role, comma-separated. Each
+    /// entry matches an access token in one of three forms:
+    ///
+    ///   - a provider-verified email:      `ops@acme.com`
+    ///   - a bare OIDC subject (`sub`):    `a1b2c3d4-5e6f-7890-abcd-ef1234567890`
+    ///   - a provider-qualified subject:   `https://accounts.google.com 1234567890`
+    ///
+    /// An email matches only when the provider marks it verified, so prefer the
+    /// subject forms, which are stable and not user-settable.
+    #[serde(default)]
+    #[arg(long, value_delimiter = ',', env = "FELDERA_OWNERS")]
+    pub owners: Vec<String>,
+
+    /// OIDC trust relationships granting the platform-wide `owner` role, as a
+    /// JSON array. A token from `issuer` whose `sub` matches `subject`, and
+    /// whose `aud` matches `audience` when one is given, acts as an owner. `*`
+    /// is a wildcard in `subject` and `audience`.
+    ///
+    /// `FELDERA_OWNER_TRUSTS='[{"issuer": "https://accounts.google.com",
+    /// "subject": "1234567890", "audience": "my-client-id"}]'`
+    ///
+    /// Owner is configuration only, like `--owners`: it is never granted at
+    /// runtime, so no request can mint an owner. Trusts registered through the
+    /// API grant `read`, `write` or `admin` within one tenant.
+    #[serde(default)]
+    #[arg(long, default_value = "[]", env = "FELDERA_OWNER_TRUSTS")]
+    pub owner_trusts: OwnerTrusts,
+
+    /// Permit a trust registered through the API to name an issuer on a private
+    /// or loopback address. Default: `false`.
+    ///
+    /// The manager fetches a trust's issuer from its own network position
+    /// before it verifies any token: in installations where tenant admins are
+    /// allowed and need to point to local issuers, set this to true. Not
+    /// permitted by default, so tenant admins cannot steer the manager to fetch
+    /// internal service locations. https is required either way.
+    ///
+    /// Issuers named at deploy time, the login provider and `--owner-trusts`,
+    /// are unaffected: they may sit on a private network either way.
+    #[serde(default)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "FELDERA_ALLOW_INTERNAL_TENANT_TRUST_ISSUERS")]
+    pub allow_internal_tenant_trust_issuers: bool,
+
+    /// Role assigned to an authenticated user who has no explicit tenant
+    /// membership yet. Must be `read` or `write`. Default: `read`.
+    #[serde(default = "default_default_role")]
+    #[arg(long, default_value = "read", value_parser = parse_default_role, env = "FELDERA_AUTH_DEFAULT_ROLE")]
+    pub default_role: Role,
+
+    /// Role granted to the user whose login first creates a tenant
+    /// (auto-provisioning). Must be `read`, `write`, or `admin`. Default:
+    /// `admin`, so the tenant's creator can manage it. Set it lower (e.g.
+    /// `write`) for a shared sandbox where users should not administer the
+    /// tenant they land in.
+    #[serde(default = "default_first_user_role")]
+    #[arg(long, default_value = "admin", value_parser = parse_first_user_role, env = "FELDERA_AUTH_FIRST_USER_ROLE")]
+    pub first_user_role: Role,
+
+    /// Provision tenants and memberships at login according to the tenancy
+    /// strategy: the token's `tenants` claim, the issuer tenant, or the
+    /// per-`sub` personal tenant. Default: `true`.
+    ///
+    /// When `false`, a login creates no tenant and enrolls no one. Access
+    /// comes only from membership rows granted through the RBAC endpoints,
+    /// a user with no membership is denied, and `--default-role` and
+    /// `--first-user-role` do not apply. Requires a configured `--owners` or
+    /// `--owner-trusts`, because otherwise no principal could ever grant
+    /// access.
+    #[serde(default = "default_provision_on_login")]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true, env = "FELDERA_AUTH_PROVISION_ON_LOGIN")]
+    pub provision_on_login: bool,
+
+    /// URL path prefix that Feldera is served under.
+    ///
+    /// Set this when Feldera sits behind a reverse proxy that mounts it on a
+    /// subpath rather than at the origin root — for example, serving
+    /// `https://example.com/feldera/` instead of `https://example.com/`.
+    ///
+    /// The value must start with a `/` and must not end with one (e.g.
+    /// `/feldera`). Leave it empty (the default) to serve from the root path.
+    ///
+    /// When set, the HTTP API is mounted under `<base-path>/v0`, the web
+    /// console under `<base-path>/`, and the manager rewrites the embedded
+    /// console bundle at startup so its client-side router, links, and API
+    /// calls all use the prefix. No rebuild is required.
+    #[serde(default)]
+    #[arg(long, default_value = "", env = "FELDERA_HTTP_BASE_PATH")]
+    pub http_base_path: String,
+
+    /// Allow a `PATCH` of `deployment_config` to resize a running pipeline's CPU and memory in
+    /// place, without a restart. Enable only when the runner supports it.
+    #[serde(default)]
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = false, env = "FELDERA_ENABLE_PIPELINE_RESIZE")]
+    pub enable_pipeline_resize: bool,
+}
+
+/// A trust relationship granting the platform-wide `owner` role, declared at
+/// launch through `--owner-trusts` / `FELDERA_OWNER_TRUSTS`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OwnerTrust {
+    /// Issuer URL, matched against the token's `iss` claim exactly.
+    pub issuer: String,
+    /// Pattern matched against the token's `sub` claim. `*` matches any
+    /// sequence of characters.
+    pub subject: String,
+    /// Pattern matched against the token's `aud` claim. Omit to accept any
+    /// audience.
+    #[serde(default)]
+    pub audience: Option<String>,
+}
+
+impl OwnerTrust {
+    /// Whether this trust admits the token described by these claims. The
+    /// issuer must match exactly; the subject and, when the trust sets one, the
+    /// audience match as claim patterns, where `*` stands for any sequence. A
+    /// trust that sets no audience accepts any, since some issuers put nothing
+    /// useful in the audience of a workload token.
+    pub fn admits(&self, issuer: &str, subject: &str, audiences: &[String]) -> bool {
+        self.issuer == issuer
+            && claim_matches(&self.subject, subject)
+            && match &self.audience {
+                None => true,
+                Some(pattern) => audiences.iter().any(|aud| claim_matches(pattern, aud)),
+            }
+    }
+}
+
+/// The configured owner trusts. A newtype so that the command line and the
+/// environment can carry the whole list as one JSON value, while a config file
+/// can spell it as an ordinary list.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct OwnerTrusts(pub Vec<OwnerTrust>);
+
+impl OwnerTrusts {
+    /// Whether any configured trust admits this token as a platform owner.
+    pub fn admits(&self, issuer: &str, subject: &str, audiences: &[String]) -> bool {
+        self.0
+            .iter()
+            .any(|trust| trust.admits(issuer, subject, audiences))
+    }
+
+    /// Whether any configured trust names this issuer. The auth path checks
+    /// this before fetching an issuer's discovery document, so that an issuer
+    /// nobody trusts never causes an outbound request.
+    pub fn names_issuer(&self, issuer: &str) -> bool {
+        self.0.iter().any(|trust| trust.issuer == issuer)
+    }
+}
+
+impl FromStr for OwnerTrusts {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let trusts: Vec<OwnerTrust> = serde_json::from_str(value)
+            .map_err(|e| format!("owner trusts must be a JSON array: {e}"))?;
+        for trust in &trusts {
+            if trust.issuer.is_empty() {
+                return Err("owner trust issuer must not be empty".to_string());
+            }
+            if trust.subject.is_empty() {
+                return Err("owner trust subject must not be empty".to_string());
+            }
+        }
+        Ok(OwnerTrusts(trusts))
+    }
 }
 
 impl ApiServerConfig {
+    /// Refuse a configuration that could never mint a membership: with
+    /// provisioning off and no configured owner, every login is denied and no
+    /// principal could ever create a tenant or grant access. A startup error
+    /// beats a silently bricked installation.
+    pub fn validate_authorization(&self) -> Result<(), String> {
+        if self.auth_provider != AuthProviderType::None
+            && !self.provision_on_login
+            && self.owners.is_empty()
+            && self.owner_trusts.0.is_empty()
+        {
+            return Err(
+                "provision-on-login is disabled but neither --owners nor --owner-trusts is \
+                 configured. With provisioning off, access comes only from membership rows, and \
+                 without an owner no principal could ever create one. Configure an owner or \
+                 re-enable --provision-on-login."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Where a trust registered through the API may point.
+    pub(crate) fn tenant_issuer_policy(&self) -> TenantIssuerPolicy {
+        if self.allow_internal_tenant_trust_issuers {
+            TenantIssuerPolicy::AllowInternal
+        } else {
+            TenantIssuerPolicy::PublicHttpsOnly
+        }
+    }
+
     /// CORS configuration
     pub(crate) fn cors(&self) -> actix_cors::Cors {
         if self.dev_mode {
@@ -964,9 +1340,28 @@ impl ApiServerConfig {
                 .allowed_headers(vec![
                     header::AUTHORIZATION,
                     header::ACCEPT,
+                    header::CONTENT_TYPE,
                     header::HeaderName::from_static(crate::auth::TENANT_HEADER),
                 ])
                 .supports_credentials()
+        }
+    }
+
+    /// The configured base path, normalized to either an empty string (a root
+    /// deployment) or a `/`-prefixed prefix without a trailing slash.
+    ///
+    /// Normalization is lenient: leading/trailing whitespace and trailing
+    /// slashes are trimmed, and a missing leading slash is added. Examples:
+    /// `""` → `""`, `"/"` → `""`, `"feldera"` → `"/feldera"`,
+    /// `"/feldera/"` → `"/feldera"`.
+    pub(crate) fn normalized_http_base_path(&self) -> String {
+        let trimmed = self.http_base_path.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else if trimmed.starts_with('/') {
+            trimmed.to_string()
+        } else {
+            format!("/{trimmed}")
         }
     }
 
@@ -987,6 +1382,65 @@ impl ApiServerConfig {
             individual_tenant: true,
             authorized_groups: vec![],
             auth_audience: "feldera-api".to_string(),
+            owners: vec![],
+            owner_trusts: OwnerTrusts::default(),
+            allow_internal_tenant_trust_issuers: false,
+            default_role: Role::Read,
+            first_user_role: Role::Admin,
+            provision_on_login: true,
+            http_base_path: String::new(),
+            enable_pipeline_resize: false,
+        }
+    }
+}
+
+/// The URL prefix the API and web console are mounted under, registered as
+/// app data so middleware can recover a root-relative path from a request.
+///
+/// Actix reports the full URL path, so a manager served from `/feldera` sees
+/// `/feldera/v0/pipelines`, while every path-matching rule in the manager —
+/// the RBAC route table, the session-endpoint exemption — is authored against
+/// root-relative patterns like `/v0/pipelines`. Middleware calls
+/// [`BasePath::root_relative`] before matching.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BasePath(pub String);
+
+impl BasePath {
+    /// `req`'s path as the manager's route tables spell it: root-relative, with
+    /// the deployment's base path removed.
+    ///
+    /// Reads the percent-decoded path actix itself dispatches on, so the
+    /// comparison sees the same spelling the router used.
+    pub(crate) fn root_relative(req: &ServiceRequest) -> &str {
+        Self::strip_from(req, req.match_info().as_str())
+    }
+
+    /// `path`, already taken from `req`, with `req`'s base path removed.
+    ///
+    /// The prefix comes from app data, which `build_app` registers on the App.
+    /// A request that carries none is already root-relative.
+    pub(crate) fn strip_from<'a>(req: &ServiceRequest, path: &'a str) -> &'a str {
+        match req.app_data::<BasePath>() {
+            Some(base_path) => base_path.strip(path),
+            None => path,
+        }
+    }
+
+    /// `path` with the base prefix removed.
+    ///
+    /// Callers see only paths actix already routed into a prefixed scope, so
+    /// the prefix is always present; a path without it comes back unchanged
+    /// rather than truncated into something else.
+    fn strip<'a>(&self, path: &'a str) -> &'a str {
+        if self.0.is_empty() {
+            return path;
+        }
+        match path.strip_prefix(self.0.as_str()) {
+            // The prefix has to end on a segment boundary, as actix's own scope
+            // matching requires: `/felderax` is a different mount point, not
+            // `/feldera` with a suffix.
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+            _ => path,
         }
     }
 }
@@ -1071,6 +1525,24 @@ pub struct CompilerConfig {
     #[arg(long, default_value_t = 1000)]
     pub binary_upload_retry_delay_ms: u64,
 
+    /// Directory of a local `feldera-udf` crate, the SDK that the Rust UDFs of Gen2
+    /// programs are written against.
+    ///
+    /// When unset, UDFs build against a crates.io release (`--gen2-udf-sdk-version`).
+    #[serde(default)]
+    #[arg(long, env = "GEN2_UDF_SDK_PATH")]
+    pub gen2_udf_sdk_path: Option<String>,
+
+    /// The crates.io release of `feldera-udf` that the Rust UDFs of Gen2 programs build
+    /// against (default: 0.0.1). Mutually exclusive with `--gen2-udf-sdk-path`.
+    #[serde(default)]
+    #[arg(
+        long,
+        env = "GEN2_UDF_SDK_VERSION",
+        conflicts_with = "gen2_udf_sdk_path"
+    )]
+    pub gen2_udf_sdk_version: Option<String>,
+
     /// Precompile Rust dependencies in the working directory.
     ///
     /// Instructs the manager to download and compile all crates needed by
@@ -1085,6 +1557,13 @@ pub struct CompilerConfig {
 }
 
 impl CompilerConfig {
+    /// The `feldera-udf` release Gen2 UDFs build against when no local SDK is configured.
+    pub(crate) fn gen2_udf_sdk_release(&self) -> &str {
+        self.gen2_udf_sdk_version
+            .as_deref()
+            .unwrap_or(DEFAULT_GEN2_UDF_SDK_VERSION)
+    }
+
     pub(crate) fn working_dir(&self) -> PathBuf {
         Path::new(&self.compiler_working_directory).to_path_buf()
     }
@@ -1097,6 +1576,34 @@ impl CompilerConfig {
         self.compilation_cargo_lock_path =
             help_canonicalize_path(&self.compilation_cargo_lock_path)?;
         self.dbsp_override_path = help_canonicalize_path(&self.dbsp_override_path)?;
+        // Generated UDF crates depend on the SDK by path, which must not be relative to them.
+        self.gen2_udf_sdk_path = self
+            .gen2_udf_sdk_path
+            .as_deref()
+            .map(help_canonicalize_path)
+            .transpose()?;
+        if let Some(sdk_path) = &self.gen2_udf_sdk_path
+            && !Path::new(sdk_path).join("Cargo.toml").is_file()
+        {
+            return Err(AnyError::msg(format!(
+                "the Gen-2 UDF SDK location '{sdk_path}' holds no Cargo.toml: \
+                 '--gen2-udf-sdk-path' must name the directory of the 'feldera-udf' crate"
+            )));
+        }
+        if self.gen2_udf_sdk_path.is_some() && self.gen2_udf_sdk_version.is_some() {
+            return Err(AnyError::msg(
+                "'--gen2-udf-sdk-path' and '--gen2-udf-sdk-version' are mutually exclusive: \
+                 Gen2 UDFs build against either a local SDK or a crates.io release",
+            ));
+        }
+        if let Some(version) = &self.gen2_udf_sdk_version
+            && semver::Version::parse(version).is_err()
+        {
+            return Err(AnyError::msg(format!(
+                "the Gen2 UDF SDK version '{version}' is not a version: \
+                 '--gen2-udf-sdk-version' must name a 'feldera-udf' release, such as '0.0.1'"
+            )));
+        }
         Ok(self)
     }
 }
@@ -1139,6 +1646,16 @@ impl LocalRunnerConfig {
     pub(crate) fn binary_file_path(&self, pipeline_id: PipelineId, version: Version) -> PathBuf {
         self.pipeline_dir(pipeline_id)
             .join(format!("program_{pipeline_id}_v{version}"))
+    }
+
+    /// Location to write the fetched UDF library of a Gen-2 pipeline to.
+    pub(crate) fn udf_library_file_path(
+        &self,
+        pipeline_id: PipelineId,
+        version: Version,
+    ) -> PathBuf {
+        self.pipeline_dir(pipeline_id)
+            .join(format!("udf_library_{pipeline_id}_v{version}.so"))
     }
 
     /// Location to write the fetched pipeline binary to.
@@ -1188,6 +1705,118 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// `root_relative` reads the prefix from app data. `build_app` always
+    /// registers it, so the fallback covers only a request built without it —
+    /// which is root-relative already.
+    #[test]
+    fn root_relative_path_falls_back_to_the_raw_path() {
+        let req = actix_web::test::TestRequest::get()
+            .uri("/v0/pipelines")
+            .to_srv_request();
+        assert_eq!(BasePath::root_relative(&req), "/v0/pipelines");
+
+        let req = actix_web::test::TestRequest::get()
+            .uri("/feldera/v0/pipelines")
+            .app_data(BasePath("/feldera".to_string()))
+            .to_srv_request();
+        assert_eq!(BasePath::root_relative(&req), "/v0/pipelines");
+    }
+
+    /// `strip` recovers the root-relative path the route tables are written
+    /// against. A root deployment is a pass-through, and a path that never
+    /// carried the prefix is left alone rather than mangled.
+    #[test]
+    fn base_path_strips_the_prefix() {
+        assert_eq!(
+            BasePath(String::new()).strip("/v0/pipelines"),
+            "/v0/pipelines"
+        );
+        let base = BasePath("/feldera".to_string());
+        assert_eq!(base.strip("/feldera/v0/pipelines"), "/v0/pipelines");
+        assert_eq!(base.strip("/feldera"), "");
+        assert_eq!(base.strip("/v0/pipelines"), "/v0/pipelines");
+        // The prefix must end on a segment boundary: `/felderax` is a different
+        // mount point, so its paths are none of this base path's business.
+        assert_eq!(base.strip("/felderax/v0"), "/felderax/v0");
+    }
+
+    #[test]
+    fn owner_trusts_parse_from_json() {
+        let trusts: OwnerTrusts = r#"[
+            {"issuer": "https://accounts.google.com", "subject": "1234567890", "audience": "my-client"},
+            {"issuer": "https://token.actions.githubusercontent.com", "subject": "repo:acme/*"}
+        ]"#
+        .parse()
+        .expect("valid owner trusts");
+        assert_eq!(trusts.0.len(), 2);
+        assert_eq!(trusts.0[0].audience.as_deref(), Some("my-client"));
+        // An omitted audience accepts any audience.
+        assert_eq!(trusts.0[1].audience, None);
+
+        // The default, and the value the argument carries when unset.
+        assert_eq!("[]".parse::<OwnerTrusts>().unwrap(), OwnerTrusts::default());
+
+        // A trust that names no issuer or no subject would match on the wrong
+        // half of the pair, so it is refused at startup rather than at auth time.
+        assert!(r#"[{"issuer": "", "subject": "x"}]"#.parse::<OwnerTrusts>().is_err());
+        assert!(
+            r#"[{"issuer": "https://idp.example", "subject": ""}]"#
+                .parse::<OwnerTrusts>()
+                .is_err()
+        );
+        assert!("not json".parse::<OwnerTrusts>().is_err());
+    }
+
+    #[test]
+    fn owner_trusts_admit_the_right_tokens() {
+        let trust = |issuer: &str, subject: &str, audience: Option<&str>| OwnerTrust {
+            issuer: issuer.to_string(),
+            subject: subject.to_string(),
+            audience: audience.map(str::to_string),
+        };
+        let aud = |a: &str| vec![a.to_string()];
+
+        let trusts = OwnerTrusts(vec![
+            trust(
+                "https://accounts.google.com",
+                "1234567890",
+                Some("client-a"),
+            ),
+            trust("https://ci.example", "repo:acme/*", None),
+        ]);
+
+        // Issuer, subject and audience all agree.
+        assert!(trusts.admits(
+            "https://accounts.google.com",
+            "1234567890",
+            &aud("client-a")
+        ));
+        // Right subject, wrong audience.
+        assert!(!trusts.admits(
+            "https://accounts.google.com",
+            "1234567890",
+            &aud("client-b")
+        ));
+        // The issuer is matched exactly, never as a pattern.
+        assert!(!trusts.admits(
+            "https://accounts.google.com.evil.test",
+            "1234567890",
+            &aud("client-a")
+        ));
+        // A trust with no audience accepts any, including none at all.
+        assert!(trusts.admits("https://ci.example", "repo:acme/api", &aud("any")));
+        assert!(trusts.admits("https://ci.example", "repo:acme/api", &[]));
+        // The subject pattern still has to match.
+        assert!(!trusts.admits("https://ci.example", "repo:other/api", &[]));
+        // No configured trusts admits nobody.
+        assert!(!OwnerTrusts::default().admits("https://ci.example", "x", &[]));
+
+        // The issuer gate is separate: it asks only whether fetching that
+        // issuer's keys is worth doing.
+        assert!(trusts.names_issuer("https://ci.example"));
+        assert!(!trusts.names_issuer("https://elsewhere.example"));
+    }
+
     #[test]
     fn test_cpu_quantity() {
         assert_eq!(cpu_quantity_to_workers("100m").unwrap(), 1);
@@ -1213,9 +1842,7 @@ mod tests {
 
     #[test]
     fn test_https_testing_mode_generates_cert_and_key() {
-        if crate::unstable_features().is_none() {
-            crate::platform_enable_unstable("testing");
-        }
+        crate::enable_test_unstable_features();
         let config = CommonConfig {
             enable_https: true,
             unstable_features: Some("testing".to_string()),
@@ -1242,5 +1869,130 @@ mod tests {
             ..CommonConfig::test_config()
         };
         assert!(std::panic::catch_unwind(|| config.https_config()).is_err());
+    }
+
+    /// The Gen-2 UDF SDK location is made absolute, and one that is not a crate stops startup.
+    #[test]
+    fn gen2_udf_sdk_path_must_name_a_crate() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let sdk_dir = tempfile::tempdir().unwrap();
+        let existing_path = working_dir.path().to_string_lossy().to_string();
+        let config = |gen2_udf_sdk_path: Option<String>| CompilerConfig {
+            compiler_working_directory: existing_path.clone(),
+            compilation_profile: CompilationProfile::Optimized,
+            sql_compiler_path: existing_path.clone(),
+            sql_compiler_cache_url: String::new(),
+            compilation_cargo_lock_path: existing_path.clone(),
+            dbsp_override_path: existing_path.clone(),
+            binary_upload_endpoint: None,
+            binary_upload_timeout_secs: 600,
+            binary_upload_max_retries: 3,
+            binary_upload_retry_delay_ms: 1000,
+            gen2_udf_sdk_path,
+            gen2_udf_sdk_version: None,
+            precompile: false,
+        };
+        let sdk_path = format!("{}/.", sdk_dir.path().display());
+
+        assert_eq!(config(None).canonicalize().unwrap().gen2_udf_sdk_path, None);
+        let error = config(Some(sdk_path.clone())).canonicalize().unwrap_err();
+        assert!(error.to_string().contains("--gen2-udf-sdk-path"), "{error}");
+
+        std::fs::write(sdk_dir.path().join("Cargo.toml"), "").unwrap();
+        let canonical_sdk_path = std::fs::canonicalize(sdk_dir.path()).unwrap();
+        assert_eq!(
+            config(Some(sdk_path))
+                .canonicalize()
+                .unwrap()
+                .gen2_udf_sdk_path,
+            Some(canonical_sdk_path.to_string_lossy().to_string())
+        );
+    }
+
+    /// The Gen2 UDF SDK version must be a version, since it pins the crates.io release, and it
+    /// excludes a local SDK path.
+    #[test]
+    fn gen2_udf_sdk_version_must_be_a_version() {
+        let working_dir = tempfile::tempdir().unwrap();
+        let existing_path = working_dir.path().to_string_lossy().to_string();
+        let config =
+            |gen2_udf_sdk_path: Option<String>, gen2_udf_sdk_version: &str| CompilerConfig {
+                compiler_working_directory: existing_path.clone(),
+                compilation_profile: CompilationProfile::Optimized,
+                sql_compiler_path: existing_path.clone(),
+                sql_compiler_cache_url: String::new(),
+                compilation_cargo_lock_path: existing_path.clone(),
+                dbsp_override_path: existing_path.clone(),
+                binary_upload_endpoint: None,
+                binary_upload_timeout_secs: 600,
+                binary_upload_max_retries: 3,
+                binary_upload_retry_delay_ms: 1000,
+                gen2_udf_sdk_path,
+                gen2_udf_sdk_version: Some(gen2_udf_sdk_version.to_string()),
+                precompile: false,
+            };
+
+        for version in ["0.1.0", "1.2.3-rc.1"] {
+            let config = config(None, version).canonicalize().unwrap();
+            assert_eq!(config.gen2_udf_sdk_release(), version);
+        }
+        for not_a_version in ["", "0.1", "latest", "=0.1.0", "0.1.0\"]"] {
+            let error = config(None, not_a_version).canonicalize().unwrap_err();
+            assert!(
+                error.to_string().contains("--gen2-udf-sdk-version"),
+                "{not_a_version}: {error}"
+            );
+        }
+
+        let sdk_dir = tempfile::tempdir().unwrap();
+        std::fs::write(sdk_dir.path().join("Cargo.toml"), "").unwrap();
+        let sdk_path = Some(sdk_dir.path().to_string_lossy().to_string());
+        let error = config(sdk_path, "0.1.0").canonicalize().unwrap_err();
+        assert!(error.to_string().contains("mutually exclusive"), "{error}");
+        let error = CompilerConfig::try_parse_from([
+            "compiler",
+            "--gen2-udf-sdk-path=/opt/sdk",
+            "--gen2-udf-sdk-version=0.1.0",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Provisioning off without a configured owner is a bricked installation,
+    /// so startup refuses it. With authentication off the flag is inert.
+    #[test]
+    fn provisioning_off_requires_an_owner() {
+        let mut config = ApiServerConfig::test_config();
+        config.auth_provider = AuthProviderType::GenericOidc;
+        config.provision_on_login = false;
+        assert!(config.validate_authorization().is_err());
+
+        config.owners = vec!["ops@acme.test".to_string()];
+        assert!(config.validate_authorization().is_ok());
+
+        config.owners.clear();
+        config.auth_provider = AuthProviderType::None;
+        assert!(config.validate_authorization().is_ok());
+    }
+
+    /// The platform version suffix matches the edition of the build.
+    #[test]
+    fn platform_version_matches_edition() {
+        let platform_version = default_platform_version();
+        match crate::edition() {
+            "EnterpriseDev" => assert!(
+                platform_version.contains("+enterprise-dev"),
+                "{platform_version}"
+            ),
+            "Enterprise" => assert!(
+                platform_version.contains("+enterprise") && !platform_version.contains("-dev"),
+                "{platform_version}"
+            ),
+            "Open source" => assert!(
+                !platform_version.contains("enterprise"),
+                "{platform_version}"
+            ),
+            edition => panic!("unexpected edition {edition}"),
+        }
     }
 }

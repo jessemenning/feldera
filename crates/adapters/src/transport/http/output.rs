@@ -3,6 +3,7 @@ use actix_web::{HttpResponse, http::header::ContentType, web::Bytes};
 use anyhow::{Result as AnyResult, anyhow, bail};
 use async_stream::stream;
 use crossbeam::sync::ShardedLock;
+use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::transport::{OutputBatchType, Step};
 use serde::{Deserialize, Serializer, ser::SerializeStruct};
 use serde_json::value::RawValue;
@@ -17,6 +18,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info_span};
 
 // TODO: make this configurable via endpoint config.
@@ -79,11 +81,20 @@ struct HttpOutputEndpointInner {
     total_buffers: AtomicU64,
     snapshot: AtomicBool,
     sender: ShardedLock<Option<mpsc::Sender<SendRequest>>>,
+    /// `ControllerInner::shutdown_token`, which releases a
+    /// `backpressure` wait that the client is not going to end.  See
+    /// [HttpOutputEndpointInner::wait_for_ack].
+    shutdown: CancellationToken,
     // async_error_callback: RwLock<Option<AsyncErrorCallback>>,
 }
 
 impl HttpOutputEndpointInner {
-    pub(crate) fn new(name: &str, format: HttpOutputFormat, backpressure: bool) -> Self {
+    pub(crate) fn new(
+        name: &str,
+        format: HttpOutputFormat,
+        backpressure: bool,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             name: name.to_string(),
             format,
@@ -91,17 +102,60 @@ impl HttpOutputEndpointInner {
             total_buffers: AtomicU64::new(0),
             snapshot: AtomicBool::new(false),
             sender: ShardedLock::new(None),
+            shutdown,
             // async_error_callback: RwLock::new(None),
         }
     }
 
-    fn push_buffer(&self, buffer: Option<&[u8]>, blocking: bool) -> AnyResult<()> {
+    /// Waits for the client to receive chunk `seq_number`, which is what
+    /// `backpressure` mode promises, and gives that up if the pipeline tears
+    /// down first.
+    ///
+    /// The ack comes from the actix streaming body, which stays suspended at
+    /// its `yield` for as long as the client does not read.  This runs on the
+    /// controller's output thread, a DBSP aux thread that
+    /// `RuntimeHandle::kill` joins, so waiting out a stalled client would hang
+    /// the teardown.
+    ///
+    /// The chunk is queued either way, so abandoning the wait leaves it where
+    /// a non-blocking push leaves one: delivered if the client reads again
+    /// before the request ends, dropped with the request otherwise.
+    fn wait_for_ack(&self, ack_receiver: oneshot::Receiver<()>, seq_number: u64) {
+        // Panic safety: `block_on` panics inside a tokio async context.  This
+        // runs on the output thread (`output_thread_func`), which is not one.
+        //
+        // Whichever of the two wins a tie is fine: an acked chunk reached the
+        // client, and a shutdown means nothing waits on the chunk any more.
+        TOKIO.block_on(async {
+            if self
+                .shutdown
+                .run_until_cancelled(ack_receiver)
+                .await
+                .is_none()
+            {
+                debug!(
+                    "HTTP output endpoint '{}': abandoning the wait for chunk #{} because \
+                     the pipeline is shutting down",
+                    self.name, seq_number,
+                );
+            }
+        });
+    }
+
+    /// Pushes one chunk: a payload, a step count that closes a step, or a keep-alive.
+    fn push_buffer(
+        &self,
+        buffer: Option<&[u8]>,
+        processed_steps: Option<Step>,
+        blocking: bool,
+    ) -> AnyResult<()> {
         let seq_number = self.total_buffers.fetch_add(1, Ordering::AcqRel);
 
         let json_buf = Vec::with_capacity(buffer.map(|b| b.len()).unwrap_or(0) + 1024);
         let mut serializer = serde_json::Serializer::new(json_buf);
+        let num_fields = 2 + usize::from(buffer.is_some()) + usize::from(processed_steps.is_some());
         let mut struct_serializer = serializer
-            .serialize_struct("Chunk", if buffer.is_some() { 3 } else { 2 })
+            .serialize_struct("Chunk", num_fields)
             .map_err(|e| anyhow!("error serializing 'Chunk' struct: '{e}'"))?;
         struct_serializer
             .serialize_field("sequence_number", &seq_number)
@@ -109,6 +163,11 @@ impl HttpOutputEndpointInner {
         struct_serializer
             .serialize_field("snapshot", &self.snapshot.load(Ordering::Acquire))
             .map_err(|e| anyhow!("error serializing 'snapshot' field: '{e}'"))?;
+        if let Some(processed_steps) = processed_steps {
+            struct_serializer
+                .serialize_field("processed_steps", &processed_steps)
+                .map_err(|e| anyhow!("error serializing 'processed_steps' field: '{e}'"))?;
+        }
 
         if let Some(buffer) = buffer {
             match self.format {
@@ -156,7 +215,7 @@ impl HttpOutputEndpointInner {
             sender.try_send((Buffer::new(seq_number, Bytes::from(json_buf)), ack_sender))
         }) && let Some(ack_receiver) = ack_receiver
         {
-            let _ = ack_receiver.blocking_recv();
+            self.wait_for_ack(ack_receiver, seq_number);
         }
 
         Ok(())
@@ -190,9 +249,19 @@ pub(crate) struct HttpOutputEndpoint {
 }
 
 impl HttpOutputEndpoint {
-    pub(crate) fn new(name: &str, format: HttpOutputFormat, backpressure: bool) -> Self {
+    pub(crate) fn new(
+        name: &str,
+        format: HttpOutputFormat,
+        backpressure: bool,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
-            inner: Arc::new(HttpOutputEndpointInner::new(name, format, backpressure)),
+            inner: Arc::new(HttpOutputEndpointInner::new(
+                name,
+                format,
+                backpressure,
+                shutdown,
+            )),
         }
     }
 
@@ -248,7 +317,7 @@ impl HttpOutputEndpoint {
                         Err(_) => {
                             // Send the empty chunk via the `push_buffer` method to
                             // make sure it gets assigned correct sequence number.
-                            let _ = inner.push_buffer(None, false);
+                            let _ = inner.push_buffer(None, None, false);
                         }
                         Ok(None) => break,
                         Ok(Some((buffer, ack_sender))) => {
@@ -293,7 +362,23 @@ impl OutputEndpoint for HttpOutputEndpoint {
     fn push_buffer(&mut self, buffer: &[u8]) -> AnyResult<()> {
         let _guard = info_span!("http_output").entered();
         self.inner
-            .push_buffer(Some(buffer), self.inner.backpressure)
+            .push_buffer(Some(buffer), None, self.inner.backpressure)
+    }
+
+    /// Marks the end of the step's output with an empty chunk that carries
+    /// `count`, so that a client that has received the chunk is guaranteed
+    /// to have received the output of every step below `count`.  Under
+    /// backpressure the chunk waits for the client like a standard payload.
+    fn steps_processed(&mut self, count: Step) {
+        if let Err(e) = self
+            .inner
+            .push_buffer(None, Some(count), self.inner.backpressure)
+        {
+            error!(
+                "HTTP output endpoint '{}': failed to send the chunk that ends step {count}: {e}",
+                self.inner.name
+            );
+        }
     }
 
     fn push_key(
@@ -318,5 +403,58 @@ however the HTTP transport does not support this representation."
 
     fn is_fault_tolerant(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc as std_mpsc, thread};
+
+    /// `backpressure` mode must stop waiting for the client once the pipeline
+    /// tears down.
+    ///
+    /// `push_buffer` runs on the controller's output thread, which is a DBSP
+    /// aux thread that `RuntimeHandle::kill` joins, and the ack arrives only
+    /// after the client reads the chunk.  Nothing drains the channel here,
+    /// which is what a client that stopped reading looks like from this side.
+    #[test]
+    fn a_shutdown_releases_a_backpressure_wait() {
+        let shutdown = CancellationToken::new();
+        let endpoint = HttpOutputEndpoint::new(
+            "test_endpoint",
+            HttpOutputFormat::Json,
+            true,
+            shutdown.clone(),
+        );
+
+        // Held so that `try_send` succeeds, never read so that no chunk is
+        // ever acked.
+        let _receiver = HttpOutputEndpoint::connect(&endpoint);
+
+        // Push from a thread of its own, so that a regression fails this test
+        // rather than hanging the whole run.
+        let (pushed, push_returned) = std_mpsc::channel();
+        let mut pushing_endpoint = endpoint.clone();
+        let pusher = thread::spawn(move || {
+            let result = pushing_endpoint.push_buffer(br#"[{"insert": {"id": 1}}]"#);
+            let _ = pushed.send(result.is_ok());
+        });
+
+        assert!(
+            push_returned
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "`backpressure` mode must wait for the client to receive the chunk"
+        );
+
+        shutdown.cancel();
+        assert!(
+            push_returned
+                .recv_timeout(Duration::from_secs(30))
+                .expect("a shutdown must release the wait for the client"),
+            "abandoning the wait must not report an error: the chunk stays queued"
+        );
+        pusher.join().unwrap();
     }
 }

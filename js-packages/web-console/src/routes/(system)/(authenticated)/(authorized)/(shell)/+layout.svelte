@@ -1,0 +1,277 @@
+<script lang="ts">
+  import { closedIntervalAction } from 'common-lib/promise'
+  import Dayjs from 'dayjs'
+  import { invalidateAll } from '$app/navigation'
+  import { page } from '$app/state'
+  import SvelteKitTopLoader from '$lib/components/common/SvelteKitTopLoader.svelte'
+  import LineBanner, { BannerButton } from '$lib/components/layout/LineBanner.svelte'
+  import NavigationExtras from '$lib/components/layout/NavigationExtras.svelte'
+  import OverlayDrawer from '$lib/components/layout/OverlayDrawer.svelte'
+  import AuthErrorToast from '$lib/components/other/AuthErrorToast.svelte'
+  import BookADemo from '$lib/components/other/BookADemo.svelte'
+  import CreatePipelineButton from '$lib/components/pipelines/CreatePipelineButton.svelte'
+  import OpenSupportBundleDialog from '$lib/components/supportBundle/OpenSupportBundleDialog.svelte'
+  import { useInterval } from '$lib/compositions/common/useInterval.svelte'
+  import { fetchConfigs } from '$lib/compositions/configCache'
+  import {
+    useClusterHealth,
+    useRefreshClusterHealth
+  } from '$lib/compositions/health/useClusterHealth.svelte'
+  import { useAdaptiveDrawer } from '$lib/compositions/layout/useAdaptiveDrawer.svelte'
+  import { useContextDrawer } from '$lib/compositions/layout/useContextDrawer.svelte'
+  import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
+  import { useRefreshPipelineList } from '$lib/compositions/pipelines/usePipelineList.svelte'
+  import { useIsEnterprise } from '$lib/compositions/useEdition.svelte'
+  import { usePipelineAction } from '$lib/compositions/usePipelineAction.svelte'
+  import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
+  import { useSystemMessages } from '$lib/compositions/useSystemMessages.svelte'
+  import { useToast } from '$lib/compositions/useToastNotification'
+  import { clusterHealthMessage } from '$lib/functions/pipelines/health'
+  import { resolve } from '$lib/functions/svelte'
+  import type { Snippet } from '$lib/types/svelte'
+  import type { LayoutData } from './$types'
+
+  const { children, data }: { children: Snippet; data: LayoutData } = $props()
+
+  // The app shell: pollers that keep the pipeline list, cluster health and backend version
+  // current, the navigation drawers, and the banners. Every page that works on a live Feldera
+  // instance lives in this group; a page that reads uploaded data, like the profile viewer,
+  // sits beside it under `(authorized)` and never mounts these pollers. The health poller
+  // forgets its verdict on the way out, since the profile menu shows that one on every page;
+  // the pipeline list needs no such reset, as it is read inside this group only.
+  //
+  // This layout only ever mounts with an acting tenant resolved: the enclosing `(authorized)`
+  // group's `+layout.ts` redirects to /select-tenant otherwise. So the pollers need no guard,
+  // and unmounting on the way out stops them.
+  useRefreshPipelineList()
+  useRefreshClusterHealth()
+  usePipelineAction()
+
+  const rightDrawer = useAdaptiveDrawer('right')
+  const contextDrawer = useContextDrawer()
+  const globalDialog = useGlobalDialog()
+
+  const systemMessages = useSystemMessages()
+  const clusterHealth = useClusterHealth()
+  const now = useInterval(() => new Date(), 3600000, 3600000 - (Date.now() % 3600000))
+
+  // Check for backend version changes every 10 seconds, starting 10 seconds
+  // after layout load (first tick is delayed by `periodMs`).
+  // Calls `fetchConfigs()` to both get the latest config and update the cache,
+  // otherwise `invalidateAll()` would re-render the root layout from a stale cache
+  // and trigger the version mismatch in a loop.
+  let dismissTimeout: ReturnType<typeof setTimeout> | undefined
+  $effect.pre(() =>
+    closedIntervalAction(async () => {
+      try {
+        const { config } = await fetchConfigs()
+        // `feldera` is set for the life of this layout (the group's gate proves
+        // it), but `config` is not: a session that loses its acting tenant
+        // mid-poll gets no `Configuration` back, and that is no version change.
+        const currentVersion = data.feldera!.version
+        const currentRevision = data.feldera!.revision
+        if (config && (config.version !== currentVersion || config.revision !== currentRevision)) {
+          // Automatically refresh the page data to get the new backend version
+          await invalidateAll()
+
+          // Show a notification that the backend was updated
+          const msgId = `backend_version_changed`
+
+          // Auto-dismiss after 30 seconds; clear any prior pending timer.
+          clearTimeout(dismissTimeout)
+          dismissTimeout = setTimeout(() => systemMessages.dismiss(msgId), 30000)
+          systemMessages.upsert(msgId, {
+            id: msgId,
+            text: `Feldera was updated from version ${currentVersion} to ${config.version}.`,
+            dismissable: { forMs: 0 },
+            onDismiss: () => clearTimeout(dismissTimeout)
+          })
+        }
+      } catch (e) {
+        // Silently ignore errors when checking for version changes
+        console.error('Failed to check backend version:', e)
+      }
+    }, 10000)
+  )
+
+  const displayedMessages = $derived(
+    systemMessages.displayedMessages.map((message) => {
+      const text = message.text.replace(/\{toDaysHoursFromNow (\d+)\}/, (_match, milliseconds) => {
+        const duration = Dayjs.duration(
+          parseInt(milliseconds) - now.current.valueOf(),
+          'milliseconds'
+        )
+        const days = duration.asDays()
+        const hours = duration.hours()
+        return days > 1
+          ? `${days.toFixed()} ${'days'}`
+          : hours > 0
+            ? `${hours.toFixed()} ${hours > 1 ? 'hours' : 'hour'}`
+            : 'less than an hour'
+      })
+      return { ...message, text }
+    })
+  )
+  const isEnterprise = useIsEnterprise()
+  // No poll has answered yet, or the poller is gone: nothing to report either way.
+  const healthMessage = $derived(
+    clusterHealth.current ? clusterHealthMessage(clusterHealth.current, isEnterprise.value) : null
+  )
+
+  const api = usePipelineManager()
+  const { toastMain, dismissMain } = useToast()
+  $effect(() => {
+    if (!api.isNetworkHealthy) {
+      toastMain(
+        'Unable to reach this Feldera instance.\nEither the cluster is unresponsive, or there is an issue with the network connection.'
+      )
+    } else if (!api.isAuthHealthy) {
+      toastMain(AuthErrorToast)
+    } else {
+      dismissMain()
+    }
+  })
+
+  // The toast renders in the root layout, which outlives this layout, and it never
+  // expires on its own. Leaving the shell has to take it down: a page outside the shell, such
+  // as the profile viewer, must not keep warning about an instance it does not read.
+  // The effect runs on unmount only.
+  $effect(() => dismissMain)
+
+  let isFelderaReachable = $derived(api.isNetworkHealthy && api.isAuthHealthy)
+</script>
+
+{#snippet supportBundleDialog()}
+  <OpenSupportBundleDialog></OpenSupportBundleDialog>
+{/snippet}
+
+<SvelteKitTopLoader
+  height={2}
+  color={'var(--color-primary-500)'}
+  showSpinner={false}
+  ignoreBeforeNavigate={() => false}
+  ignoreAfterNavigate={() => false}
+></SvelteKitTopLoader>
+<div
+  class="flex h-full flex-col {isFelderaReachable
+    ? ''
+    : 'disabled pointer-events-auto select-text [&_.monaco-editor-background]:pointer-events-none [&_[role="button"]]:pointer-events-none [&_[role="separator"]]:pointer-events-none [&_a]:pointer-events-none [&_button]:pointer-events-none'}"
+>
+  {#if healthMessage && !page.url.pathname.startsWith(resolve('/health'))}
+    <LineBanner variant="error">
+      {#snippet start()}
+        <span>{healthMessage}</span>
+        {@render BannerButton({
+          text: 'See details',
+          href: resolve('/health/')
+        })}
+      {/snippet}
+    </LineBanner>
+  {/if}
+  {#each displayedMessages as message}
+    {#if message.id.startsWith('expiring_license_')}
+      <LineBanner
+        dismiss={message.dismissable !== 'never'
+          ? () => systemMessages.dismiss(message.id)
+          : undefined}
+      >
+        {#snippet start()}
+          <span>{@html message.text}</span>
+          {#if message.action}
+            {@render BannerButton(message.action)}
+          {/if}
+        {/snippet}
+      </LineBanner>
+    {:else if message.id.startsWith('version_available_')}
+      <LineBanner
+        dismiss={message.dismissable !== 'never'
+          ? () => systemMessages.dismiss(message.id)
+          : undefined}
+        variant="aether"
+      >
+        {#snippet center()}
+          <span>{@html message.text}</span>
+          {#if message.action}
+            {@render BannerButton(message.action)}
+          {/if}
+        {/snippet}
+      </LineBanner>
+    {:else}
+      <LineBanner
+        dismiss={message.dismissable !== 'never'
+          ? () => systemMessages.dismiss(message.id)
+          : undefined}
+        testid={`box-system-message-${message.id}`}
+      >
+        {#snippet start()}
+          <span>{@html message.text}</span>
+          {#if message.action}
+            {@render BannerButton(message.action)}
+          {/if}
+        {/snippet}
+      </LineBanner>
+    {/if}
+  {/each}
+  <!-- <Drawer width="w-[22rem]" bind:open={showDrawer.value} side="left">
+  <div class="flex h-full w-full flex-col gap-1">
+    <span class="mx-5 my-4 flex items-end justify-center">
+      <a href="{base}/">
+        {#if darkMode.value === 'dark'}
+          <FelderaModernLogoColorLight class="h-12"></FelderaModernLogoColorLight>
+        {:else}
+          <FelderaModernLogoColorDark class="h-12"></FelderaModernLogoColorDark>
+        {/if}
+      </a>
+    </span>
+    <PipelinesList bind:pipelines={pipelines.pipelines}></PipelinesList>
+  </div>
+</Drawer> -->
+  {@render children()}
+
+  <OverlayDrawer
+    width="w-72"
+    bind:open={rightDrawer.value}
+    side="right"
+    modal={true}
+    class="bg-white-dark flex flex-col gap-2 p-4"
+  >
+    <!-- One column as wide as its widest button, with every button stretched to that
+         width. The New Pipeline slot adds no width of its own, so the name input that
+         replaces its button keeps the column as it is. -->
+    <div class="mt-4 flex flex-col gap-2 self-center">
+      <div class="relative [contain:inline-size]">
+        <CreatePipelineButton
+          inputClass="w-full"
+          btnClass="w-full preset-filled-surface-50-950"
+          onSuccess={() => {
+            rightDrawer.value = false
+          }}
+        ></CreatePipelineButton>
+      </div>
+      <button
+        class="btn preset-tonal-surface"
+        onclick={() => {
+          globalDialog.dialog = supportBundleDialog
+          rightDrawer.value = false
+        }}
+        data-testid="btn-open-support-bundle"
+      >
+        <span class="fd fd-stethoscope text-[16px]"></span>
+        Open support bundle
+      </button>
+      <BookADemo class="btn preset-filled-primary-500" placement="nav_drawer">Book a demo</BookADemo
+      >
+    </div>
+    <div class="mt-4"></div>
+    <NavigationExtras inline></NavigationExtras>
+  </OverlayDrawer>
+  <OverlayDrawer
+    width="w-[100vw] md:w-[50vw] max-w-3xl"
+    side="right"
+    bind:open={() => !!contextDrawer.content, () => (contextDrawer.content = null)}
+    modal={false}
+    class="bg-white-dark scrollbar overflow-auto p-4 pb-0 md:p-6 md:pb-0"
+  >
+    {@render contextDrawer.content?.()}
+  </OverlayDrawer>
+</div>

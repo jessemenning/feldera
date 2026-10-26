@@ -1,7 +1,7 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
 default_language_version:
-  rust: 1.94.1
+  rust: 1.99.0
 repos:
   - repo: local
     hooks:
@@ -15,7 +15,7 @@ repos:
       - id: cargo-clippy-check
         name: Clippy Check
         description: Run the Clippy linter on the package.
-        entry: cargo clippy --locked --no-deps -- -D warnings
+        entry: cargo clippy --locked --no-deps --all-targets -- -D warnings
         language: rust
         files: \.rs$
         pass_filenames: false
@@ -46,6 +46,13 @@ repos:
         exclude: 'crates/pipeline-manager/migrations/.*|.*\.patch|.*\.svg|.*\.java'
   - repo: local
     hooks:
+      - id: validate-crypto-deps
+        name: Validate cryptography dependencies
+        description: Cryptography goes through AWS-LC; a second implementation corrupts the heap.
+        entry: scripts/validate-crypto-deps.sh
+        language: system
+        files: Cargo\.(toml|lock)$
+        pass_filenames: false
       - id: fix-rust-mod-naming
         name: Rust module naming
         entry: scripts/fix-rust-module-naming
@@ -57,6 +64,17 @@ repos:
         entry: cargo run --bin=pipeline-manager -- --dump-openapi
         language: system
         files: \.rs$
+        pass_filenames: false
+      # Runs after the openapi update, which is what it reads.  The generated
+      # client is openapi-ts output passed through prettier and then biome;
+      # biome reports findings it cannot fix in the generator's own code, so
+      # its status is ignored and the files are the verdict.
+      - id: update-api-client
+        name: Update API client
+        description: Regenerate the TypeScript API client from openapi.json
+        entry: bash -c 'cd js-packages/web-console && bun install --frozen-lockfile && bunx openapi-ts && bunx prettier --log-level warn --write src/lib/services/manager && { bunx biome check --write src/lib/services/manager || true; }'
+        language: system
+        files: '(\.rs$|^openapi\.json$)'
         pass_filenames: false
       # The reason this runs after the openapi update is because the openapi
       # generation adds documentation to e.g., the rest-api crate.

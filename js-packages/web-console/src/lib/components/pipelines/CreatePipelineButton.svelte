@@ -1,36 +1,57 @@
 <script lang="ts">
+  import RBAC from '$lib/components/auth/RBAC.svelte'
   import PipelineNameInput from '$lib/components/pipelines/PipelineNameInput.svelte'
 
   const {
     inputClass,
     btnClass,
-    onSuccess
-  }: { class?: string; inputClass?: string; btnClass?: string; onSuccess?: () => void } = $props()
+    onSuccess,
+    shortLabelOnMobile = false
+  }: {
+    class?: string
+    inputClass?: string
+    btnClass?: string
+    onSuccess?: () => void
+    /** Shorten the label to "New" below the `md` breakpoint, where space is tight. */
+    shortLabelOnMobile?: boolean
+  } = $props()
 </script>
 
-<PipelineNameInput inputClass="input h-9 {inputClass}" {onSuccess}>
-  {#snippet createButton(onclick)}
-    <div class="flex justify-center">
-      <button class="btn h-9 {btnClass}" {onclick}>
-        <span class="fd fd fd-plus text-2xl"></span>
-        New Pipeline
-      </button>
-    </div>
-  {/snippet}
+<!-- Creating a pipeline is the only thing this control does, so gate the whole
+     affordance. It is the sole caller of PipelineNameInput, so one gate here
+     covers every place the New Pipeline button appears. -->
+<RBAC require="write:pipeline">
+  <PipelineNameInput inputClass="input h-9 {inputClass}" {onSuccess}>
+    {#snippet createButton(onclick)}
+      <div class="flex justify-center">
+        <button class="btn {btnClass}" {onclick}>
+          <span class="fd fd-plus"></span>
+          {#if shortLabelOnMobile}
+            <span class="md:hidden">New</span>
+            <span class="hidden md:inline">New Pipeline</span>
+          {:else}
+            New Pipeline
+          {/if}
+        </button>
+      </div>
+    {/snippet}
 
-  {#snippet afterInput(error)}
-    <div class="absolute top-10 z-20">
-      {#if error}
-        <div class="bg-white-dark bg-white-dark rounded-container px-2 py-2 text-error-500 shadow">
-          {error}
-        </div>
-      {:else}
-        <div
-          class="bg-white-dark rounded-container px-2 py-2 whitespace-pre text-surface-600-400 shadow"
-        >
-          Press Enter to create
-        </div>
-      {/if}
-    </div>
-  {/snippet}
-</PipelineNameInput>
+    {#snippet afterInput(error)}
+      <div class="absolute top-10 z-20">
+        {#if error}
+          <div
+            class="bg-white-dark bg-white-dark rounded-container px-2 py-2 text-error-500 shadow"
+          >
+            {error}
+          </div>
+        {:else}
+          <div
+            class="bg-white-dark rounded-container px-2 py-2 whitespace-pre text-surface-600-400 shadow"
+          >
+            Press Enter to create
+          </div>
+        {/if}
+      </div>
+    {/snippet}
+  </PipelineNameInput>
+</RBAC>

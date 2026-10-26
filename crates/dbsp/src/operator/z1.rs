@@ -3,6 +3,7 @@
 use crate::Runtime;
 use crate::circuit::circuit_builder::StreamId;
 use crate::circuit::metadata::{MEMORY_ALLOCATIONS_COUNT, SIZE_DISTRIBUTION, STATE_RECORDS_COUNT};
+use crate::circuit::operator_traits::{FileOperatorCheckpoint, OperatorCheckpoint};
 use crate::{
     Error, NumEntries,
     algebra::HasZero,
@@ -18,16 +19,16 @@ use crate::{
     circuit_cache_key,
     storage::file::to_bytes,
 };
-use feldera_storage::{FileCommitter, StoragePath};
+use feldera_storage::StoragePath;
 use rkyv::bytecheck;
 use size_of::{Context, SizeOf};
-use std::sync::Arc;
 use std::{borrow::Cow, mem::replace};
 
 use super::require_persistent_id;
 
 circuit_cache_key!(DelayedId<C, D>(StreamId => Stream<C, D>));
 circuit_cache_key!(NestedDelayedId<C, D>(StreamId => Stream<C, D>));
+use rkyv::with::CopyOptimize;
 
 /// Like [`FeedbackConnector`] but specialized for [`Z1`] feedback operator.
 ///
@@ -226,9 +227,13 @@ pub struct Z1<T> {
     values: T,
 }
 
+// The blob is a whole serialized state, so it is copied in bulk: `Vec<u8>`'s own
+// rkyv impl resolves it byte by byte, one write call each. `CopyOptimize` keeps
+// the archived layout, an `ArchivedVec<u8>`, so existing checkpoints still read.
 #[derive(rkyv::Serialize, rkyv::Deserialize, rkyv::Archive)]
 #[archive_attr(derive(rkyv::CheckBytes))]
 pub struct CommittedZ1 {
+    #[with(CopyOptimize)]
     values: Vec<u8>,
 }
 
@@ -258,14 +263,10 @@ where
         }
     }
 
-    /// Return the absolute path of the file for this operator.
-    ///
-    /// # Arguments
-    /// - `cid`: The checkpoint id.
-    /// - `persistent_id`: The persistent id that identifies the spine within
-    ///   the circuit for a given checkpoint.
-    fn checkpoint_file<P: AsRef<str>>(base: &StoragePath, persistent_id: P) -> StoragePath {
-        base.child(format!("z1-{}.dat", persistent_id.as_ref()))
+    /// Return the name of the file for this operator given the persistent id
+    /// that identifies the spine within the circuit for a given checkpoint.
+    fn checkpoint_file<P: AsRef<str>>(persistent_id: P) -> String {
+        format!("z1-{}.dat", persistent_id.as_ref())
     }
 }
 
@@ -308,26 +309,19 @@ where
 
     fn checkpoint(
         &mut self,
-        base: &StoragePath,
         persistent_id: Option<&str>,
-        files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), Error> {
-        let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
-
+    ) -> Result<Option<Box<dyn OperatorCheckpoint>>, Error> {
         let committed: CommittedZ1 = (self as &Self).try_into()?;
-        let as_bytes = to_bytes(&committed).expect("Serializing CommittedZ1 should work.");
-        files.push(
-            Runtime::storage_backend()
-                .unwrap()
-                .write(&Self::checkpoint_file(base, persistent_id), as_bytes)?,
-        );
-        Ok(())
+        Ok(Some(Box::new(FileOperatorCheckpoint {
+            name: Self::checkpoint_file(require_persistent_id(persistent_id, &self.global_id)?),
+            content: to_bytes(&committed).expect("Serializing CommittedZ1 should work."),
+        })))
     }
 
     fn restore(&mut self, base: &StoragePath, persistent_id: Option<&str>) -> Result<(), Error> {
         let persistent_id = require_persistent_id(persistent_id, &self.global_id)?;
 
-        let z1_path = Self::checkpoint_file(base, persistent_id);
+        let z1_path = base.clone().join(Self::checkpoint_file(persistent_id));
         let content = Runtime::storage_backend().unwrap().read(&z1_path)?;
         let committed = rkyv::check_archived_root::<CommittedZ1>(&content).map_err(|e| {
             crate::circuit::checkpointer::checkpoint_invalid_data_error(
@@ -649,6 +643,34 @@ mod test {
             Ok(Some(_)) => {}
             Ok(None) => panic!("check_archived_root accepted garbage as valid CommittedZ1"),
             Err(_) => panic!("check_archived_root panicked on garbage input"),
+        }
+    }
+
+    /// The same struct without `#[with(CopyOptimize)]`, as a layout reference.
+    #[derive(rkyv::Serialize, rkyv::Archive)]
+    struct PerElementZ1 {
+        values: Vec<u8>,
+    }
+
+    /// Copying the state blob in bulk must leave the archived bytes exactly as
+    /// the per-element path wrote them, or a checkpoint taken by an earlier
+    /// build would no longer restore.
+    #[test]
+    fn bulk_copy_keeps_the_committed_layout() {
+        for length in [0, 1, 4096] {
+            let values: Vec<u8> = (0..length).map(|i| (i * 13 + 5) as u8).collect();
+            let bulk = crate::storage::file::to_bytes(&CommittedZ1 {
+                values: values.clone(),
+            })
+            .unwrap();
+            let per_element = crate::storage::file::to_bytes(&PerElementZ1 {
+                values: values.clone(),
+            })
+            .unwrap();
+            assert_eq!(bulk.as_slice(), per_element.as_slice(), "length {length}");
+
+            let restored: CommittedZ1 = crate::trace::aligned_deserialize(&bulk[..]);
+            assert_eq!(restored.values, values, "length {length}");
         }
     }
 

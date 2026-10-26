@@ -6,10 +6,12 @@
 //! The cost of these operations grows with the number of batches in the vector,
 //! so it is beneficial to reduce the number by merging batches.
 
+use crate::trace::AccessHint;
 use crate::{
     Error, NumEntries, Runtime,
     circuit::{
-        ElapsedTime, ThreadCpuTime, max_level0_batch_size_records,
+        ElapsedTime, accumulator_merge_threshold_batches, integral_merge_threshold_batches,
+        max_level0_batch_size_records,
         metadata::{
             BLOOM_FILTER_BITS_PER_KEY, BLOOM_FILTER_HIT_RATE_PERCENT, BLOOM_FILTER_HITS_COUNT,
             BLOOM_FILTER_MISSES_COUNT, BLOOM_FILTER_SIZE_BYTES, COMPACTION_STATE, COMPLETED_MERGES,
@@ -24,9 +26,12 @@ use crate::{
         },
         metrics::COMPACTION_STALL_TIME_NANOSECONDS,
         negative_weight_multiplier,
+        operator_traits::OperatorCheckpoint,
         runtime::{TOKIO_BUFFER_CACHE, TOKIO_WORKER_INDEX},
+        top_level_negative_weight_fraction,
     },
     dynamic::{DynVec, Factory},
+    profile::{ParkReason, ParkingFor},
     storage::{
         buffer_cache::{BufferCache, CacheStats},
         file::{FilterKind, FilterStats},
@@ -34,6 +39,7 @@ use crate::{
     time::Timestamp,
     trace::{
         Batch, BatchReader, BatchReaderFactories, Builder, Cursor, Filter, GroupFilter, Trace,
+        TraceRole,
         cursor::{CursorList, Position},
         merge_batches,
         ord::fallback::pick_insert_destination,
@@ -59,6 +65,7 @@ use ouroboros::self_referencing;
 use rand::Rng;
 use rkyv::{Archive, Archived, Deserialize, Fallible, Serialize, ser::Serializer};
 use size_of::{Context, HumanBytes, SizeOf};
+use smallvec::SmallVec;
 use std::{
     borrow::Cow,
     future::Future,
@@ -89,7 +96,7 @@ mod push_merger;
 mod snapshot;
 pub use snapshot::{BatchReaderWithSnapshot, SpineSnapshot, WithSnapshot};
 
-use super::{BatchLocation, cursor::CursorFactory};
+use super::{BatchLayout, BatchLocation, cursor::CursorFactory};
 
 pub use list_merger::ListMerger;
 
@@ -119,7 +126,25 @@ pub(crate) const MAX_LEVEL0_BATCH_SIZE_RECORDS: u16 = 14_999;
 /// something else asks it to, such as a compaction request or memory pressure.
 pub(crate) const MIN_LEVEL0_MERGE_BATCHES: usize = 8;
 
-fn scope_tokio_merger_locals<F>(
+/// Sets the task-local variables of a merger task around `future`.
+///
+/// The variables give the task the worker index, buffer cache, and `FBuf`
+/// slab set of the foreground worker that it works for.  The rest of a merger
+/// task's context, the DBSP runtime and the background thread type, belongs to
+/// the thread.  Only the threads of the merger runtime have it, so the
+/// returned future must run on the merger runtime.
+///
+/// # Arguments
+///
+/// * `worker_index` - the foreground worker that the task works for.
+/// * `buffer_cache` - that worker's background buffer cache.
+/// * `slab_allocator` - that worker's background `FBuf` slab set.
+/// * `future` - the work of the task.
+///
+/// # Returns
+///
+/// A future that runs `future` with the variables set.
+pub(crate) fn scope_tokio_merger_locals<F>(
     worker_index: usize,
     buffer_cache: Arc<BufferCache>,
     slab_allocator: Arc<FBufSlabs>,
@@ -198,7 +223,8 @@ impl Display for CompactionStatus {
     }
 }
 
-/// A group of batches with similar sizes (as determined by [size_from_level]).
+/// A group of batches with similar sizes (as determined by
+/// [`Spine::size_to_level`]).
 #[derive(Clone, SizeOf)]
 struct Slot<B>
 where
@@ -254,66 +280,121 @@ where
     }
 }
 
+/// Minimum and maximum numbers of batches to merge at each level.
+///
+/// The minimum number of batches to merge is key to performance.  The maximum
+/// number seems much less important.
+const MERGE_COUNTS: [RangeInclusive<usize>; MAX_LEVELS] = [
+    MIN_LEVEL0_MERGE_BATCHES..=128,
+    8..=64,
+    3..=64,
+    3..=64,
+    3..=64,
+    3..=64,
+    2..=64,
+    2..=64,
+    2..=64,
+];
+
+/// How many batches `level` waits for before it merges.
+///
+/// For levels >=2, returns `merge_threshold_batches` clamped by `MERGE_COUNTS[level].start/end`.
+/// For levels 0 and 1, returns `MERGE_COUNTS[level].start`.
+///
+/// See [`SharedState::try_start_merge`].
+fn min_batches_to_merge(level: usize, merge_threshold_batches: usize) -> usize {
+    let merge_counts = &MERGE_COUNTS[level];
+    if level >= 2 {
+        (*merge_counts.start()).max(merge_threshold_batches.min(*merge_counts.end()))
+    } else {
+        *merge_counts.start()
+    }
+}
+
 impl<B> Slot<B>
 where
     B: Batch,
 {
-    /// If this slot doesn't currently have an ongoing merge, and it does have
-    /// at least MERGE_COUNTS[level].start() loose batches, picks an upper limit
-    /// of the loose batches and makes them into merging batches, and returns
-    /// those batches. Otherwise, returns `None` without changing anything.
-    ///
-    /// We merge the least recently added batches (ensuring that batches
-    /// eventually get merged).
-    fn try_start_merge(&mut self, level: usize) -> Option<Vec<Arc<B>>> {
-        /// Minimum and maximum numbers of batches to merge at each level.
-        ///
-        /// The minimum number of batches to merge is key to performance.  The
-        /// maximum number seems much less important.
-        const MERGE_COUNTS: [RangeInclusive<usize>; MAX_LEVELS] = [
-            MIN_LEVEL0_MERGE_BATCHES..=128,
-            8..=64,
-            3..=64,
-            3..=64,
-            3..=64,
-            3..=64,
-            2..=64,
-            2..=64,
-            2..=64,
-        ];
-
-        let merge_counts = &MERGE_COUNTS[level];
-
-        // Start a merge if there is no ongoing merge and there are either enough loose batches to start a merge,
-        // or we are under high memory pressure and there's at least one in-memory batch in this slot, or
-        // compaction has been requested and there are more than one batches in the slot.
-        if self.merging_batches.is_none()
-            && (self.loose_batches.len() >= *merge_counts.start()
-                || self.must_relieve_memory_pressure()
-                || (self.compaction_status == CompactionStatus::Requested
-                    && self.loose_batches.len() > 1))
-        {
-            // Compaction requested - merge all batches in the slot.
-            let max_batches = if self.compaction_status == CompactionStatus::Requested {
-                self.compaction_status = CompactionStatus::InProgress;
-                usize::MAX
-            } else {
-                *merge_counts.end()
-            };
-
-            let n = std::cmp::min(max_batches, self.loose_batches.len());
-            let batches = self.loose_batches.drain(..n).collect::<Vec<_>>();
-            self.merging_batches = Some(batches.clone());
-            Some(batches)
-        } else {
-            None
-        }
+    /// Moves the first `n` loose batches into a merge and returns them.
+    fn start_merge_of(&mut self, n: usize) -> Vec<Arc<B>> {
+        let batches = self.loose_batches.drain(..n).collect::<Vec<_>>();
+        self.merging_batches = Some(batches.clone());
+        batches
     }
 
-    /// Returns true if the slot must relieve memory pressure, i.e., if the memory pressure level is >=high
-    /// and there's at least one in-memory batch in this slot.
+    /// Starts a merge of every batch at `level` when more than
+    /// `min_negative_fraction` of the records they hold have negative weights.
+    ///
+    /// Used to initiate merge at `level` without waiting for `merge_threshold_batches`
+    /// if the level contains many negative weights. Merging negative weights is beneficial
+    /// since they are likely to cancel out some records, reducing the overall storage
+    /// footprint.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - the level this slot holds.
+    /// * `min_negative_fraction` - the share of the level's records with
+    ///   negative weights that has to be exceeded.
+    ///
+    /// # Returns
+    ///
+    /// The batches the merge takes, or `None` when the slot is already
+    /// merging, holds fewer than two batches, or holds too few retractions.
+    /// A batch that does not count its negative weights counts as having
+    /// none.
+    fn try_start_cancelling_merge(
+        &mut self,
+        level: usize,
+        min_negative_fraction: f64,
+    ) -> Option<Vec<Arc<B>>> {
+        if self.merging_batches.is_some() || self.loose_batches.len() < 2 {
+            return None;
+        }
+        let (records, negative) =
+            self.loose_batches
+                .iter()
+                .fold((0u64, 0u64), |(records, negative), batch| {
+                    (
+                        records + batch.len_upper_bound() as u64,
+                        negative + batch.negative_weight_count().unwrap_or(0),
+                    )
+                });
+        if records == 0 || negative as f64 / records as f64 <= min_negative_fraction {
+            return None;
+        }
+        let n = self.loose_batches.len().min(*MERGE_COUNTS[level].end());
+        Some(self.start_merge_of(n))
+    }
+
+    /// Moves this slot's in-memory batches into a merge and returns them.
+    ///
+    /// The batches left behind keep the order they arrived in.
+    fn start_merge_of_in_memory(&mut self) -> Vec<Arc<B>> {
+        let mut taken = Vec::new();
+        let mut left = VecDeque::with_capacity(self.loose_batches.len());
+        for batch in self.loose_batches.drain(..) {
+            if batch.location() == BatchLocation::Memory {
+                taken.push(batch);
+            } else {
+                left.push_back(batch);
+            }
+        }
+        self.loose_batches = left;
+        if !taken.is_empty() {
+            self.merging_batches = Some(taken.clone());
+        }
+        taken
+    }
+
+    /// Returns true if the slot must relieve memory pressure, i.e., if the memory pressure level is >=high,
+    /// the runtime has storage, and there's at least one in-memory batch in this slot.
     /// In this case, we will initiate a new merge regardless of the number of loose batches.
     fn must_relieve_memory_pressure(&self) -> bool {
+        // Without storage, the merge would leave its output in memory, and the
+        // slot would merge that output again, forever.
+        if Runtime::min_merge_storage_bytes().is_none() {
+            return false;
+        }
         if let Some(memory_pressure) = Runtime::memory_pressure() {
             memory_pressure >= MemoryPressure::High
                 && self
@@ -351,12 +432,32 @@ where
     #[size_of(skip)]
     factories: B::Factories,
     name: Arc<String>,
+
+    /// Worker that owns this spine, fixed when it is constructed.
+    ///
+    /// It selects the background buffer cache and slab allocator that this
+    /// spine's merges use, and it is the worker they are reported under.
+    owner_worker: usize,
     #[size_of(skip)]
     key_filter: Option<Filter<B::Key>>,
     #[size_of(skip)]
     value_filter: Option<GroupFilter<B::Val>>,
     #[size_of(skip)]
     frontier: B::Time,
+    #[size_of(skip)]
+    role: TraceRole,
+    /// Batches a level above level 1 waits for before it merges; zero means
+    /// the `MERGE_COUNTS` minimum.  A spine with a filter merges at the
+    /// minimum instead; see [`Self::try_start_merge`].
+    #[size_of(skip)]
+    merge_threshold_batches: usize,
+    /// The share of the records at the spine's highest level with negative
+    /// weights above which the level merges its batches.
+    #[size_of(skip)]
+    top_level_negative_weight_fraction: f64,
+    /// How this spine's merges and spills lay out what they write.
+    #[size_of(skip)]
+    layout: BatchLayout,
     slots: [Slot<B>; MAX_LEVELS],
     #[size_of(skip)]
     request_exit: bool,
@@ -368,13 +469,26 @@ impl<B> SharedState<B>
 where
     B: Batch,
 {
-    pub fn new(factories: &B::Factories, name: Arc<String>) -> Self {
+    pub fn new(
+        factories: &B::Factories,
+        name: Arc<String>,
+        owner_worker: usize,
+        role: TraceRole,
+    ) -> Self {
         Self {
             factories: factories.clone(),
             name,
+            owner_worker,
             key_filter: None,
             value_filter: None,
             frontier: B::Time::minimum(),
+            role,
+            merge_threshold_batches: match role {
+                TraceRole::Accumulator => accumulator_merge_threshold_batches(),
+                TraceRole::Integral => integral_merge_threshold_batches(),
+            },
+            top_level_negative_weight_fraction: top_level_negative_weight_fraction(),
+            layout: BatchLayout::default(),
             slots: std::array::from_fn(|_| Slot::default()),
             request_exit: false,
             spine_stats: SpineStats::default(),
@@ -400,13 +514,20 @@ where
         self.slots[level].notify.notify_one();
     }
 
-    fn batch_count(&self) -> BatchCount {
-        BatchCount(
+    /// Number of batches waiting to be merged, which excludes the ones already
+    /// being merged. This is the count backpressure is based on.
+    fn count_loose_batches(&self) -> LooseBatchCount {
+        LooseBatchCount(
             self.slots
                 .iter()
                 .map(|s| s.loose_batches.len())
                 .sum::<usize>(),
         )
+    }
+
+    /// Number of batches in the spine, loose and merging alike.
+    fn count_all_batches(&self) -> usize {
+        self.slots.iter().map(Slot::n_batches).sum()
     }
 
     fn get_filters(&self) -> (Option<Filter<B::Key>>, Option<GroupFilter<B::Val>>) {
@@ -415,7 +536,7 @@ where
 
     /// Gets a copy of all of the batches (whether loose or being merged).
     fn get_batches(&self) -> Vec<Arc<B>> {
-        let mut batches = Vec::with_capacity(self.slots.iter().map(Slot::n_batches).sum());
+        let mut batches = Vec::with_capacity(self.count_all_batches());
         for slot in &self.slots {
             batches.extend(slot.all_batches().cloned());
         }
@@ -458,7 +579,7 @@ where
             .slots
             .iter()
             .all(|s| s.compaction_status == CompactionStatus::None);
-        let total_batches: usize = self.slots.iter().map(Slot::n_batches).sum();
+        let total_batches = self.count_all_batches();
         all_requests_processed && !self.is_merging() && total_batches <= 1
     }
 
@@ -483,25 +604,13 @@ where
         let cache_stats = batches.iter().fold(CacheStats::default(), |stats, batch| {
             stats + batch.cache_stats()
         });
-        let pre_len = batches.iter().map(|b| b.len()).sum();
-        let post_len = new_batch.len();
+        let pre_len = batches.iter().map(|b| b.len_upper_bound()).sum();
+        let post_len = new_batch.len_upper_bound();
         self.spine_stats
             .report_merge(pre_len, post_len, cache_stats);
-        Span::new(LEVEL_NAMES[level])
-            .with_category("Spine")
-            .with_start(start)
-            .with_tooltip(|| {
-                format!(
-                    "{} in worker {} merged {} batches ({pre_len} -> {post_len}) in {} steps using {:.1} ms real time and {:.1} ms CPU time",
-                    &self.name,
-                    Runtime::worker_index(),
-                    batches.len(),
-                    n_steps,
-                    elapsed.real.as_secs_f64() * 1000.0,
-                    elapsed.cpu.as_secs_f64() * 1000.0
-                )
-            })
-            .record();
+        let n_merged_batches = batches.len();
+        let merge_name = self.name.clone();
+        let owner = self.owner_worker;
 
         if slot.compaction_status == CompactionStatus::InProgress {
             // We finished merging all batches in the slot as part of compaction.
@@ -526,6 +635,30 @@ where
         } else if !new_batch.is_empty() {
             self.add_batch(new_batch, new_level);
         }
+
+        // Recorded here, rather than where the merge is accounted above, so the
+        // batch counts describe the spine as the merge leaves it: `loose` is
+        // what backpressure measures, and it is what grows when merging cannot
+        // keep up with the batches each step adds.
+        let loose = self.count_loose_batches().0;
+        let total = self.count_all_batches();
+        Span::new(LEVEL_NAMES[level])
+            .with_category("Spine")
+            .with_start(start)
+            .with_tooltip(|| {
+                // The merge runs on a pooled merger thread whose
+                // `Runtime::worker_index()` is set from this same owner, so the
+                // owner is the only worker there is to report here.
+                format!(
+                    "{merge_name} on behalf of worker {owner} merged {n_merged_batches} batches \
+                     ({pre_len} -> {post_len} rows) in {n_steps} steps using {real_ms:.1} ms real \
+                     time and {cpu_ms:.1} ms CPU time; spine now holds {loose} loose of {total} \
+                     batches",
+                    real_ms = elapsed.real.as_secs_f64() * 1000.0,
+                    cpu_ms = elapsed.cpu.as_secs_f64() * 1000.0,
+                )
+            })
+            .record();
     }
 
     /// Returns a copy of the data that the caller can use to construct a
@@ -544,6 +677,103 @@ where
                 return Some(i);
             }
         }
+        None
+    }
+
+    /// Starts a merge at `level` if one is due, and returns what it takes.
+    ///
+    /// Tries to balance the following considerations:
+    /// 1. Merging too few batches increases read and write amplification and generates
+    ///    a lot of IO pressure, which can slow down the entire pipeline.
+    /// 2. Waiting too long before triggering a merge can cause the spine to
+    ///    accumulate many batches, which can slow down lookups and waste storage
+    ///    by delaying GC and merging of updates with the same values.
+    ///
+    /// - The default case: the merger will run as soon as the level
+    ///   has at least `merge_threshold_batches`. `merge_threshold_batches` is
+    ///   10 by default, which ensures that the merge will likely produce
+    ///   a batch at the next level of the tree.
+    ///   This, in turn, ensures that the amount of work the merger does per
+    ///   record doesn't depend on how fast the merger is, i.e., a faster merger
+    ///   doesn't generate more IO pressure by starting many small merges.
+    ///
+    ///   `merge_threshold_batches` is configurable in dev tweaks. Separate knobs
+    ///   are available for spines used in accumulators and in integrals, since
+    ///   they have different access patterns: the former are append only, the
+    ///   latter must support lookups as well.
+    ///
+    /// - There are several cases when we merge without waiting for `merge_threshold_batches`
+    ///   batches:
+    ///   - Under high memory pressure we want to quickly merge all in-memory batches
+    ///     and flush them to disk. In this case, we will initiate a merge of
+    ///     in-memory batches only.
+    ///   - A spine with a key or value filter can accumulate garbage. For such spines
+    ///     we initiate a merge with at least MERGE_COUNTS[level].start
+    ///     batches, so as not to hinder GC.
+    ///     TODO: a more subtle heuristic may sample the level first to measure
+    ///     how much it's likely to shrink with GC.
+    ///   - A level with many negative weights can shrink during merge, reducing
+    ///     spine's size on disk. This only pays off for the top-most level where
+    ///     most of the spine's state typically lives.
+    ///
+    /// # Arguments
+    ///
+    /// * `level` - the level to merge at.
+    ///
+    /// # Returns
+    ///
+    /// The batches now being merged, or `None` if no merge started.
+    fn try_start_merge(&mut self, level: usize) -> Option<Vec<Arc<B>>> {
+        let slot = &mut self.slots[level];
+        if slot.merging_batches.is_some() {
+            return None;
+        }
+
+        // Compaction takes everything, whatever merging would otherwise wait
+        // for.
+        if slot.compaction_status == CompactionStatus::Requested && slot.loose_batches.len() > 1 {
+            slot.compaction_status = CompactionStatus::InProgress;
+            let all = slot.loose_batches.len();
+            return Some(slot.start_merge_of(all));
+        }
+
+        let merge_counts = &MERGE_COUNTS[level];
+        let n = slot.loose_batches.len().min(*merge_counts.end());
+
+        // Reduce the merge threshold for batches that get GC'd.
+        let merge_threshold_batches = if self.key_filter.is_some() || self.value_filter.is_some() {
+            0
+        } else {
+            self.merge_threshold_batches
+        };
+
+        // Check this before memory pressure to avoid the pathological case where only in-memory
+        // batches are merged repeatedly; the total number of batches keeps growing unbounded.
+        //
+        // TODO: It might be a good idea to start an in-memory-only merge even if there's
+        // >merge_threshold_batches loose batches, in order to relieve the pressure asap. This will require
+        // another threshold to prevent accumulating unbounded batches, e.g., 3 x merge_threshold_batches.
+        if n >= min_batches_to_merge(level, merge_threshold_batches) {
+            return Some(slot.start_merge_of(n));
+        }
+
+        // Memory pressure is about the batches held in memory, and only they
+        // have to move.  Merging the level's stored batches as well would
+        // spend exactly the work the threshold is there to avoid.
+        if slot.must_relieve_memory_pressure() {
+            let batches = slot.start_merge_of_in_memory();
+            if !batches.is_empty() {
+                return Some(batches);
+            }
+        }
+
+        // The topmost level merges early when enough of its records have
+        // negative weights.
+        if self.last_non_empty_slot() == Some(level) {
+            let min_negative_fraction = self.top_level_negative_weight_fraction;
+            return self.slots[level].try_start_cancelling_merge(level, min_negative_fraction);
+        }
+
         None
     }
 
@@ -581,10 +811,63 @@ where
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-struct BatchCount(usize);
+/// Handed out by `backpressure_waiter` when the spine holds too many batches.
+///
+/// Awaiting `notify` blocks until merging catches up; `report` then describes
+/// the wait for the metric and the profile.
+struct BackpressureWait {
+    notify: OwnedNotified,
+    name: Arc<String>,
+    start: Instant,
+    initial_loose: usize,
+    initial_total: usize,
+}
 
-impl BatchCount {
+impl BackpressureWait {
+    /// Splits into the future to await and the description to report afterwards.
+    ///
+    /// The future carries the declaration that the park hook reads, so that a
+    /// caller outside this module charges `circuit_wait_by_reason_seconds` the
+    /// same way [`SpineInner::backpressure_wait`] does, without having to know
+    /// that it must.
+    fn split(
+        self,
+    ) -> (
+        impl Future<Output = ()> + Send + use<>,
+        BackpressureWaitReport,
+    ) {
+        let notify = self.notify;
+        let wait = async move {
+            let _parked = ParkingFor::new(ParkReason::MergeBackpressure);
+            notify.await;
+        };
+        (
+            wait,
+            BackpressureWaitReport {
+                name: self.name,
+                start: self.start,
+                initial_loose: self.initial_loose,
+                initial_total: self.initial_total,
+            },
+        )
+    }
+}
+
+/// What a [`BackpressureWait`] leaves behind once its future has been awaited.
+///
+/// Reaches beyond this module because the sharded accumulator awaits the future
+/// and reports the wait; see [`Spine::backpressure_waiter`].
+pub(crate) struct BackpressureWaitReport {
+    name: Arc<String>,
+    start: Instant,
+    initial_loose: usize,
+    initial_total: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct LooseBatchCount(usize);
+
+impl LooseBatchCount {
     const HIGH_THRESHOLD: usize = 128;
 
     fn should_apply_backpressure(&self) -> bool {
@@ -687,10 +970,16 @@ where
         worker_index: usize,
         factories: &B::Factories,
         name: Arc<String>,
+        role: TraceRole,
     ) -> Self {
         let idle = Arc::new(Condvar::new());
         let no_backpressure = Arc::new(Notify::new());
-        let state = Arc::new(Mutex::new(SharedState::new(factories, name)));
+        let state = Arc::new(Mutex::new(SharedState::new(
+            factories,
+            name,
+            worker_index,
+            role,
+        )));
 
         let max_level0_batch_size_records = max_level0_batch_size_records();
         assert!(
@@ -752,51 +1041,92 @@ where
         // Do an initial check of the batch count.  If it's already dropped,
         // exit early, otherwise save the name and the initial number of
         // batches for later recording.
-        let (name, initial_batches);
+        let (name, initial_batches, initial_total);
         {
             let state = self.state.lock().unwrap();
-            let batch_count = state.batch_count();
-            if batch_count.should_relieve_backpressure() {
+            let loose = state.count_loose_batches();
+            if loose.should_relieve_backpressure() {
                 return;
             }
             name = state.name.clone();
-            initial_batches = batch_count.0;
+            initial_batches = loose.0;
+            initial_total = state.count_all_batches();
         }
 
-        // Wait for the batch count to drop below the threshold.
-        let final_batches = loop {
+        // Wait for the loose batch count to drop below the threshold.
+        let _parked = ParkingFor::new(ParkReason::MergeBackpressure);
+        loop {
             let notify = self.no_backpressure.notified();
             {
-                let mut state = self.state.lock().unwrap();
-                let batch_count = state.batch_count();
-                if batch_count.should_relieve_backpressure() {
-                    state.spine_stats.backpressure_wait += start_time.elapsed();
-                    break batch_count.0;
+                let state = self.state.lock().unwrap();
+                if state.count_loose_batches().should_relieve_backpressure() {
+                    break;
                 }
             }
             notify.await;
-        };
+        }
 
-        // Record the wait.
-        COMPACTION_STALL_TIME_NANOSECONDS
-            .fetch_add(start_time.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        Span::new("backpressure-wait")
-            .with_category("Spine")
-            .with_start(start_time)
-            .with_tooltip(|| {
-                format!("{name} wait for drop from {initial_batches} to {final_batches} batches")
-            })
-            .record();
+        self.record_backpressure_wait(BackpressureWaitReport {
+            name,
+            start: start_time,
+            initial_loose: initial_batches,
+            initial_total,
+        });
     }
 
-    fn backpressure_waiter(&self) -> Option<OwnedNotified> {
+    /// Returns something to await when the spine holds too many batches, or
+    /// `None` when it does not.
+    ///
+    /// Callers that await the result should report the wait through
+    /// [`Self::record_backpressure_wait`], so that it reaches
+    /// `merge_backpressure_wait_time_seconds` and the profile. Awaiting this
+    /// without reporting is how a wait becomes invisible.
+    fn backpressure_waiter(&self) -> Option<BackpressureWait> {
         let notify = self.no_backpressure.clone().notified_owned();
-        self.state
-            .lock()
-            .unwrap()
-            .batch_count()
-            .should_apply_backpressure()
-            .then_some(notify)
+        let state = self.state.lock().unwrap();
+        let loose = state.count_loose_batches();
+        loose.should_apply_backpressure().then(|| {
+            let total = state.count_all_batches();
+            BackpressureWait {
+                notify,
+                name: state.name.clone(),
+                start: Instant::now(),
+                initial_loose: loose.0,
+                initial_total: total,
+            }
+        })
+    }
+
+    /// Accounts for a wait that [`Self::backpressure_waiter`] handed out and the
+    /// caller has finished awaiting.
+    fn record_backpressure_wait(&self, wait: BackpressureWaitReport) {
+        let elapsed = wait.start.elapsed();
+        let (final_loose, final_total, owner) = {
+            let mut state = self.state.lock().unwrap();
+            state.spine_stats.backpressure_wait += elapsed;
+            (
+                state.count_loose_batches().0,
+                state.count_all_batches(),
+                state.owner_worker,
+            )
+        };
+        COMPACTION_STALL_TIME_NANOSECONDS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        Span::new("backpressure-wait")
+            .with_category("Spine")
+            .with_start(wait.start)
+            .with_tooltip(|| {
+                format!(
+                    "{name} owned by worker {owner} waited {wait_ms:.1} ms for merges on behalf of \
+                     worker {merging_worker}: loose batches {initial_loose} -> {final_loose}, \
+                     total {initial_total} -> {final_total}",
+                    name = wait.name,
+                    wait_ms = elapsed.as_secs_f64() * 1000.0,
+                    merging_worker = Runtime::worker_index(),
+                    initial_loose = wait.initial_loose,
+                    initial_total = wait.initial_total,
+                )
+            })
+            .record();
     }
 
     /// Adds `batches` to the shared merging state and wakes up the merger.
@@ -822,19 +1152,6 @@ where
             .unwrap();
         batches.extend(state.take_loose_batches());
         batches
-    }
-
-    /// Stops the initiation of new merges.  Returns `(not_merging, merging)`,
-    /// where `not_merging` is the batches that were not being merged and
-    /// `merging` is the ones that were. Merging of batches in `merging` will
-    /// continue, and further merges of the results of those merges could happen
-    /// as well. The caller can re-insert `not_merging` later by passing it to
-    /// [Self::resume].
-    fn pause_new_merges(&self) -> (Vec<Arc<B>>, Vec<Arc<B>>) {
-        let mut state = self.state.lock().unwrap();
-        let not_merging = state.take_loose_batches();
-        let merging = state.get_batches();
-        (not_merging, merging)
     }
 
     /// Starts merging again with `batches`, which are presumably what
@@ -883,7 +1200,7 @@ where
                 if !batches.is_empty() {
                     let mut tuple_counts = EnumMap::<BatchLocation, usize>::default();
                     for batch in batches {
-                        tuple_counts[batch.location()] += batch.len();
+                        tuple_counts[batch.location()] += batch.len_upper_bound();
                     }
 
                     let mut facts = Vec::with_capacity(3);
@@ -977,7 +1294,7 @@ where
                 membership_filter_stats[kind] += batch.membership_filter_stats();
             }
             if kind == FilterKind::Bloom {
-                bloom_filter_records += batch.key_count();
+                bloom_filter_records += batch.key_count_upper_bound();
             }
             range_filter_stats += batch.range_filter_stats();
             let on_storage = batch.location() == BatchLocation::Storage;
@@ -1050,7 +1367,7 @@ where
                 BLOOM_FILTER_HIT_RATE_PERCENT,
                 Vec::new(),
                 MetaItem::Percent {
-                    numerator: bloom_filter_stats.hits as u64,
+                    numerator: bloom_filter_stats.hits as i64,
                     denominator: bloom_filter_stats.hits as u64 + bloom_filter_stats.misses as u64,
                 },
             ),
@@ -1073,7 +1390,7 @@ where
                 ROARING_FILTER_HIT_RATE_PERCENT,
                 Vec::new(),
                 MetaItem::Percent {
-                    numerator: roaring_filter_stats.hits as u64,
+                    numerator: roaring_filter_stats.hits as i64,
                     denominator: roaring_filter_stats.hits as u64
                         + roaring_filter_stats.misses as u64,
                 },
@@ -1097,7 +1414,7 @@ where
                 RANGE_FILTER_HIT_RATE_PERCENT,
                 Vec::new(),
                 MetaItem::Percent {
-                    numerator: range_filter_stats.hits as u64,
+                    numerator: range_filter_stats.hits as i64,
                     denominator: range_filter_stats.hits as u64 + range_filter_stats.misses as u64,
                 },
             ),
@@ -1224,7 +1541,7 @@ where
                                 self.no_backpressure.notify_waiters();
                                 break;
                             }
-                            if state.batch_count().should_relieve_backpressure() {
+                            if state.count_loose_batches().should_relieve_backpressure() {
                                 self.no_backpressure.notify_waiters();
                             }
                         }
@@ -1266,7 +1583,7 @@ where
             // Get all the state we need to create the merger, then drop the
             // lock.
             let mut state = self.state.lock().unwrap();
-            let batches = if let Some(batches) = state.slots[level].try_start_merge(level) {
+            let batches = if let Some(batches) = state.try_start_merge(level) {
                 batches
             } else {
                 // There is nothing to merge at the current level - initiate compaction at the next level.
@@ -1288,6 +1605,7 @@ where
             let key_filter = state.key_filter.clone();
             let value_filter = state.value_filter.clone();
             let frontier = state.frontier.clone();
+            let layout = state.layout;
             let snapshot = value_filter
                 .as_ref()
                 .is_some_and(|value_filter| value_filter.requires_snapshot())
@@ -1305,6 +1623,7 @@ where
                 &value_filter,
                 snapshot,
                 frontier,
+                layout,
             ))
         };
 
@@ -1324,8 +1643,8 @@ where
             if level == 0 {
                 self.worker_state.report_slot0_merge(merger.fuel);
             }
-            let merger = opt_merger.take().unwrap();
-            let new_batch = Arc::new(merger.builder.done());
+            let mut merger = opt_merger.take().unwrap();
+            let new_batch = merger.elapsed.record(|| Arc::new(merger.builder.done()));
             let new_level =
                 Spine::<B>::size_to_level(&new_batch, self.max_level0_batch_size_records, true);
             self.state.lock().unwrap().merge_complete(
@@ -1421,10 +1740,11 @@ where
         value_filter: &Option<GroupFilter<B::Val>>,
         snapshot: Option<Arc<SpineSnapshot<B>>>,
         frontier: B::Time,
+        layout: BatchLayout,
     ) -> Self {
         let factories = batches[0].factories();
         let batch_refs: Vec<&B> = batches.iter().map(|b| b.as_ref()).collect();
-        let builder = B::Builder::for_merge(&factories, batch_refs, None);
+        let builder = B::Builder::for_merge(&factories, batch_refs, None, layout);
         Self {
             builder,
             fuel: 0,
@@ -1454,9 +1774,7 @@ where
     fn merge(&mut self, mut fuel: isize) -> isize {
         debug_assert!(fuel > 0);
         let supplied_fuel = fuel;
-        let start = Instant::now();
-        let start_cpu = ThreadCpuTime::now();
-        match &mut self.inner {
+        self.elapsed.record(|| match &mut self.inner {
             MergeInner::ListMerger(merger) => {
                 merger.work(&mut self.builder, &self.frontier, &mut fuel);
                 self.done = fuel > 0;
@@ -1470,11 +1788,7 @@ where
                     merger.run();
                 }
             }
-        };
-        self.elapsed += ElapsedTime {
-            real: start.elapsed(),
-            cpu: start_cpu.elapsed(),
-        };
+        });
         self.n_steps += 1;
         let consumed_fuel = supplied_fuel - fuel;
         self.fuel += consumed_fuel;
@@ -1507,11 +1821,12 @@ impl SpineStats {
         self.cache_stats += cache_stats;
     }
 
-    /// Reports the percentage (in range `0..=100`) of updates that merging
-    /// eliminated.
+    /// Reports the percentage of updates that merging eliminated. The
+    /// percentage is negative when the merges output more updates than their
+    /// inputs.
     fn merge_reduction(&self) -> MetaItem {
         MetaItem::Percent {
-            numerator: self.pre_len - self.post_len,
+            numerator: self.pre_len as i64 - self.post_len as i64,
             denominator: self.pre_len,
         }
     }
@@ -1536,6 +1851,9 @@ where
     dirty: bool,
     key_filter: Option<Filter<B::Key>>,
     value_filter: Option<GroupFilter<B::Val>>,
+
+    /// A copy of the merger state's layout, for the spills `insert` makes.
+    layout: BatchLayout,
 
     /// The asynchronous merger.
     merger: AsyncMerger<B>,
@@ -1644,7 +1962,7 @@ where
         self.merger
             .get_batches()
             .iter()
-            .map(|batch| batch.len())
+            .map(|batch| batch.len_upper_bound())
             .sum()
     }
 
@@ -1657,6 +1975,22 @@ impl<B> BatchReader for Spine<B>
 where
     B: Batch,
 {
+    fn is_empty(&self) -> bool {
+        let batches = self.merger.get_batches();
+        let non_empty = batches
+            .iter()
+            .filter(|batch| !batch.is_empty())
+            .take(2)
+            .count();
+        match non_empty {
+            0 => true,
+            1 => false,
+            // Updates in different batches can cancel, and the cursor skips the
+            // (key, value) pairs whose weights add up to zero, so only the cursor
+            // can tell.
+            _ => !SpineCursor::new_cursor(&self.factories, batches).key_valid(),
+        }
+    }
     type Key = B::Key;
     type Val = B::Val;
     type Time = B::Time;
@@ -1669,19 +2003,19 @@ where
         self.factories.clone()
     }
 
-    fn key_count(&self) -> usize {
+    fn key_count_upper_bound(&self) -> usize {
         self.merger
             .get_batches()
             .iter()
-            .map(|batch| batch.key_count())
+            .map(|batch| batch.key_count_upper_bound())
             .sum()
     }
 
-    fn len(&self) -> usize {
+    fn len_upper_bound(&self) -> usize {
         self.merger
             .get_batches()
             .iter()
-            .map(|batch| batch.len())
+            .map(|batch| batch.len_upper_bound())
             .sum()
     }
 
@@ -1705,27 +2039,17 @@ where
         SpineCursor::new_cursor(&self.factories, self.merger.get_batches())
     }
 
+    fn cursor_with_hint(&self, hint: AccessHint) -> Self::Cursor<'_> {
+        SpineCursor::new_cursor_with_hint(&self.factories, self.merger.get_batches(), hint)
+    }
+
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)
     where
         RG: Rng,
     {
         let batches = self.merger.get_batches();
-        let total_keys = batches.iter().map(|batch| batch.key_count()).sum::<usize>();
         let batch_refs: Vec<_> = batches.iter().map(Arc::as_ref).collect();
-        sample_keys_from_batches(
-            &self.factories,
-            &batch_refs,
-            rng,
-            |batch| {
-                if sample_size == 0 || total_keys == 0 {
-                    0
-                } else {
-                    ((batch.key_count() as u128) * (sample_size as u128) / (total_keys as u128))
-                        as usize
-                }
-            },
-            sample,
-        );
+        sample_keys_from_batches(&self.factories, &batch_refs, rng, sample_size, sample);
     }
 
     async fn fetch<KR>(
@@ -1757,12 +2081,13 @@ where
     /// - `persistent_id`: The persistent id that identifies the spine within
     ///   the circuit for a given checkpoint.
     fn checkpoint_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
-        base.child(format!("pspine-{}.dat", persistent_id))
+        base.clone().join(format!("pspine-{}.dat", persistent_id))
     }
 
     /// Return the absolute path of the file for this Spine's batchlist.
-    fn batchlist_file(&self, base: &StoragePath, persistent_id: &str) -> StoragePath {
-        base.child(format!("pspine-batches-{}.dat", persistent_id))
+    fn batchlist_file(base: &StoragePath, persistent_id: &str) -> StoragePath {
+        base.clone()
+            .join(format!("pspine-batches-{}.dat", persistent_id))
     }
 }
 
@@ -1793,12 +2118,31 @@ impl<B: Batch> Clone for SpineCursor<B> {
 
 impl<B: Batch> SpineCursor<B> {
     pub fn new_cursor(factories: &B::Factories, batches: Vec<Arc<B>>) -> Self {
+        Self::new_cursor_with_hint(factories, batches, AccessHint::Unknown)
+    }
+
+    /// A cursor over `batches` whose every batch cursor is told how it will
+    /// be moved; see [`AccessHint`].
+    ///
+    /// # Arguments
+    ///
+    /// * `factories` - factories for the batches.
+    /// * `batches` - the batches to read, newest last.
+    /// * `hint` - how the cursors will be moved; see [`AccessHint`].
+    pub fn new_cursor_with_hint(
+        factories: &B::Factories,
+        batches: Vec<Arc<B>>,
+        hint: AccessHint,
+    ) -> Self {
         SpineCursorBuilder {
             batches,
             cursor_builder: |batches| {
                 CursorList::new(
                     factories.weight_factory(),
-                    batches.iter().map(|batch| batch.cursor()).collect(),
+                    batches
+                        .iter()
+                        .map(|batch| batch.cursor_with_hint(hint))
+                        .collect(),
                 )
             },
         }
@@ -1807,6 +2151,10 @@ impl<B: Batch> SpineCursor<B> {
 }
 
 impl<B: Batch> Cursor<B::Key, B::Val, B::Time, B::R> for SpineCursor<B> {
+    fn value_count_upper_bound(&self) -> usize {
+        self.with_cursor(|cursor| cursor.value_count_upper_bound())
+    }
+
     // fn key_vtable(&self) -> &'static VTable<B::Key> {
     //     self.cursor.key_vtable()
     // }
@@ -1940,13 +2288,14 @@ where
 {
     type Batch = B;
 
-    fn new(factories: &B::Factories, name: Arc<String>) -> Self {
+    fn new(factories: &B::Factories, name: Arc<String>, role: TraceRole) -> Self {
         Self::with_runtime(
             Runtime::runtime()
                 .expect("Attempting to create a spine merger outside of a DBSP runtime"),
             Runtime::worker_index(),
             factories,
             name,
+            role,
         )
     }
 
@@ -1955,16 +2304,17 @@ where
     }
 
     fn fork(&self) -> Self {
-        // Take the name, frontier, filters, and batches under a single lock
-        // acquisition, so that the fork sees a consistent view even if a
+        // Take the name, role, frontier, filters, and batches under a single
+        // lock acquisition, so that the fork sees a consistent view even if a
         // background merge completes concurrently.  The filters come from
         // the locked state, rather than from `self.key_filter` and
         // `self.value_filter`, because the locked copies are what the
         // source's merges actually enforce.
-        let (name, frontier, (key_filter, value_filter), batches) = {
+        let (name, role, frontier, (key_filter, value_filter), batches) = {
             let state = self.merger.state.lock().unwrap();
             (
                 state.name.clone(),
+                state.role,
                 state.frontier.clone(),
                 state.get_filters(),
                 state.get_batches(),
@@ -1976,7 +2326,9 @@ where
             Runtime::worker_index(),
             &self.factories,
             name,
-        );
+            role,
+        )
+        .with_layout(self.layout);
 
         if let Some(filter) = key_filter {
             fork.retain_keys(filter);
@@ -2026,7 +2378,7 @@ where
     }
 
     async fn insert(&mut self, batch: impl Into<Arc<Self::Batch>>) {
-        let batch = Self::maybe_flush_batch(batch, &self.factories, || {
+        let batch = Self::maybe_flush_batch(batch, &self.factories, self.layout, || {
             self.merger.state.lock().unwrap().get_filters()
         });
         if !batch.is_empty() {
@@ -2034,7 +2386,7 @@ where
             if self
                 .merger
                 .add_batch(batch, false)
-                .batch_count()
+                .count_loose_batches()
                 .should_apply_backpressure()
             {
                 self.merger.backpressure_wait().await;
@@ -2057,7 +2409,7 @@ where
             self.dirty = true;
             self.merger
                 .add_batch(batch, false)
-                .batch_count()
+                .count_loose_batches()
                 .should_apply_backpressure()
         } else {
             false
@@ -2096,73 +2448,22 @@ where
         &self.value_filter
     }
 
-    fn save(
-        &mut self,
-        base: &StoragePath,
-        persistent_id: &str,
-        files: &mut Vec<Arc<dyn FileCommitter>>,
-    ) -> Result<(), Error> {
-        fn persist_batches<B>(batches: Vec<Arc<B>>) -> Vec<Arc<B>>
-        where
-            B: Batch,
-        {
-            batches
-                .into_iter()
-                .map(|batch| {
-                    if let Some(persisted) = batch.persisted() {
-                        Arc::new(persisted)
-                    } else {
-                        batch
-                    }
-                })
-                .collect::<Vec<_>>()
+    fn save(&mut self, persistent_id: &str) -> Result<Box<dyn OperatorCheckpoint>, Error> {
+        let batches = self.get_batches();
+        // `restore` reads every batch back with this spine's factories, so a
+        // batch they cannot read would leave a checkpoint that never restores.
+        for batch in &batches {
+            assert!(
+                batch.restorable_with(&self.factories),
+                "spine {persistent_id} holds a batch on storage that its factories \
+                 could not restore from a checkpoint"
+            );
         }
-
-        // Persist all the batches, and stick the not-merging batches back into
-        // the merger.  (Putting the persisted batches into the merger means
-        // that we don't have to persist them again for the next checkpoint,
-        // saving time then. On the other hand, we do have to read them back
-        // from disk to use them: no free lunch.)
-        let (not_merging, merging) = self.merger.pause_new_merges();
-        let not_merging = persist_batches(not_merging);
-        self.merger.resume(not_merging.iter().cloned());
-        let merging = persist_batches(merging);
-
-        // Get the persistent IDs.
-        let ids = not_merging
-            .iter()
-            .chain(merging.iter())
-            .map(|batch| {
-                let file = batch
-                    .file_reader()
-                    .expect("The batch should have been persisted");
-                let path = file.path().to_string();
-                files.push(file);
-                path
-            })
-            .collect::<Vec<_>>();
-
-        let backend = Runtime::storage_backend().unwrap();
-        let committed: CommittedSpine = (ids, self as &Self).into();
-        let as_bytes = to_bytes(&committed).expect("Serializing CommittedSpine should work.");
-        // Push the pspine state file committer into the shared list so the
-        // checkpoint commit phase calls `.commit()` on it. Otherwise the
-        // file is fsynced inside `complete()` but never explicitly
-        // committed alongside the rest of the checkpoint, leaving its
-        // durability guarantee tied to the implementation detail.
-        let pspine_writer = backend.write(&Self::checkpoint_file(base, persistent_id), as_bytes)?;
-        files.push(pspine_writer);
-
-        // Write the batches as a separate file, this allows to parse it
-        // in `Checkpointer` without the need to know the exact Spine type.
-        let pspine_batches = PSpineBatches {
-            files: committed.batches,
-        };
-        backend
-            .write_json(&self.batchlist_file(base, persistent_id), &pspine_batches)
-            .and_then(|reader| reader.commit())?;
-
-        Ok(())
+        Ok(Box::new(SpineOperatorCheckpoint {
+            persistent_id: persistent_id.into(),
+            batches,
+            dirty: self.dirty,
+        }))
     }
 
     fn restore(&mut self, base: &StoragePath, persistent_id: &str) -> Result<(), Error> {
@@ -2223,6 +2524,78 @@ where
     }
 }
 
+/// A snapshot of a [Spine] ready to be written to a checkpoint.
+pub struct SpineOperatorCheckpoint<B> {
+    /// Persistent ID provided to [Spine::save].
+    persistent_id: String,
+    /// The batches that will go into the checkpoint.
+    batches: Vec<Arc<B>>,
+    /// Dirty flag.
+    dirty: bool,
+}
+
+impl<B> OperatorCheckpoint for SpineOperatorCheckpoint<B>
+where
+    B: Batch,
+{
+    fn write(
+        self: Box<Self>,
+        base: &StoragePath,
+    ) -> Result<SmallVec<[Arc<dyn FileCommitter>; 1]>, Error> {
+        // Persist all the batches and collect their names.
+        let (ids, mut files): (Vec<_>, SmallVec<_>) = self
+            .batches
+            .iter()
+            .map(|batch| {
+                let file = batch.file_reader().unwrap_or_else(|| {
+                    let persisted = batch
+                        .persisted()
+                        .expect("The batch should have been persisted");
+                    persisted
+                        .file_reader()
+                        .expect("The persisted batch should be readable")
+                });
+                (file.path().to_string(), file as Arc<dyn FileCommitter>)
+            })
+            .unzip();
+
+        // Write the spine in the form that we will restore from.
+        let backend = Runtime::storage_backend().unwrap();
+        let committed_spine = CommittedSpine {
+            batches: ids,
+            merged: Vec::new(),
+            effort: 0,
+            dirty: self.dirty,
+        };
+        let as_bytes = to_bytes(&committed_spine).expect("Serializing CommittedSpine should work.");
+        files.push(backend.write(
+            &Spine::<B>::checkpoint_file(base, &self.persistent_id),
+            as_bytes,
+        )?);
+
+        // Write the batches in a form that `Checkpointer` can read without the
+        // need to know the exact Spine type.
+        let pspine_batches = PSpineBatches {
+            files: committed_spine.batches,
+        };
+        files.push(backend.write_json(
+            &Spine::<B>::batchlist_file(base, &self.persistent_id),
+            &pspine_batches,
+        )?);
+
+        Ok(files)
+    }
+}
+
+impl<B> Debug for SpineOperatorCheckpoint<B> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpineOperatorCheckpoint")
+            .field("persistent_id", &self.persistent_id)
+            .field("dirty", &self.dirty)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<B> Spine<B>
 where
     B: Batch,
@@ -2232,7 +2605,7 @@ where
         debug_assert_eq!(MAX_LEVELS, 9);
         debug_assert!(max_level0_batch_size_records > 0 && max_level0_batch_size_records <= 99_999);
 
-        let len = batch.len();
+        let len = batch.len_upper_bound();
 
         let effective_len = if merge {
             // Merge batches with many negative weights more aggressively. Negative updates are likely to cancel
@@ -2268,7 +2641,7 @@ where
         }
     }
 
-    /// Allocates a new `Spine` for `worker_index` in `runtime`.
+    /// Allocates a new `Spine` for `worker_index` in `runtime`, for `role`.
     ///
     /// In the common case, [Spine::new] uses the current thread's runtime and
     /// worker index.
@@ -2277,14 +2650,42 @@ where
         worker_index: usize,
         factories: &B::Factories,
         name: Arc<String>,
+        role: TraceRole,
     ) -> Self {
         Spine {
             factories: factories.clone(),
             dirty: false,
             key_filter: None,
             value_filter: None,
-            merger: AsyncMerger::new(runtime, worker_index, factories, name),
+            layout: BatchLayout::default(),
+            merger: AsyncMerger::new(runtime, worker_index, factories, name, role),
         }
+    }
+
+    /// The role this spine was built with.
+    pub fn role(&self) -> TraceRole {
+        self.merger.state.lock().unwrap().role
+    }
+
+    /// Returns this spine with `layout` for the batches its merges and spills
+    /// write from now on.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout` - how to lay out the batches written from now on.
+    pub fn with_layout(mut self, layout: BatchLayout) -> Self {
+        self.layout = layout;
+        self.merger.state.lock().unwrap().layout = layout;
+        self
+    }
+
+    /// How this spine's merges and spills lay out what they write.
+    ///
+    /// # Returns
+    ///
+    /// The layout, which is the default unless [`Self::with_layout`] set one.
+    pub fn layout(&self) -> BatchLayout {
+        self.layout
     }
 
     pub fn complete_merges(&mut self) {
@@ -2299,11 +2700,26 @@ where
     }
 
     /// Returns `batch`, first pushing it to storage if it exceeds the
-    /// user-configured `min_storage_bytes` or if we're under high memory
-    /// pressure.
+    /// user-configured `min_spill_size` or if we're under high memory
+    /// pressure.  A batch pushed to storage is laid out as `layout` asks.
+    /// The runtime of the current thread decides whether to spill.  Outside a
+    /// runtime, the batch stays in memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` - the batch to keep or spill.
+    /// * `factories` - factories for the batch.
+    /// * `layout` - how a spilled batch lays out its file.
+    /// * `filters` - the key and value filters to apply while spilling, asked for only
+    ///   if the batch is spilled.
+    ///
+    /// # Returns
+    ///
+    /// The batch on storage if it was spilled, and the batch as it arrived otherwise.
     pub fn maybe_flush_batch<F>(
         batch: impl Into<Arc<B>>,
         factories: &B::Factories,
+        layout: BatchLayout,
         filters: F,
     ) -> Arc<B>
     where
@@ -2311,7 +2727,8 @@ where
     {
         let batch = batch.into();
         if batch.location() == BatchLocation::Memory
-            && pick_insert_destination(&batch) == BatchLocation::Storage
+            && pick_insert_destination(Runtime::runtime().as_ref(), &batch)
+                == BatchLocation::Storage
         {
             let _span = Span::new("eager spill")
                 .with_category("Spine")
@@ -2319,14 +2736,18 @@ where
                     format!(
                         "Eagerly spill {} batch with {} keys and {} values",
                         HumanBytes::from(batch.approximate_byte_size()),
-                        batch.key_count(),
-                        batch.len()
+                        batch.key_count_upper_bound(),
+                        batch.len_upper_bound()
                     )
                 });
             match Arc::try_unwrap(batch) {
                 Ok(mut batch) => {
-                    let builder =
-                        B::Builder::for_merge(factories, [&batch], Some(BatchLocation::Storage));
+                    let builder = B::Builder::for_merge(
+                        factories,
+                        [&batch],
+                        Some(BatchLocation::Storage),
+                        layout,
+                    );
                     let (key_filter, value_filter) = filters();
                     Arc::new(ListMerger::merge(
                         factories,
@@ -2336,8 +2757,12 @@ where
                 }
                 Err(batch) => {
                     let batch_ref: &B = &batch;
-                    let builder =
-                        B::Builder::for_merge(factories, [batch_ref], Some(BatchLocation::Storage));
+                    let builder = B::Builder::for_merge(
+                        factories,
+                        [batch_ref],
+                        Some(BatchLocation::Storage),
+                        layout,
+                    );
                     let (key_filter, value_filter) = filters();
                     Arc::new(ListMerger::merge(
                         factories,
@@ -2353,8 +2778,22 @@ where
 
     /// Returns an object that can be used to wait for backpressure to be
     /// relieved.  Returns `None` if no backpressure is needed.
-    pub fn backpressure_waiter(&self) -> Option<OwnedNotified> {
-        self.merger.backpressure_waiter()
+    ///
+    /// Pass the report half to [`Self::record_backpressure_wait`] after
+    /// awaiting, so the wait shows up in
+    /// `merge_backpressure_wait_time_seconds` and in profiles.
+    pub(crate) fn backpressure_waiter(
+        &self,
+    ) -> Option<(
+        impl Future<Output = ()> + Send + use<B>,
+        BackpressureWaitReport,
+    )> {
+        self.merger.backpressure_waiter().map(|wait| wait.split())
+    }
+
+    /// Reports a wait obtained from [`Self::backpressure_waiter`].
+    pub(crate) fn record_backpressure_wait(&self, report: BackpressureWaitReport) {
+        self.merger.record_backpressure_wait(report)
     }
 }
 
@@ -2366,5 +2805,835 @@ where
 
     fn ro_snapshot(&self) -> SpineSnapshot<B> {
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackpressureWait, LooseBatchCount, SpineStats};
+    use crate::circuit::metadata::MetaItem;
+    use crate::profile::{ParkReason, current_park_reason};
+    use crate::storage::buffer_cache::CacheStats;
+    use std::{
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Instant,
+    };
+    use tokio::sync::Notify;
+
+    fn backpressure_wait() -> BackpressureWait {
+        BackpressureWait {
+            notify: Arc::new(Notify::new()).notified_owned(),
+            name: Arc::new("spine".into()),
+            start: Instant::now(),
+            initial_loose: LooseBatchCount::HIGH_THRESHOLD,
+            initial_total: LooseBatchCount::HIGH_THRESHOLD,
+        }
+    }
+
+    /// A caller outside this module awaits the future that `split` hands out
+    /// rather than `backpressure_wait`, so the declaration the park hook reads
+    /// has to travel with the future.  Without it the wait lands in the
+    /// breakdown's catch-all instead of `merge_backpressure`.
+    #[test]
+    fn a_handed_out_wait_declares_merge_backpressure() {
+        let (wait, _report) = backpressure_wait().split();
+        let mut wait = Box::pin(wait);
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert_eq!(current_park_reason(), ParkReason::Unattributed);
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(current_park_reason(), ParkReason::MergeBackpressure);
+    }
+
+    /// The declaration lasts as long as the wait and no longer: dropping the
+    /// future, which is what awaiting it to completion does, takes it back.
+    #[test]
+    fn dropping_a_handed_out_wait_takes_back_the_declaration() {
+        // Boxed rather than `pin!`ed, so that dropping the binding drops the
+        // future and not just a pin to it.
+        let (wait, _report) = backpressure_wait().split();
+        let mut wait = Box::pin(wait);
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+        drop(wait);
+        assert_eq!(current_park_reason(), ParkReason::Unattributed);
+    }
+
+    /// Merges that output more updates than their inputs report a negative
+    /// reduction.
+    #[test]
+    fn merge_reduction_can_be_negative() {
+        let mut stats = SpineStats::default();
+        stats.report_merge(10, 15, CacheStats::default());
+        assert_eq!(
+            stats.merge_reduction(),
+            MetaItem::Percent {
+                numerator: -5,
+                denominator: 10
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod merge_rule_test {
+    use super::{CompactionStatus, MERGE_COUNTS, Merge, MergerType, SharedState, Slot};
+    use crate::algebra::{OrdZSet, OrdZSetFactories};
+    use crate::circuit::{CircuitConfig, mkconfig};
+    use crate::dynamic::{DynData, DynUnit};
+    use crate::trace::{
+        BatchLayout, BatchLocation, BatchReader, BatchReaderFactories, Builder, Filter,
+        GroupFilter, TraceRole, test::run_in_circuit_with_storage_config,
+    };
+    use crate::typed_batch::OrdZSet as TypedOrdZSet;
+    use crate::utils::Tup2;
+    use crate::{Runtime, ZWeight};
+    use feldera_types::memory_pressure::MemoryPressure;
+    use std::sync::{Arc, Mutex};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    /// A batch of `n` distinct records.
+    fn batch(n: usize) -> Arc<OrdZSet<DynData>> {
+        let tuples: Vec<Tup2<Tup2<i32, ()>, ZWeight>> =
+            (0..n as i32).map(|i| Tup2(Tup2(i, ()), 1)).collect();
+        Arc::new(TypedOrdZSet::<i32>::from_tuples((), tuples).into_inner())
+    }
+
+    /// A batch of `n` distinct records, each with weight -1.
+    fn retractions(n: usize) -> Arc<OrdZSet<DynData>> {
+        let tuples: Vec<Tup2<Tup2<i32, ()>, ZWeight>> =
+            (0..n as i32).map(|i| Tup2(Tup2(i, ()), -1)).collect();
+        Arc::new(TypedOrdZSet::<i32>::from_tuples((), tuples).into_inner())
+    }
+
+    fn slot_with(sizes: &[usize]) -> Slot<OrdZSet<DynData>> {
+        let mut slot = Slot::default();
+        for &n in sizes {
+            slot.loose_batches.push_back(batch(n));
+        }
+        slot
+    }
+
+    /// A level merges once it holds the count it waits for, and not before:
+    /// short of ten it waits, even with the three the built-in minimum would
+    /// have merged.
+    #[test]
+    fn a_level_merges_at_its_full_count() {
+        for short in [*MERGE_COUNTS[2].start(), 9] {
+            let mut state = state_with(2, slot_with(&vec![10; short]));
+            assert!(
+                state.try_start_merge(2).is_none(),
+                "{short} batches are short of a threshold of ten"
+            );
+            assert!(
+                state.slots[2].merging_batches.is_none(),
+                "nothing may have been taken"
+            );
+        }
+
+        let mut full = state_with(2, slot_with(&[10; 10]));
+        let taken = full
+            .try_start_merge(2)
+            .expect("ten batches are the count the level waits for");
+        assert_eq!(taken.len(), 10);
+    }
+
+    /// Only the batches held in memory have to move under memory pressure;
+    /// merging the stored ones as well is the work the rule avoids.
+    #[test]
+    fn relieving_memory_pressure_takes_only_the_in_memory_batches() {
+        let mut slot = slot_with(&[10; 3]);
+        assert!(
+            slot.loose_batches
+                .iter()
+                .all(|b| b.location() == BatchLocation::Memory),
+            "the batches this builds are in memory, which is what the test needs"
+        );
+        let taken = slot.start_merge_of_in_memory();
+        assert_eq!(taken.len(), 3, "every in-memory batch goes");
+        assert!(slot.loose_batches.is_empty());
+        assert_eq!(slot.merging_batches.as_ref().map(Vec::len), Some(3));
+    }
+
+    /// Memory pressure merges a level's in-memory batches only if the runtime
+    /// has storage to move them to.
+    #[test]
+    fn memory_pressure_merges_only_with_storage() {
+        let temp_dir = tempdir().expect("Can't create temp dir for storage");
+        for (has_storage, config) in [
+            (false, CircuitConfig::with_workers(1)),
+            (true, mkconfig(temp_dir.path())),
+        ] {
+            // A one-byte budget puts the runtime under critical memory pressure.
+            let config = config.with_max_rss_bytes(Some(1));
+
+            // Under memory pressure, the runtime would write a new batch to
+            // storage, so this one is built outside it.
+            let in_memory = batch(10);
+            assert_eq!(in_memory.location(), BatchLocation::Memory);
+
+            let observed = Arc::new(Mutex::new(None));
+            let reporter = Arc::clone(&observed);
+            run_in_circuit_with_storage_config(config, move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Runtime::memory_pressure() < Some(MemoryPressure::High)
+                    && Instant::now() < deadline
+                {
+                    sleep(Duration::from_millis(10));
+                }
+
+                // One batch is short of every merge rule but memory pressure.
+                let mut slot = Slot::default();
+                slot.loose_batches.push_back(in_memory);
+                let mut state = state_with(2, slot);
+                let merged = state.try_start_merge(2).is_some();
+                *reporter.lock().unwrap() = Some((Runtime::memory_pressure(), merged));
+            });
+
+            let (pressure, merged) = observed.lock().unwrap().take().unwrap();
+            assert!(
+                pressure >= Some(MemoryPressure::High),
+                "memory pressure is {pressure:?}"
+            );
+            assert_eq!(merged, has_storage, "has_storage: {has_storage}");
+        }
+    }
+
+    /// Relieving memory pressure can leave one in-memory batch to merge, so a
+    /// merge of a single batch has to work: the merger reaches its loop for
+    /// the last remaining cursor without having gone round the one that
+    /// compares cursors against each other.
+    #[test]
+    fn a_merge_of_one_batch_keeps_its_records() {
+        let one = batch(1_000);
+        let mut merge = Merge::new(
+            MergerType::ListMerger,
+            vec![one.clone()],
+            &None,
+            &None,
+            None,
+            (),
+            BatchLayout::default(),
+        );
+        for _ in 0..1_000 {
+            if merge.done {
+                break;
+            }
+            merge.merge(1 << 20);
+        }
+        assert!(merge.done, "a merge of one batch did not finish");
+        let merged = merge.builder.done();
+        assert_eq!(merged.len_upper_bound(), one.len_upper_bound(), "records");
+        assert_eq!(
+            merged.key_count_upper_bound(),
+            one.key_count_upper_bound(),
+            "keys"
+        );
+    }
+
+    /// Compaction is not subject to any of this: it takes the whole level.
+    #[test]
+    fn compaction_takes_every_batch() {
+        let mut slot = slot_with(&[10; 4]);
+        slot.compaction_status = CompactionStatus::Requested;
+        let mut state = state_with(1, slot);
+        let taken = state
+            .try_start_merge(1)
+            .expect("compaction merges whatever it has");
+        assert_eq!(taken.len(), 4);
+        assert_eq!(
+            state.slots[1].compaction_status,
+            CompactionStatus::InProgress
+        );
+    }
+
+    /// A level more than the given share of whose records are retractions
+    /// merges every batch it holds, so that they cancel.
+    #[test]
+    fn retractions_past_the_share_merge_the_level() {
+        // 30 of 110 records retract: past a fifth.
+        let mut slot = slot_with(&[80]);
+        slot.loose_batches.push_back(retractions(30));
+        let merging = slot
+            .try_start_cancelling_merge(2, 0.2)
+            .expect("a level that is 27% retractions should merge");
+        assert_eq!(merging.len(), 2);
+        assert!(slot.loose_batches.is_empty());
+        assert_eq!(slot.merging_batches.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// The share has to be exceeded, not just reached, and a level short of
+    /// it is left as it is.
+    #[test]
+    fn retractions_short_of_the_share_leave_the_level() {
+        let mut slot = slot_with(&[80]);
+        slot.loose_batches.push_back(retractions(20));
+        assert!(
+            slot.try_start_cancelling_merge(2, 0.2).is_none(),
+            "exactly a fifth is not past a fifth"
+        );
+
+        let mut slot = slot_with(&[90]);
+        slot.loose_batches.push_back(retractions(10));
+        assert!(slot.try_start_cancelling_merge(2, 0.2).is_none(), "a tenth");
+        assert_eq!(slot.loose_batches.len(), 2, "nothing was taken");
+        assert!(slot.merging_batches.is_none());
+    }
+
+    /// A lone batch has nothing to cancel against, whatever it holds.
+    #[test]
+    fn a_lone_batch_does_not_merge_for_its_retractions() {
+        let mut slot = Slot::default();
+        slot.loose_batches.push_back(retractions(50));
+        assert!(slot.try_start_cancelling_merge(2, 0.2).is_none());
+    }
+
+    /// A level that is already merging starts no other merge.
+    #[test]
+    fn a_running_merge_holds_off_a_cancelling_one() {
+        let mut slot = slot_with(&[10]);
+        slot.loose_batches.push_back(retractions(10));
+        slot.merging_batches = Some(vec![batch(10)]);
+        assert!(slot.try_start_cancelling_merge(2, 0.2).is_none());
+    }
+
+    /// At a share of one the level never merges for its retractions: no
+    /// share of its records can exceed all of them.
+    #[test]
+    fn a_share_of_one_turns_the_cancelling_merge_off() {
+        let mut slot = Slot::default();
+        slot.loose_batches.push_back(retractions(10));
+        slot.loose_batches.push_back(retractions(10));
+        assert!(slot.try_start_cancelling_merge(2, 1.0).is_none());
+    }
+
+    /// An integral's shared state holding `slot` at `level` and nothing else.
+    fn state_with(level: usize, slot: Slot<OrdZSet<DynData>>) -> SharedState<OrdZSet<DynData>> {
+        let mut state = integral_state();
+        state.slots[level] = slot;
+        state
+    }
+
+    /// An integral's shared state, outside any runtime, so with the default
+    /// settings: levels wait for ten batches, and the highest merges for its
+    /// retractions past a fifth.
+    fn integral_state() -> SharedState<OrdZSet<DynData>> {
+        SharedState::new(
+            &<OrdZSetFactories<DynData>>::new::<i32, (), ZWeight>(),
+            Arc::new(String::from("merge_rule_test")),
+            0,
+            TraceRole::Integral,
+        )
+    }
+
+    /// Only the highest level that holds any batches merges for its
+    /// retractions.  Batches above a level, loose or merging, leave it to
+    /// wait for its own count, and the spine's share is what decides.
+    #[test]
+    fn only_the_highest_level_merges_for_its_retractions() {
+        // Two batches at level 2, a third of whose records retract: short of
+        // the level's own count of ten, past the default share of a fifth.
+        let filled = || {
+            let mut state = integral_state();
+            state.slots[2].loose_batches.push_back(batch(80));
+            state.slots[2].loose_batches.push_back(retractions(40));
+            state
+        };
+
+        let mut highest = filled();
+        assert_eq!(
+            highest.try_start_merge(2).map(|batches| batches.len()),
+            Some(2),
+            "the highest level merges"
+        );
+
+        let mut below_loose = filled();
+        below_loose.slots[3].loose_batches.push_back(batch(1000));
+        assert!(
+            below_loose.try_start_merge(2).is_none(),
+            "a level with loose batches above it waits"
+        );
+        assert_eq!(below_loose.slots[2].loose_batches.len(), 2);
+
+        let mut below_merging = filled();
+        below_merging.slots[3].merging_batches = Some(vec![batch(1000)]);
+        assert!(
+            below_merging.try_start_merge(2).is_none(),
+            "a level with a merge running above it waits"
+        );
+
+        let mut off = filled();
+        off.top_level_negative_weight_fraction = 1.0;
+        assert!(
+            off.try_start_merge(2).is_none(),
+            "a share of one turns it off"
+        );
+    }
+
+    /// A spine with a key or value filter drops what the filter rejects only
+    /// when it merges, so its levels merge at the `MERGE_COUNTS` minimum
+    /// instead of waiting for the ten its role asks for.  Short of the
+    /// minimum, it waits like any other spine.
+    #[test]
+    fn a_spine_with_a_filter_merges_at_the_built_in_minimum() {
+        let minimum = *MERGE_COUNTS[2].start();
+        let filters: [(&str, fn(&mut SharedState<OrdZSet<DynData>>)); 3] = [
+            ("no filter", |_| {}),
+            ("a key filter", |state| {
+                state.key_filter = Some(Filter::new(Box::new(|_: &DynData| true)));
+            }),
+            ("a value filter", |state| {
+                state.value_filter =
+                    Some(GroupFilter::Simple(Filter::new(Box::new(|_: &DynUnit| {
+                        true
+                    }))));
+            }),
+        ];
+        for role in [TraceRole::Integral, TraceRole::Accumulator] {
+            for (name, set_filter) in filters {
+                let mut state = SharedState::new(
+                    &<OrdZSetFactories<DynData>>::new::<i32, (), ZWeight>(),
+                    Arc::new(String::from("merge_rule_test")),
+                    0,
+                    role,
+                );
+                set_filter(&mut state);
+                for batches in [minimum - 1, minimum] {
+                    state.slots[2] = slot_with(&vec![10; batches]);
+                    let expected = (name != "no filter" && batches == minimum).then_some(minimum);
+                    assert_eq!(
+                        state.try_start_merge(2).map(|taken| taken.len()),
+                        expected,
+                        "{role:?} spine with {name} and {batches} batches at level 2"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_threshold_test {
+    use super::{LooseBatchCount, MAX_LEVELS, MERGE_COUNTS, min_batches_to_merge};
+    use crate::ZWeight;
+    use crate::typed_batch::OrdZSet as TypedOrdZSet;
+    use crate::utils::Tup2;
+    use crate::{
+        algebra::{OrdZSet, OrdZSetFactories},
+        circuit::mkconfig,
+        dynamic::{DowncastTrait, DynData},
+        trace::{
+            BatchReader, BatchReaderFactories, Filter, Spine, Trace, TraceRole,
+            test::{run_in_circuit_with_storage, run_in_circuit_with_storage_config},
+        },
+    };
+    use feldera_types::config::{DevTweaks, dev_tweaks::MAX_MERGE_THRESHOLD_BATCHES};
+    use std::sync::{Arc, Mutex};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    fn zset_factories() -> OrdZSetFactories<DynData> {
+        BatchReaderFactories::new::<i32, (), ZWeight>()
+    }
+
+    /// The merge threshold `spine` was built with.
+    fn merge_threshold_batches(spine: &Spine<OrdZSet<DynData>>) -> usize {
+        spine.merger.state.lock().unwrap().merge_threshold_batches
+    }
+
+    /// Batches that can wait in a spine with no level ready to merge.
+    fn loose_batches_with_no_merge_due(merge_threshold_batches: usize) -> usize {
+        (0..MAX_LEVELS)
+            .map(|level| min_batches_to_merge(level, merge_threshold_batches) - 1)
+            .sum()
+    }
+
+    /// A spine blocks its producer at `LooseBatchCount::HIGH_THRESHOLD` loose
+    /// batches and only a merge unblocks it, so no accepted threshold may let
+    /// that many wait with no merge due.
+    #[test]
+    fn the_bound_keeps_a_stalled_spine_under_backpressure() {
+        for merge_threshold_batches in [
+            0,
+            usize::from(DevTweaks::default().accumulator_merge_threshold_batches()),
+            usize::from(MAX_MERGE_THRESHOLD_BATCHES),
+        ] {
+            let stalled = loose_batches_with_no_merge_due(merge_threshold_batches);
+            assert!(
+                !LooseBatchCount(stalled).should_apply_backpressure(),
+                "{merge_threshold_batches} leaves {stalled} batches waiting with no merge due, \
+                 at or past the backpressure threshold of {}",
+                LooseBatchCount::HIGH_THRESHOLD
+            );
+        }
+        assert!(
+            loose_batches_with_no_merge_due(18) >= LooseBatchCount::HIGH_THRESHOLD,
+            "18 was supposed to be the value that stalls"
+        );
+    }
+
+    /// With zero, every level waits for its `MERGE_COUNTS` minimum.
+    #[test]
+    fn zero_reproduces_the_table() {
+        for (level, range) in MERGE_COUNTS.iter().enumerate() {
+            assert_eq!(
+                min_batches_to_merge(level, 0),
+                *range.start(),
+                "level {level}"
+            );
+        }
+    }
+
+    /// Above level 1, the setting is the number of batches a level waits
+    /// for.  Levels 0 and 1 keep their `MERGE_COUNTS` minimum.
+    #[test]
+    fn a_larger_setting_raises_only_the_upper_levels() {
+        assert_eq!(min_batches_to_merge(0, 10), *MERGE_COUNTS[0].start());
+        assert_eq!(min_batches_to_merge(1, 10), 8);
+        for level in 2..MAX_LEVELS {
+            assert_eq!(min_batches_to_merge(level, 10), 10, "level {level}");
+        }
+    }
+
+    /// The setting is clamped to the level's `MERGE_COUNTS` range.
+    #[test]
+    fn the_setting_stays_within_the_levels_range() {
+        for (level, range) in MERGE_COUNTS.iter().enumerate() {
+            assert_eq!(
+                min_batches_to_merge(level, 2),
+                *range.start(),
+                "level {level}"
+            );
+            let widest = if level >= 2 {
+                *range.end()
+            } else {
+                *range.start()
+            };
+            assert_eq!(min_batches_to_merge(level, 1000), widest, "level {level}");
+        }
+    }
+
+    /// A spine built as an accumulator carries the accumulator's threshold,
+    /// and one built as an integral carries the integral's.
+    ///
+    /// The thresholds are read inside the runtime but compared outside it: a
+    /// panic in a worker cannot unwind, so an assertion there would abort the
+    /// test process instead of reporting which comparison failed.
+    #[test]
+    fn the_role_reaches_the_spine() {
+        // The roles share a default, so the test sets them apart: with equal
+        // thresholds a spine that read the wrong role's would still match.
+        let temp_dir = tempdir().expect("Can't create temp dir for storage");
+        let mut config = mkconfig(temp_dir.path());
+        config.dev_tweaks.integral_merge_threshold_batches = Some(4);
+        config.dev_tweaks.accumulator_merge_threshold_batches = Some(7);
+
+        let observed = Arc::new(Mutex::new(None));
+        let reporter = Arc::clone(&observed);
+        run_in_circuit_with_storage_config(config, move || {
+            let name = Arc::new(String::from("merge_threshold_test"));
+            let integral = Spine::<OrdZSet<DynData>>::new(
+                &zset_factories(),
+                name.clone(),
+                TraceRole::Integral,
+            );
+            let accumulator =
+                Spine::<OrdZSet<DynData>>::new(&zset_factories(), name, TraceRole::Accumulator);
+            *reporter.lock().unwrap() = Some((
+                merge_threshold_batches(&integral),
+                merge_threshold_batches(&accumulator),
+            ));
+        });
+
+        let (integral, accumulator) = observed
+            .lock()
+            .unwrap()
+            .expect("the circuit did not report the spines' thresholds");
+        assert_eq!(integral, 4, "an integral's spine");
+        assert_eq!(accumulator, 7, "an accumulator's spine");
+    }
+
+    /// A fork keeps its source's role.
+    #[test]
+    fn a_fork_keeps_its_role() {
+        let observed = Arc::new(Mutex::new(None));
+        let reporter = Arc::clone(&observed);
+        run_in_circuit_with_storage(move || {
+            let name = Arc::new(String::from("merge_threshold_test"));
+            let accumulator =
+                Spine::<OrdZSet<DynData>>::new(&zset_factories(), name, TraceRole::Accumulator);
+            let fork = accumulator.fork();
+            *reporter.lock().unwrap() = Some((
+                fork.role(),
+                merge_threshold_batches(&fork),
+                merge_threshold_batches(&accumulator),
+            ));
+        });
+
+        let (role, fork_threshold, source_threshold) = observed
+            .lock()
+            .unwrap()
+            .expect("the circuit did not report the fork's role");
+        assert_eq!(role, TraceRole::Accumulator);
+        assert_eq!(fork_threshold, source_threshold);
+    }
+
+    /// Both roles wait for ten batches before merging.
+    ///
+    /// The integral used to default to zero, which left every level on its
+    /// `MERGE_COUNTS` minimum of three.  A merge of three produces a batch
+    /// that stays at its own level and is merged again, so the records were
+    /// written about twice for every level they climbed.
+    #[test]
+    fn both_roles_default_to_ten() {
+        let tweaks = DevTweaks::default();
+        assert_eq!(tweaks.accumulator_merge_threshold_batches(), 10);
+        assert_eq!(tweaks.integral_merge_threshold_batches(), 10);
+    }
+
+    /// Either default can be overridden, including back to zero.
+    #[test]
+    fn either_role_can_be_configured() {
+        let tweaks = DevTweaks {
+            accumulator_merge_threshold_batches: Some(0),
+            integral_merge_threshold_batches: Some(12),
+            ..DevTweaks::default()
+        };
+        assert_eq!(tweaks.accumulator_merge_threshold_batches(), 0);
+        assert_eq!(tweaks.integral_merge_threshold_batches(), 12);
+        assert_eq!(min_batches_to_merge(3, 0), *MERGE_COUNTS[3].start());
+        assert_eq!(min_batches_to_merge(3, 12), 12);
+    }
+
+    /// Setting both thresholds to zero resets every spine to the
+    /// `MERGE_COUNTS` minimum.
+    ///
+    /// Read inside the runtime, checked outside it, as in
+    /// [`the_role_reaches_the_spine`].
+    #[test]
+    fn zero_switches_the_feature_off_for_both_roles() {
+        let temp_dir = tempdir().expect("Can't create temp dir for storage");
+        let mut config = mkconfig(temp_dir.path());
+        config.dev_tweaks.accumulator_merge_threshold_batches = Some(0);
+        config.dev_tweaks.integral_merge_threshold_batches = Some(0);
+
+        let observed = Arc::new(Mutex::new(None));
+        let reporter = Arc::clone(&observed);
+        run_in_circuit_with_storage_config(config, move || {
+            let name = Arc::new(String::from("merge_threshold_test"));
+            let integral = Spine::<OrdZSet<DynData>>::new(
+                &zset_factories(),
+                name.clone(),
+                TraceRole::Integral,
+            );
+            let accumulator =
+                Spine::<OrdZSet<DynData>>::new(&zset_factories(), name, TraceRole::Accumulator);
+            *reporter.lock().unwrap() = Some((
+                merge_threshold_batches(&integral),
+                merge_threshold_batches(&accumulator),
+            ));
+        });
+
+        let (integral, accumulator) = observed
+            .lock()
+            .unwrap()
+            .expect("the circuit did not report the spines' thresholds");
+        for (level, range) in MERGE_COUNTS.iter().enumerate() {
+            assert_eq!(
+                min_batches_to_merge(level, integral),
+                *range.start(),
+                "level {level}"
+            );
+            assert_eq!(
+                min_batches_to_merge(level, accumulator),
+                *range.start(),
+                "level {level}"
+            );
+        }
+    }
+
+    /// Out-of-range settings that skipped `DevTweaks::validate` are clamped
+    /// into range on every read, not only on the first, which logs the
+    /// warning.
+    ///
+    /// Read inside the runtime, checked outside it, as in
+    /// [`the_role_reaches_the_spine`].
+    #[test]
+    fn out_of_range_settings_are_clamped() {
+        for (fraction, clamped_fraction) in [(1.5, 1.0), (-0.5, 0.0), (f64::NAN, 1.0)] {
+            let temp_dir = tempdir().expect("Can't create temp dir for storage");
+            let mut config = mkconfig(temp_dir.path());
+            config.dev_tweaks.integral_merge_threshold_batches =
+                Some(MAX_MERGE_THRESHOLD_BATCHES + 1);
+            config.dev_tweaks.accumulator_merge_threshold_batches = Some(u16::MAX);
+            config.dev_tweaks.top_level_negative_weight_fraction = Some(fraction);
+
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let reporter = Arc::clone(&observed);
+            run_in_circuit_with_storage_config(config, move || {
+                let name = Arc::new(String::from("merge_threshold_test"));
+                for role in [TraceRole::Integral, TraceRole::Accumulator] {
+                    let spine =
+                        Spine::<OrdZSet<DynData>>::new(&zset_factories(), name.clone(), role);
+                    let state = spine.merger.state.lock().unwrap();
+                    reporter.lock().unwrap().push((
+                        state.merge_threshold_batches,
+                        state.top_level_negative_weight_fraction,
+                    ));
+                }
+            });
+
+            let observed = observed.lock().unwrap();
+            assert_eq!(
+                observed.len(),
+                2,
+                "the circuit did not report the spines' settings"
+            );
+            for &(threshold, used_fraction) in observed.iter() {
+                assert_eq!(
+                    threshold,
+                    usize::from(MAX_MERGE_THRESHOLD_BATCHES),
+                    "fraction {fraction}"
+                );
+                assert_eq!(used_fraction, clamped_fraction, "fraction {fraction}");
+            }
+        }
+    }
+
+    /// A batch of the given keys and weights.
+    fn zset(records: impl Iterator<Item = (i32, ZWeight)>) -> OrdZSet<DynData> {
+        let tuples: Vec<Tup2<Tup2<i32, ()>, ZWeight>> = records
+            .map(|(key, weight)| Tup2(Tup2(key, ()), weight))
+            .collect();
+        TypedOrdZSet::<i32>::from_tuples((), tuples).into_inner()
+    }
+
+    /// A spine whose only level holds two batches, a third of whose records
+    /// retract the rest, merges them although the level waits for ten: the
+    /// retractions cancel, and the spine keeps only what they left.
+    ///
+    /// The layout is read inside the runtime and checked outside it, because
+    /// a panic in a worker would abort the test process.
+    #[test]
+    fn retractions_at_the_highest_level_cancel() {
+        let temp_dir = tempdir().expect("Can't create temp dir for storage");
+        let observed = Arc::new(Mutex::new(None));
+        let reporter = Arc::clone(&observed);
+        run_in_circuit_with_storage_config(mkconfig(temp_dir.path()), move || {
+            let mut spine = Spine::<OrdZSet<DynData>>::new(
+                &zset_factories(),
+                Arc::new(String::from("merge_threshold_test")),
+                TraceRole::Integral,
+            );
+            // 600,000 records, then retractions of the first 300,000: both
+            // batches land at level 2, which then holds 900,000 records, a
+            // third of them retractions.
+            spine.insert_without_blocking(zset((0..600_000).map(|key| (key, 1))));
+            spine.insert_without_blocking(zset((0..300_000).map(|key| (key, -1))));
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let layout = loop {
+                let layout = {
+                    let state = spine.merger.state.lock().unwrap();
+                    let slot = &state.slots[2];
+                    (
+                        slot.loose_batches.len(),
+                        slot.merging_batches.is_some(),
+                        slot.loose_batches
+                            .iter()
+                            .map(|batch| batch.len_upper_bound())
+                            .sum::<usize>(),
+                    )
+                };
+                if (layout.0 == 1 && !layout.1) || Instant::now() > deadline {
+                    break layout;
+                }
+                sleep(Duration::from_millis(10));
+            };
+            *reporter.lock().unwrap() = Some(layout);
+        });
+
+        let (loose, merging, records) = observed
+            .lock()
+            .unwrap()
+            .expect("the circuit did not report the spine's layout");
+        assert_eq!(
+            (loose, merging),
+            (1, false),
+            "level 2 should have merged its two batches into one"
+        );
+        assert_eq!(
+            records, 300_000,
+            "the retractions should have cancelled the records they retract"
+        );
+    }
+
+    /// A spine with a key filter merges three batches at level 2, the
+    /// `MERGE_COUNTS` minimum, although its role waits for ten, and the merge
+    /// drops the keys the filter rejects.
+    ///
+    /// The layout is read inside the runtime and checked outside it, because
+    /// a panic in a worker would abort the test process.
+    #[test]
+    fn a_filtered_spine_merges_at_the_built_in_minimum() {
+        let temp_dir = tempdir().expect("Can't create temp dir for storage");
+        let observed = Arc::new(Mutex::new(None));
+        let reporter = Arc::clone(&observed);
+        run_in_circuit_with_storage_config(mkconfig(temp_dir.path()), move || {
+            let mut spine = Spine::<OrdZSet<DynData>>::new(
+                &zset_factories(),
+                Arc::new(String::from("merge_threshold_test")),
+                TraceRole::Integral,
+            );
+            // Keys below 300,000 have expired.
+            spine.retain_keys(Filter::new(Box::new(|key: &DynData| {
+                *key.downcast_checked::<i32>() >= 300_000
+            })));
+            // Three batches of 200,000 records, each of which lands at level 2.
+            for first in [0, 200_000, 400_000] {
+                spine.insert_without_blocking(zset((first..first + 200_000).map(|key| (key, 1))));
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let layout = loop {
+                let layout = {
+                    let state = spine.merger.state.lock().unwrap();
+                    let slot = &state.slots[2];
+                    (
+                        slot.loose_batches.len(),
+                        slot.merging_batches.is_some(),
+                        slot.loose_batches
+                            .iter()
+                            .map(|batch| batch.len_upper_bound())
+                            .sum::<usize>(),
+                    )
+                };
+                if (layout.0 == 1 && !layout.1) || Instant::now() > deadline {
+                    break layout;
+                }
+                sleep(Duration::from_millis(10));
+            };
+            *reporter.lock().unwrap() = Some(layout);
+        });
+
+        let (loose, merging, records) = observed
+            .lock()
+            .unwrap()
+            .expect("the circuit did not report the spine's layout");
+        assert_eq!(
+            (loose, merging),
+            (1, false),
+            "level 2 should have merged its three batches into one"
+        );
+        assert_eq!(
+            records, 300_000,
+            "the merge should have dropped the keys the filter rejects"
+        );
     }
 }

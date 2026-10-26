@@ -1,7 +1,13 @@
 import json
+import re
 import time
+import uuid
+from contextlib import closing
 from http import HTTPStatus
+from itertools import islice
 from urllib.parse import quote_plus
+
+import pytest
 
 from .helper import (
     create_pipeline,
@@ -15,11 +21,16 @@ from .helper import (
     clear_pipeline,
     gen_pipeline_name,
     wait_for_condition,
+    wait_for_pipeline_reachable,
 )
+
+from tests import TEST_CLIENT
 
 from feldera.testutils import FELDERA_TEST_NUM_HOSTS
 from feldera.stats import PipelineStatistics
 from feldera.enums import PipelineStatus
+from feldera.rest.errors import FelderaAPIError
+from feldera.rest.logs import LogPosition
 
 
 def _ingest_lines(name: str, table: str, body: str):
@@ -57,6 +68,7 @@ def test_pipeline_metrics(pipeline_name):
     """
     create_pipeline(pipeline_name, "")
     start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
 
     # Default
     r_default = get(api_url(f"/pipelines/{pipeline_name}/metrics"))
@@ -84,6 +96,126 @@ def test_pipeline_metrics(pipeline_name):
     assert r_bad.status_code == HTTPStatus.BAD_REQUEST
 
 
+def _reported_statuses(text: str, pipeline_name: str, metric: str) -> dict[str, int]:
+    """Returns the status to value mapping that `metric` reports for `pipeline_name`."""
+    statuses = {}
+    for line in text.splitlines():
+        m = re.fullmatch(rf"{metric}\{{(.*)\}} (\d+)", line)
+        if not m:
+            continue
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        if labels["pipeline_name"] == pipeline_name:
+            statuses[labels["status"]] = int(m.group(2))
+    return statuses
+
+
+def _reported_statuses_json(
+    families: list, pipeline_name: str, metric: str
+) -> dict[str, int]:
+    """Returns the status to value mapping that JSON `metric` reports for `pipeline_name`."""
+    for family in families:
+        if family.get("key") != metric:
+            continue
+        return {
+            value["labels"]["status"]: value["value"]
+            for value in family["values"]
+            if value["labels"]["pipeline_name"] == pipeline_name
+        }
+    return {}
+
+
+def _assert_only(reported: dict[str, int], metric: str, expected: str):
+    assert [s for s, value in reported.items() if value == 1] == [expected], (
+        metric,
+        reported,
+    )
+    assert len(reported) > 1, f"{metric} reports only the current status: {reported}"
+
+
+def _assert_reports(text: str, pipeline_name: str, status: str):
+    _assert_only(
+        _reported_statuses(text, pipeline_name, "pipeline_status"),
+        "pipeline_status",
+        status,
+    )
+
+
+def _assert_reports_json(families: list, pipeline_name: str, status: str):
+    _assert_only(
+        _reported_statuses_json(families, pipeline_name, "pipeline_status"),
+        "pipeline_status",
+        status,
+    )
+
+
+@gen_pipeline_name
+def test_pipeline_status_metrics(pipeline_name):
+    """
+    Tests that the status of a pipeline is reported throughout its lifecycle,
+    including while it is stopped and therefore exports no metrics of its own.
+    """
+    create_pipeline(pipeline_name, "")
+    r = get(api_url("/metrics"))
+    assert r.status_code == HTTPStatus.OK, r.text
+    assert "# TYPE pipeline_status gauge" in r.text
+    _assert_reports(r.text, pipeline_name, "Stopped")
+
+    start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
+    r = get(api_url("/metrics"))
+    _assert_reports(r.text, pipeline_name, "Paused")
+
+    resume_pipeline(pipeline_name)
+    r = get(api_url("/metrics"))
+    _assert_reports(r.text, pipeline_name, "Running")
+    assert "# TYPE records_processed_total counter" in r.text
+
+    stop_pipeline(pipeline_name)
+    r = get(api_url("/metrics"))
+    _assert_reports(r.text, pipeline_name, "Stopped")
+
+
+@gen_pipeline_name
+def test_single_pipeline_status_metrics(pipeline_name):
+    """
+    Tests that the per-pipeline metrics endpoint reports the status in both
+    output formats, including while the pipeline is stopped and therefore
+    answers no scrape of its own.
+    """
+    url = api_url(f"/pipelines/{pipeline_name}/metrics")
+    create_pipeline(pipeline_name, "")
+
+    # A stopped pipeline exports no metrics itself, but still reports its status.
+    r = get(url)
+    assert r.status_code == HTTPStatus.OK, r.text
+    _assert_reports(r.text, pipeline_name, "Stopped")
+    assert "records_processed_total" not in r.text
+
+    start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
+    r = get(url)
+    assert r.status_code == HTTPStatus.OK, r.text
+    _assert_reports(r.text, pipeline_name, "Paused")
+    assert "# TYPE records_processed_total counter" in r.text
+
+    # The two formats must not disagree about the status.
+    if FELDERA_TEST_NUM_HOSTS == 1:
+        r = get(f"{url}?format=json")
+        assert r.status_code == HTTPStatus.OK, r.text
+        families = json.loads(r.text)
+        _assert_reports_json(families, pipeline_name, "Paused")
+        assert any(f.get("key") == "records_processed_total" for f in families)
+
+    stop_pipeline(pipeline_name)
+    r = get(url)
+    assert r.status_code == HTTPStatus.OK, r.text
+    _assert_reports(r.text, pipeline_name, "Stopped")
+
+    # A name that does not exist is still an error, not an all-zero report.
+    r = get(api_url(f"/pipelines/{pipeline_name}-absent/metrics"))
+    assert r.status_code == HTTPStatus.NOT_FOUND, r.text
+
+
 @gen_pipeline_name
 def test_pipeline_stats(pipeline_name):
     """
@@ -104,6 +236,7 @@ def test_pipeline_stats(pipeline_name):
 
     create_pipeline(pipeline_name, sql)
     start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
 
     # Create output connector on v1 (egress)
     r_out = post_no_body(api_url(f"/pipelines/{pipeline_name}/egress/v1"), stream=True)
@@ -135,7 +268,7 @@ def test_pipeline_stats(pipeline_name):
     assert r_stats.status_code == HTTPStatus.OK, (r_stats.status_code, r_stats.text)
     r_stats_json = r_stats.json()
     keys = sorted(r_stats_json.keys())
-    assert keys == [
+    expected = [
         "checkpoint_activity",
         "global_metrics",
         "inputs",
@@ -143,6 +276,11 @@ def test_pipeline_stats(pipeline_name):
         "permanent_checkpoint_errors",
         "suspend_error",
     ]
+    if FELDERA_TEST_NUM_HOSTS > 1:
+        expected.append("host_metrics")
+    assert keys == sorted(expected)
+    if FELDERA_TEST_NUM_HOSTS > 1:
+        assert len(r_stats_json["host_metrics"]) == FELDERA_TEST_NUM_HOSTS
     stats = PipelineStatistics.from_dict(r_stats_json)
 
     gm = stats.global_metrics
@@ -152,6 +290,18 @@ def test_pipeline_stats(pipeline_name):
     assert gm.pipeline_complete
     assert gm.buffered_input_records == 0
     assert gm.buffered_input_bytes == 0
+    # The compiler records both in the pipeline binary. Comparing against the
+    # version the manager reports for this pipeline checks that the injection
+    # happened: the pipeline falls back to its own crate version when the
+    # platform did not supply one.
+    r_pipeline = get(api_url(f"/pipelines/{pipeline_name}"))
+    assert r_pipeline.status_code == HTTPStatus.OK, (
+        r_pipeline.status_code,
+        r_pipeline.text,
+    )
+    assert gm.platform_version == r_pipeline.json()["platform_version"]
+    # This pipeline uses the platform's own runtime
+    assert gm.runtime_version == gm.platform_version
 
     inputs = stats.inputs
     assert len(inputs) == 1
@@ -225,6 +375,7 @@ def test_pipeline_logs(pipeline_name):
 
     # Pause pipeline
     start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
     assert (
         get(api_url(f"/pipelines/{pipeline_name}/logs"), stream=True).status_code
         == HTTPStatus.OK
@@ -232,6 +383,7 @@ def test_pipeline_logs(pipeline_name):
 
     # Start pipeline
     resume_pipeline(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
     assert (
         get(api_url(f"/pipelines/{pipeline_name}/logs"), stream=True).status_code
         == HTTPStatus.OK
@@ -269,3 +421,103 @@ def test_pipeline_logs(pipeline_name):
         timeout_s=30.0,
         poll_interval_s=0.5,
     )
+
+
+# A sequence number the buffer can never reach. A cursor carrying it is answered with the
+# end of the stream, which is how a reader asks "how far along is the stream?" without
+# waiting for a line to arrive.
+_SEQ_BEYOND_END = 2**64 - 1
+
+
+def _read_logs(
+    pipeline_name: str, cursor: str | None, count: int
+) -> tuple[LogPosition, list[str], str]:
+    """
+    Opens the logs stream at `cursor`, reads its first `count` log lines, and reports the
+    position it started at, those lines, and the cursor that carries on after them.
+
+    A `count` of zero reads the position alone, which is all a caller already at the end
+    of the stream can expect to receive. The position arrives with the response head, so
+    such a read completes without waiting for a line that may never come.
+    """
+    with TEST_CLIENT.resume_pipeline_logs(pipeline_name, cursor) as stream:
+        lines = list(islice(stream, count))
+        return stream.position, lines, stream.cursor()
+
+
+def _lines_retained(pipeline_name: str) -> int:
+    """
+    How many log lines the buffer currently holds, read from response heads alone.
+
+    Counting by reading lines would have to tell "no line yet" from "no line ever", which
+    a stream that blocks waiting for the next line cannot answer. Two positions bracket
+    the buffer instead: a first connection starts after whatever was already evicted, and
+    a cursor past the end is answered with the end of the stream.
+    """
+    start, _, _ = _read_logs(pipeline_name, None, 0)
+    end, _, _ = _read_logs(pipeline_name, f"{start.epoch}:{_SEQ_BEYOND_END}", 0)
+    return end.seq - start.seq
+
+
+@gen_pipeline_name
+def test_pipeline_logs_cursor(pipeline_name):
+    """
+    A caller that presents a cursor receives the lines it is missing, rather than the
+    whole retained buffer, with neither duplication nor loss across the reconnect.
+    """
+    create_pipeline(pipeline_name, "CREATE TABLE t1(c1 INTEGER);")
+    start_pipeline_as_paused(pipeline_name)
+    wait_for_pipeline_reachable(pipeline_name)
+
+    prefix, suffix = 3, 2
+    wait_for_condition(
+        "pipeline has produced enough log lines",
+        lambda: _lines_retained(pipeline_name) >= prefix + suffix,
+        timeout_s=60.0,
+        poll_interval_s=1.0,
+    )
+
+    # A full catch-up, read first, is the authority on what the stream holds. Every read
+    # below asserts a zero gap, so an eviction crossing the test fails on the position
+    # that reports it rather than on a line comparison that cannot explain itself.
+    whole_position, whole, _ = _read_logs(pipeline_name, None, prefix + suffix)
+    assert (whole_position.seq, whole_position.gap) == (0, 0), whole_position
+    epoch = whole_position.epoch
+
+    # Read the head of the stream, then reconnect where that read left off. The two
+    # partial reads must reconstruct the prefix of the full read exactly: a cursor that
+    # replayed would duplicate lines here, one that skipped would drop them.
+    first, head, after_head = _read_logs(pipeline_name, None, prefix)
+    assert (first.epoch, first.seq, first.gap) == (epoch, 0, 0), first
+    # The stream counts the lines it delivered, so the reader hands the cursor back
+    # instead of keeping a count of its own.
+    assert after_head == f"{epoch}:{prefix}"
+
+    resumed, tail, _ = _read_logs(pipeline_name, after_head, suffix)
+    assert resumed.epoch == epoch, resumed
+    assert (resumed.seq, resumed.gap) == (prefix, 0), resumed
+    assert head + tail == whole
+
+    # A cursor from another instance of the buffer refers to lines this instance never
+    # held, so it is answered with a full catch-up instead of being trusted.
+    stale, replayed, _ = _read_logs(pipeline_name, f"{uuid.uuid4()}:{prefix}", prefix)
+    assert stale.epoch == epoch, stale
+    assert (stale.seq, stale.gap) == (0, 0), stale
+    assert replayed == head
+
+    # A cursor past the end of the stream names a position the buffer can never reach.
+    # Answering with the end of the stream is what lets the next connection resume, where
+    # echoing the position back would deliver nothing for the life of the epoch.
+    beyond_end, _, _ = _read_logs(pipeline_name, f"{epoch}:{_SEQ_BEYOND_END}", 0)
+    assert beyond_end.gap == 0, beyond_end
+    assert prefix + suffix <= beyond_end.seq < _SEQ_BEYOND_END, beyond_end
+
+    # Omitting the cursor keeps the legacy stream, which always replays from the start.
+    with closing(TEST_CLIENT.get_pipeline_logs(pipeline_name)) as legacy:
+        assert next(legacy) == whole[0]
+
+    # A malformed cursor can only come from a broken client, so it is rejected rather
+    # than quietly reinterpreted as some other position.
+    with pytest.raises(FelderaAPIError) as rejected:
+        TEST_CLIENT.resume_pipeline_logs(pipeline_name, "nonsense")
+    assert rejected.value.status_code == HTTPStatus.BAD_REQUEST, rejected.value

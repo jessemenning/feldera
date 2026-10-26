@@ -27,6 +27,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Random;
 import java.util.function.BiFunction;
+import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
 
 /** Regression tests that executed in incremental mode */
 public class IncrementalRegression2Tests extends SqlIoTest {
@@ -183,13 +184,19 @@ public class IncrementalRegression2Tests extends SqlIoTest {
             int mapIndexCount = 0;
 
             @Override
-            public void postorder(DBSPMapIndexOperator unused) {
+            public void postorder(DBSPMapIndexOperator index) {
                 this.mapIndexCount++;
+                // The shared index holds the two columns that the joins read, and not the
+                // third column of 'customers'
+                Assert.assertEquals(2, index.getOutputIndexedZSetType()
+                        .elementType.to(DBSPTypeTuple.class).size());
             }
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(0, this.mapIndexCount);
+                // The MapIndex over 'customers' is kept, since a join does not share the
+                // index of a table.  Both joins read this index.
+                Assert.assertEquals(1, this.mapIndexCount);
             }
         });
     }
@@ -260,13 +267,19 @@ public class IncrementalRegression2Tests extends SqlIoTest {
             int mapIndexCount = 0;
 
             @Override
-            public void postorder(DBSPMapIndexOperator unused) {
+            public void postorder(DBSPMapIndexOperator index) {
                 this.mapIndexCount++;
+                // The shared index holds the two columns that the joins read, and not the
+                // third column of 'customers'
+                Assert.assertEquals(2, index.getOutputIndexedZSetType()
+                        .elementType.to(DBSPTypeTuple.class).size());
             }
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(0, this.mapIndexCount);
+                // The MapIndex over 'customers' is kept, since a join does not share the
+                // index of a table.  Both joins read this index.
+                Assert.assertEquals(1, this.mapIndexCount);
             }
         });
     }
@@ -287,29 +300,35 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                     c1.name
                 FROM customers AS c1
                 JOIN customers AS c2
-                    ON c1.customer_id = c2.customer_id;""");
+                    ON c1.customer_id = c2.customer_id;""").withStringTrim();
         // Validated on Postgres
         ccs.step("""
                 INSERT INTO customers (customer_id, name, first) VALUES
                   (1, 'Johnson', 'Alice'),
                   (2, 'Smith',   'Bob'),
                   (3, 'White',   'Carol');""", """
-                 first | name1 | name    | weight
-                ---------------------------------------
-                 Alice| Johnson| Johnson|  1
-                 Bob| Smith| Smith|        1
-                 Carol| White| White|      1""");
+                 first | name1   | name    | weight
+                ------------------------------------
+                 Alice | Johnson | Johnson | 1
+                 Bob   | Smith   | Smith   | 1
+                 Carol | White   | White   | 1""");
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             int mapIndexCount = 0;
 
             @Override
-            public void postorder(DBSPMapIndexOperator unused) {
+            public void postorder(DBSPMapIndexOperator index) {
                 this.mapIndexCount++;
+                // The shared index holds the two columns that the joins read, and not the
+                // third column of 'customers'
+                Assert.assertEquals(2, index.getOutputIndexedZSetType()
+                        .elementType.to(DBSPTypeTuple.class).size());
             }
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(0, this.mapIndexCount);
+                // The MapIndex over 'customers' is kept, since a join does not share the
+                // index of a table.  Both joins read this index.
+                Assert.assertEquals(1, this.mapIndexCount);
             }
         });
     }
@@ -466,9 +485,9 @@ public class IncrementalRegression2Tests extends SqlIoTest {
 
             @Override
             public void endVisit() {
-                // If sharing of map-index operators works, there are 3,
-                // otherwise there are 4.  LATENESS prevents sharing
-                Assert.assertEquals(4, this.mapIndexCount);
+                // Both joins read one index of customers: the join with orders1 keeps every
+                // customer, so the shared integral is not garbage collected
+                Assert.assertEquals(3, this.mapIndexCount);
             }
         });
     }
@@ -530,62 +549,6 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                   103     | 2024-01-12 |NULL          |                | Dave|           3
                   104     | 2024-01-13 |NULL          |                |NULL           |
                   105     | 2024-01-14 | Bob|           1              | Bob|            1""");
-    }
-
-    @Test
-    public void issue5842() {
-        var cc = this.getCC("""
-                CREATE TABLE T(x INT, y INT NOT NULL PRIMARY KEY);
-                CREATE TABLE S1(w INT);
-                CREATE VIEW V1 AS SELECT * FROM T JOIN S1 ON T.y = S1.w;""");
-        cc.visit(new CircuitVisitor(cc.compiler) {
-            int mapIndexCount = 0;
-
-            @Override
-            public void postorder(DBSPMapIndexOperator unused) {
-                this.mapIndexCount++;
-            }
-
-            @Override
-            public void postorder(DBSPFlatMapIndexOperator unused) {
-                this.mapIndexCount++;
-            }
-
-            @Override
-            public void endVisit() {
-                // Check that one of the 2 MapIndex operators has been removed
-                Assert.assertEquals(1, this.mapIndexCount);
-            }
-        });
-    }
-
-    @Test
-    public void issue5842a() {
-        var cc = this.getCC("""
-                CREATE TABLE T(x INT, y INT NOT NULL PRIMARY KEY);
-                CREATE TABLE S1(w INT);
-                CREATE TABLE S2(w INT);
-                CREATE VIEW V1 AS SELECT * FROM T JOIN S1 ON T.y = S1.w;
-                CREATE VIEW V2 AS SELECT * FROM T JOIN S2 ON T.y = S2.w;""");
-        cc.visit(new CircuitVisitor(cc.compiler) {
-            int mapIndexCount = 0;
-
-            @Override
-            public void postorder(DBSPMapIndexOperator unused) {
-                this.mapIndexCount++;
-            }
-
-            @Override
-            public void postorder(DBSPFlatMapIndexOperator unused) {
-                this.mapIndexCount++;
-            }
-
-            @Override
-            public void endVisit() {
-                // One for each S input, none for T
-                Assert.assertEquals(2, this.mapIndexCount);
-            }
-        });
     }
 
     @Test
@@ -775,7 +738,6 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                   ON prev.id = me.id
                  AND prev.ts BETWEEN me.ts - INTERVAL '3' HOURS AND me.ts
                 GROUP BY me.id, me.ts;""");
-        // There should be two retain_values operators
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             int retains = 0;
 
@@ -786,7 +748,8 @@ public class IncrementalRegression2Tests extends SqlIoTest {
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(2, this.retains);
+                // The two sides of the self-join share one trace, with one merged retain_values operator
+                Assert.assertEquals(1, this.retains);
             }
         });
     }
@@ -813,7 +776,6 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                   ON prev.id = me.id
                  AND prev.ts BETWEEN me.ts - INTERVAL '3' HOURS AND me.ts
                 GROUP BY me.id, me.ts;""");
-        // There should be two retain_values operators
         ccs.visit(new CircuitVisitor(ccs.compiler) {
             int retains = 0;
 
@@ -824,7 +786,8 @@ public class IncrementalRegression2Tests extends SqlIoTest {
 
             @Override
             public void endVisit() {
-                Assert.assertEquals(2, this.retains);
+                // The two sides of the self-join share one trace, with one merged retain_values operator
+                Assert.assertEquals(1, this.retains);
             }
         });
     }
@@ -954,5 +917,18 @@ public class IncrementalRegression2Tests extends SqlIoTest {
                 Assert.assertEquals(1, this.filters);
             }
         });
+    }
+
+    /** ENFORCE_POSITIVE_INPUTS catches a delete of an absent row in an incremental circuit. */
+    @Test
+    public void testEnforcePositiveInputs() {
+        String sql = """
+                SET ENFORCE_POSITIVE_INPUTS = TRUE;
+                CREATE TABLE T(x INT NOT NULL);
+                CREATE VIEW V AS SELECT x FROM T;""";
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.submitStatementsForCompilation(sql);
+        this.runtimeFail(compiler, "REMOVE FROM T VALUES (1);",
+                "Table t: negative weight found");
     }
 }

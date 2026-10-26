@@ -1,5 +1,9 @@
 //! Variant is a dynamically-typed object that can represent
 //! the values in a SQL program.
+//!
+//! Deprecated: [`crate::FlatVariant`] is the SQL VARIANT type now.  This
+//! module implements the type it replaces, so it allows its own use of it.
+#![allow(deprecated)]
 
 use crate::{
     Date, GeoPoint, LongInterval, ShortInterval, SqlDecimal, SqlString, Time, Timestamp,
@@ -8,16 +12,15 @@ use crate::{
 };
 use dbsp::algebra::{F32, F64};
 use feldera_fxp::DynamicDecimal;
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use feldera_types::serde_with_context::serde_config::VariantFormat;
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
-use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{self, Error as _};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
-use std::borrow::Cow;
 use std::cmp::Ord;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -26,7 +29,18 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::{fmt::Debug, hash::Hash};
 
+/// The legacy enum under a name that is not itself deprecated.
+///
+/// A `#[allow(deprecated)]` attribute covers an item's body, not the tokens
+/// of a macro invocation, so the few in-crate spots that pass the enum to a
+/// macro name it through this alias instead.
+pub(crate) type LegacyVariant = Variant;
+
 /// Represents a Sql value with a VARIANT type.
+#[deprecated(
+    since = "0.340.0",
+    note = "the SQL VARIANT type is implemented using `SqlVariant`; `Variant` still works but will be removed"
+)]
 #[derive(
     Debug,
     Default,
@@ -41,6 +55,7 @@ use std::{fmt::Debug, hash::Hash};
     rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive(bound(
     serialize = "__S: rkyv::ser::ScratchSpace + rkyv::ser::Serializer + rkyv::ser::SharedSerializeRegistry",
@@ -82,6 +97,19 @@ pub enum Variant {
     TimestampTz(TimestampTz),
     // Note: if you extend this enum, add new labels at the end
     // This will hopefully preserve compatibility of the storage format.
+}
+
+/// The legacy variant declines: it is an enum over maps and arrays, so
+/// reproducing the decoded hash means writing the discriminant at the decoded
+/// width and recursing through each arm, which nobody has done.  It
+/// implements the trait all the same, so that a caller bounded on
+/// `Archived<K>: HashRepr` compiles for it and decodes instead of failing to
+/// build.  `FlatVariant`, which supersedes it, hashes faithfully.
+impl crate::__HashRepr for ArchivedVariant {
+    const FAITHFUL: bool = false;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, _state: &mut H) {}
 }
 
 /////////////// Variant index
@@ -215,29 +243,32 @@ impl<'de> Deserialize<'de> for Variant {
             where
                 V: MapAccess<'de>,
             {
-                match visitor.next_key_seed(KeyClassifier)? {
+                let (first_key, first_value) = match visitor.next_key_seed(KeyClassifier)? {
+                    None => return Ok(Variant::Map(BTreeMap::new().into())),
+                    Some(KeyClass::Map(key)) => (key, visitor.next_value()?),
                     Some(KeyClass::Number) => {
-                        let number: DynamicDecimal = visitor.next_value()?;
-                        Ok(Variant::SqlDecimal((
-                            number.significand(),
-                            number.exponent(),
-                        )))
-                    }
-                    Some(KeyClass::Map(first_key)) => {
-                        let mut values = BTreeMap::new();
-
-                        values.insert(
-                            Variant::String(SqlString::from(first_key)),
-                            visitor.next_value()?,
-                        );
-                        while let Some((key, value)) = visitor.next_entry::<String, Variant>()? {
-                            values.insert(Variant::String(SqlString::from(key)), value);
+                        match visitor.next_value_seed(NumberTokenValue(VariantVisitor))? {
+                            TokenValue::Number(text) => {
+                                let number =
+                                    DynamicDecimal::deserialize(
+                                        IntoDeserializer::<V::Error>::into_deserializer(text),
+                                    )?;
+                                return Ok(Variant::SqlDecimal((
+                                    number.significand(),
+                                    number.exponent(),
+                                )));
+                            }
+                            TokenValue::Entry(value) => (DECIMAL_KEY_TOKEN.to_string(), value),
                         }
-
-                        Ok(Variant::Map(values.into()))
                     }
-                    None => Ok(Variant::Map(BTreeMap::new().into())),
+                };
+
+                let mut values = BTreeMap::new();
+                values.insert(Variant::String(SqlString::from(first_key)), first_value);
+                while let Some((key, value)) = visitor.next_entry::<String, Variant>()? {
+                    values.insert(Variant::String(SqlString::from(key)), value);
                 }
+                Ok(Variant::Map(values.into()))
             }
         }
 
@@ -255,13 +286,8 @@ impl<'de, AUX> DeserializeWithContext<'de, SqlSerdeConfig, AUX> for Variant {
     {
         match context.variant_format {
             VariantFormat::Json => Variant::deserialize(deserializer),
-            VariantFormat::JsonString => {
-                let s = Cow::<String>::deserialize(deserializer)?;
-                serde_json::from_str::<Variant>(&s).map_err(|e| {
-                    D::Error::custom(format!(
-                        "error deserializing VARIANT type from a JSON string: {e}"
-                    ))
-                })
+            VariantFormat::JsonString | VariantFormat::ParquetVariant => {
+                crate::variant_binary::deserialize_variant(deserializer)
             }
         }
     }
@@ -325,6 +351,116 @@ impl Visitor<'_> for KeyClassifier {
     }
 }
 
+/// Reads the value of a map entry whose key is [`DECIMAL_KEY_TOKEN`].
+///
+/// serde_json with `arbitrary_precision` hands over a JSON number as a map with
+/// this one entry, and delivers the number's text with `visit_string`. serde_json
+/// delivers the strings of JSON text with `visit_str` or `visit_borrowed_str`.
+/// Every other value belongs to a JSON object that uses the token as an ordinary
+/// key, and the wrapped visitor builds it.
+#[doc(hidden)]
+pub(crate) struct NumberTokenValue<V>(pub(crate) V);
+
+/// The value that [`NumberTokenValue`] reads.
+#[doc(hidden)]
+pub(crate) enum TokenValue<T> {
+    /// The text of a JSON number.
+    Number(String),
+    /// The value of an object entry, built by the wrapped visitor.
+    Entry(T),
+}
+
+impl<'de, V: Visitor<'de>> DeserializeSeed<'de> for NumberTokenValue<V> {
+    type Value = TokenValue<V::Value>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+macro_rules! forward_to_entry {
+    ($($method:ident: $type:ty),* $(,)?) => {
+        $(
+            fn $method<E: de::Error>(self, value: $type) -> Result<Self::Value, E> {
+                self.0.$method(value).map(TokenValue::Entry)
+            }
+        )*
+    };
+}
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for NumberTokenValue<V> {
+    type Value = TokenValue<V::Value>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        self.0.expecting(formatter)
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(TokenValue::Number(value))
+    }
+
+    forward_to_entry! {
+        visit_bool: bool,
+        visit_i8: i8,
+        visit_i16: i16,
+        visit_i32: i32,
+        visit_i64: i64,
+        visit_i128: i128,
+        visit_u8: u8,
+        visit_u16: u16,
+        visit_u32: u32,
+        visit_u64: u64,
+        visit_u128: u128,
+        visit_f32: f32,
+        visit_f64: f64,
+        visit_char: char,
+        visit_str: &str,
+        visit_borrowed_str: &'de str,
+        visit_bytes: &[u8],
+        visit_borrowed_bytes: &'de [u8],
+        visit_byte_buf: Vec<u8>,
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.0.visit_none().map(TokenValue::Entry)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.0.visit_unit().map(TokenValue::Entry)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.0.visit_some(deserializer).map(TokenValue::Entry)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.0
+            .visit_newtype_struct(deserializer)
+            .map(TokenValue::Entry)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        self.0.visit_seq(seq).map(TokenValue::Entry)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        self.0.visit_map(map).map(TokenValue::Entry)
+    }
+
+    fn visit_enum<A: de::EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+        self.0.visit_enum(data).map(TokenValue::Entry)
+    }
+}
+
 impl Serialize for Variant {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -352,6 +488,9 @@ impl SerializeWithContext<SqlSerdeConfig> for Variant {
                 serializer.serialize_str(&self.to_json_string().map_err(|e| {
                     S::Error::custom(format!("error serializing VARIANT to JSON string: {e}"))
                 })?)
+            }
+            VariantFormat::ParquetVariant => {
+                crate::variant_binary::serialize_variant(self, serializer)
             }
             VariantFormat::Json => match self {
                 Variant::SqlNull | Variant::VariantNull => serializer.serialize_none(),
@@ -388,7 +527,7 @@ impl SerializeWithContext<SqlSerdeConfig> for Variant {
 
 impl Variant {
     /// Get the runtime type of a Variant value
-    fn get_type_string(&self) -> &'static str {
+    pub(crate) fn get_type_string(&self) -> &'static str {
         match self {
             Variant::SqlNull => "NULL",
             Variant::VariantNull => "VARIANT",
@@ -731,8 +870,8 @@ macro_rules! into_numeric {
                         Variant::UBigInt(x) => [< cast_to_ $type_name _u64 >](x),
                         Variant::Real(x) => [< cast_to_ $type_name _f >](x),
                         Variant::Double(x) => [< cast_to_ $type_name _d >](x),
-                        Variant::SqlDecimal(d) => match i128::try_from(DynamicDecimal::new(d.0, d.1)) {
-                            Ok(value) => [< cast_to_ $type_name _i128 >](value),
+                        Variant::SqlDecimal(d) => match <$type>::try_from(DynamicDecimal::new(d.0, d.1)) {
+                            Ok(value) => Ok(value),
                             Err(_) => Err(SqlRuntimeError::from_string(format!(
                                 "variant is {}, which cannot be converted to {}",
                                 typeof_(value),
@@ -1634,6 +1773,52 @@ mod test {
             .into(),
         );
         assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn deserialize_number_token_key() {
+        const TOKEN: &str = "$serde_json::private::Number";
+        let string = |s: &str| Variant::String(SqlString::from_ref(s));
+        let map = |entries: Vec<(&str, Variant)>| {
+            Variant::Map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (string(k), v))
+                    .collect::<BTreeMap<Variant, Variant>>()
+                    .into(),
+            )
+        };
+        let large = Variant::SqlDecimal((184467440737095516150, 0));
+        let cases = [
+            (
+                format!(r#"{{"{TOKEN}":"1"}}"#),
+                map(vec![(TOKEN, string("1"))]),
+            ),
+            (
+                format!(r#"{{"{TOKEN}":"1","x":2}}"#),
+                map(vec![(TOKEN, string("1")), ("x", Variant::UBigInt(2))]),
+            ),
+            (
+                format!(r#"{{"v":{{"{TOKEN}":"1"}}}}"#),
+                map(vec![("v", map(vec![(TOKEN, string("1"))]))]),
+            ),
+            (
+                format!(r#"{{"{TOKEN}":{{"a":true}}}}"#),
+                map(vec![(TOKEN, map(vec![("a", Variant::Boolean(true))]))]),
+            ),
+            (
+                format!(r#"{{"{TOKEN}":184467440737095516150}}"#),
+                map(vec![(TOKEN, large.clone())]),
+            ),
+            ("184467440737095516150".to_string(), large),
+            ("1.5".to_string(), Variant::SqlDecimal((15, 1))),
+        ];
+        for (input, expected) in cases {
+            let from_str = serde_json::from_str::<Variant>(&input).unwrap();
+            let from_reader = serde_json::from_reader::<_, Variant>(input.as_bytes()).unwrap();
+            assert_eq!(from_str, expected, "from_str({input})");
+            assert_eq!(from_reader, expected, "from_reader({input})");
+        }
     }
 
     #[test]

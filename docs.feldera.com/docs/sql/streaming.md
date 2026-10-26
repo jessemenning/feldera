@@ -18,21 +18,6 @@ lateness time units out of order.
 See the [Time Series Analysis Guide](/tutorials/time-series#timestamp-columns-and-lateness)
 for details.
 
-<!-- ## `WATERMARK` expressions
-
-:::warning
-
-The `WATERMARK` feature is still experimental, and it may be removed
-or substantially modified in the future.
-
-:::
-
-`WATERMARK` is an annotation on a column of a table that delays the processing
-of the input rows by a constant amount of time.
-
-See the [Time Series Analysis Guide](/tutorials/time-series#delaying-inputs-with-watermark)
-for details. -->
-
 ## `append_only` tables
 
 The `append_only` annotation on a table instructs Feldera that the table will
@@ -55,3 +40,181 @@ i.e., rows that are guaranteed to never get deleted or updated.
 
 See the [Time Series Analysis Guide](/tutorials/time-series#emitting-final-values-of-a-view-with-emit_final)
 for details.
+
+## Soft deletes with temporal filters
+
+An input connector can be configured with the [`soft_delete`](/connectors#soft_delete)
+property to transform deletions into insertions; in this case the `is_delete` metadata
+attribute records the kind of change (insert/delete), essentially converting a table
+into a log.  Note that the table does *not* declare a `PRIMARY KEY` column, although
+the data may contain one.  Since the connector transforms every change into an
+insertion, the table only receives insertions, so it can be declared
+[`append_only`](#append_only-tables), which enables additional optimizations.
+
+The [Soft deletes](/connectors#soft-deletes) section shows how one can write a query
+to recover the current contents of the table from this log: group the changes
+on the columns forming the primary key, rank them by time, keep the latest one,
+and return it only when it is an insertion.  That query returns one row for each
+primary key, but it must remember every change in the log, so its state grows
+without bound.
+
+However, in some cases only a bounded window of the table is necessary for
+computing the desired results.  When a
+[temporal filter](/tutorials/time-series#now-and-temporal-filters) can be used
+to describe the window, the entire computation can be performed using finite
+state, by sequencing the computation as follows:
+
+```
+[connector with soft deletes] -> [temporal filter] -> [reconstruct table] -> [views]
+```
+
+The following program reconstructs only the recent contents
+of a change stream while never storing more than the last seven
+days of changes:
+
+```sql
+-- The 'soft_delete' connector property converts this
+-- table into a log of changes to the table.
+CREATE TABLE input_log (
+    id BIGINT, -- not declared as primary key
+    s VARCHAR,
+    ts TIMESTAMP NOT NULL,
+    -- Is the change a deletion?  Produced by the connector
+    is_delete BOOLEAN DEFAULT CAST(CONNECTOR_METADATA()['is_delete'] AS BOOLEAN)
+) WITH (
+    -- A soft-delete table only receives insertions
+    'append_only' = 'true',
+    'connectors' = '[{
+        "name": "changes",
+        "soft_delete": true,
+        "transport": {
+            "name": "kafka_input",
+            "config": {
+                "topic": "changes",
+                "start_from": "earliest",
+                "bootstrap.servers": "example.com:9092",
+                "include_timestamp": true
+            }
+        },
+        "format": {
+            "name": "json",
+            "config": { "update_format": "insert_delete" }
+        }
+    }]'
+);
+
+-- Contains only changes to 'input_log' from the last 7 days
+CREATE LOCAL VIEW recent AS
+SELECT * FROM input_log
+WHERE ts >= NOW() - INTERVAL 7 DAYS AND ts <= NOW();
+
+-- The contents of the 'input' table limited to the last 7 days
+CREATE LOCAL VIEW input AS
+SELECT id, s, ts
+FROM (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY id ORDER BY ts DESC, is_delete NULLS FIRST
+    ) AS rn
+    FROM recent
+)
+WHERE rn = 1 AND is_delete IS NOT TRUE;
+
+-- Rolling aggregates over the reconstructed table: for each record,
+-- the number of records with a timestamp in the preceding minute, hour, and day.
+CREATE VIEW input_stats AS
+SELECT
+    id, s, ts,
+    COUNT(*) OVER minute_window AS rows_last_minute,
+    COUNT(*) OVER hour_window AS rows_last_hour,
+    COUNT(*) OVER day_window AS rows_last_day
+FROM input
+WINDOW
+    minute_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 MINUTE PRECEDING AND CURRENT ROW),
+    hour_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW),
+    day_window AS (ORDER BY ts RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW);
+```
+
+The view `input_stats` consumes the reconstructed table using
+[rolling aggregates](/tutorials/time-series#rolling-aggregates) over three
+shorter intervals.  The aggregates see the reconstructed table rather than the
+log, so a deleted record stops contributing to the counts as soon as its
+deletion arrives.
+
+Two details of the query matter for correctness:
+
+* The `is_delete` term in the `ORDER BY` clause ranks an insertion ahead of a
+  deletion that carries the same timestamp, which keeps the new value of a
+  record that a CDC stream updates with a single delete-insert message pair.
+  See [Soft deletes](/connectors#soft-deletes) for details.
+
+* The polarity filter `is_delete IS NOT TRUE` must be outside the subquery
+  that ranks the changes. Filtering out the deletions before ranking would
+  "resurrect" the previous insertion of a deleted key.
+
+## Unbounded state warnings
+
+The compiler analyzes programs to find operators whose state is
+likely to grow without bound: joins, aggregates, `DISTINCT`, window functions,
+and the indexes of tables with a `PRIMARY KEY`.  This is a static analysis,
+not based on actual data.  In consequence the analysis is
+best effort, and can err in both directions:
+it can report as unbounded an operator whose state stays small in
+practice, and it can miss state that grows very large, such as a
+chain of joins that can produce an output exponentially larger than the inputs.
+
+The compiler performs this analysis only if it infers that the compiled
+program performs stream processing, i.e., when one of the following holds:
+
+- a table or view column has a [`LATENESS`](#lateness-expressions) annotation,
+- a table is declared [`append_only`](#append_only-tables),
+- a [temporal filter](/tutorials/time-series#now-and-temporal-filters)
+  compares a column with `NOW()`.
+
+For streaming programs the compiler assumes that every table can grow without bound,
+even a table that is not part of a stream, such as a dimension table.  The
+[`expected_size`](/sql/grammar#size-hints) table property can be used to inform the
+compiler that the size of the table is bounded.  Operators downstream
+of such tables are generally considered bounded too, so they are not
+reported (even if the table size is actually very large).
+
+### Annotating dimension tables
+
+A common streaming pattern joins a stream of events, kept bounded by a
+temporal filter or by lateness, with a dimension table, such as a list
+of products or customers.  The compiler cannot tell a dimension table
+from a table that grows without bound, so without further information
+it reports the join, which retains the whole table.  When the join is
+on a key of the dimension table, such as its `PRIMARY KEY`, each event
+matches at most one row, so the output of the join is as bounded as the
+stream of events and the operators downstream of the join are not
+reported; a join on other columns reports them too.  The join columns
+must have the type of the key columns, or a lossless widening of it: a
+`VARCHAR` event column matched against a `VARCHAR(255)` key, or a
+`BIGINT` column against an `INT` key, is recognized, while a key of
+type `CHAR(n)`, whose comparison ignores trailing spaces, or a join
+column narrower than the key is not.  Declare the expected size of
+each dimension table:
+
+```sql
+CREATE TABLE products (
+    sku VARCHAR NOT NULL PRIMARY KEY,
+    name VARCHAR
+) WITH ('expected_size' = '100000');
+```
+
+With this annotation the join with `products` and the operators
+downstream of the join are no longer reported, and the remaining
+warnings point at state that really grows with the stream, such as the
+index of an event table that has a `PRIMARY KEY` but no `LATENESS`.
+The analysis treats [recursive views](/sql/recursion) conservatively
+and is likely to report false positives for them.
+
+Sometimes the warnings cannot point precisely to the SQL construct that
+is responsible for the actual state, and then they will provide only
+an approximate position.
+
+You can silence these warnings with `SET FELDERA_IGNORE_WARNING_UNBOUNDED_STATE = ON`.
+
+The [time series guide](/tutorials/time-series) explains how lateness,
+`append_only`, and temporal filters let the compiler garbage-collect
+state.

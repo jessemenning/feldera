@@ -27,10 +27,16 @@ on one of its primary key columns—in that case, you must specify the `material
 To declare a materialized view, use the `CREATE MATERIALIZED VIEW` syntax:
 
 ```sql
-CREATE MATERIALIZED VIEW my_view as SELECT * from my_table;
+CREATE MATERIALIZED VIEW my_view AS SELECT * FROM my_table;
 ```
 
 These declarations instruct Feldera to maintain a complete snapshot of the table or view.
+
+An [index](grammar.md#creating-indexes) of a view that is not materialized stores no data.
+The first index of a materialized view shares the stored contents of the view; each additional
+index stores its own copy of the contents, ordered by the index columns.  An output connector
+attached to any index of a materialized view can send a snapshot of the view when the connector
+starts (`send_snapshot`).
 
 ## Inspecting materialized tables and views
 

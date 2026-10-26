@@ -3,8 +3,9 @@ use crate::{
     algebra::{HasOne, HasZero, IndexedZSet, OrdZSet, ZTrace},
     circuit::{
         OwnershipPreference, Scope,
+        bootstrap::register_replay_stream,
         checkpointer::Checkpoint,
-        circuit_builder::{CircuitBase, RefStreamValue, register_replay_stream},
+        circuit_builder::{CircuitBase, RefStreamValue},
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
         operator_traits::{BinaryOperator, Operator, TernaryOperator},
     },
@@ -25,7 +26,7 @@ use crate::{
     },
     utils::Tup2,
 };
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 use std::{
@@ -51,6 +52,7 @@ use super::trace::BoundsId;
     Serialize,
     Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -307,7 +309,6 @@ where
                 .add_binary_operator(
                     <InputUpsert<Spine<B>, U, B>>::new(
                         factories.batch_factories.clone(),
-                        factories.opt_key_factory,
                         factories.opt_val_factory,
                         patch_func,
                     ),
@@ -480,7 +481,6 @@ where
     U: DataTrait + ?Sized,
 {
     batch_factories: B::Factories,
-    opt_key_factory: &'static dyn Factory<DynOpt<B::Key>>,
     opt_val_factory: &'static dyn Factory<DynOpt<B::Val>>,
     patch_func: PatchFunc<T::Val, U>,
 
@@ -501,13 +501,11 @@ where
 {
     pub fn new(
         batch_factories: B::Factories,
-        opt_key_factory: &'static dyn Factory<DynOpt<B::Key>>,
         opt_val_factory: &'static dyn Factory<DynOpt<B::Val>>,
         patch_func: PatchFunc<T::Val, U>,
     ) -> Self {
         Self {
             batch_factories,
-            opt_key_factory,
             opt_val_factory,
             patch_func,
             input_batch_stats: BatchSizeStats::new(),
@@ -579,7 +577,7 @@ where
             B::Builder::with_capacity(&self.batch_factories, n_updates * 2, n_updates * 2);
 
         // Current key for which we are processing updates.
-        let mut cur_key: Box<DynOpt<T::Key>> = self.opt_key_factory.default_box();
+        let mut cur_key = None;
 
         // Current value associated with the key after applying all processed updates
         // to it.
@@ -603,9 +601,9 @@ where
 
             // We finished processing updates for the previous key. Push them to the
             // builder and generate a retraction for the new key.
-            if cur_key.get() != Some(key) {
+            if cur_key != Some(key) {
                 // Push updates for the previous key to the builder.
-                if let Some(cur_key) = cur_key.get_mut() {
+                if let Some(cur_key) = cur_key {
                     if let Some(val) = cur_val.get_mut() {
                         key_updates.push_with(&mut |item| {
                             let (v, w) = item.split_mut();
@@ -625,7 +623,7 @@ where
                     key_updates.clear();
                 }
 
-                cur_key.from_ref(key);
+                cur_key = Some(key);
                 cur_val.set_none();
 
                 // Generate retraction if `key` is present in the trace.
@@ -670,7 +668,7 @@ where
         }
 
         // Push updates for the last key.
-        if let Some(cur_key) = cur_key.get_mut() {
+        if let Some(cur_key) = cur_key {
             if let Some(val) = cur_val.get_mut() {
                 key_updates.push_with(&mut |item| {
                     let (v, w) = item.split_mut();
@@ -839,7 +837,7 @@ where
         );
 
         // Current key for which we are processing updates.
-        let mut cur_key: Box<DynOpt<T::Key>> = self.factories.opt_key_factory.default_box();
+        let mut cur_key = None;
 
         // Current value associated with the key after applying all processed updates
         // to it.
@@ -867,9 +865,9 @@ where
 
             // We finished processing updates for the previous key. Push them to the
             // builder and generate a retraction for the new key.
-            if cur_key.get() != Some(key) {
+            if cur_key != Some(key) {
                 // Push updates for the previous key to the builder.
-                if let Some(cur_key) = cur_key.get_mut() {
+                if let Some(cur_key) = cur_key {
                     if let Some(val) = cur_val.get_mut() {
                         key_updates.push_with(&mut |item| {
                             let (v, w) = item.split_mut();
@@ -890,7 +888,7 @@ where
                 }
 
                 skip_key = false;
-                cur_key.from_ref(key);
+                cur_key = Some(key);
                 cur_val.set_none();
 
                 // Generate retraction if `key` is present in the trace.
@@ -970,7 +968,7 @@ where
         }
 
         // Push updates for the last key.
-        if let Some(cur_key) = cur_key.get_mut() {
+        if let Some(cur_key) = cur_key {
             if let Some(val) = cur_val.get_mut() {
                 key_updates.push_with(&mut |item| {
                     let (v, w) = item.split_mut();
@@ -995,7 +993,7 @@ where
         self.error_stream_val.put(errors);
 
         let result = builder.done();
-        self.output_batch_stats.add_batch(result.len());
+        self.output_batch_stats.add_batch(result.len_upper_bound());
         result
     }
 

@@ -20,6 +20,7 @@ use crate::{
         tokio::TOKIO,
     },
     circuit_cache_key,
+    profile::{ParkReason, ParkingFor},
 };
 use binrw::{BinRead, BinResult, BinWrite};
 use crossbeam_utils::CachePadded;
@@ -34,6 +35,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt::{Debug, Display},
+    future::{Future, ready},
     io::{Cursor, IoSlice},
     iter::zip,
     marker::PhantomData,
@@ -42,7 +44,7 @@ use std::{
     ops::Range,
     pin::{Pin, pin},
     sync::{
-        Arc, Mutex, MutexGuard, RwLock,
+        Arc, Mutex, MutexGuard, RwLock, Weak,
         atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -55,7 +57,7 @@ use tokio::{
     },
     sync::{Notify, OnceCell, futures::OwnedNotified},
     task::JoinHandle,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{error, info, warn};
@@ -89,8 +91,25 @@ circuit_cache_key!(local ExchangeCacheId<T>(ExchangeId => Arc<Exchange<T>>));
 struct ExchangeHeader {
     /// The unique identifier for the exchange.
     exchange_id: ExchangeId,
-    /// Sequence number for the collection of messages.
+    /// Position of this message among all of the messages on its connection,
+    /// that is, from the sending host to the receiving host for one
+    /// [MessageType], across all exchanges and all sending workers.  The
+    /// receiver uses it to drop retransmissions and to acknowledge.
     sequence: u64,
+    /// In synchronous exchange, the sender's round: how many messages the
+    /// sender sent to this host for this exchange before this one.  Zero for
+    /// streaming messages and pings.
+    ///
+    /// The receiver must deliver each sender's rounds of an exchange in
+    /// order, and `sequence` cannot ensure that.  Big and small messages
+    /// travel over different connections, each with its own sequence
+    /// numbers, so round `r + 1` on one connection can arrive before round
+    /// `r` on the other.  One sequence for both connections would order every
+    /// message from one host to another, across all exchanges and workers,
+    /// which would make small messages wait for big ones and defeat the
+    /// reason for separate connections (see [MessageSize]).  `round` orders
+    /// only the messages that must be in order.
+    round: u64,
     #[bw(write_with = MessageType::write)]
     #[br(parse_with = MessageType::read)]
     message_type: MessageType,
@@ -105,7 +124,7 @@ impl ExchangeHeader {
     /// Returns the number of bytes that `ExchangeHeader::to_bytes()` will
     /// return for the given `count`.
     fn len_for_count(count: usize) -> usize {
-        (4 + 8 + 1 + 4) + 8 * count
+        (4 + 8 + 8 + 1 + 4) + 8 * count
     }
 
     /// Serializes this header into a `Vec` that contains
@@ -144,7 +163,39 @@ impl ExchangeHeader {
             }
         }
     }
+
+    /// Constructs a ping frame: an [ExchangeHeader] with [PING_SEQUENCE] as its
+    /// sequence number and `n` zero-length payloads, matching the shape
+    /// `read_message` expects for a real message on this connection.  The
+    /// receiver recognizes and skips it (see `ExchangeServer::serve`); the
+    /// caller doesn't wait for or need a reply, since the write attempt itself
+    /// is the point.
+    fn new_ping(
+        exchange_id: ExchangeId,
+        sender: u32,
+        message_type: MessageType,
+        count: usize,
+    ) -> Self {
+        Self {
+            exchange_id,
+            sequence: PING_SEQUENCE,
+            round: 0,
+            sender,
+            message_type,
+            payload_lens: vec![0; count],
+        }
+    }
 }
+
+/// Sequence number that marks an [ExchangeHeader] as a liveness probe rather
+/// than a real message, with all of its payload lengths zero.  No real
+/// message ever uses this sequence number, since real sequence numbers start
+/// at 0 and increase by one at a time.
+///
+/// A probe lets a sender that is waiting for an acknowledgement cheaply check
+/// whether the connection has gone half-open, without paying to retransmit a
+/// possibly large backlog on the chance that the receiver is merely busy.
+const PING_SEQUENCE: u64 = u64::MAX;
 
 struct ExchangeMessage {
     /// The time at which the message was created.  This allows tracking the
@@ -161,16 +212,44 @@ struct ExchangeMessage {
     /// The sender's worker ID.
     sender: usize,
 
+    /// The sender's round (see [ExchangeHeader::round]).
+    round: u64,
+
     /// The messages to send, one per worker on the destination remote host.
     ///
     /// The workers and the host are implicit in the [ExchangeClient] that this
     /// `ExchangeMessage` is sent to.
     data: Vec<FBuf>,
+
+    /// Number of bytes that this message occupies on the wire, which is what
+    /// it charges against the capacity of the channel that queues it.
+    ///
+    /// The header counts along with the payloads, so that a message with empty
+    /// payloads still charges something.  That way the channel bounds the
+    /// number of queued messages as well as their total size.
+    wire_len: isize,
 }
 
 impl ExchangeMessage {
-    fn isize_len(&self) -> isize {
-        isize::try_from(self.data.len()).unwrap()
+    fn new(
+        global_node_id: Arc<String>,
+        exchange_id: ExchangeId,
+        sender: usize,
+        round: u64,
+        data: Vec<FBuf>,
+    ) -> Self {
+        let payloads = data.iter().map(|payload| payload.len()).sum::<usize>();
+        let wire_len =
+            isize::try_from(ExchangeHeader::len_for_count(data.len()) + payloads).unwrap();
+        Self {
+            start: Instant::now(),
+            global_node_id,
+            exchange_id,
+            sender,
+            round,
+            data,
+            wire_len,
+        }
     }
 }
 
@@ -231,7 +310,7 @@ impl MessageType {
 }
 
 struct ExchangeChannelInner {
-    /// Remaining capacity.  When this is negative, the channel is
+    /// Remaining capacity, in bytes.  When this is negative, the channel is
     /// oversubscribed and no more messages should be queued until the other end
     /// acknowledges some of the messages that have been sent.
     remaining: isize,
@@ -250,6 +329,8 @@ struct ExchangeChannelInner {
 }
 
 impl ExchangeChannelInner {
+    /// Creates a channel that queues up to `capacity` bytes of unacknowledged
+    /// messages before it reports itself overfull.
     fn new(capacity: usize) -> Self {
         Self {
             remaining: capacity.try_into().unwrap(),
@@ -274,7 +355,7 @@ impl ExchangeChannelInner {
             && let Some(message) = self.messages.pop_front()
         {
             self.sequence += 1;
-            self.remaining += message.isize_len();
+            self.remaining += message.wire_len;
         }
         if before < 0 && self.remaining >= 0 {
             self.nonfull.notify_waiters();
@@ -282,7 +363,7 @@ impl ExchangeChannelInner {
     }
 
     fn push(&mut self, message: ExchangeMessage) {
-        self.remaining -= message.isize_len();
+        self.remaining -= message.wire_len;
         self.messages.push_back(Arc::new(message));
         self.nonempty.notify_waiters();
     }
@@ -292,10 +373,19 @@ impl ExchangeChannelInner {
     }
 }
 
+/// Wraps a wait for a tx queue to drain in the declaration the park hook
+/// reads, so that it reaches `circuit_wait_by_reason_seconds` as `network`.
+async fn declare_network_wait(drained: OwnedNotified) {
+    let _parked = ParkingFor::new(ParkReason::Network);
+    drained.await;
+}
+
 #[derive(Clone)]
 struct ExchangeChannel(Arc<Mutex<ExchangeChannelInner>>);
 
 impl ExchangeChannel {
+    /// Creates a channel that queues up to `capacity` bytes of unacknowledged
+    /// messages before it reports itself overfull.
     pub fn new(capacity: usize) -> Self {
         Self(Arc::new(Mutex::new(ExchangeChannelInner::new(capacity))))
     }
@@ -318,18 +408,27 @@ impl ExchangeChannel {
     }
 
     /// Appends `message` to the queue.  If the channel is then overfull,
-    /// returns an [OwnedNotified] that can be used to wait for it to drain.
+    /// returns a future that can be awaited to wait for it to drain.
     /// Otherwise, returns `None`.
-    pub fn push(&self, message: ExchangeMessage) -> Option<OwnedNotified> {
+    pub fn push(
+        &self,
+        message: ExchangeMessage,
+    ) -> Option<impl Future<Output = ()> + Send + use<>> {
         let mut inner = self.inner();
         inner.push(message);
-        inner.drain_waiter()
+        inner.drain_waiter().map(declare_network_wait)
     }
 
-    /// If this channel is overfull, returns an [OwnedNotified] that can be used
-    /// to wait for it to drain.  Otherwise, returns `None`.
-    fn drain_waiter(&self) -> Option<OwnedNotified> {
-        self.inner().drain_waiter()
+    /// If this channel is overfull, returns a future that can be awaited to
+    /// wait for it to drain.  Otherwise, returns `None`.
+    fn drain_waiter(&self) -> Option<impl Future<Output = ()> + Send + use<>> {
+        self.inner().drain_waiter().map(declare_network_wait)
+    }
+
+    /// True if the channel holds messages that the receiver has not
+    /// acknowledged yet.
+    fn has_unacknowledged(&self) -> bool {
+        !self.inner().messages.is_empty()
     }
 }
 
@@ -338,12 +437,17 @@ pub struct ExchangeClient {
 }
 
 impl ExchangeClient {
+    /// Creates a client that queues up to `capacity` bytes of unacknowledged
+    /// messages before a sender has to wait.  A single message larger than
+    /// `capacity` still goes out on its own; the sender just waits for the
+    /// receiver to acknowledge it before queuing another one.
     async fn new(
         message_type: MessageType,
         remote_address: SocketAddr,
         remote_workers: &Range<usize>,
+        capacity: usize,
     ) -> Self {
-        let channel = ExchangeChannel::new(10_000_000);
+        let channel = ExchangeChannel::new(capacity);
         TOKIO.spawn(Self::run(
             message_type,
             remote_address,
@@ -369,13 +473,45 @@ impl ExchangeClient {
         channel: ExchangeChannel,
     ) -> std::io::Result<()> {
         let mut min_sequence = 0;
+        let count = remote_workers.len();
         loop {
             // Get the next message to send.
-            let (message, sequence) = match channel.get(min_sequence) {
-                Ok(result) => result,
-                Err(notified) => {
-                    notified.await;
-                    continue;
+            let (message, sequence) = loop {
+                // Either get a message to send or a notification that will tell
+                // us when one is ready.
+                let txq_grew = match channel.get(min_sequence) {
+                    Ok(result) => break result,
+                    Err(txq_grew) => txq_grew,
+                };
+
+                if channel.has_unacknowledged() {
+                    // We've sent messages that the server has not yet
+                    // acknowledged.  This is common, because the server only
+                    // acknowledges them once they're fully received.  However,
+                    // if it takes a long time for the server to acknowledge any
+                    // given message, that can mean that the connection got
+                    // closed silently and we'll never get a reply (perhaps
+                    // because a FIN or RST from the server got dropped on the
+                    // wire).  We will only find that out if we send more data.
+                    // Let's make sure that we always send more data by sending
+                    // a "ping" no-op message if the data we send is not
+                    // acknowledged within `ping_interval()`.
+                    if timeout(ping_interval(), txq_grew).await.is_err()
+                        && let Ok((message, _sequence)) = channel.get(0)
+                    {
+                        tx.write_all(
+                            &ExchangeHeader::new_ping(
+                                message.exchange_id,
+                                message.sender as u32,
+                                message_type,
+                                count,
+                            )
+                            .to_bytes(),
+                        )
+                        .await?;
+                    }
+                } else {
+                    txq_grew.await;
                 }
             };
             min_sequence = sequence + 1;
@@ -387,10 +523,10 @@ impl ExchangeClient {
             // We want to write a header, followed by all the data buffers.  To
             // minimize the system calls required to do this, we assemble them
             // into a collection of IoSlices.  First, create the header.
-            let n = remote_workers.len();
             let header = ExchangeHeader {
                 exchange_id: message.exchange_id,
                 sequence,
+                round: message.round,
                 sender: message.sender as u32,
                 message_type,
                 payload_lens: message
@@ -402,7 +538,7 @@ impl ExchangeClient {
             .to_bytes();
 
             // Assemble the IoSlices.
-            let mut slices = Vec::with_capacity(1 + n);
+            let mut slices = Vec::with_capacity(1 + count);
             slices.push(IoSlice::new(&header));
             for data in &message.data {
                 if !data.is_empty() {
@@ -420,11 +556,7 @@ impl ExchangeClient {
                 .with_start(message.start)
                 .with_category("Exchange")
                 .with_tooltip(|| {
-                    format!(
-                        "{} send {}",
-                        &message.global_node_id,
-                        HumanBytes::from(size),
-                    )
+                    format!("{} send {}", message.global_node_id, HumanBytes::from(size),)
                 });
             while !bufs.is_empty() {
                 let n = tx.write_vectored(bufs).await?;
@@ -448,7 +580,7 @@ impl ExchangeClient {
             tx,
             message_type,
             remote_workers.clone(),
-            channel.clone()
+            channel.clone(),
         ));
         select(rx, tx).await.factor_first().0
     }
@@ -482,20 +614,23 @@ impl ExchangeClient {
         }
     }
 
+    /// Queues a message.  `round` is the sender's round in synchronous
+    /// exchange (see [ExchangeHeader::round]), otherwise 0.
     pub fn send(
         &self,
         global_node_id: Arc<String>,
         exchange_id: ExchangeId,
         sender: usize,
+        round: u64,
         data: Vec<FBuf>,
-    ) -> Option<OwnedNotified> {
-        self.channel.push(ExchangeMessage {
-            start: Instant::now(),
+    ) -> Option<impl Future<Output = ()> + Send + use<>> {
+        self.channel.push(ExchangeMessage::new(
             global_node_id,
             exchange_id,
             sender,
+            round,
             data,
-        })
+        ))
     }
 
     pub async fn wait(&self) {
@@ -511,11 +646,14 @@ pub type ExchangeId = u32;
 pub trait ExchangeDelivery: Send + Sync {
     fn name(&self) -> Arc<String>;
 
-    fn received<'a>(
-        &'a self,
+    /// Delivers `data` from `sender`.  `round` is the sender's round in
+    /// synchronous exchange (see [ExchangeHeader::round]), otherwise 0.
+    fn received(
+        self: Arc<Self>,
         sender: usize,
+        round: u64,
         data: Vec<AlignedVec>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
 /// Ensures that at most one connection at a time serves as the receiver for a
@@ -661,17 +799,67 @@ impl ExchangeDirectory {
             .clone()
     }
 
-    pub fn get(
+    pub fn insert(&self, exchange_id: ExchangeId, delivery: Arc<dyn ExchangeDelivery>) {
+        self.entries
+            .write()
+            .unwrap()
+            .entry(exchange_id)
+            .and_modify(|_| panic!())
+            .or_insert_with(|| ExchangeDirectoryEntry::new(delivery));
+    }
+
+    /// Returns this directory for the network tasks of the runtime (see
+    /// [WeakExchangeDirectory]).
+    fn downgrade(&self) -> WeakExchangeDirectory {
+        WeakExchangeDirectory {
+            next_sequence: self.next_sequence.clone(),
+            entries: Arc::downgrade(&self.entries),
+            connections: self.connections.clone(),
+        }
+    }
+}
+
+/// An [ExchangeDirectory] for the network tasks of a runtime, which refers to
+/// the exchanges weakly.
+///
+/// The exchanges hold the runtime, and the network tasks continue to run
+/// after the runtime stops.  With strong references, the tasks would keep the
+/// runtime, and the lock on its storage, for as long as they run.
+#[derive(Clone)]
+struct WeakExchangeDirectory {
+    /// See [ExchangeDirectory].
+    next_sequence: Arc<Vec<EnumMap<MessageType, AtomicU64>>>,
+
+    /// See [ExchangeDirectory].  The upgrade fails after the runtime stops.
+    entries: Weak<RwLock<HashMap<ExchangeId, ExchangeDirectoryEntry>>>,
+
+    /// See [ExchangeDirectory].
+    connections: ConnectionRegistry,
+}
+
+impl WeakExchangeDirectory {
+    /// Finds where to deliver message `sequence` of `message_type` from
+    /// `sending_host_idx` to exchange `exchange_id`.
+    ///
+    /// After the runtime stops, there is no exchange, so a message in
+    /// sequence goes to [Discard].
+    fn get(
         &self,
         exchange_id: ExchangeId,
         sending_host_idx: usize,
         message_type: MessageType,
         sequence: u64,
     ) -> Result<ExchangeGet, ExchangeGetError> {
-        let map = self.entries.read().unwrap();
-        let entry = map
-            .get(&exchange_id)
-            .ok_or(ExchangeGetError::UnknownExchange(exchange_id))?;
+        let delivery: Arc<dyn ExchangeDelivery> = match self.entries.upgrade() {
+            Some(entries) => entries
+                .read()
+                .unwrap()
+                .get(&exchange_id)
+                .ok_or(ExchangeGetError::UnknownExchange(exchange_id))?
+                .delivery
+                .clone(),
+            None => Arc::new(Discard),
+        };
         match self.next_sequence[sending_host_idx][message_type].compare_exchange(
             sequence,
             sequence + 1,
@@ -681,7 +869,7 @@ impl ExchangeDirectory {
             Ok(_) => {
                 // Correct sequence number.
                 Ok(ExchangeGet {
-                    delivery: Some(entry.delivery.clone()),
+                    delivery: Some(delivery),
                     next_sequence: sequence + 1,
                 })
             }
@@ -703,15 +891,6 @@ impl ExchangeDirectory {
         }
     }
 
-    pub fn insert(&self, exchange_id: ExchangeId, delivery: Arc<dyn ExchangeDelivery>) {
-        self.entries
-            .write()
-            .unwrap()
-            .entry(exchange_id)
-            .and_modify(|_| panic!())
-            .or_insert_with(|| ExchangeDirectoryEntry::new(delivery));
-    }
-
     /// Registers `cancel`/`handle` as the connection serving
     /// `sending_host_idx` and `message_type`, cancelling any previous
     /// connection serving the same pair and waiting for it to fully exit
@@ -729,9 +908,30 @@ impl ExchangeDirectory {
     }
 }
 
+/// Drops the messages that arrive after the runtime stops.
+///
+/// The server still acknowledges these messages, so that a sender does not
+/// wait for them.
+struct Discard;
+
+impl ExchangeDelivery for Discard {
+    fn name(&self) -> Arc<String> {
+        Arc::new(String::from("Discard"))
+    }
+
+    fn received(
+        self: Arc<Self>,
+        _sender: usize,
+        _round: u64,
+        _data: Vec<AlignedVec>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(ready(()))
+    }
+}
+
 struct ExchangeServer {
     layout: Layout,
-    directory: ExchangeDirectory,
+    directory: WeakExchangeDirectory,
     stream: TcpStream,
 
     /// Cancelled by a subsequent connection that takes over this connection's
@@ -753,10 +953,13 @@ impl ExchangeServer {
     /// This is pure network I/O: it doesn't touch the sequence number or
     /// deliver anything, so unlike the rest of message processing, it's safe
     /// to abandon at any point (see `serve`'s use of `cancel`).
-    async fn read_message(
-        stream: &mut TcpStream,
+    async fn read_message<S>(
+        stream: &mut S,
         n: usize,
-    ) -> std::io::Result<Option<(ExchangeHeader, Vec<AlignedVec>, usize)>> {
+    ) -> std::io::Result<Option<(ExchangeHeader, Vec<AlignedVec>, usize)>>
+    where
+        S: AsyncRead + Unpin,
+    {
         let Some(header) = ExchangeHeader::read(n, stream).await? else {
             return Ok(None);
         };
@@ -789,7 +992,10 @@ impl ExchangeServer {
             let pointer = payload.as_mut_ptr() as *mut MaybeUninit<u8>;
             let mut slice = unsafe { std::slice::from_raw_parts_mut(pointer, len) };
             while !slice.is_empty() {
-                stream.read_buf(&mut slice).await?;
+                // At EOF, `read_buf` returns 0 forever.
+                if stream.read_buf(&mut slice).await? == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
             }
             unsafe { payload.set_len(len) };
             data.push(payload);
@@ -839,6 +1045,13 @@ impl ExchangeServer {
                     .await;
             }
 
+            if sequence == PING_SEQUENCE {
+                // A liveness probe: the sender doesn't wait for or need a
+                // reply, so just skip it rather than running it through
+                // delivery or the sequence counter.
+                continue;
+            }
+
             let ExchangeGet {
                 delivery,
                 next_sequence,
@@ -884,7 +1097,7 @@ impl ExchangeServer {
 
             EXCHANGE_MESSAGES_RECEIVED.fetch_add(n, Ordering::Relaxed);
             if let Some(delivery) = delivery {
-                delivery.received(sender, data).await;
+                delivery.received(sender, header.round, data).await;
             } else {
                 DUPLICATE_EXCHANGE_MESSAGES_RECEIVED.fetch_add(n, Ordering::Relaxed);
             }
@@ -915,6 +1128,14 @@ pub struct ExchangeClients {
     ///
     /// We use one RPC client per [MessageType] per [Host].
     clients: Vec<(Host, EnumMap<MessageType, OnceCell<ExchangeClient>>)>,
+
+    /// Bytes of queued but unacknowledged messages that each client in
+    /// `clients` admits, from `dev_tweaks.exchange_channel_capacity_bytes`.
+    ///
+    /// We read it here, where we still have the [Runtime], because the clients
+    /// connect from the Tokio runtime's threads, where the dev tweaks are not
+    /// in scope.
+    channel_capacity_bytes: usize,
 }
 
 impl ExchangeClients {
@@ -939,6 +1160,7 @@ impl ExchangeClients {
                 .other_hosts()
                 .map(|host| (host.clone(), Default::default()))
                 .collect(),
+            channel_capacity_bytes: runtime.dev_tweaks().exchange_channel_capacity_bytes(),
         }
     }
 
@@ -954,7 +1176,7 @@ impl ExchangeClients {
                     Some(ExchangeListener::new(
                         local_address,
                         runtime.take_exchange_listener(),
-                        directory,
+                        directory.downgrade(),
                         self.layout.clone(),
                     ))
                 } else {
@@ -969,16 +1191,31 @@ impl ExchangeClients {
             .find(|(host, _client)| host.workers.contains(&worker))
             .unwrap();
         cell[message_type]
-            .get_or_init(|| ExchangeClient::new(message_type, host.address, &host.workers))
+            .get_or_init(|| {
+                ExchangeClient::new(
+                    message_type,
+                    host.address,
+                    &host.workers,
+                    self.channel_capacity_bytes,
+                )
+            })
             .await
     }
 
-    pub async fn wait(&self) {
+    /// Waits until every `message_type` channel to a remote host is under its
+    /// capacity.
+    ///
+    /// The caller names the message type it sends.  Waiting on the others
+    /// would couple unrelated flow control: synchronous exchange discards the
+    /// waiters from its own sends, because it drains each message before it
+    /// sends the next one, and its delivery path parks until the receiving
+    /// workers have consumed the previous round.  Waiting on a synchronous
+    /// channel here would therefore make one host's progress depend on how far
+    /// another host has advanced within a step.
+    pub async fn wait(&self, message_type: MessageType) {
         for (_, clients) in &self.clients {
-            for client in clients.values() {
-                if let Some(client) = client.get() {
-                    client.wait().await;
-                }
+            if let Some(client) = clients[message_type].get() {
+                client.wait().await;
             }
         }
     }
@@ -1003,6 +1240,12 @@ impl CallbackInner {
 }
 
 struct Callback(AtomicPtr<CallbackInner>);
+
+impl Default for Callback {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
 impl Callback {
     fn empty() -> Self {
@@ -1060,6 +1303,66 @@ impl<T> Mailbox<T> {
     }
 }
 
+/// The state of one worker, in its role as a receiver, in an [Exchange].
+#[derive(Default)]
+struct ReceiverState {
+    /// Counts the number of messages received in the current round of
+    /// communication.  The receiver must wait until it has all `npeers`
+    /// messages before reading all of them from mailboxes in one pass.
+    full_mailboxes: AtomicUsize,
+
+    /// Notified when all `npeers` messages are ready.
+    notify: Notify,
+}
+
+/// The state of one worker, in its role as a sender, in an [Exchange].
+#[derive(Default)]
+struct SenderState {
+    /// Counts the local mailboxes that hold data from this sender that their
+    /// receivers have not yet taken.  Delivery from the sender waits until
+    /// this is 0, then sets it to `local_workers.len()` and writes all of the
+    /// mailboxes in one pass.
+    full_mailboxes: AtomicUsize,
+
+    /// Invoked when `full_mailboxes` drops to 0.
+    callback: Callback,
+
+    /// Notified when `full_mailboxes` drops to 0.
+    notify: Notify,
+
+    /// For a local sender, the round of its next message to remote hosts
+    /// (see [ExchangeHeader::round]).
+    next_send_round: AtomicU64,
+
+    /// For a remote sender, the rounds of its messages received here.
+    receive_rounds: Mutex<ReceiveRounds>,
+}
+
+/// The rounds received from one remote sender in an [Exchange] (see
+/// [ExchangeHeader::round]).
+#[derive(Default)]
+struct ReceiveRounds {
+    /// The round to deliver next.  It advances to `r + 1` as soon as round
+    /// `r` claims the receivers' mailboxes, before round `r` is delivered, so
+    /// that it is never behind a round that the receivers have taken.
+    next: u64,
+
+    /// A round that arrived before it was `next`, with its data.  A sender's
+    /// big and small messages travel over different connections, so its round
+    /// `r + 1` can arrive while round `r` is still in flight.
+    ///
+    /// There can be only one.  Every worker on the sending host pushes its
+    /// round `r` of an exchange before any of them pushes round `r + 1` (a
+    /// worker can push round `r + 1` only after every local receiver,
+    /// including each sender itself, has taken round `r`, and a worker takes
+    /// round `r` only after its own `send_all` for round `r` returns).  So the
+    /// sender's round `r + 2` can arrive only after its host has every
+    /// worker's round `r + 1`, which the workers here send only after the
+    /// receivers here have taken the sender's round `r`, which in turn claimed
+    /// the mailboxes and made `next` at least `r + 1`.
+    early: Option<(u64, Vec<AlignedVec>)>,
+}
+
 /// `Exchange` is an N-to-N communication primitive that partitions data across
 /// multiple concurrent threads.
 ///
@@ -1082,29 +1385,14 @@ pub(crate) struct Exchange<T> {
     /// Range of worker IDs on the local host.
     local_workers: Range<usize>,
 
-    /// Counts the number of messages received in the current round of
-    /// communication per receiver.  The receiver must wait until it has all
-    /// `npeers` messages before reading all of them from mailboxes in one
-    /// pass.
-    receiver_counters: Vec<AtomicUsize>,
+    /// The state of each worker as a receiver, indexed by worker.  Only the
+    /// local workers' entries are used.  Padded to a cache line because
+    /// senders on many threads update different receivers' counters.
+    receivers: Vec<CachePadded<ReceiverState>>,
 
-    /// Callback invoked when all `npeers` messages are ready for a receiver.
-    receiver_callbacks: Vec<Callback>,
-
-    /// Notified when all `npeers` messages are ready for a receiver.
-    receiver_notifies: Vec<Notify>,
-
-    /// Counts the number of empty mailboxes ready to accept new data per
-    /// sender.  Delivery from any given sender waits until all
-    /// `local_workers.len()` mailboxes are available before writing them in one
-    /// pass.
-    sender_counters: Vec<CachePadded<AtomicUsize>>,
-
-    /// Callback invoked when all `npeers` mailboxes are available.
-    sender_callbacks: Vec<Callback>,
-
-    /// Notified when all `npeers` mailboxes are available.
-    sender_notifies: Vec<Notify>,
+    /// The state of each worker as a sender, indexed by worker.  Padded to a
+    /// cache line for the same reason as `receivers`.
+    senders: Vec<CachePadded<SenderState>>,
 
     /// The RPC clients to contact remote hosts.
     clients: Arc<ExchangeClients>,
@@ -1155,7 +1443,7 @@ impl ExchangeListener {
     fn new(
         local_address: SocketAddr,
         exchange_listener: Option<std::net::TcpListener>,
-        directory: ExchangeDirectory,
+        directory: WeakExchangeDirectory,
         layout: Layout,
     ) -> Self {
         let token = CancellationToken::new();
@@ -1236,14 +1524,8 @@ where
             npeers,
             local_workers: layout.local_workers(),
             clients,
-            receiver_counters: (0..npeers).map(|_| AtomicUsize::new(0)).collect(),
-            receiver_callbacks: (0..npeers).map(|_| Callback::empty()).collect(),
-            receiver_notifies: (0..npeers).map(|_| Notify::new()).collect(),
-            sender_counters: (0..npeers)
-                .map(|_| CachePadded::new(AtomicUsize::new(layout.local_workers().len())))
-                .collect(),
-            sender_notifies: (0..npeers).map(|_| Notify::new()).collect(),
-            sender_callbacks: (0..npeers).map(|_| Callback::empty()).collect(),
+            receivers: (0..npeers).map(|_| CachePadded::default()).collect(),
+            senders: (0..npeers).map(|_| CachePadded::default()).collect(),
             mailboxes,
             deserialization_usecs: AtomicU64::new(0),
             deserialized_bytes: AtomicUsize::new(0),
@@ -1320,20 +1602,60 @@ where
         F: Fn() + Send + Sync + 'static,
     {
         debug_assert!(sender < self.npeers);
-        self.sender_callbacks[sender].set_callback(cb);
+        self.senders[sender].callback.set_callback(cb);
     }
 
     pub fn ready_to_send(&self, sender: usize) -> bool {
-        self.sender_counters[sender].load(Ordering::Acquire) == self.local_workers.len()
+        self.senders[sender].full_mailboxes.load(Ordering::Acquire) == 0
+    }
+
+    /// Delivers `round` from remote `sender`, which must be the next round to
+    /// deliver from it, then each early round that follows it.
+    ///
+    /// Delivering a round waits until the receivers take the previous round,
+    /// which can need other senders' messages that are queued behind `round`
+    /// on the connection that brought it.  So the caller, which serves that
+    /// connection, delivers only `round`, and a new task delivers each early
+    /// round after it.  Claiming the mailboxes orders the deliveries: a round
+    /// claims them only after the receivers take the round before it.
+    fn deliver_rounds(
+        self: Arc<Self>,
+        sender: usize,
+        round: u64,
+        data: Vec<AlignedVec>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            self.wait_for_ready_to_send(sender).await;
+
+            // Advance `next` before delivering `round`, because the receivers
+            // can take `round` as soon as it is delivered, and then the sender
+            // can go on to round `round + 2`.
+            let early = {
+                let mut rounds = self.senders[sender].receive_rounds.lock().unwrap();
+                rounds.next = round + 1;
+                rounds
+                    .early
+                    .take_if(|(early, _)| *early == round + 1)
+                    .map(|(_, data)| data)
+            };
+
+            for (receiver, data) in zip(self.local_workers.clone(), data) {
+                self.deliver(sender, receiver, Mailbox::Rx(data));
+            }
+            if let Some(data) = early {
+                TOKIO.spawn(self.clone().deliver_rounds(sender, round + 1, data));
+            }
+        })
     }
 
     /// Waits until all the mailboxes to receive data from `sender` are empty.
     async fn wait_for_ready_to_send(&self, sender: usize) {
         fn ready_to_send<T>(this: &Exchange<T>, sender: usize) -> bool {
-            this.sender_counters[sender]
+            this.senders[sender]
+                .full_mailboxes
                 .compare_exchange(
-                    this.local_workers.len(),
                     0,
+                    this.local_workers.len(),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -1342,8 +1664,9 @@ where
 
         // Wait for the receivers to have empty mailboxes first.
         if !ready_to_send(self, sender) {
+            let _parked = ParkingFor::new(ParkReason::Peers);
             loop {
-                let notify = self.sender_notifies[sender].notified();
+                let notify = self.senders[sender].notify.notified();
                 if ready_to_send(self, sender) {
                     break;
                 }
@@ -1376,10 +1699,10 @@ where
         assert!(mailbox.is_none());
         *mailbox = Some(item);
 
-        let old_counter = self.receiver_counters[receiver].fetch_add(1, Ordering::AcqRel);
+        let receiver_state = &self.receivers[receiver];
+        let old_counter = receiver_state.full_mailboxes.fetch_add(1, Ordering::AcqRel);
         if old_counter >= self.npeers - 1 {
-            self.receiver_callbacks[receiver].call();
-            self.receiver_notifies[receiver].notify_waiters();
+            receiver_state.notify.notify_waiters();
         }
     }
 
@@ -1401,6 +1724,12 @@ where
         let sender = Runtime::worker_index();
 
         self.wait_for_ready_to_send(sender).await;
+
+        // Every call sends one message to each remote host, so one round
+        // counter per sender serves all of them.
+        let round = self.senders[sender]
+            .next_send_round
+            .fetch_add(1, Ordering::Relaxed);
 
         let runtime = Runtime::runtime().unwrap();
         let layout = runtime.layout();
@@ -1431,12 +1760,21 @@ where
                     // We discard the return value that could allow us to wait
                     // for the channel tx buffer to drain, because exchange is
                     // synchronous, meaning that it will drain before we send
-                    // the next message.
+                    // the next message.  Big and small messages use different
+                    // connections, so they may arrive out of order; `round`
+                    // lets the receiver put them back in order (see
+                    // [ReceiveRounds]).
                     let _ = self
                         .clients
                         .connect(receivers.start, message_type)
                         .await
-                        .send(global_node_id.clone(), self.exchange_id, sender, items);
+                        .send(
+                            global_node_id.clone(),
+                            self.exchange_id,
+                            sender,
+                            round,
+                            items,
+                        );
                 }
             }
         }
@@ -1459,13 +1797,15 @@ where
     {
         let receiver = Runtime::worker_index();
         fn may_receive<T>(exchange: &Exchange<T>, receiver: usize) -> bool {
-            exchange.receiver_counters[receiver]
+            exchange.receivers[receiver]
+                .full_mailboxes
                 .compare_exchange(exchange.npeers, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         }
         if !may_receive(self, receiver) {
+            let _parked = ParkingFor::new(ParkReason::Peers);
             loop {
-                let notifier = self.receiver_notifies[receiver].notified();
+                let notifier = self.receivers[receiver].notify.notified();
                 if may_receive(self, receiver) {
                     break;
                 }
@@ -1482,10 +1822,12 @@ where
         for sender in 0..self.npeers {
             let mailbox = self.mailbox(sender, receiver).take().unwrap();
             data.push(mailbox.deserialize(&deserialize));
-            let old_counter = self.sender_counters[sender].fetch_add(1, Ordering::AcqRel);
-            if old_counter + 1 >= self.local_workers.len() {
-                self.sender_callbacks[sender].call();
-                self.sender_notifies[sender].notify_waiters();
+            let sender_state = &self.senders[sender];
+            let old_counter = sender_state.full_mailboxes.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(old_counter > 0);
+            if old_counter == 1 {
+                sender_state.callback.call();
+                sender_state.notify.notify_waiters();
             }
         }
 
@@ -1501,17 +1843,43 @@ where
         self.name.get()
     }
 
-    fn received<'a>(
-        &'a self,
+    fn received(
+        self: Arc<Self>,
         sender: usize,
+        round: u64,
         data: Vec<AlignedVec>,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            self.wait_for_ready_to_send(sender).await;
-
-            for (receiver, data) in zip(self.local_workers.clone(), data) {
-                self.deliver(sender, receiver, Mailbox::Rx(data));
+            // Deliver `round` now only if it is the next round from `sender`.
+            // Keep an early round for later, so that the connection that
+            // brought it can go on to its next message without waiting.
+            {
+                let mut rounds = self.senders[sender].receive_rounds.lock().unwrap();
+                if round < rounds.next {
+                    error!(
+                        "exchange {}: dropping round {round} from worker {sender}, which was already delivered (next round is {})",
+                        self.exchange_id, rounds.next
+                    );
+                    return;
+                } else if round > rounds.next {
+                    if round > rounds.next + 1 {
+                        error!(
+                            "exchange {}: round {round} from worker {sender} arrived while waiting for round {}",
+                            self.exchange_id, rounds.next
+                        );
+                    }
+                    assert!(
+                        rounds.early.is_none(),
+                        "exchange {}: round {round} from worker {sender} arrived while round {} was already waiting for round {}",
+                        self.exchange_id,
+                        rounds.early.as_ref().unwrap().0,
+                        rounds.next
+                    );
+                    rounds.early = Some((round, data));
+                    return;
+                }
             }
+            self.deliver_rounds(sender, round, data).await
         })
     }
 }
@@ -2115,10 +2483,18 @@ where
     Some((sender, receiver))
 }
 
+/// Count of tests currently disabling fault injection (see
+/// `tests::FaultInjectionDisabled`).
+#[cfg(test)]
+static FAULT_INJECTION_DISABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 #[cfg(test)]
 fn inject_fault(kind: impl Display) -> bool {
     use rand::Rng as _;
 
+    if FAULT_INJECTION_DISABLE_COUNT.load(Ordering::Relaxed) > 0 {
+        return false;
+    }
     if rand::thread_rng().gen_range(0..100) == 0 {
         warn!("injecting failure: {kind}");
         true
@@ -2143,16 +2519,36 @@ fn backoff_time() -> Duration {
     Duration::from_millis(1000)
 }
 
+/// How long a connection tx task waits, after it has nothing new to send and
+/// the receiver has not acknowledged everything already sent, before probing
+/// with a ping.
+///
+/// A receiver acknowledges a message only after its workers have consumed it,
+/// which can legitimately take a while under load, so this should not be so
+/// short that ordinary scheduling delays trigger probes constantly. But
+/// because a ping costs only a few bytes, this can be much shorter than it
+/// would need to be if it triggered a retransmission instead.
+#[cfg(test)]
+fn ping_interval() -> Duration {
+    Duration::from_millis(20)
+}
+
+#[cfg(not(test))]
+fn ping_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
 #[cfg(test)]
 mod tests {
     use feldera_storage::tokio::TOKIO;
+    use feldera_types::config::DevTweaks;
     use itertools::Itertools;
 
     use super::Exchange;
     use crate::{
         Circuit, RootCircuit,
         circuit::{
-            CircuitConfig, Layout, Runtime,
+            Runtime,
             runtime::{WorkerLocation, WorkerLocations},
             schedule::{DynamicScheduler, Scheduler},
         },
@@ -2162,13 +2558,12 @@ mod tests {
         },
         storage::file::{to_bytes, to_bytes_dyn},
         trace::aligned_deserialize,
-        utils::test::init_test_logger,
+        utils::test::{
+            init_test_logger,
+            multihost::{TestHosts, run_on_hosts},
+        },
     };
-    use std::{
-        iter::{repeat, zip},
-        net::TcpListener,
-        sync::Arc,
-    };
+    use std::sync::{Arc, atomic::Ordering};
 
     /// Number of rounds for exchange.
     ///
@@ -2187,83 +2582,41 @@ mod tests {
             let n_workers = Runtime::num_workers();
             let global_node_id = Arc::new(String::from("test_global_node_id"));
             for round in 0..ROUNDS {
+                // Each value names its receiver too, so that a value delivered to
+                // the wrong worker is caught.
                 exchange
-                    .send_all_with_serializer(&global_node_id, repeat((sender, round)), |data| {
-                        to_bytes(&data).unwrap()
-                    })
+                    .send_all_with_serializer(
+                        &global_node_id,
+                        (0..n_workers).map(|receiver| (sender, receiver, round)),
+                        |data| to_bytes(&data).unwrap(),
+                    )
                     .await;
 
                 let (received, _) = exchange
                     .receive_all(|data| aligned_deserialize(&data[..]), None)
                     .await;
 
-                let expected = (0..n_workers).map(|worker| (worker, round)).collect_vec();
+                let expected = (0..n_workers)
+                    .map(|worker| (worker, sender, round))
+                    .collect_vec();
                 assert_eq!(received, expected);
             }
         });
     }
 
-    fn test_circuit(
-        workers: usize,
-        hosts: usize,
-        circuit: impl FnOnce() + Copy + Clone + Send + Sync + 'static,
-    ) {
-        match hosts {
-            0 => unreachable!(),
-            1 => {
-                let hruntime = Runtime::run(workers, move |_parker| circuit())
-                    .expect("failed to start runtime");
-
-                hruntime.join().unwrap();
+    // A worker panic fails the test, even though the other workers wait
+    // forever for data from the worker that panicked.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[should_panic(expected = "panicked")]
+    fn run_on_hosts_fails_on_worker_panic() {
+        init_test_logger();
+        run_on_hosts(4, 2, || {
+            if Runtime::worker_index() == 0 {
+                panic!("worker 0 fails before its first exchange");
             }
-            _ => {
-                assert!(workers >= hosts);
-
-                // Bind some listening sockets.
-                let exchange_listeners = (0..hosts)
-                    .map(|_| {
-                        TcpListener::bind("127.0.0.1:0")
-                            .expect("should be able to bind a port on localhost")
-                    })
-                    .collect_vec();
-
-                // Assemble the listening sockets' addresses into something we can pass
-                // to `Layout::new_multihost`.
-                let params = exchange_listeners
-                    .iter()
-                    .enumerate()
-                    .map(|(index, listener)| {
-                        (
-                            listener
-                                .local_addr()
-                                .expect("should be able to get local address"),
-                            workers / hosts + (index < workers % hosts) as usize,
-                        )
-                    })
-                    .collect_vec();
-
-                // Create the runtimes.
-                let mut runtimes = Vec::with_capacity(hosts);
-                for ((local_address, _), exchange_listener) in
-                    zip(params.iter(), exchange_listeners)
-                {
-                    let cconf = CircuitConfig::from(
-                        Layout::new_multihost(&params, *local_address).unwrap(),
-                    )
-                    .with_exchange_listener(exchange_listener);
-
-                    runtimes.push(
-                        Runtime::run(cconf, move |_parker| circuit())
-                            .expect("failed to start runtime"),
-                    );
-                }
-
-                // Wait for the runtimes to finish.
-                for runtime in runtimes {
-                    runtime.join().unwrap();
-                }
-            }
-        }
+            circuit();
+        });
     }
 
     // Test an exchange object with multiple concurrent senders/receivers on a single host.
@@ -2272,7 +2625,7 @@ mod tests {
     fn single_host() {
         init_test_logger();
         for workers in [2, 4, 8] {
-            test_circuit(workers, 1, circuit);
+            run_on_hosts(workers, 1, circuit);
         }
     }
 
@@ -2282,8 +2635,171 @@ mod tests {
     fn multihost() {
         init_test_logger();
         for (workers, hosts) in [(2, 2), (4, 2), (8, 2), (3, 3), (4, 4), (16, 4)] {
-            test_circuit(workers, hosts, circuit);
+            run_on_hosts(workers, hosts, circuit);
         }
+    }
+
+    /// Seed for the padding in the mixed-size tests:
+    /// `DBSP_EXCHANGE_TEST_SEED`, or a random one.  Printed, so that a failing
+    /// run's padding can be replayed.
+    fn mixed_size_seed() -> u64 {
+        let seed = match std::env::var("DBSP_EXCHANGE_TEST_SEED") {
+            Ok(seed) => seed
+                .parse()
+                .expect("DBSP_EXCHANGE_TEST_SEED must be a number"),
+            Err(_) => rand::random(),
+        };
+        println!("mixed-size exchange test seed {seed} (set DBSP_EXCHANGE_TEST_SEED to replay)");
+        seed
+    }
+
+    /// A circuit that iterates for `ROUNDS` rounds, like `circuit`, over
+    /// `n_exchanges` exchanges at once.  In each round, each sender sends
+    /// on every exchange before it receives on any of them, and it pads its
+    /// value with a number of bytes drawn from `seed`, so that the message
+    /// for one host goes over the big-message connection in some rounds and
+    /// over the small-message connection in others.  Rounds must still
+    /// arrive in order.
+    fn mixed_size_circuit(seed: u64, n_exchanges: usize) {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+
+        // Padding per value: none, under the small-message limit, and over it.
+        const PADDING: [usize; 4] = [0, 1000, 4097, 8192];
+        const ROUNDS: usize = if cfg!(miri) { 16 } else { 256 };
+
+        let runtime = Runtime::runtime().unwrap();
+        let exchanges = (0..n_exchanges)
+            .map(|id| Exchange::with_runtime(&runtime, id as u32, ExchangeActivity::AllSteps))
+            .collect_vec();
+        TOKIO.block_on(async {
+            let sender = Runtime::worker_index();
+            let n_workers = Runtime::num_workers();
+            let global_node_id = Arc::new(String::from("test_global_node_id"));
+            let mut rng = StdRng::seed_from_u64(seed ^ ((sender as u64) << 32));
+            for round in 0..ROUNDS {
+                for exchange in &exchanges {
+                    let padding = vec![0u8; PADDING[rng.gen_range(0..PADDING.len())]];
+                    exchange
+                        .send_all_with_serializer(
+                            &global_node_id,
+                            (0..n_workers)
+                                .map(|receiver| (sender, receiver, round, padding.clone())),
+                            |data| to_bytes(&data).unwrap(),
+                        )
+                        .await;
+                }
+                for exchange in &exchanges {
+                    let (received, _) = exchange
+                        .receive_all(|data| aligned_deserialize(&data[..]), None)
+                        .await;
+                    let received = received
+                        .into_iter()
+                        .map(
+                            |(sender, receiver, round, _padding): (
+                                usize,
+                                usize,
+                                usize,
+                                Vec<u8>,
+                            )| { (sender, receiver, round) },
+                        )
+                        .collect_vec();
+
+                    let expected = (0..n_workers)
+                        .map(|worker| (worker, sender, round))
+                        .collect_vec();
+                    assert_eq!(received, expected, "seed {seed}");
+                }
+            }
+        });
+    }
+
+    // Test an exchange whose messages alternate between big and small, on
+    // multiple hosts.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn multihost_mixed_size() {
+        init_test_logger();
+        let seed = mixed_size_seed();
+        for (workers, hosts) in [(2, 2), (4, 2), (3, 3), (4, 4)] {
+            run_on_hosts(workers, hosts, move || mixed_size_circuit(seed, 1));
+        }
+    }
+
+    // Like `multihost_mixed_size`, with two exchanges whose messages share
+    // the connections, so that a round waiting for its predecessor on the
+    // other connection holds up the other exchange's messages too.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn multihost_mixed_size_two_exchanges() {
+        init_test_logger();
+        let seed = mixed_size_seed();
+        for (workers, hosts) in [(2, 2), (4, 2), (3, 3), (4, 4)] {
+            run_on_hosts(workers, hosts, move || mixed_size_circuit(seed, 2));
+        }
+    }
+
+    // `received` delivers each sender's rounds in order: a round that arrives
+    // early returns at once but is delivered only after its predecessor, and
+    // a round that was already delivered is dropped.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn received_delivers_rounds_in_order() {
+        use super::ExchangeDelivery;
+        use rkyv::AlignedVec;
+
+        init_test_logger();
+        Runtime::run(1, |_parker| {
+            let exchange = Exchange::<usize>::with_runtime(
+                &Runtime::runtime().unwrap(),
+                0,
+                ExchangeActivity::AllSteps,
+            );
+            let payload = |n: usize| {
+                let mut data = AlignedVec::new();
+                data.extend_from_slice(&to_bytes(&n).unwrap());
+                vec![data]
+            };
+            let receive = |exchange: &Exchange<usize>| {
+                TOKIO
+                    .block_on(exchange.receive_all(|data| aligned_deserialize(&data[..]), None))
+                    .0
+            };
+
+            // Round 1 arrives before round 0: it returns at once (so that its
+            // connection can go on), but it is not delivered yet.
+            TOKIO.block_on(exchange.clone().received(0, 1, payload(11)));
+            assert!(exchange.ready_to_send(0), "round 1 must wait for round 0");
+
+            // Round 0 is delivered, then round 1, which has to wait until
+            // round 0 is taken, so deliver round 0 from another task.
+            let on_time = TOKIO.spawn({
+                let exchange = exchange.clone();
+                async move { exchange.received(0, 0, payload(10)).await }
+            });
+            assert_eq!(receive(&exchange), vec![10]);
+            assert_eq!(receive(&exchange), vec![11]);
+            TOKIO.block_on(on_time).unwrap();
+
+            // The task that delivered round 1 advances the next round to 2 just
+            // after the delivery that `receive` saw, so wait for that.
+            while exchange.senders[0].receive_rounds.lock().unwrap().next != 2 {
+                std::thread::yield_now();
+            }
+
+            // Round 1 again: already delivered, so it is dropped.
+            TOKIO.block_on(exchange.clone().received(0, 1, payload(99)));
+            assert!(
+                exchange.ready_to_send(0),
+                "a stale round must not be delivered"
+            );
+
+            // Round 2 is delivered normally.
+            TOKIO.block_on(exchange.clone().received(0, 2, payload(12)));
+            assert_eq!(receive(&exchange), vec![12]);
+        })
+        .expect("failed to start runtime")
+        .join()
+        .unwrap();
     }
 
     fn operator_circuit<S>()
@@ -2301,18 +2817,20 @@ mod tests {
             let (sender, receiver) = new_exchange_operators(
                 None,
                 Vec::new,
+                // Each value names its receiver too, so that a value delivered to
+                // the wrong worker is caught.
                 move |n, vals| {
-                    for location in WorkerLocations::new() {
+                    for (receiver, location) in WorkerLocations::new().enumerate() {
                         match location {
-                            WorkerLocation::Local => vals.push(Mailbox::Plain(n)),
+                            WorkerLocation::Local => vals.push(Mailbox::Plain((n, receiver))),
                             WorkerLocation::Remote => {
-                                vals.push(Mailbox::Tx(to_bytes_dyn(&n).unwrap()))
+                                vals.push(Mailbox::Tx(to_bytes_dyn(&(n, receiver)).unwrap()))
                             }
                         }
                     }
                 },
                 |data| aligned_deserialize(&data[..]),
-                |v: &mut Vec<usize>, n| v.push(n),
+                |v: &mut Vec<(usize, usize)>, x| v.push(x),
                 ExchangeActivity::AllSteps,
             )
             .unwrap();
@@ -2321,7 +2839,10 @@ mod tests {
             circuit
                 .add_exchange(sender, receiver, &source)
                 .inspect(move |v| {
-                    assert_eq!(&vec![round; Runtime::num_workers()], v);
+                    assert_eq!(
+                        &vec![(round, Runtime::worker_index()); Runtime::num_workers()],
+                        v
+                    );
                     round += 1;
                 });
             Ok(())
@@ -2340,9 +2861,9 @@ mod tests {
     // `ExchangeSender` - sends each number to all peers.
     // `ExchangeReceiver` - combines all received numbers in a vector.
     // `Inspect` - validates the output of the receiver.
-    fn test_operators_single_host(circuit: impl FnOnce() + Copy + Clone + Send + Sync + 'static) {
+    fn test_operators_single_host(circuit: impl FnOnce() + Copy + Send + Sync + 'static) {
         for workers in [2, 16, 32] {
-            test_circuit(workers, 1, circuit);
+            run_on_hosts(workers, 1, circuit);
         }
     }
 
@@ -2352,9 +2873,9 @@ mod tests {
     // `ExchangeSender` - sends each number to all peers.
     // `ExchangeReceiver` - combines all received numbers in a vector.
     // `Inspect` - validates the output of the receiver.
-    fn test_operators_multihost(circuit: impl FnOnce() + Copy + Clone + Send + Sync + 'static) {
+    fn test_operators_multihost(circuit: impl FnOnce() + Copy + Send + Sync + 'static) {
         for (workers, hosts) in [(2, 2), (4, 2), (8, 2), (3, 3), (4, 4), (16, 4)] {
-            test_circuit(workers, hosts, circuit);
+            run_on_hosts(workers, hosts, circuit);
         }
     }
 
@@ -2370,5 +2891,415 @@ mod tests {
     fn operators_multihost_dynamic() {
         init_test_logger();
         test_operators_multihost(operator_circuit::<DynamicScheduler>);
+    }
+
+    /// Killed hosts drop their runtimes.  The network tasks of a host continue
+    /// to run after a kill, and they find the sharded accumulators of the host
+    /// in its exchange directory.  The accumulators hold the runtime, so if
+    /// the tasks held the directory strongly, a killed host would keep its
+    /// runtime, and the lock on its storage, and could not start again from
+    /// that storage.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn killed_hosts_drop_their_runtimes() {
+        init_test_logger();
+        let mut hosts = TestHosts::start(4, 2, |circuit| {
+            let (input, input_handle) = circuit.add_input_zset::<u64>();
+            // An input stream is already sharded, so `shard_accumulate` on it
+            // would not use a sharded accumulator.  The stream from `map` is
+            // not sharded.
+            let (accumulated, enable_count) = input.map(|x| *x).shard_accumulate().into_parts();
+            enable_count.enable();
+            Ok((input_handle, accumulated.latest_output(), enable_count))
+        });
+        for key in 0..16 {
+            hosts.result(0).0.push(key, 1);
+        }
+        hosts.transaction();
+
+        // Fails unless every host drops its runtime.
+        hosts.kill();
+    }
+
+    /// Disables the random `inject_fault` failures used by the round-based
+    /// resilience tests (`single_host`, `multihost`, ...) for the lifetime of
+    /// the guard. Tests that drive the wire protocol directly through a single
+    /// hand-accepted `TcpStream` have no way to recover from an injected
+    /// "connection failure": the client would reconnect to a fresh socket that
+    /// the test never accepts, leaving the test reading a dead stream.
+    ///
+    /// If we used this feature for disabling fault injection a lot, then it
+    /// would negate the value of fault injection entirely, but we only use it
+    /// in tests that run very quickly, whereas the tests that do benefit from
+    /// fault injection are longer running.
+    struct FaultInjectionDisabled;
+
+    impl FaultInjectionDisabled {
+        fn new() -> Self {
+            super::FAULT_INJECTION_DISABLE_COUNT.fetch_add(1, Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for FaultInjectionDisabled {
+        fn drop(&mut self) {
+            super::FAULT_INJECTION_DISABLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    // Exercises the liveness ping mechanism directly: a fake receiver
+    // acknowledges nothing, so the sender has no way to tell a slow receiver
+    // from a half-open connection except by asking.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn pings_repeatedly_without_retransmitting() {
+        use super::{ExchangeClient, ExchangeHeader, MessageType, PING_SEQUENCE};
+        use feldera_storage::fbuf::FBuf;
+        use std::time::Duration;
+        use tokio::{io::AsyncWriteExt, net::TcpListener as AsyncTcpListener, time::timeout};
+
+        init_test_logger();
+        let _guard = FaultInjectionDisabled::new();
+        TOKIO.block_on(async {
+            let listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let remote_workers = 0..1;
+            let client = ExchangeClient::new(
+                MessageType::Streaming,
+                addr,
+                &remote_workers,
+                DevTweaks::default().exchange_channel_capacity_bytes(),
+            )
+            .await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            client.send(Arc::new("test".into()), 0, 0, 0, vec![FBuf::new()]);
+
+            // Read the message but never acknowledge it.
+            let header = ExchangeHeader::read(1, &mut stream).await.unwrap().unwrap();
+            assert_eq!(header.sequence, 0);
+
+            // With nothing new to send and no acknowledgement, the sender
+            // should keep probing rather than hang -- and answering the
+            // probe should not turn the next one into a retransmit.
+            for _ in 0..3 {
+                let ping = timeout(Duration::from_secs(5), ExchangeHeader::read(1, &mut stream))
+                    .await
+                    .expect("sender should keep pinging instead of hanging")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    ping.sequence, PING_SEQUENCE,
+                    "expected a ping, not a retransmit"
+                );
+                stream.write_u64_le(0).await.unwrap();
+            }
+        });
+    }
+
+    // Checks that a message queued right after the sender has sent a ping goes
+    // out immediately.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn new_message_sent_without_waiting_after_a_ping() {
+        use super::{ExchangeClient, ExchangeHeader, MessageType, PING_SEQUENCE};
+        use feldera_storage::fbuf::FBuf;
+        use std::time::{Duration, Instant};
+        use tokio::net::TcpListener as AsyncTcpListener;
+
+        init_test_logger();
+        let _guard = FaultInjectionDisabled::new();
+        TOKIO.block_on(async {
+            let listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let remote_workers = 0..1;
+            let client = ExchangeClient::new(
+                MessageType::Streaming,
+                addr,
+                &remote_workers,
+                DevTweaks::default().exchange_channel_capacity_bytes(),
+            )
+            .await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Send and never acknowledge the first message, leaving the sender
+            // idle with an unacknowledged backlog, then wait for it to actually
+            // ping rather than guessing how long that takes.
+            client.send(Arc::new("test".into()), 0, 0, 0, vec![FBuf::new()]);
+            let header = ExchangeHeader::read(1, &mut stream).await.unwrap().unwrap();
+            assert_eq!(header.sequence, 0);
+            let ping = ExchangeHeader::read(1, &mut stream).await.unwrap().unwrap();
+            assert_eq!(ping.sequence, PING_SEQUENCE);
+
+            // Queue a second message right after the ping and check it
+            // arrives promptly, not held up by anything.
+            client.send(Arc::new("test".into()), 0, 0, 0, vec![FBuf::new()]);
+            let start = Instant::now();
+            let header =
+                tokio::time::timeout(Duration::from_secs(5), ExchangeHeader::read(1, &mut stream))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(header.sequence, 1);
+            assert!(
+                start.elapsed() < Duration::from_millis(15),
+                "new data should be sent immediately after a ping, not held up behind it"
+            );
+        });
+    }
+
+    /// Number of payloads per message in the channel tests below, that is, the
+    /// number of workers on the receiving host.
+    const CHANNEL_TEST_WORKERS: usize = 2;
+
+    /// Bytes that a message charges against a channel's capacity beyond its
+    /// payloads.
+    fn header_len() -> usize {
+        super::ExchangeHeader::len_for_count(CHANNEL_TEST_WORKERS)
+    }
+
+    /// Returns a message with `CHANNEL_TEST_WORKERS` payloads of `payload_len`
+    /// bytes each.
+    fn test_message(payload_len: usize) -> super::ExchangeMessage {
+        use feldera_storage::fbuf::FBuf;
+
+        let data = (0..CHANNEL_TEST_WORKERS)
+            .map(|_| {
+                let mut payload = FBuf::new();
+                payload.resize(payload_len, 0);
+                payload
+            })
+            .collect();
+        super::ExchangeMessage::new(Arc::new("test".into()), 0, 0, 0, data)
+    }
+
+    fn remaining(channel: &super::ExchangeChannel) -> isize {
+        channel.inner().remaining
+    }
+
+    // A channel's capacity is a budget of bytes, so a few big messages exhaust
+    // it even though the number of messages is small.
+    #[test]
+    fn channel_capacity_counts_bytes() {
+        let cost = (header_len() + CHANNEL_TEST_WORKERS * 1000) as isize;
+        let channel = super::ExchangeChannel::new(2 * cost as usize);
+
+        assert!(channel.push(test_message(1000)).is_none());
+        assert_eq!(remaining(&channel), cost);
+
+        assert!(channel.push(test_message(1000)).is_none());
+        assert_eq!(remaining(&channel), 0);
+
+        assert!(
+            channel.push(test_message(1000)).is_some(),
+            "a third message should exhaust a budget of two messages' bytes"
+        );
+        assert_eq!(remaining(&channel), -cost);
+    }
+
+    // A message with empty payloads still charges for its header, so that the
+    // queue bounds the number of messages as well as their total size.
+    #[test]
+    fn channel_capacity_counts_empty_messages() {
+        let channel = super::ExchangeChannel::new(2 * header_len());
+
+        assert!(channel.push(test_message(0)).is_none());
+        assert!(channel.push(test_message(0)).is_none());
+        assert_eq!(remaining(&channel), 0);
+        assert!(
+            channel.push(test_message(0)).is_some(),
+            "an empty message should still charge for its header"
+        );
+    }
+
+    // Acknowledging a message returns exactly the bytes that it charged.
+    #[test]
+    fn channel_drain_returns_bytes() {
+        let cost = (header_len() + CHANNEL_TEST_WORKERS * 1000) as isize;
+        let capacity = 2 * cost as usize;
+        let channel = super::ExchangeChannel::new(capacity);
+
+        for _ in 0..3 {
+            channel.push(test_message(1000));
+        }
+        assert_eq!(remaining(&channel), capacity as isize - 3 * cost);
+
+        channel.drain(2);
+        assert_eq!(remaining(&channel), capacity as isize - cost);
+        assert!(channel.drain_waiter().is_none());
+
+        channel.drain(3);
+        assert_eq!(remaining(&channel), capacity as isize);
+        assert!(!channel.has_unacknowledged());
+    }
+
+    // A message bigger than the whole budget is still queued; the sender just
+    // waits for it to be acknowledged before queuing another one.
+    #[test]
+    fn channel_queues_oversized_message() {
+        let channel = super::ExchangeChannel::new(10);
+        let cost = (header_len() + CHANNEL_TEST_WORKERS * 1000) as isize;
+
+        assert!(channel.push(test_message(1000)).is_some());
+        assert_eq!(remaining(&channel), 10 - cost);
+        assert!(
+            channel.get(0).is_ok(),
+            "the message should be queued to send"
+        );
+
+        channel.drain(1);
+        assert_eq!(remaining(&channel), 10);
+        assert!(channel.drain_waiter().is_none());
+    }
+
+    // A sender receives its waiter from `push` but may not poll it until
+    // later, so a drain in between must still wake it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn channel_waiter_wakes_after_an_earlier_drain() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let channel = super::ExchangeChannel::new(10);
+        let waiter = channel
+            .push(test_message(1000))
+            .expect("channel is overfull");
+
+        // Drain before the waiter is ever polled.
+        channel.drain(1);
+
+        TOKIO.block_on(async {
+            timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a waiter handed out before the drain should still wake");
+        });
+    }
+
+    // A connection that closes in the middle of a payload is an error, not a
+    // spin that waits forever for the rest of the payload.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn read_message_fails_on_eof_in_payload() {
+        use super::{ExchangeHeader, ExchangeServer, MessageType};
+        use std::time::Duration;
+        use tokio::{io::AsyncWriteExt, time::timeout};
+
+        let _guard = FaultInjectionDisabled::new();
+        let header = ExchangeHeader {
+            exchange_id: 0,
+            sequence: 0,
+            round: 0,
+            message_type: MessageType::Streaming,
+            sender: 0,
+            payload_lens: vec![10],
+        };
+        let mut bytes = header.to_bytes();
+        bytes.extend_from_slice(&[1, 2, 3]);
+
+        TOKIO.block_on(async {
+            // Unlike a byte slice, a pipe yields to the runtime at EOF, the
+            // way a socket does, so `timeout` can catch a spin.
+            let (mut writer, mut stream) = tokio::io::duplex(bytes.len());
+            writer.write_all(&bytes).await.unwrap();
+            drop(writer);
+            let result = timeout(
+                Duration::from_secs(5),
+                ExchangeServer::read_message(&mut stream, 1),
+            )
+            .await
+            .expect("EOF in a payload should not hang");
+            assert_eq!(
+                result.err().map(|error| error.kind()),
+                Some(std::io::ErrorKind::UnexpectedEof)
+            );
+        });
+    }
+
+    // End to end at the configured budget: a sender that pushes past the
+    // capacity through a real client and socket waits, and resumes once the
+    // receiver acknowledges.  This is the behavior that #7176 was missing; the
+    // tests above only check the arithmetic that produces it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn client_applies_backpressure_past_capacity() {
+        use super::{ExchangeClient, ExchangeHeader, MessageType};
+        use feldera_storage::fbuf::FBuf;
+        use std::time::Duration;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener as AsyncTcpListener,
+            time::timeout,
+        };
+
+        init_test_logger();
+        let _guard = FaultInjectionDisabled::new();
+
+        let capacity = DevTweaks::default().exchange_channel_capacity_bytes();
+
+        // Two of these messages, headers included, fill the budget exactly.
+        let payload_len = capacity / 2 - ExchangeHeader::len_for_count(1);
+
+        TOKIO.block_on(async {
+            let listener = AsyncTcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let remote_workers = 0..1;
+            let client =
+                ExchangeClient::new(MessageType::Streaming, addr, &remote_workers, capacity).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let message = || {
+                let mut payload = FBuf::new();
+                payload.resize(payload_len, 0);
+                vec![payload]
+            };
+            let send =
+                |client: &ExchangeClient| client.send(Arc::new("test".into()), 0, 0, 0, message());
+
+            assert!(send(&client).is_none(), "half the budget should fit");
+            assert!(send(&client).is_none(), "the whole budget should fit");
+            let waiter = send(&client).expect("a third message should exceed the budget");
+
+            // Receive all three messages, then acknowledge them.
+            for sequence in 0..3 {
+                let header = ExchangeHeader::read(1, &mut stream).await.unwrap().unwrap();
+                assert_eq!(header.sequence, sequence);
+                assert_eq!(header.payload_lens, vec![payload_len as u64]);
+                let mut payload = vec![0; payload_len];
+                stream.read_exact(&mut payload).await.unwrap();
+            }
+            stream.write_u64_le(3).await.unwrap();
+
+            timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("acknowledgement should release the sender");
+            assert!(send(&client).is_none(), "the budget should be free again");
+        });
+    }
+
+    /// A sender that has filled its tx queue waits for the wire to drain it,
+    /// and the park hook has to see a reason for that wait rather than the
+    /// catch-all every operator await falls into.
+    #[test]
+    fn a_full_tx_queue_declares_a_network_wait() {
+        use crate::profile::{ParkReason, current_park_reason};
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+
+        // A budget of one byte, against a message that costs a header and two
+        // payloads.
+        let channel = super::ExchangeChannel::new(1);
+        let drained = channel
+            .push(test_message(1000))
+            .expect("an overfull channel hands out a wait");
+
+        let mut drained = Box::pin(drained);
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert_eq!(current_park_reason(), ParkReason::Unattributed);
+        assert!(drained.as_mut().poll(&mut context).is_pending());
+        assert_eq!(current_park_reason(), ParkReason::Network);
     }
 }

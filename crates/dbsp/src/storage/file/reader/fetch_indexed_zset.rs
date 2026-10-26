@@ -2,11 +2,11 @@ use std::{collections::BTreeMap, marker::PhantomData, ops::Range, sync::Arc};
 
 use feldera_storage::{error::StorageError, fbuf::FBuf};
 use itertools::Itertools;
-use smallvec::SmallVec;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::{
     dynamic::{DataTrait, DynVec, WeightTrait},
+    profile::{ParkReason, ParkingFor},
     storage::{
         buffer_cache::BufferCache,
         file::{
@@ -156,7 +156,6 @@ where
     sender: UnboundedSender<Fetch0ReadResults>,
 
     tmp_key: Box<K>,
-    key_stack: Box<DynVec<K>>,
     output: Box<DynVec<K>>,
     row_groups: Vec<Range<u64>>,
 
@@ -179,11 +178,6 @@ where
         let output = factories.keys_factory.default_box();
         let tmp_key = factories.key_factory.default_box();
 
-        // Allocate a stack for `DataBlock::find_with_cache`.  10 levels should
-        // be deeper than any normal file.
-        let mut key_stack = factories.keys_factory.default_box();
-        key_stack.reserve_exact(10);
-
         let mut this = Self {
             keys,
             reader,
@@ -192,7 +186,6 @@ where
             sender,
             receiver,
             tmp_key,
-            key_stack,
             output,
             row_groups: Vec::new(),
             pending: 0,
@@ -224,7 +217,10 @@ where
     async fn async_run(&mut self) -> Result<(), Error> {
         while !self.is_done() {
             let mut reads = Vec::new();
-            let msg = self.receiver.recv().await.unwrap();
+            let msg = {
+                let _parked = ParkingFor::new(ParkReason::StorageRead);
+                self.receiver.recv().await.unwrap()
+            };
             self.process_results(msg, &mut reads)?;
             self.run_(reads)?;
         }
@@ -259,7 +255,7 @@ where
         reads: &mut Vec<Fetch0Read>,
     ) -> Result<(), Error> {
         self.pending -= 1;
-        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+        for (read, result) in results.reads.into_iter().zip(results.results) {
             let raw = result?;
             let tree_block = TreeBlock::from_raw_with_cache(
                 decompress(self.reader.file.compression, read.node.location, raw)?,
@@ -308,21 +304,14 @@ where
     ) -> Result<(), Error> {
         match tree_block {
             TreeBlock::Data(data_block) => {
-                let mut index_stack = SmallVec::<[usize; 10]>::new();
-                self.key_stack.clear();
                 for i in key_range.clone() {
                     let key = &self.keys[i];
-                    if unsafe {
-                        data_block.find_with_cache(
-                            &self.factories,
-                            &mut *self.key_stack,
-                            &mut index_stack,
-                            key,
-                        )
-                    } {
-                        let child_index = index_stack.pop().unwrap();
-                        self.output.push_val(self.key_stack.last_mut().unwrap());
-                        self.key_stack.truncate(index_stack.len());
+                    // SAFETY: `data_block` came from this reader's file, whose
+                    // column 0 holds archived `(K, A)` items of `self.factories`.
+                    if let Some(child_index) =
+                        unsafe { data_block.find(&self.factories, key, &mut self.tmp_key) }
+                    {
+                        self.output.push_val(&mut self.tmp_key);
                         if data_block.row_groups.is_some() {
                             self.row_groups.push(data_block.row_group(child_index)?);
                         }
@@ -540,7 +529,10 @@ where
     ) -> Result<VecIndexedWSet<K0, K1, A1>, Error> {
         while !self.is_done() {
             let mut reads = Vec::new();
-            let msg = self.receiver.recv().await.unwrap();
+            let msg = {
+                let _parked = ParkingFor::new(ParkReason::StorageRead);
+                self.receiver.recv().await.unwrap()
+            };
             self.process_results(msg, &mut reads)?;
             self.run_(reads)?;
         }
@@ -575,7 +567,7 @@ where
         reads: &mut Vec<Fetch1Read>,
     ) -> Result<(), Error> {
         self.pending -= 1;
-        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+        for (read, result) in results.reads.into_iter().zip(results.results) {
             let raw = result?;
             let tree_block = TreeBlock::from_raw_with_cache(
                 decompress(self.reader.file.compression, read.node.location, raw)?,
@@ -870,10 +862,8 @@ impl<'a> Iterator for RowsIter<'a> {
             } else if !self.rows.middle.is_empty() {
                 self.range = self.ranges[self.rows.middle.start].clone();
                 self.rows.middle.start += 1;
-            } else if let Some(after) = self.rows.after.take() {
-                self.range = after;
             } else {
-                return None;
+                self.range = self.rows.after.take()?;
             }
         }
 

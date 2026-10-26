@@ -20,23 +20,30 @@ import {
 import {
   cleanupPipeline,
   configureTestClient,
-  type ExtendedPipeline
+  type ExtendedPipeline,
+  TEST_COMPILATION_PROFILE
 } from '$lib/services/testPipelineHelpers'
 
 // Mock SvelteKit's $app/state for components that read `page.data.feldera`
 // and `page.url` (the CodeEditor parses positions from the URL hash).
-vi.mock('$app/state', () => ({
-  page: {
-    data: {
-      feldera: {
-        version: 'test-runtime',
-        unstableFeatures: [],
-        edition: 'Open Source'
-      }
-    },
-    url: new URL('http://localhost/')
+vi.mock('$app/state', async () => {
+  const { permissionsOf, roleOf } = await import('$lib/services/rbac')
+  const role = roleOf('write')
+  return {
+    page: {
+      data: {
+        feldera: {
+          version: 'test-runtime',
+          unstableFeatures: [],
+          edition: 'Open Source',
+          role,
+          permissions: permissionsOf(role)
+        }
+      },
+      url: new URL('http://localhost/')
+    }
   }
-}))
+})
 
 import PipelineEditLayout from '$lib/components/layout/pipelines/PipelineEditLayout.svelte'
 import type { WritablePipeline } from '$lib/compositions/useWritablePipeline.svelte'
@@ -81,6 +88,7 @@ describe('Deleted pipeline state', () => {
     await putPipeline(PIPELINE_NAME, {
       name: PIPELINE_NAME,
       program_code: 'CREATE TABLE t1 (id INT);',
+      program_config: { profile: TEST_COMPILATION_PROFILE },
       runtime_config: {}
     })
     pipeline = await getExtendedPipeline(PIPELINE_NAME)
@@ -89,7 +97,7 @@ describe('Deleted pipeline state', () => {
 
   afterAll(async () => {
     await cleanupPipeline(PIPELINE_NAME)
-  }, 30_000)
+  }, 60_000)
 
   describe('PipelineEditLayout', () => {
     it('shows deleted chip and banner when deleted', async () => {
@@ -314,6 +322,7 @@ describe('Deleted pipeline state', () => {
       await putPipeline(tempName, {
         name: tempName,
         program_code: 'CREATE TABLE t2 (id INT);',
+        program_config: { profile: TEST_COMPILATION_PROFILE },
         runtime_config: {}
       })
 

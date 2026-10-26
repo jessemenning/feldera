@@ -5,6 +5,7 @@ import org.dbsp.sqlCompiler.circuit.annotation.IsProjection;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAggregateLinearPostprocessOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPAsofJoinOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPFlatMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPIndexedTopKOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinBaseOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinFilterMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.DBSPJoinIndexOperator;
@@ -34,7 +35,11 @@ import org.dbsp.sqlCompiler.ir.IDBSPOuterNode;
 import org.dbsp.sqlCompiler.ir.aggregate.DBSPAggregateList;
 import org.dbsp.sqlCompiler.ir.aggregate.IAggregate;
 import org.dbsp.sqlCompiler.ir.expression.DBSPClosureExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPComparatorExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPEqualityComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPFieldComparatorExpression;
+import org.dbsp.sqlCompiler.ir.expression.DBSPNoComparatorExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPFlatmap;
 import org.dbsp.sqlCompiler.ir.expression.DBSPIfExpression;
 import org.dbsp.sqlCompiler.ir.expression.DBSPRawTupleExpression;
@@ -66,11 +71,15 @@ import java.util.Objects;
 public class RemoveUnusedFields extends CircuitCloneVisitor {
     public final FindUsedFields find;
     final AnalyzedSet<DBSPOperator> operatorsAnalyzed;
+    /** Functions analyzed before which have no unused fields.  An operator whose inputs
+     * changed is a new operator with the same function, which needs no new analysis. */
+    final AnalyzedSet<DBSPExpression> fullyUsedFunctions;
 
     public RemoveUnusedFields(DBSPCompiler compiler, AnalyzedSet<DBSPOperator> operatorsAnalyzed) {
         super(compiler, false);
         this.find = new FindUsedFields(compiler);
         this.operatorsAnalyzed = operatorsAnalyzed;
+        this.fullyUsedFunctions = new AnalyzedSet<>();
     }
 
     OutputPort getProjection(CalciteRelNode node, FieldUseMap fieldMap, OutputPort input) {
@@ -103,9 +112,19 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
         return this.operatorsAnalyzed.done(operator);
     }
 
+    /** True if the operator or its function were analyzed before */
+    boolean done(DBSPSimpleOperator operator, DBSPClosureExpression function) {
+        return this.done(operator) || this.fullyUsedFunctions.contains(function);
+    }
+
+    /** Record that the analysis of 'function' found no unused fields */
+    void noUnusedFields(DBSPClosureExpression function) {
+        this.fullyUsedFunctions.done(function);
+    }
+
     boolean processStarJoin(DBSPStarJoinBaseOperator join) {
         DBSPClosureExpression joinFunction = join.getClosureFunction();
-        if (this.done(join))
+        if (this.done(join, joinFunction))
             return false;
         var useMap = this.find.findUsedFields(joinFunction);
 
@@ -119,6 +138,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             useMaps.add(map);
         }
         if (!anyUnused) {
+            this.noUnusedFields(joinFunction);
             return false;
         }
 
@@ -139,7 +159,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
 
     boolean processJoin(DBSPJoinBaseOperator join) {
         DBSPClosureExpression joinFunction = join.getClosureFunction();
-        if (this.done(join))
+        if (this.done(join, joinFunction))
             return false;
         var useMap = this.find.findUsedFields(joinFunction);
 
@@ -150,8 +170,10 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
         RewriteFields rw = useMap.getFieldRewriter(this.compiler, 1);
         FieldUseMap leftRemap = rw.getUseMap(left);
         FieldUseMap rightRemap = rw.getUseMap(right);
-        if (!leftRemap.hasUnusedFields(1) && !rightRemap.hasUnusedFields(1))
+        if (!leftRemap.hasUnusedFields(1) && !rightRemap.hasUnusedFields(1)) {
+            this.noUnusedFields(joinFunction);
             return false;
+        }
 
         OutputPort leftMap = getProjection(join.getRelNode(), leftRemap, join.left());
         OutputPort rightMap = getProjection(join.getRelNode(), rightRemap, join.right());
@@ -300,15 +322,16 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
 
     @Override
     public void postorder(DBSPAggregateLinearPostprocessOperator operator) {
-        if (this.done(operator)) {
+        DBSPClosureExpression closure = operator.getClosureFunction();
+        if (this.done(operator, closure)) {
             super.postorder(operator);
             return;
         }
-        DBSPClosureExpression closure = operator.getClosureFunction();
         Utilities.enforce(closure.parameters.length == 1);
         var useMap = this.find.findUsedFields(closure);
 
         if (!useMap.hasUnusedFields(1)) {
+            this.noUnusedFields(closure);
             super.postorder(operator);
             return;
         }
@@ -318,6 +341,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
         DBSPClosureExpression compressed = rw.rewriteClosure(closure);
         if (EquivalenceContext.equiv(closure, compressed)) {
             // This optimization achieves nothing
+            this.noUnusedFields(closure);
             super.postorder(operator);
             return;
         }
@@ -326,6 +350,71 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
         DBSPSimpleOperator result = new DBSPAggregateLinearPostprocessOperator(
                 operator.getRelNode(), operator.getOutputIndexedZSetType(), compressed,
                 operator.postProcess, adjust.outputPort());
+        this.map(operator, result);
+    }
+
+    /** Mark in 'rowFields' the fields of the sorted row that the comparator reads.
+     * @return false if the comparator is not a chain of field comparisons. */
+    static boolean setComparedFieldsToUsed(DBSPComparatorExpression comparator, FieldUseMap rowFields) {
+        while (!comparator.is(DBSPNoComparatorExpression.class)) {
+            DBSPFieldComparatorExpression byField = comparator.as(DBSPFieldComparatorExpression.class);
+            if (byField == null)
+                return false;
+            rowFields.setUsed(byField.fieldNo);
+            comparator = byField.source;
+        }
+        return true;
+    }
+
+    /** Rebuild a chain of field comparisons over the row type with the unused fields removed. */
+    static DBSPComparatorExpression remapComparedFields(
+            DBSPComparatorExpression comparator, FieldUseMap rowFields, DBSPType newRowType) {
+        if (comparator.is(DBSPNoComparatorExpression.class))
+            return new DBSPNoComparatorExpression(comparator.getNode(), newRowType);
+        DBSPFieldComparatorExpression byField = comparator.to(DBSPFieldComparatorExpression.class);
+        DBSPComparatorExpression source = remapComparedFields(byField.source, rowFields, newRowType);
+        int newFieldNo = rowFields.getNewIndex(byField.fieldNo);
+        return new DBSPFieldComparatorExpression(
+                byField.getNode(), source, newFieldNo, byField.ascending, byField.nullsFirst);
+    }
+
+    @Override
+    public void postorder(DBSPIndexedTopKOperator operator) {
+        // The TopK reads its input row both with 3 functions: the comparator, the equalityComparator,
+        // and the outputProducer
+        DBSPComparatorExpression comparator = operator.getFunction().as(DBSPComparatorExpression.class);
+        DBSPComparatorExpression equality = operator.equalityComparator.comparator;
+        if (comparator == null || this.done(operator)) {
+            super.postorder(operator);
+            return;
+        }
+
+        DBSPClosureExpression producer = operator.outputProducer
+                .ensureTree(this.compiler).to(DBSPClosureExpression.class);
+        Utilities.enforce(producer.parameters.length == 2);
+        ParameterFieldUse useMap = this.find.findUsedFields(producer);
+        // The rank (parameter 0) is a scalar; mark it used
+        useMap.get(producer.parameters[0]).setUsed();
+        FieldUseMap rowUse = useMap.get(producer.parameters[1]);
+        FieldUseMap rowFields = rowUse.deref();
+        if (!setComparedFieldsToUsed(comparator, rowFields) || // Marks used fields in rowUse
+            !setComparedFieldsToUsed(equality, rowFields) || // Marks used fields in rowUse
+            !rowUse.hasUnusedFields(1)) {
+            super.postorder(operator);
+            return;
+        }
+
+        RewriteFields rw = useMap.getFieldRewriter(this.compiler, 1);
+        DBSPClosureExpression newProducer = rw.rewriteClosure(producer);
+        DBSPMapIndexOperator adjust = this.projectValue(operator, rowUse);
+        DBSPType newRowType = adjust.getOutputIndexedZSetType().elementType;
+        DBSPComparatorExpression newComparator = remapComparedFields(comparator, rowFields, newRowType);
+        DBSPEqualityComparatorExpression newEquality = new DBSPEqualityComparatorExpression(
+                operator.equalityComparator.getNode(), remapComparedFields(equality, rowFields, newRowType));
+        DBSPSimpleOperator result = new DBSPIndexedTopKOperator(
+                operator.getRelNode(), operator.numbering, newComparator, operator.limit,
+                newEquality, newProducer, operator.isMultiset, adjust.outputPort())
+                .copyAnnotations(operator);
         this.map(operator, result);
     }
 
@@ -431,7 +520,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
     public void postorder(DBSPMapOperator operator) {
         if (operator.hasAnnotation(a -> a.is(IsProjection.class))
                 || !operator.getFunction().is(DBSPClosureExpression.class)
-                || this.done(operator)) {
+                || this.done(operator, operator.getClosureFunction())) {
             // avoid infinite recursion
             super.postorder(operator);
             return;
@@ -444,6 +533,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
 
         if (operator.input().outputType().is(DBSPTypeZSet.class)) {
             if (!useMap.hasUnusedFields(1)) {
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -455,6 +545,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             if (EquivalenceContext.equiv(closure, projection) ||
                     EquivalenceContext.equiv(closure, compressed)) {
                 // This optimization achieves nothing
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -468,6 +559,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             this.map(operator, result);
         } else {
             if (!useMap.hasUnusedFields(2)) {
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -477,6 +569,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             DBSPClosureExpression compressed = rw.rewriteClosure(closure);
             if (EquivalenceContext.equiv(closure, compressed)) {
                 // This optimization achieves nothing
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -495,7 +588,8 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
     @Override
     public void postorder(DBSPMapIndexOperator operator) {
         // almost identical to the Map case
-        if (operator.hasAnnotation(a -> a.is(IsProjection.class)) || this.done(operator)) {
+        if (operator.hasAnnotation(a -> a.is(IsProjection.class))
+                || this.done(operator, operator.getClosureFunction())) {
             // avoid infinite recursion
             super.postorder(operator);
             return;
@@ -508,6 +602,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
 
         if (operator.input().outputType().is(DBSPTypeZSet.class)) {
             if (!useMap.hasUnusedFields(1)) {
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -517,6 +612,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             OutputPort source = this.mapped(operator.input());
             DBSPClosureExpression projection = Objects.requireNonNull(fm.getProjection(1));
             if (EquivalenceContext.equiv(compressed, closure)) {
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -530,6 +626,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             this.map(operator, result);
         } else {
             if (!useMap.hasUnusedFields(2)) {
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }
@@ -540,6 +637,7 @@ public class RemoveUnusedFields extends CircuitCloneVisitor {
             if (EquivalenceContext.equiv(closure, projection) ||
                     EquivalenceContext.equiv(closure, projection)) {
                 // This optimization achieves nothing
+                this.noUnusedFields(closure);
                 super.postorder(operator);
                 return;
             }

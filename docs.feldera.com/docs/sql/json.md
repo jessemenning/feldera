@@ -140,7 +140,8 @@ the map corresponds to a field of the user-defined structure.
 |-------------------------------|-------------|
 | `VARIANTNULL()`               | Can be used to create an instance of the `VARIANT` `null` value. |
 | `TYPEOF(variant)`             | Argument must be a `VARIANT` value.  Returns a string describing the runtime type of the value |
-| `PARSE_JSON(string)`          | Parses a string that represents a JSON value, returns a `VARIANT` object, or `NULL` if parsing fails (more details [below](#parse_json)) |
+| `PARSE_JSON(string)`          | Parses a string that represents a JSON value and returns a `VARIANT` object; fails at runtime if the string is not valid JSON (more details [below](#parse_json)) |
+| `TRY_PARSE_JSON(string)`      | Like `PARSE_JSON`, but returns `NULL` if the string is not valid JSON (more details [below](#try_parse_json)) |
 | `TO_JSON(variant)`            | Argument must be a `VARIANT` value.  Returns a string that represents the serialization of a `VARIANT` value. If the value cannot be represented as JSON, the result is `NULL` (more details [below](#to_json)) |
 | `JSON_EACH_<type>(variant)`   | A family of functions; each extracts from a `VARIANT` holding a JSON object the fields whose values have a specified runtime type, as a `MAP` (more details [below](#json_each)) |
 | `JSON_OBJECT_KEYS(variant)`   | Returns the top-level keys of a `VARIANT` holding a JSON object, as a sorted `ARRAY` of strings (more details [below](#json_object_keys)) |
@@ -175,6 +176,23 @@ SELECT CAST(
           VARIANTNULL()
                                       ] AS VARIANT)
       ] AS VARIANT)
+```
+
+If the string is not valid JSON, `PARSE_JSON` fails at runtime.  Use
+[`TRY_PARSE_JSON`](#try_parse_json) for input that may be invalid.
+
+### `TRY_PARSE_JSON`
+
+`TRY_PARSE_JSON` converts a valid JSON string exactly as `PARSE_JSON`
+does, and returns a SQL `NULL` if the string is not valid JSON.  The
+string `'null'` is valid JSON, so `TRY_PARSE_JSON('null')` returns the
+`VARIANT` `null` value, not a SQL `NULL`.
+
+```sql
+SELECT TRY_PARSE_JSON('{') IS NULL;
+-- TRUE
+SELECT TRY_PARSE_JSON('null') IS NULL;
+-- FALSE
 ```
 
 ### `TO_JSON`
@@ -565,8 +583,8 @@ and computes the average of the first two entries in the array:
 CREATE TABLE json (id INT, json VARIANT);
 
 CREATE VIEW average AS SELECT
-CAST(json['name'] AS VARCHAR) as name,
-((CAST(json['scores'][1] AS DECIMAL(8, 2)) + CAST(json['scores'][2] AS DECIMAL(8, 2))) / 2) as average
+CAST(json['name'] AS VARCHAR) AS name,
+((CAST(json['scores'][1] AS DECIMAL(8, 2)) + CAST(json['scores'][2] AS DECIMAL(8, 2))) / 2) AS average
 FROM json;
 ```
 
@@ -608,7 +626,7 @@ SELECT CAST(CAST(1 AS VARIANT) AS TINYINT)
 1
 
 -- Some VARIANT objects when output receive double quotes
-select CAST('string' as VARIANT)
+SELECT CAST('string' AS VARIANT)
 "string"
 
 -- CHAR(3) values are represented as VARCHAR in variants
@@ -621,26 +639,26 @@ abc
 
 -- The value representing a VARIANT null value (think of a JSON null)
 SELECT VARIANTNULL()
-null
+NULL
 
 -- VARIANT null is not the same as SQL NULL
 SELECT VARIANTNULL() IS NULL
-false
+FALSE
 
 -- Two VARIANT nulls are equal, unlike SQL NULL
 SELECT VARIANTNULL() = VARIANTNULL()
-true
+TRUE
 
 SELECT TYPEOF(VARIANTNULL())
 VARIANT
 
 -- Variants delegate equality to the underlying values
 SELECT CAST(1 AS VARIANT) = CAST(1 AS VARIANT)
-true
+TRUE
 
 -- To be equal two variants must have the same value and the same runtime type
 SELECT CAST(1 AS VARIANT) = CAST(CAST(1 AS TINYINT) AS VARIANT)
-false
+FALSE
 
 -- An array of variant values can have values with any underlying type
 SELECT ARRAY[CAST(1 AS VARIANT), CAST('abc' AS VARIANT)]
@@ -652,7 +670,7 @@ SELECT MAP['a', CAST(1 AS VARIANT), 'b', CAST('abc' AS VARIANT), 'c', CAST(ARRAY
 
 -- Variant values allow access by index, but return null if they are not arrays
 SELECT (CAST(1 AS VARIANT))[1]
-null
+NULL
 
 SELECT CAST(ARRAY[1,2,3] AS VARIANT)[1]
 1
@@ -675,35 +693,35 @@ SELECT CAST(TIME '10:01:01' AS VARIANT)
 -- One can access fields by name in a VARIANT, even if the
 -- variant does not have named fields
 SELECT CAST(ARRAY[1,2,3] AS VARIANT)['name']
-null
+NULL
 
 -- One can access fields by name in a VARIANT, even if the
 -- variant does not have named fields
 SELECT CAST(ARRAY[1,2,3] AS VARIANT)."name"
-null
+NULL
 
 -- One can access fields by index in a VARIANT
-SELECT CAST(Map[1,'a',2,'b',3,'c'] AS VARIANT)[1]
+SELECT CAST(MAP[1,'a',2,'b',3,'c'] AS VARIANT)[1]
 "a"
 
-SELECT TYPEOF(CAST(Map[1,'a',2,'b',3,'c'] AS VARIANT)[1])
+SELECT TYPEOF(CAST(MAP[1,'a',2,'b',3,'c'] AS VARIANT)[1])
 VARCHAR
 
 -- Note that field name is quoted to match the case of the key
-SELECT CAST(Map['a',1,'b',2,'c',3] AS VARIANT)."a"
+SELECT CAST(MAP['a',1,'b',2,'c',3] AS VARIANT)."a"
 1
 
 -- Unquoted uppercase field name does not match
-SELECT CAST(Map['A',1,'b',2,'c',3] AS VARIANT).A
+SELECT CAST(MAP['A',1,'b',2,'c',3] AS VARIANT).A
 NULL
 
 -- The safest way is to index with a string
-SELECT CAST(Map['a',1,'b',2,'c',3] AS VARIANT)['a']
+SELECT CAST(MAP['a',1,'b',2,'c',3] AS VARIANT)['a']
 1
 
 -- Maps can have variant keys too
 -- (but you have to index with a variant).
-SELECT (Map[CAST('a' AS VARIANT), 1, CAST(1 AS VARIANT), 2])[CAST(1 AS VARIANT)]
+SELECT (MAP[CAST('a' AS VARIANT), 1, CAST(1 AS VARIANT), 2])[CAST(1 AS VARIANT)]
 2
 
 -- Navigating a JSON-like object
@@ -725,17 +743,17 @@ SELECT PARSE_JSON('"a"')
 "a"
 
 SELECT PARSE_JSON('false')
-false
+FALSE
 
 -- A VARIANT null
 SELECT PARSE_JSON('null')
-null
+NULL
 
 SELECT TYPEOF(PARSE_JSON('null'))
 VARIANT
 
 -- a SQL null
-SELECT PARSE_JSON(null)
+SELECT PARSE_JSON(NULL)
 NULL
 
 
@@ -749,7 +767,7 @@ SELECT PARSE_JSON('{"a": 1, "b": 2}')
 SELECT TO_JSON(PARSE_JSON(1))
 1
 
-SELECT TO_JSON(null)
+SELECT TO_JSON(NULL)
 NULL
 
 SELECT TO_JSON(PARSE_JSON('1'))
@@ -759,12 +777,12 @@ SELECT TO_JSON(PARSE_JSON('"a"'))
 "a"
 
 SELECT TO_JSON(PARSE_JSON('false'))
-false
+FALSE
 
 SELECT TO_JSON(PARSE_JSON('null'))
-null
+NULL
 
-SELECT TO_JSON(PARSE_JSON(null))
+SELECT TO_JSON(PARSE_JSON(NULL))
 NULL
 
 SELECT TO_JSON(PARSE_JSON('[1,2,3]'))
@@ -774,7 +792,7 @@ SELECT TO_JSON(PARSE_JSON('{ "a": 1, "b": 2 }'))
 {"a":1,"b":2}
 
 SELECT PARSE_JSON('{ "a": 1, "b": 2 }') = PARSE_JSON('{"b":2,"a":1}')
-true
+TRUE
 
 -- dates are emitted as strings
 SELECT TO_JSON(CAST(DATE '2020-01-01' AS VARIANT))
@@ -785,33 +803,33 @@ SELECT TO_JSON(CAST(TIMESTAMP '2020-01-01 10:00:00' AS VARIANT))
 "2020-01-01 10:00:00"
 
 -- values with user-defined types can be converted to JSON
-CREATE TYPE S AS (i INT, s VARCHAR, a INT ARRAY);
+CREATE TYPE s AS (i INT, s VARCHAR, a INT ARRAY);
 SELECT TO_JSON(CAST(s(2, 'a', ARRAY[1, 2, 3]) AS VARIANT));
 {"a":[1,2,3],"i":2,"s":"a"}
 
 -- The result of JSON parsing can be converted to user-defined types
-SELECT CAST(PARSE_JSON('{"i": 2, "s": "a", "a": [1, 2, 3]}') AS S);
+SELECT CAST(PARSE_JSON('{"i": 2, "s": "a", "a": [1, 2, 3]}') AS s);
 {a=[1,2,3], i=2, s="a"}
 
 -- This works even for nested types, such as user-defined types that
 -- contain arrays of user-defined types
-CREATE TYPE t AS (sa S ARRAY);
-SELECT TO_JSON(CAST(t(ARRAY[s(2, 'a', ARRAY[1, NULL, 3]), s(3, 'b', array())]) AS VARIANT));
-{"sa":[{"a":[1,null,3],"i":2,"s":"a"},{"a":[],"i":3,"s":"b"}]}
+CREATE TYPE t AS (sa s ARRAY);
+SELECT TO_JSON(CAST(t(ARRAY[s(2, 'a', ARRAY[1, NULL, 3]), s(3, 'b', ARRAY())]) AS VARIANT));
+{"sa":[{"a":[1,NULL,3],"i":2,"s":"a"},{"a":[],"i":3,"s":"b"}]}
 
-SELECT CAST(CAST(MAP['i', 0] AS VARIANT) AS S)
+SELECT CAST(CAST(MAP['i', 0] AS VARIANT) AS s)
 -- produces a structure S(I=0, A=NULL, S=NULL); missing fields are set to 'NULL'
 
-SELECT CAST(CAST(MAP['i', 's'] AS VARIANT) AS S)
+SELECT CAST(CAST(MAP['i', 's'] AS VARIANT) AS s)
 -- produces a structure S(I=NULL, A=NULL, S=NULL), since the field 'I' has the wrong type
 
-SELECT CAST(CAST(MAP['I', 's'] AS VARIANT) AS S)
+SELECT CAST(CAST(MAP['I', 's'] AS VARIANT) AS s)
 -- produces a structure S(I=NULL, A=NULL, S=NULL), since the field 'i' is uppercase
 -- yet unquoted field names are converted to lowercase
 
-SELECT CAST(CAST(MAP['i', 0, 'X', 2] AS VARIANT) AS S)
+SELECT CAST(CAST(MAP['i', 0, 'X', 2] AS VARIANT) AS s)
 -- produces a structure S(I=0, A=NULL, S=NULL), since the extra field 'X' in the map is ignored
 
-SELECT CAST(PARSE_JSON('{"sa": [{"i": 2, "s": "a", "a": [1, 2, 3]}]}') AS T)
+SELECT CAST(PARSE_JSON('{"sa": [{"i": 2, "s": "a", "a": [1, 2, 3]}]}') AS t)
 -- produces a structure T(sa=[i=2, s="a", "a"={1,2,3}])
 ```

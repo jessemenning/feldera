@@ -13,7 +13,10 @@ No automatic cleanup; pipelines are left in place for inspection after failures.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import time
 import unittest
 from http import HTTPStatus
 from typing import Any, Dict, Iterable
@@ -21,11 +24,14 @@ from urllib.parse import quote, quote_plus
 
 import pytest
 import requests
-from feldera.testutils import FELDERA_TEST_NUM_HOSTS, FELDERA_TEST_NUM_WORKERS
-from feldera.testutils_oidc import get_oidc_test_helper
+from feldera.testutils import (
+    FELDERA_TEST_NUM_HOSTS,
+    FELDERA_TEST_NUM_WORKERS,
+    feldera_bearer_token,
+    reclaim_pipeline,
+)
 
 from tests import (
-    API_KEY,
     BASE_URL,
     FELDERA_REQUESTS_VERIFY,
     TEST_CLIENT,
@@ -35,19 +41,21 @@ from tests.utils import wait_for_condition, wait_for_records
 
 API_PREFIX = "/v0"
 
+# Pipeline create (POST /pipelines) and replace or update (PUT/PATCH /pipelines/<name>).
+_PIPELINE_WRITE_PATH = re.compile(rf"^{API_PREFIX}/pipelines(/[^/?]+)?/?(\?.*)?$")
+
+logger = logging.getLogger(__name__)
+
 
 def _base_headers() -> Dict[str, str]:
     headers = {
         "Accept": "application/json",
     }
 
-    # Try OIDC authentication first, then fall back to API_KEY
-    oidc_helper = get_oidc_test_helper()
-    if oidc_helper is not None:
-        token = oidc_helper.obtain_access_token()
+    # Resolved per request: a GitHub Actions ID token expires mid-suite.
+    token = feldera_bearer_token()
+    if token:
         headers["Authorization"] = f"Bearer {token}"
-    elif API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
 
     return headers
 
@@ -56,6 +64,31 @@ def api_url(fragment: str) -> str:
     if not fragment.startswith("/"):
         fragment = "/" + fragment
     return f"{API_PREFIX}{fragment}"
+
+
+def _with_pinned_runtime_version(method: str, path: str, body: Any) -> Any:
+    """
+    Mirror `PipelineBuilder`: when `FELDERA_RUNTIME_VERSION` is set, a pipeline
+    write that names no runtime version gets it, so raw REST tests run on the
+    same engine as the SDK tests.
+    """
+    runtime_version = os.environ.get("FELDERA_RUNTIME_VERSION")
+    if not runtime_version or not isinstance(body, dict):
+        return body
+    if method.upper() not in ("POST", "PUT", "PATCH"):
+        return body
+    if not _PIPELINE_WRITE_PATH.match(path):
+        return body
+    # A PATCH without program_config leaves the stored one untouched.
+    if method.upper() == "PATCH" and "program_config" not in body:
+        return body
+    program_config = body.get("program_config", {})
+    if not isinstance(program_config, dict) or "runtime_version" in program_config:
+        return body
+    return {
+        **body,
+        "program_config": {**program_config, "runtime_version": runtime_version},
+    }
 
 
 def http_request(method: str, path: str, **kwargs) -> requests.Response:
@@ -72,6 +105,8 @@ def http_request(method: str, path: str, **kwargs) -> requests.Response:
     if not path.startswith("/"):
         path = "/" + path
     url = BASE_URL.rstrip("/") + path
+    if "json" in kwargs:
+        kwargs["json"] = _with_pinned_runtime_version(method, path, kwargs["json"])
 
     # Allow override of base headers for testing unauthenticated requests
     base_headers_arg = kwargs.pop("base_headers", None)
@@ -133,14 +168,6 @@ def create_pipeline(name: str, sql: str):
             "logging": "debug",
         },
     }
-    # Mirror `PipelineBuilder`: in CI `FELDERA_RUNTIME_VERSION` pins the runtime
-    # in theory this isn't needed because all platform tests should NOT run with
-    # a runtime version set and a runtime test should NOT use this function and
-    # use PipelineBuilder, but it avoids a footgun in case a runtime test were to
-    # ever use this helper by accident
-    runtime_version = os.environ.get("FELDERA_RUNTIME_VERSION")
-    if runtime_version:
-        payload["program_config"] = {"runtime_version": runtime_version}
     r = post_json(api_url("/pipelines"), payload)
     assert r.status_code == HTTPStatus.CREATED, r.text
     wait_for_program_success(name, 1)
@@ -162,22 +189,25 @@ def pause_pipeline(name: str, wait: bool = True):
     TEST_CLIENT.pause_pipeline(name, wait=wait)
 
 
-def stop_pipeline(name: str, force: bool = True, wait: bool = True):
-    TEST_CLIENT.stop_pipeline(name, force=force, wait=wait)
+def stop_pipeline(
+    name: str, force: bool = True, wait: bool = True, timeout_s: float | None = None
+):
+    TEST_CLIENT.stop_pipeline(name, force=force, wait=wait, timeout_s=timeout_s)
 
 
-def clear_pipeline(name: str, wait: bool = True):
+def clear_pipeline(name: str, wait: bool = True, timeout_s: float | None = None):
     r = post_no_body(f"{API_PREFIX}/pipelines/{name}/clear")
     if wait and r.status_code == HTTPStatus.ACCEPTED:
-        TEST_CLIENT.clear_storage(name)
+        TEST_CLIENT.clear_storage(name, timeout_s=timeout_s)
     return r
 
 
 def reset_pipeline(name: str):
+    """Force-stop `name` and clear its storage."""
     if get_pipeline(name, "status").status_code != HTTPStatus.OK:
         return
-    stop_pipeline(name, force=True)
-    clear_pipeline(name)
+    for failure in reclaim_pipeline(name):
+        logger.warning("pipeline cleanup: %s", failure)
 
 
 def delete_pipeline(name: str):
@@ -194,6 +224,16 @@ def connector_action(pipeline: str, table: str, connector: str, action: str):
     r = post_no_body(
         api_url(
             f"/pipelines/{pipeline}/tables/{table_enc}/connectors/{connector}/{action}"
+        )
+    )
+    return r
+
+
+def output_connector_action(pipeline: str, view: str, connector: str, action: str):
+    view_enc = quote(view, safe="")
+    r = post_no_body(
+        api_url(
+            f"/pipelines/{pipeline}/views/{view_enc}/connectors/{connector}/{action}"
         )
     )
     return r
@@ -219,6 +259,56 @@ def pipeline_stats(pipeline: str):
     return r.json()
 
 
+def wait_for_pipeline_reachable(pipeline_name: str, timeout_s: float = 30.0) -> None:
+    """
+    Poll the pipeline's `/stats` endpoint until it responds.
+
+    `start_pipeline()`/`resume_pipeline()`/`start_pipeline_as_paused()` (`wait=True`)
+    only wait for the control plane's deployment_status to report "running";
+    the pod itself can still be briefly unreachable through its k8s service
+    afterward. Call this before the *first* raw (no-retry) helper call that
+    talks to the pod directly -- ingress, egress, stats, metrics, logs,
+    checkpoint, clear, circuit profiles, etc. -- to absorb that startup race
+    instead of flaking on it.
+
+    Most tests don't need this call at all:
+
+    - Calls made through the `feldera.Pipeline`/`FelderaClient` SDK (e.g.
+      `pipeline.input_json`, `pipeline.query`) already retry transient 503s
+      themselves, so the race resolves on its own.
+    - Once any pod-facing call -- raw or SDK -- has already succeeded for a
+      given pipeline incarnation, the pod is proven reachable and later raw
+      calls in the same test don't need to wait again.
+
+    It's only the *first* raw pod-facing call after a start/resume, with
+    nothing preceding it to have already warmed the connection, that's
+    exposed to this race.
+
+    :raises RuntimeError: If an error other than transient unreachability is
+        returned.
+    :raises TimeoutError: If the pod is still unreachable after `timeout_s`.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        response = get(api_url(f"/pipelines/{pipeline_name}/stats"))
+        if response.status_code == HTTPStatus.OK:
+            return
+        if (
+            response.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+            and response.json().get("error_code") == "PipelineInteractionUnreachable"
+        ):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"pipeline '{pipeline_name}' still unreachable after {timeout_s:.0f}s"
+                )
+            time.sleep(0.5)
+            continue
+        raise RuntimeError(
+            f"unexpected response waiting for pipeline '{pipeline_name}' to "
+            f"become reachable: {response.status_code} {response.text}"
+        )
+
+
 def connector_stats(pipeline: str, table: str, connector: str):
     table_enc = quote(table, safe="")
     res = get(
@@ -232,6 +322,19 @@ def connector_stats(pipeline: str, table: str, connector: str):
 
 def connector_paused(pipeline, table: str, connector: str) -> bool:
     return connector_stats(pipeline, table, connector)["paused"]
+
+
+def output_connector_stats(pipeline: str, view: str, connector: str):
+    view_enc = quote(view, safe="")
+    res = get(
+        api_url(f"/pipelines/{pipeline}/views/{view_enc}/connectors/{connector}/stats")
+    )
+    assert res.status_code == HTTPStatus.OK, (res.status_code, res.text)
+    return res.json()
+
+
+def output_connector_paused(pipeline: str, view: str, connector: str) -> bool:
+    return output_connector_stats(pipeline, view, connector)["paused"]
 
 
 def wait_for_program_success(
@@ -250,6 +353,18 @@ def wait_for_program_success(
         timeout_s=timeout_s,
         poll_interval_s=poll_interval_s,
     )
+
+
+def wait_until_compiled(pipeline, timeout_s: float = 600.0) -> None:
+    """
+    Wait until the latest program of `pipeline` compiles.
+
+    Call this after a program change and before `start(timeout_s=...)`.
+    Then the start timeout does not include time in the compiler queue.
+    """
+    # A program change sets the new version and `Pending` in one step,
+    # so this never accepts the old program as compiled.
+    wait_for_program_success(pipeline.name, pipeline.program_version(), timeout_s)
 
 
 def extract_object_by_name(

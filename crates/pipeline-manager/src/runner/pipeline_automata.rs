@@ -2,25 +2,30 @@ use crate::config::CommonConfig;
 use crate::db::error::DBError;
 use crate::db::storage::{ExtendedPipelineDescrRunner, Storage};
 use crate::db::storage_postgres::StoragePostgres;
+use crate::db::types::deployment::merge_deployment_config;
 use crate::db::types::pipeline::{
-    runtime_desired_status_to_string, runtime_status_to_string, ExtendedPipelineDescr,
-    ExtendedPipelineDescrMonitoring, PipelineId,
+    ExtendedPipelineDescr, ExtendedPipelineDescrMonitoring, PipelineId,
+    runtime_desired_status_to_string, runtime_status_to_string,
 };
-use crate::db::types::program::{generate_pipeline_config, ProgramStatus};
+use crate::db::types::program::{ProgramStatus, RuntimeSelector, generate_pipeline_config};
 use crate::db::types::resources_status::{ResourcesDesiredStatus, ResourcesStatus};
 use crate::db::types::storage::StorageStatus;
 use crate::db::types::tenant::TenantId;
 use crate::db::types::utils::{
-    validate_deployment_config, validate_program_info, validate_runtime_config,
+    validate_deployment_config, validate_program_config, validate_program_info,
+    validate_runtime_config,
 };
 use crate::error::source_error;
 use crate::is_supported_runtime;
 use crate::runner::error::RunnerError;
 use crate::runner::interaction::{format_pipeline_url, format_timeout_error_message};
 use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
-use crate::runner::pipeline_logs::{start_thread_pipeline_logs, LogMessage, LogsSender};
-use chrono::Utc;
-use feldera_observability::ReqwestTracingExt;
+use crate::runner::pipeline_logs::{
+    FollowRequest, LogMessage, LogsSender, start_thread_pipeline_logs,
+};
+use chrono::{DateTime, Utc};
+use feldera_types::config::LegacySpelling;
+use feldera_types::config::PipelineConfig;
 use feldera_types::error::ErrorResponse;
 use feldera_types::runtime_status::{
     ExtendedRuntimeStatus, RuntimeDesiredStatus, RuntimeStatus, RuntimeStatusDetails,
@@ -36,7 +41,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio::{sync::Mutex, time::Duration};
 use tokio::{sync::Notify, time::timeout};
-use tracing::{debug, error, info, warn, Level};
+use tracing::{Level, debug, error, info, warn};
 use uuid::Uuid;
 
 /// Every cycle, the automaton decides one of these actions to undertake.
@@ -100,6 +105,110 @@ impl<T: PipelineExecutor> Drop for PipelineAutomaton<T> {
     }
 }
 
+/// The runtime the program configuration selects. A configuration that fails to
+/// parse selects the platform's runtime.
+fn program_runtime_selector(program_config: &serde_json::Value) -> RuntimeSelector {
+    validate_program_config(program_config, false)
+        .map(|config| config.runtime_version())
+        .unwrap_or_default()
+}
+
+/// Whether the program configuration selects the Gen-2 engine, which runs the
+/// pipeline directly and so compiles no pipeline binary (only program info is
+/// delivered). A configuration that fails to parse is treated as not Gen-2.
+fn program_config_is_gen2(program_config: &serde_json::Value) -> bool {
+    program_runtime_selector(program_config).is_gen2()
+}
+
+/// Whether more than `duration` has passed between `since` and `now`. A
+/// duration longer than `i64::MAX` milliseconds never passes; cast to `i64` it
+/// would go negative and pass at once.
+fn elapsed_exceeds(since: DateTime<Utc>, now: DateTime<Utc>, duration: Duration) -> bool {
+    let elapsed = now
+        .timestamp_millis()
+        .saturating_sub(since.timestamp_millis());
+    i64::try_from(duration.as_millis()).is_ok_and(|duration| elapsed > duration)
+}
+
+/// The release that renamed the duration settings. A binary compiled by an
+/// earlier platform reads only the older spelling.
+const DURATION_RENAME_VERSION: Version = Version::new(0, 366, 0);
+
+/// The release that renamed the size settings, likewise.
+const SIZE_RENAME_VERSION: Version = Version::new(0, 367, 0);
+
+/// Whether a pipeline compiled by `platform_version` predates the `rename`
+/// release, in which case the executor hands it the settings that release
+/// renamed in their older spelling. A pipeline keeps the binary it was compiled
+/// with until its runtime is updated, so after an upgrade it may still run an
+/// older one. A version that does not parse is taken to predate the rename:
+/// every Feldera release so far reads the older spelling, so writing it is
+/// safe either way.
+fn platform_version_predates(platform_version: &str, rename: Version) -> bool {
+    !Version::parse(platform_version).is_ok_and(|version| version >= rename)
+}
+
+/// Whether the program configuration pins, with `runtime_version`, a runtime
+/// that may predate the `rename` release. The executor hands such a runtime
+/// the renamed settings in their older spelling, which every Feldera release
+/// so far accepts. A tagged version is compared with the release; a commit
+/// hash tells nothing about its age, so it gets the older spelling. The
+/// platform's own runtime and the Gen-2 engine read the current spelling. A
+/// configuration that fails to parse is treated as not pinning.
+fn pinned_runtime_predates(program_config: &serde_json::Value, rename: Version) -> bool {
+    validate_program_config(program_config, false)
+        .map(|config| match config.runtime_version() {
+            RuntimeSelector::Platform(_) | RuntimeSelector::Gen2(_) => false,
+            RuntimeSelector::Version(tag) => {
+                platform_version_predates(tag.trim_start_matches('v'), rename)
+            }
+            RuntimeSelector::Sha(_) => true,
+        })
+        .unwrap_or(false)
+}
+
+/// Which settings the runtime of a pipeline reads only in their older
+/// spelling: those of each rename that the runtime, whether pinned by the
+/// program configuration or the one the pipeline was compiled with, predates.
+fn legacy_spelling_for(
+    program_config: &serde_json::Value,
+    platform_version: &str,
+) -> LegacySpelling {
+    let predates = |rename: Version| {
+        pinned_runtime_predates(program_config, rename.clone())
+            || platform_version_predates(platform_version, rename)
+    };
+    LegacySpelling {
+        durations: predates(DURATION_RENAME_VERSION),
+        sizes: predates(SIZE_RENAME_VERSION),
+    }
+}
+
+/// URL at which the compiler server serves the pipeline binary or UDF library with these
+/// checksums.
+pub(crate) fn compiler_binary_url(
+    common_config: &CommonConfig,
+    pipeline_id: PipelineId,
+    program_version: crate::db::types::version::Version,
+    source_checksum: &str,
+    integrity_checksum: &str,
+) -> String {
+    format!(
+        "{}://{}:{}/binary/{}/{}/{}/{}",
+        if common_config.enable_https {
+            "https"
+        } else {
+            "http"
+        },
+        common_config.compiler_host,
+        common_config.compiler_port,
+        pipeline_id,
+        program_version,
+        source_checksum,
+        integrity_checksum,
+    )
+}
+
 /// Pipeline automaton monitors the runtime state of a single pipeline and continually reconciles
 /// actual with desired state. The automaton runs as a separate tokio task.
 pub struct PipelineAutomaton<T>
@@ -135,8 +244,8 @@ where
     client: reqwest::Client,
 
     /// Set when the pipeline executor `provision()` is called in the `Provisioning` stage.
-    /// Content is the provisioning timeout in seconds.
-    provision_called: Option<u64>,
+    /// Content is the provisioning timeout.
+    provision_called: Option<Duration>,
 
     /// Default maximum time to wait for the pipeline resources to be provisioned.
     /// This can differ significantly between the type of runner.
@@ -166,6 +275,9 @@ where
 
     /// Previously observed storage status details.
     prev_storage_status_details: Option<StorageStatusDetails>,
+
+    /// A cycle that takes at least this long is logged. Tests set it.
+    slow_cycle_threshold: Duration,
 }
 
 impl<T: PipelineExecutor> PipelineAutomaton<T> {
@@ -206,6 +318,12 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
     /// If nothing changes, this will create the same event.
     const DETAILS_UPDATE_MAX_INTERVAL: Duration = Duration::from_secs(600);
 
+    /// A cycle slower than this is logged, because the automaton cannot act on
+    /// a new desired status, such as a stop, until the cycle finishes. It is
+    /// above [Self::PIPELINE_STATUS_HTTP_REQUEST_TIMEOUT], which an unreachable
+    /// pipeline uses up in every cycle.
+    const SLOW_CYCLE_THRESHOLD: Duration = Duration::from_secs(10);
+
     /// Creates a new automaton for a given pipeline.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -218,7 +336,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         client: reqwest::Client,
         pipeline_handle: T,
         default_provisioning_timeout: Duration,
-        follow_request_receiver: mpsc::Receiver<mpsc::Sender<String>>,
+        follow_request_receiver: mpsc::Receiver<FollowRequest>,
         logs_sender: LogsSender,
         logs_receiver: mpsc::Receiver<LogMessage>,
     ) -> Self {
@@ -253,6 +371,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             prev_resources_status_details: None,
             prev_runtime_status_details: None,
             prev_storage_status_details: None,
+            slow_cycle_threshold: Self::SLOW_CYCLE_THRESHOLD,
         }
     }
 
@@ -270,6 +389,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             // Wait until the timeout expires, or we get notified that the
             // pipeline has been updated
             let _ = timeout(poll_timeout, self.notifier.notified()).await;
+            let cycle_start = Instant::now();
             match self.do_run().await {
                 Ok(new_poll_timeout) => {
                     poll_timeout = new_poll_timeout;
@@ -319,7 +439,8 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                             error!(
                                 pipeline_id = %pipeline_id,
                                 pipeline = self.pipeline_name.as_deref().unwrap_or("N/A"),
-                                "Automaton encountered a database error, retrying in {} seconds (retry no. {})... Error was: {e}",
+                                "Automaton encountered a database error after {:.1}s, retrying in {} seconds (retry no. {})... Error was: {e}",
+                                cycle_start.elapsed().as_secs_f64(),
                                 backoff_timeout.as_secs(),
                                 self.database_error_counter
                             );
@@ -350,6 +471,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         //
         // The complete descriptor can be converted into the monitoring one, which is done to avoid
         // checking which one was returned in the general flow.
+        let cycle_start = Instant::now();
         let pipeline_monitoring_or_complete = &self
             .db
             .lock()
@@ -362,6 +484,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             )
             .await?;
         let pipeline = &pipeline_monitoring_or_complete.only_monitoring();
+        let read_time = cycle_start.elapsed();
 
         // Determine transition
         let transition: Action = match (
@@ -453,6 +576,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 }
             }
         };
+        let decide_time = cycle_start.elapsed() - read_time;
 
         // Store the transition in the database
         let version_guard = pipeline.version;
@@ -780,6 +904,38 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             }
         }
 
+        let cycle_time = cycle_start.elapsed();
+        if cycle_time >= self.slow_cycle_threshold {
+            let parts = format!(
+                "database read {:.1}s, pipeline operations {:.1}s, database write {:.1}s",
+                read_time.as_secs_f64(),
+                decide_time.as_secs_f64(),
+                (cycle_time - read_time - decide_time).as_secs_f64(),
+            );
+            warn!(
+                pipeline_id = %pipeline.id,
+                pipeline = %pipeline.name,
+                "Runner cycle was slow: {:.1}s in total ({parts}) with resources status {} (desired: {}) and storage status {}",
+                cycle_time.as_secs_f64(),
+                pipeline.deployment_resources_status,
+                pipeline.deployment_resources_desired_status,
+                pipeline.storage_status,
+            );
+            self.logs_sender
+                .send(LogMessage::new_from_control_plane(
+                    module_path!(),
+                    "runner",
+                    pipeline.name.clone(),
+                    pipeline.id.to_string(),
+                    Level::WARN,
+                    &format!(
+                        "The control plane took {:.1}s to update the pipeline status, so a status change such as a stop can be delayed ({parts})",
+                        cycle_time.as_secs_f64(),
+                    ),
+                ))
+                .await;
+        }
+
         // Determine the poll timeout based on the pipeline status it has stayed or become.
         // This timeout can be preempted by a database notification.
         let poll_timeout = match new_resources_status {
@@ -815,7 +971,6 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             .client
             .request(method, &url)
             .timeout(timeout)
-            .with_sentry_tracing()
             .send()
             .await
             .map_err(|e| {
@@ -851,7 +1006,10 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             match serde_json::to_value(details) {
                 Ok(storage_status_details) => Some(storage_status_details),
                 Err(e) => {
-                    error!("Automaton of pipeline {} is unable to serialize storage status details due to: {e}", self.pipeline_id);
+                    error!(
+                        "Automaton of pipeline {} is unable to serialize storage status details due to: {e}",
+                        self.pipeline_id
+                    );
                     None
                 }
             }
@@ -871,7 +1029,10 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             ProgramStatus::Success
                 if !is_supported_runtime(&self.platform_version, &pipeline.platform_version) =>
             {
-                info!("Runner cannot start pipeline {} because its runtime version ({}) is incompatible with current ({})", pipeline.id, pipeline.platform_version, self.platform_version);
+                info!(
+                    "Runner cannot start pipeline {} because its runtime version ({}) is incompatible with current ({})",
+                    pipeline.id, pipeline.platform_version, self.platform_version
+                );
 
                 Ok(Action::RemainStoppedUpdateError {
                     error: ErrorResponse::from_error_nolog(
@@ -952,6 +1113,18 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             }
         };
 
+        // The Gen-2 engine does not support multihost pipelines yet; refuse before provisioning
+        // rather than attempting a launch that cannot succeed. The multihost start path
+        // stays intact for other runtimes.
+        if runtime_config.hosts > 1 && program_config_is_gen2(&pipeline.program_config) {
+            return Action::RemainStoppedUpdateError {
+                error: RunnerError::AutomatonGen2MultihostUnsupported {
+                    hosts: runtime_config.hosts,
+                }
+                .into(),
+            };
+        }
+
         // Validate the required program_info which includes input and output connectors
         let _program_info = match &pipeline.program_info {
             None => {
@@ -979,6 +1152,14 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         // Deployment configuration
         let mut deployment_config =
             generate_pipeline_config(pipeline.id, &pipeline.name, &runtime_config);
+        // A resize lasts until storage is cleared.
+        if let Some(previous_deployment_config) = &pipeline.deployment_config
+            && pipeline.storage_status != StorageStatus::Cleared
+            && let Ok(previous) =
+                serde_json::from_value::<PipelineConfig>(previous_deployment_config.clone())
+        {
+            merge_deployment_config(&mut deployment_config, &previous.global);
+        }
         deployment_config.storage_config =
             Some(self.pipeline_handle.generate_storage_config().await);
         let deployment_config_json = match serde_json::to_value(&deployment_config) {
@@ -995,11 +1176,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
 
         // Validate that the backing compute and storage resources, if they were attempted to be
         // provisioned, can be managed
-        if let Err(e) = self
-            .pipeline_handle
-            .can_provision(&deployment_config, &pipeline.runtime_config)
-            .await
-        {
+        if let Err(e) = self.pipeline_handle.can_provision(&deployment_config).await {
             return Action::RemainStoppedUpdateError { error: e.into() };
         }
 
@@ -1019,28 +1196,48 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
     ) -> Result<bool, DBError> {
         let program_version = pipeline.program_version;
 
-        // Cannot check for binary existence if source/integrity checksum is missing.
-        // Return Ok(false) to indicate binary is not present or cannot be verified.
-        let Some(source_checksum) = pipeline.program_binary_source_checksum.as_ref() else {
-            info!(
-                "Failed to perform binary existence check for pipeline {}: source checksum is missing. This may indicate that the program has not been compiled yet, will retry later.",
-                self.pipeline_id
-            );
-            return Ok(false);
-        };
-        let Some(binary_integrity_checksum) = pipeline.program_binary_integrity_checksum.as_ref()
-        else {
-            info!(
-                "Failed to perform binary existence check for pipeline {}: binary integrity checksum is missing. This may indicate that the program has not been compiled yet, will retry later.",
-                self.pipeline_id,
-            );
-            return Ok(false);
-        };
+        let engine_is_gen2 = program_config_is_gen2(&pipeline.program_config);
 
+        // The program info integrity checksum names the delivered program info
+        // artifact and is checked for both engines.
         let program_info_integrity_checksum = pipeline
             .program_info_integrity_checksum
             .as_deref()
             .unwrap_or("none");
+
+        // A normal pipeline verifies the binary and the program info. A Gen-2
+        // pipeline compiles no binary, so it verifies only the program info (named
+        // by its own integrity checksum) and passes "none" for the binary.
+        let (source_checksum, binary_integrity_checksum): (&str, &str) = if engine_is_gen2 {
+            if program_info_integrity_checksum == "none" {
+                info!(
+                    "Cannot verify artifacts for Gen-2 pipeline {}: program info integrity checksum is missing. This may indicate that the program has not been compiled yet, will retry later.",
+                    self.pipeline_id
+                );
+                return Ok(false);
+            }
+            (program_info_integrity_checksum, "none")
+        } else {
+            // Cannot check for binary existence if source/integrity checksum is missing.
+            // Return Ok(false) to indicate binary is not present or cannot be verified.
+            let Some(source_checksum) = pipeline.program_binary_source_checksum.as_ref() else {
+                info!(
+                    "Failed to perform binary existence check for pipeline {}: source checksum is missing. This may indicate that the program has not been compiled yet, will retry later.",
+                    self.pipeline_id
+                );
+                return Ok(false);
+            };
+            let Some(binary_integrity_checksum) =
+                pipeline.program_binary_integrity_checksum.as_ref()
+            else {
+                info!(
+                    "Failed to perform binary existence check for pipeline {}: binary integrity checksum is missing. This may indicate that the program has not been compiled yet, will retry later.",
+                    self.pipeline_id,
+                );
+                return Ok(false);
+            };
+            (source_checksum.as_str(), binary_integrity_checksum.as_str())
+        };
 
         let binary_check_url = format!(
             "{}://{}:{}/artifacts/{}/{}/{}/{}/{}",
@@ -1062,7 +1259,6 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             .client
             .get(&binary_check_url)
             .timeout(Self::PIPELINE_STATUS_HTTP_REQUEST_TIMEOUT)
-            .with_sentry_tracing()
             .send()
             .await
         {
@@ -1207,7 +1403,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentInitial.into()),
                     storage_status_details: None,
-                }
+                };
             }
             Some(deployment_initial) => *deployment_initial,
         };
@@ -1218,7 +1414,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentId.into()),
                     storage_status_details: None,
-                }
+                };
             }
             Some(deployment_id) => *deployment_id,
         };
@@ -1229,7 +1425,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentConfig.into()),
                     storage_status_details: None,
-                }
+                };
             }
             Some(deployment_config) => match validate_deployment_config(deployment_config) {
                 Ok(deployment_config) => deployment_config,
@@ -1248,46 +1444,8 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             },
         };
 
-        let Some(source_checksum) = pipeline.program_binary_source_checksum.as_ref() else {
-            return Action::TransitionToStopping {
-                error: Some(
-                    RunnerError::AutomatonCannotConstructProgramBinaryUrl {
-                        error: "source checksum is missing".to_string(),
-                    }
-                    .into(),
-                ),
-                storage_status_details: None,
-            };
-        };
-
-        // URL where the program binary can be downloaded from
-        let program_binary_url = format!(
-            "{}://{}:{}/binary/{}/{}/{}/{}",
-            if self.common_config.enable_https {
-                "https"
-            } else {
-                "http"
-            },
-            self.common_config.compiler_host,
-            self.common_config.compiler_port,
-            self.pipeline_id,
-            pipeline.program_version,
-            source_checksum,
-            if let Some(integrity_checksum) = pipeline.program_binary_integrity_checksum.as_ref() {
-                integrity_checksum
-            } else {
-                return Action::TransitionToStopping {
-                    error: Some(
-                        RunnerError::AutomatonCannotConstructProgramBinaryUrl {
-                            error: "integrity checksum is missing".to_string(),
-                        }
-                        .into(),
-                    ),
-                    storage_status_details: None,
-                };
-            },
-        );
-
+        // The program info integrity checksum names the delivered program info
+        // artifact and is required for both engines.
         let Some(program_info_integrity_checksum) =
             pipeline.program_info_integrity_checksum.as_ref()
         else {
@@ -1302,6 +1460,47 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             };
         };
 
+        // A Gen-2 pipeline compiles no binary: pass an empty binary URL (the runner
+        // then launches the engine) and name the program info artifact by its own
+        // integrity checksum. A normal pipeline builds a binary URL and names the
+        // program info by the binary source checksum.
+        let runtime_selector = program_runtime_selector(&pipeline.program_config);
+        let (program_binary_url, program_info_source_checksum) = if runtime_selector.is_gen2() {
+            (String::new(), program_info_integrity_checksum.clone())
+        } else {
+            let Some(source_checksum) = pipeline.program_binary_source_checksum.as_ref() else {
+                return Action::TransitionToStopping {
+                    error: Some(
+                        RunnerError::AutomatonCannotConstructProgramBinaryUrl {
+                            error: "source checksum is missing".to_string(),
+                        }
+                        .into(),
+                    ),
+                    storage_status_details: None,
+                };
+            };
+            let Some(integrity_checksum) = pipeline.program_binary_integrity_checksum.as_ref()
+            else {
+                return Action::TransitionToStopping {
+                    error: Some(
+                        RunnerError::AutomatonCannotConstructProgramBinaryUrl {
+                            error: "integrity checksum is missing".to_string(),
+                        }
+                        .into(),
+                    ),
+                    storage_status_details: None,
+                };
+            };
+            let program_binary_url = compiler_binary_url(
+                &self.common_config,
+                self.pipeline_id,
+                pipeline.program_version,
+                source_checksum,
+                integrity_checksum,
+            );
+            (program_binary_url, source_checksum.clone())
+        };
+
         // URL where the program info can be downloaded from
         let program_info_url = format!(
             "{}://{}:{}/program_info/{}/{}/{}/{}",
@@ -1314,7 +1513,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             self.common_config.compiler_port,
             self.pipeline_id,
             pipeline.program_version,
-            source_checksum,
+            program_info_source_checksum,
             program_info_integrity_checksum,
         );
 
@@ -1335,6 +1534,11 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
             Some(program_info) => program_info,
         };
 
+        // A runtime from before a rename, whether pinned or the one this
+        // pipeline was compiled with, reads only the older spelling.
+        let legacy_spelling =
+            legacy_spelling_for(&pipeline.program_config, &pipeline.platform_version);
+
         match self
             .pipeline_handle
             .provision(
@@ -1346,16 +1550,19 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 &program_binary_url,
                 &program_info_url,
                 pipeline.program_version,
-                &pipeline.runtime_config,
+                &runtime_selector,
+                legacy_spelling,
             )
             .await
         {
             Ok(()) => {
+                // Keep the configured value whole: truncating to seconds would
+                // turn a sub-second timeout into no timeout at all.
                 self.provision_called = Some(
                     deployment_config
                         .global
-                        .provisioning_timeout_secs
-                        .unwrap_or(self.default_provisioning_timeout.as_secs()),
+                        .provisioning_timeout
+                        .map_or(self.default_provisioning_timeout, Into::into),
                 );
                 info!(
                     pipeline_id = %pipeline.id,
@@ -1396,10 +1603,9 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
         assert!(self.provision_called.is_some());
-        let provisioning_timeout = Duration::from_secs(
-            self.provision_called
-                .expect("Provision must have been called"),
-        );
+        let provisioning_timeout = self
+            .provision_called
+            .expect("Provision must have been called");
 
         // Deployment initial runtime desired state is expected
         let deployment_initial = match &pipeline.deployment_initial {
@@ -1407,17 +1613,19 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentInitial.into()),
                     storage_status_details: None,
-                }
+                };
             }
             Some(deployment_initial) => *deployment_initial,
         };
 
         // Check whether the pipeline has finished provisioning the resources
-        let provision_status = match self
-            .pipeline_handle
-            .is_provisioned(&pipeline.runtime_config)
-            .await
-        {
+        let Some(deployment_config) = &pipeline.deployment_config else {
+            return Action::TransitionToStopping {
+                error: Some(RunnerError::AutomatonMissingDeploymentConfig.into()),
+                storage_status_details: None,
+            };
+        };
+        let provision_status = match self.pipeline_handle.is_provisioned(deployment_config).await {
             Ok(provision_status) => provision_status,
             Err(e) => {
                 error!(
@@ -1442,12 +1650,11 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 );
 
                 // Provisioning can time out if it takes too long
-                if Utc::now().timestamp_millis()
-                    - pipeline
-                        .deployment_resources_status_since
-                        .timestamp_millis()
-                    > provisioning_timeout.as_millis() as i64
-                {
+                if elapsed_exceeds(
+                    pipeline.deployment_resources_status_since,
+                    Utc::now(),
+                    provisioning_timeout,
+                ) {
                     error!(
                         pipeline_id = %pipeline.id,
                         pipeline = %pipeline.name,
@@ -1651,14 +1858,20 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
         // Retrieve latest resources status details
+        let Some(deployment_config) = &pipeline.deployment_config else {
+            return Action::TransitionToStopping {
+                error: Some(RunnerError::AutomatonMissingDeploymentConfig.into()),
+                storage_status_details: None,
+            };
+        };
         let latest_resources_status_details =
-            match self.pipeline_handle.check(&pipeline.runtime_config).await {
+            match self.pipeline_handle.check(deployment_config).await {
                 Ok(details) => details,
                 Err(e) => {
                     return Action::TransitionToStopping {
                         error: Some(e.into()),
                         storage_status_details: None,
-                    }
+                    };
                 }
             };
 
@@ -1669,7 +1882,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentLocation.into()),
                     storage_status_details: None,
-                }
+                };
             }
         };
 
@@ -1680,7 +1893,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(RunnerError::AutomatonMissingDeploymentInitial.into()),
                     storage_status_details: None,
-                }
+                };
             }
         };
 
@@ -1700,7 +1913,7 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                 return Action::TransitionToStopping {
                     error: Some(e),
                     storage_status_details: None,
-                }
+                };
             }
         };
 
@@ -1760,9 +1973,8 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
                     .runtime_status_details
                     .clone(),
             );
-            self.prev_storage_status_details = latest_runtime_extended_status
-                .storage_status_details
-                .clone();
+            self.prev_storage_status_details
+                .clone_from(&latest_runtime_extended_status.storage_status_details);
             Action::RemainProvisionedUpdateDetails {
                 deployment_resources_status_details: latest_resources_status_details,
                 extended_runtime_status: latest_runtime_extended_status.clone(),
@@ -1784,7 +1996,13 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         &mut self,
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
-        if let Err(e) = self.pipeline_handle.stop(&pipeline.runtime_config).await {
+        // A missing deployment config must not block stopping. The runtime config fields are at
+        // the top level of both, which is all the runner reads.
+        let deployment_config = pipeline
+            .deployment_config
+            .as_ref()
+            .unwrap_or(&pipeline.runtime_config);
+        if let Err(e) = self.pipeline_handle.stop(deployment_config).await {
             let message = format!("Pipeline could not be stopped (will retry): {e}");
             error!(
                 pipeline_id = %pipeline.id,
@@ -1837,7 +2055,14 @@ impl<T: PipelineExecutor> PipelineAutomaton<T> {
         &mut self,
         pipeline: &ExtendedPipelineDescrMonitoring,
     ) -> Action {
-        if let Err(e) = self.pipeline_handle.clear(&pipeline.runtime_config).await {
+        // Pipelines stopped before `deployment_config` was kept after stop have none.
+        // The runtime config fields are at the top level of both, which is all the runner reads.
+        // TODO: remove this fallback once no pipeline stopped before that change remains.
+        let deployment_config = pipeline
+            .deployment_config
+            .as_ref()
+            .unwrap_or(&pipeline.runtime_config);
+        if let Err(e) = self.pipeline_handle.clear(deployment_config).await {
             error!(
                 pipeline_id = %pipeline.id,
                 pipeline = %pipeline.name,
@@ -1856,34 +2081,147 @@ mod test {
     use crate::config::CommonConfig;
     use crate::db::storage::Storage;
     use crate::db::storage_postgres::StoragePostgres;
-    use crate::db::types::pipeline::{PipelineDescr, PipelineId};
+    use crate::db::types::pipeline::{ExtendedPipelineDescr, PipelineDescr, PipelineId};
     use crate::db::types::program::{
-        ProgramInfo, ProgramStatus, RustCompilationInfo, SqlCompilationInfo,
+        ProgramInfo, ProgramStatus, RuntimeSelector, RustCompilationInfo, SqlCompilationInfo,
     };
     use crate::db::types::resources_status::ResourcesStatus;
+    use crate::db::types::storage::StorageStatus;
     use crate::db::types::version::Version;
     use crate::error::ManagerError;
     use crate::logging;
     use crate::runner::main::MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS;
     use crate::runner::pipeline_automata::PipelineAutomaton;
     use crate::runner::pipeline_executor::{PipelineExecutor, ProvisionStatus};
-    use crate::runner::pipeline_logs::{LogMessage, LogsSender};
+    use crate::runner::pipeline_logs::{
+        FollowMode, FollowRequest, FollowerMessage, LogMessage, LogsSender,
+    };
     use async_trait::async_trait;
+    use feldera_types::config::LegacySpelling;
     use feldera_types::config::{PipelineConfig, StorageConfig};
+    use feldera_types::error::ErrorResponse;
     use feldera_types::program_schema::ProgramSchema;
     use feldera_types::runtime_status::{BootstrapConfig, RuntimeDesiredStatus, RuntimeStatus};
     use serde_json::json;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::mpsc::{channel, Sender};
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
     use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
-    use wiremock::{http, Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate, http};
+
+    /// A pipeline compiled by a platform before the duration rename runs a
+    /// binary that reads only the older spelling, however it is pinned. One
+    /// compiled by that release or a later one reads the current spelling.
+    #[test]
+    fn a_platform_before_the_rename_gets_the_older_duration_spelling() {
+        use super::DURATION_RENAME_VERSION;
+        let predates = |version| super::platform_version_predates(version, DURATION_RENAME_VERSION);
+        assert!(predates("0.365.0"));
+        assert!(predates("0.365.9+enterprise"));
+        assert!(predates("0.357.0+enterprise-dev.abc123"));
+        assert!(!predates("0.366.0"));
+        assert!(!predates("0.366.0+enterprise"));
+        assert!(!predates("0.367.1"));
+        assert!(!predates("1.0.0"));
+        // A version that does not parse is treated as predating the rename:
+        // the older spelling is safe for every runtime.
+        assert!(predates("v0"));
+        assert!(predates(""));
+    }
+
+    /// Each rename has its own gate: a platform from between the duration and
+    /// the size rename reads the current durations and the older sizes, and a
+    /// pinned tag is gated the same way, whatever the platform.
+    #[test]
+    fn each_rename_is_gated_on_its_own_release() {
+        crate::enable_test_unstable_features();
+        use super::legacy_spelling_for;
+        use feldera_types::config::LegacySpelling;
+        let both = LegacySpelling {
+            durations: true,
+            sizes: true,
+        };
+        let sizes_only = LegacySpelling {
+            durations: false,
+            sizes: true,
+        };
+        let unpinned = serde_json::json!({});
+        assert_eq!(legacy_spelling_for(&unpinned, "0.365.0"), both);
+        assert_eq!(legacy_spelling_for(&unpinned, "0.366.0"), sizes_only);
+        assert_eq!(
+            legacy_spelling_for(&unpinned, "0.366.3+enterprise"),
+            sizes_only
+        );
+        assert_eq!(
+            legacy_spelling_for(&unpinned, "0.367.0"),
+            LegacySpelling::NONE
+        );
+        let pinned = |tag: &str| serde_json::json!({"runtime_version": tag});
+        assert_eq!(legacy_spelling_for(&pinned("v0.365.0"), "0.367.0"), both);
+        assert_eq!(
+            legacy_spelling_for(&pinned("v0.366.0"), "0.367.0"),
+            sizes_only
+        );
+        assert_eq!(
+            legacy_spelling_for(&pinned("v0.367.0"), "0.367.0"),
+            LegacySpelling::NONE
+        );
+    }
+
+    /// One case per kind of runtime selector. The platform's own runtime and
+    /// the Gen-2 engine read the current spelling; a tag is compared with the
+    /// rename, whose boundary the test above covers; a commit hash tells
+    /// nothing about its age, so it gets the older spelling.
+    #[test]
+    fn only_a_pinned_older_runtime_gets_the_older_duration_spelling() {
+        crate::enable_test_unstable_features();
+        use super::DURATION_RENAME_VERSION;
+        let predates = |config: &serde_json::Value| {
+            super::pinned_runtime_predates(config, DURATION_RENAME_VERSION)
+        };
+        assert!(!predates(&serde_json::json!({})));
+        assert!(!predates(&serde_json::json!({"runtime_version": "gen2"})));
+        assert!(predates(
+            &serde_json::json!({"runtime_version": "v0.357.0"})
+        ));
+        assert!(!predates(
+            &serde_json::json!({"runtime_version": "v0.366.0"})
+        ));
+        assert!(predates(
+            &serde_json::json!({"runtime_version": "d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b"})
+        ));
+        // A configuration that does not parse pins nothing.
+        assert!(!predates(&serde_json::json!({"runtime_version": 7})));
+    }
+
+    /// A provisioning timeout longer than `i64::MAX` milliseconds, which a
+    /// duration setting can now say, never passes rather than passing at once.
+    #[test]
+    fn a_huge_provisioning_timeout_never_passes() {
+        use super::elapsed_exceeds;
+        use chrono::{TimeDelta, Utc};
+        use std::time::Duration;
+        let since = Utc::now();
+        let later = since + TimeDelta::seconds(2);
+        assert!(elapsed_exceeds(since, later, Duration::from_secs(1)));
+        assert!(!elapsed_exceeds(since, later, Duration::from_secs(3)));
+        assert!(!elapsed_exceeds(
+            since,
+            later,
+            Duration::from_secs(u64::MAX)
+        ));
+        assert!(!elapsed_exceeds(since, later, Duration::MAX));
+    }
 
     struct MockRunner {
         deployment_location: String,
+        /// The config each of `is_provisioned`, `check`, `stop` and `clear` received.
+        received: Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>,
+        /// The runtime selector each `provision` received.
+        provisioned_runtimes: Arc<std::sync::Mutex<Vec<RuntimeSelector>>>,
     }
 
     #[async_trait]
@@ -1908,11 +2246,7 @@ mod test {
             }
         }
 
-        async fn can_provision(
-            &self,
-            _: &PipelineConfig,
-            _: &serde_json::Value,
-        ) -> Result<(), ManagerError> {
+        async fn can_provision(&self, _: &PipelineConfig) -> Result<(), ManagerError> {
             Ok(())
         }
 
@@ -1926,15 +2260,24 @@ mod test {
             _: &str,
             _: &str,
             _: Version,
-            _: &serde_json::Value,
+            runtime_selector: &RuntimeSelector,
+            _legacy_spelling: LegacySpelling,
         ) -> Result<(), ManagerError> {
+            self.provisioned_runtimes
+                .lock()
+                .unwrap()
+                .push(runtime_selector.clone());
             Ok(())
         }
 
         async fn is_provisioned(
             &mut self,
-            _runtime_config: &serde_json::Value,
+            deployment_config: &serde_json::Value,
         ) -> Result<ProvisionStatus, ManagerError> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(("is_provisioned", deployment_config.clone()));
             Ok(ProvisionStatus::Provisioned {
                 location: self.deployment_location.clone(),
                 details: json!(""),
@@ -1943,16 +2286,34 @@ mod test {
 
         async fn check(
             &mut self,
-            _runtime_config: &serde_json::Value,
+            deployment_config: &serde_json::Value,
         ) -> Result<serde_json::Value, ManagerError> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(("check", deployment_config.clone()));
             Ok(json!(""))
         }
 
-        async fn stop(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+        async fn stop(
+            &mut self,
+            deployment_config: &serde_json::Value,
+        ) -> Result<(), ManagerError> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(("stop", deployment_config.clone()));
             Ok(())
         }
 
-        async fn clear(&mut self, _runtime_config: &serde_json::Value) -> Result<(), ManagerError> {
+        async fn clear(
+            &mut self,
+            deployment_config: &serde_json::Value,
+        ) -> Result<(), ManagerError> {
+            self.received
+                .lock()
+                .unwrap()
+                .push(("clear", deployment_config.clone()));
             Ok(())
         }
     }
@@ -1960,7 +2321,9 @@ mod test {
     struct AutomatonTest {
         db: Arc<Mutex<StoragePostgres>>,
         automaton: PipelineAutomaton<MockRunner>,
-        _follow_request_sender: Sender<Sender<String>>,
+        _follow_request_sender: Sender<FollowRequest>,
+        received: Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>,
+        provisioned_runtimes: Arc<std::sync::Mutex<Vec<RuntimeSelector>>>,
     }
 
     impl AutomatonTest {
@@ -2040,12 +2403,97 @@ mod test {
                 .program_status
         }
 
+        async fn deployment_error(&self) -> Option<ErrorResponse> {
+            let automaton = &self.automaton;
+            self.db
+                .lock()
+                .await
+                .get_pipeline_by_id(automaton.tenant_id, automaton.pipeline_id)
+                .await
+                .unwrap()
+                .deployment_error
+        }
+
         async fn tick(&mut self) {
             self.automaton.do_run().await.unwrap();
         }
+
+        /// Follows the pipeline log, starting with the lines it already has.
+        async fn follow_log(&self) -> Receiver<FollowerMessage> {
+            let (sender, receiver) = channel(1000);
+            self._follow_request_sender
+                .send(FollowRequest {
+                    sender,
+                    mode: FollowMode::Full,
+                })
+                .await
+                .unwrap();
+            receiver
+        }
+
+        async fn pipeline(&self) -> ExtendedPipelineDescr {
+            let automaton = &self.automaton;
+            self.db
+                .lock()
+                .await
+                .get_pipeline_by_id(automaton.tenant_id, automaton.pipeline_id)
+                .await
+                .unwrap()
+        }
+
+        async fn tick_until(
+            &mut self,
+            resources_status: ResourcesStatus,
+            storage_status: StorageStatus,
+        ) {
+            for _ in 0..10 {
+                let pipeline = self.pipeline().await;
+                if pipeline.deployment_resources_status == resources_status
+                    && pipeline.storage_status == storage_status
+                {
+                    return;
+                }
+                self.tick().await;
+            }
+            panic!("did not reach {resources_status:?} with storage {storage_status:?}");
+        }
+
+        /// Adds an environment variable the current version reserves, as an older version could
+        /// have stored it.
+        async fn reserve_env_in(&self, column: &str) {
+            let statement = format!(
+                "UPDATE pipeline SET {column} = jsonb_set({column}::jsonb, '{{env}}', '{{\"RUST_LOG\": \"debug\"}}')::varchar WHERE id = $1"
+            );
+            self.db
+                .lock()
+                .await
+                .pool
+                .get()
+                .await
+                .unwrap()
+                .execute(&statement, &[&self.automaton.pipeline_id.0])
+                .await
+                .unwrap();
+        }
+
+        async fn clear_storage(&self) {
+            let automaton = &self.automaton;
+            let name = self.pipeline().await.name;
+            self.db
+                .lock()
+                .await
+                .transit_storage_status_to_clearing_if_not_cleared(automaton.tenant_id, &name)
+                .await
+                .unwrap();
+        }
     }
 
-    async fn setup(db: Arc<Mutex<StoragePostgres>>, deployment_location: String) -> AutomatonTest {
+    async fn setup(
+        db: Arc<Mutex<StoragePostgres>>,
+        deployment_location: String,
+        runtime_config: serde_json::Value,
+        program_config: serde_json::Value,
+    ) -> AutomatonTest {
         // Create a pipeline and a corresponding automaton
         let tenant_id = TenantRecord::default().id;
         let pipeline_id = PipelineId(Uuid::now_v7());
@@ -2060,14 +2508,11 @@ mod test {
                     name: "example1".to_string(),
                     description: "Description of example1".to_string(),
                     tags: vec![],
-                    runtime_config: json!({}),
+                    runtime_config,
                     program_code: "CREATE TABLE example1 ( col1 INT );".to_string(),
                     udf_rust: "".to_string(),
                     udf_toml: "".to_string(),
-                    program_config: json!({
-                        "profile": "unoptimized",
-                        "cache": false
-                    }),
+                    program_config,
                 },
             )
             .await
@@ -2099,6 +2544,7 @@ mod test {
                     udf_stubs: "".to_string(),
                     input_connectors: Default::default(),
                     output_connectors: Default::default(),
+                    circuit_ir: None,
                     dataflow: None,
                 })
                 .unwrap(),
@@ -2116,11 +2562,11 @@ mod test {
                 tenant_id,
                 pipeline_id,
                 Version(1),
-                &RustCompilationInfo {
-                    exit_code: 0,
-                    stdout: "".to_string(),
-                    stderr: "".to_string(),
-                },
+                &RustCompilationInfo::from_process_output_streams(
+                    0,
+                    "".to_string(),
+                    "".to_string(),
+                ),
                 "not-used-program-binary-source-checksum",
                 "not-used-program-binary-integrity-checksum",
                 "not-used-program-info-integrity-checksum",
@@ -2130,7 +2576,7 @@ mod test {
 
         // Construct the automaton
         let (_follow_request_sender, follow_request_receiver) =
-            channel::<Sender<String>>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
+            channel::<FollowRequest>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
         let (logs_sender, logs_receiver) =
             channel::<LogMessage>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
         let logs_sender = LogsSender::new(logs_sender);
@@ -2145,6 +2591,8 @@ mod test {
             .map(|(host, port)| (host.to_string(), port.parse().unwrap_or(8085)))
             .unwrap_or_else(|| ("127.0.0.1".to_string(), 8085));
 
+        let received = Arc::new(std::sync::Mutex::new(vec![]));
+        let provisioned_runtimes = Arc::new(std::sync::Mutex::new(vec![]));
         let automaton = PipelineAutomaton::new(
             CommonConfig {
                 platform_version: "v0".to_string(),
@@ -2173,6 +2621,8 @@ mod test {
             client,
             MockRunner {
                 deployment_location,
+                received: received.clone(),
+                provisioned_runtimes: provisioned_runtimes.clone(),
             },
             Duration::from_secs(1),
             follow_request_receiver,
@@ -2183,6 +2633,8 @@ mod test {
             db: db.clone(),
             automaton,
             _follow_request_sender,
+            received,
+            provisioned_runtimes,
         }
     }
 
@@ -2232,13 +2684,28 @@ mod test {
     type SetupResult = (MockServer, tokio_postgres::Config, AutomatonTest);
 
     async fn setup_complete() -> SetupResult {
+        setup_complete_with(
+            json!({}),
+            json!({ "profile": "unoptimized", "cache": false }),
+        )
+        .await
+    }
+
+    async fn setup_complete_with(
+        runtime_config: serde_json::Value,
+        program_config: serde_json::Value,
+    ) -> SetupResult {
         logging::init_logging("foo".into());
         let (db, temp_dir) = crate::db::test::setup_pg().await;
         let db = Arc::new(Mutex::new(db));
         // Start a background HTTP server on a random local port
         let mock_server = MockServer::start().await;
         let addr = mock_server.address().to_string();
-        (mock_server, temp_dir, setup(db.clone(), addr).await)
+        (
+            mock_server,
+            temp_dir,
+            setup(db.clone(), addr, runtime_config, program_config).await,
+        )
     }
 
     fn artifacts_path(pipeline_id: PipelineId) -> String {
@@ -2250,6 +2717,73 @@ mod test {
             "not-used-program-binary-integrity-checksum",
             "not-used-program-info-integrity-checksum",
         )
+    }
+
+    /// The Gen-2 engine does not support multihost pipelines yet: a Gen-2 pipeline
+    /// with `runtime_config.hosts > 1` is refused at the provisioning gate, staying
+    /// Stopped with a clear error rather than launching.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn gen2_multihost_refused_before_provisioning() {
+        // Without the gate the runtime selector falls back to the platform runtime,
+        // the pipeline is not a Gen-2 pipeline, and there is nothing to refuse.
+        crate::enable_test_unstable_features();
+        assert!(crate::has_unstable_feature("runtime_version"));
+
+        let (mut server, _temp, mut test) = setup_complete_with(
+            json!({ "hosts": 2 }),
+            json!({ "runtime_version": "gen2", "profile": "unoptimized", "cache": false }),
+        ).await;
+
+        // Artifacts present so the flow reaches the provisioning gate. The Gen-2 engine
+        // names the program info artifact by its own checksum and passes "none" for the
+        // binary.
+        let artifacts_path = format!(
+            "/artifacts/{}/1/{}/none/{}",
+            test.automaton.pipeline_id,
+            "not-used-program-info-integrity-checksum",
+            "not-used-program-info-integrity-checksum",
+        );
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))]).await;
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        test.tick().await;
+
+        // Refused: stays Stopped with the Gen-2 multihost error instead of provisioning.
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        let error = test.deployment_error().await.expect("a deployment error is set");
+        assert!(
+            error.message.contains("Gen-2 engine does not support multihost pipelines"),
+            "unexpected error: {}", error.message
+        );
+    }
+
+    /// A program pinned to a Gen2 engine build hands that pin to the executor.
+    #[tokio::test]
+    #[rustfmt::skip]
+    async fn gen2_engine_pin_reaches_provision() {
+        crate::enable_test_unstable_features();
+        let sha = "d0b45d8f87056c9d2c89c6f63b2531b0c5905f9b";
+        let (mut server, _temp, mut test) = setup_complete_with(
+            json!({}),
+            json!({ "runtime_version": format!("gen2:{sha}"), "profile": "unoptimized", "cache": false }),
+        ).await;
+        let artifacts_path = format!(
+            "/artifacts/{}/1/{}/none/{}",
+            test.automaton.pipeline_id,
+            "not-used-program-info-integrity-checksum",
+            "not-used-program-info-integrity-checksum",
+        );
+        mock_endpoints(&mut server, vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))]).await;
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick().await;
+        test.tick().await; // provision()
+        assert_eq!(
+            *test.provisioned_runtimes.lock().unwrap(),
+            vec![RuntimeSelector::Gen2(Some(sha.to_string()))]
+        );
     }
 
     #[tokio::test]
@@ -2314,6 +2848,213 @@ mod test {
         test.tick().await;
         assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
         assert_eq!(test.runtime_status().await, None);
+    }
+
+    /// `stop()` and `clear()` receive the stored deployment config, which is kept after stop and
+    /// after storage is cleared, and a restart builds the same one again.
+    #[tokio::test]
+    async fn runner_receives_the_stored_deployment_config() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            &mut server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        assert_eq!(test.pipeline().await.deployment_config, None);
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        let deployment_config = test.pipeline().await.deployment_config.unwrap();
+        assert_ne!(deployment_config, test.pipeline().await.runtime_config);
+
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+        assert_eq!(
+            test.pipeline().await.deployment_config.as_ref(),
+            Some(&deployment_config)
+        );
+
+        test.clear_storage().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::Cleared)
+            .await;
+        assert_eq!(
+            test.pipeline().await.deployment_config.as_ref(),
+            Some(&deployment_config)
+        );
+
+        let received = test.received.lock().unwrap().clone();
+        let names: Vec<_> = received.iter().map(|(name, _)| *name).collect();
+        assert!(
+            names.contains(&"stop") && names.contains(&"clear"),
+            "{names:?}"
+        );
+        for (name, config) in &received {
+            assert_eq!(config, &deployment_config, "{name}");
+        }
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        assert_eq!(
+            test.pipeline().await.deployment_config,
+            Some(deployment_config)
+        );
+    }
+
+    /// A resize stored in the deployment config is kept by a restart and reset once storage is
+    /// cleared.
+    #[tokio::test]
+    async fn restart_keeps_a_resize_until_storage_is_cleared() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            &mut server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        let cpu_cores_min = |test_pipeline: &ExtendedPipelineDescr| {
+            test_pipeline.deployment_config.as_ref().unwrap()["resources"]["cpu_cores_min"].clone()
+        };
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        let initial = cpu_cores_min(&test.pipeline().await);
+        let mut resized = test.pipeline().await.deployment_config.unwrap();
+        resized["resources"]["cpu_cores_min"] = json!(0.25);
+        test.db
+            .lock()
+            .await
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE pipeline SET deployment_config = $1 WHERE id = $2",
+                &[&resized.to_string(), &test.automaton.pipeline_id.0],
+            )
+            .await
+            .unwrap();
+
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        assert_eq!(cpu_cores_min(&test.pipeline().await), json!(0.25));
+
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+        test.clear_storage().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::Cleared)
+            .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        assert_eq!(cpu_cores_min(&test.pipeline().await), initial);
+    }
+
+    /// Without a stored deployment config, `stop()` and `clear()` receive the runtime config
+    /// instead of blocking the pipeline in `Stopping` or `Clearing`.
+    #[tokio::test]
+    async fn stop_and_clear_fall_back_to_the_runtime_config() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            &mut server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        test.db
+            .lock()
+            .await
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE pipeline SET deployment_config = NULL WHERE id = $1",
+                &[&test.automaton.pipeline_id.0],
+            )
+            .await
+            .unwrap();
+
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+        test.clear_storage().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::Cleared)
+            .await;
+
+        let runtime_config = test.pipeline().await.runtime_config;
+        let received = test.received.lock().unwrap().clone();
+        assert!(
+            received.contains(&("stop", runtime_config.clone())),
+            "{received:?}"
+        );
+        assert!(
+            received.contains(&("clear", runtime_config)),
+            "{received:?}"
+        );
+    }
+
+    /// A stored deployment config that the current version rejects does not block stopping.
+    #[tokio::test]
+    async fn invalid_stored_deployment_config_does_not_block_stopping() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            &mut server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopping, StorageStatus::InUse)
+            .await;
+        test.reserve_env_in("deployment_config").await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+    }
+
+    /// A stored deployment config that the current version rejects does not hide why a start
+    /// failed.
+    #[tokio::test]
+    async fn invalid_stored_deployment_config_does_not_hide_start_error() {
+        let (mut server, _temp, mut test) = setup_complete().await;
+        let artifacts_path = artifacts_path(test.automaton.pipeline_id);
+        mock_endpoints(
+            &mut server,
+            vec![MockEndpoint::new("GET", &artifacts_path, 200, json!({}))],
+        )
+        .await;
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick_until(ResourcesStatus::Provisioning, StorageStatus::InUse)
+            .await;
+        test.desire_stopped().await;
+        test.tick_until(ResourcesStatus::Stopped, StorageStatus::InUse)
+            .await;
+        test.reserve_env_in("deployment_config").await;
+        test.reserve_env_in("runtime_config").await;
+
+        test.desire_start(RuntimeDesiredStatus::Paused).await;
+        test.tick().await;
+        assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
+        let error = test
+            .deployment_error()
+            .await
+            .expect("the start error is recorded");
+        assert!(error.message.contains("RUST_LOG"), "{}", error.message);
     }
 
     #[tokio::test]
@@ -2416,5 +3157,57 @@ mod test {
         // Remains Stopped as program is still Pending
         assert_eq!(test.resources_status().await, ResourcesStatus::Stopped);
 
+    }
+
+    /// Returns the lines that arrive on `follower` until it is quiet for 500 ms.
+    async fn read_log_until_quiet(follower: &mut Receiver<FollowerMessage>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(500), follower.recv()).await
+        {
+            if let FollowerMessage::Line(line) = message {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// A cycle that takes at least the threshold tells the pipeline log why a
+    /// status change can be delayed, with the time of each part of the cycle.
+    #[tokio::test]
+    async fn slow_cycle_is_logged() {
+        let (_server, _temp, mut test) = setup_complete().await;
+        test.automaton.slow_cycle_threshold = Duration::ZERO;
+        let mut follower = test.follow_log().await;
+        test.tick().await;
+
+        let lines = read_log_until_quiet(&mut follower).await;
+        let warning = lines
+            .iter()
+            .find(|line| line.contains("The control plane took"))
+            .unwrap_or_else(|| panic!("no slow cycle warning in {lines:?}"));
+        assert!(warning.contains("WARN"), "{warning}");
+        assert!(
+            warning.contains("so a status change such as a stop can be delayed (database read "),
+            "{warning}"
+        );
+        assert!(warning.contains(", pipeline operations "), "{warning}");
+        assert!(warning.contains(", database write "), "{warning}");
+    }
+
+    /// A cycle under the threshold logs nothing about its time.
+    #[tokio::test]
+    async fn fast_cycle_is_not_logged() {
+        let (_server, _temp, mut test) = setup_complete().await;
+        let mut follower = test.follow_log().await;
+        test.tick().await;
+
+        let lines = read_log_until_quiet(&mut follower).await;
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("The control plane took")),
+            "{lines:?}"
+        );
     }
 }

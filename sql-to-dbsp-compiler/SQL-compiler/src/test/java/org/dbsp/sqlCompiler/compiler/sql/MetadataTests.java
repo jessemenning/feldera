@@ -6,6 +6,9 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.dbsp.sqlCompiler.CompilerMain;
 import org.dbsp.sqlCompiler.circuit.DBSPCircuit;
+import org.dbsp.sqlCompiler.circuit.annotation.OperatorHash;
+import org.dbsp.sqlCompiler.circuit.operator.DBSPSourceLazyMapOperator;
+import org.dbsp.sqlCompiler.circuit.operator.IInputMapOperator;
 import org.dbsp.sqlCompiler.circuit.operator.IInputOperator;
 import org.dbsp.sqlCompiler.compiler.CompilerOptions;
 import org.dbsp.sqlCompiler.compiler.DBSPCompiler;
@@ -18,10 +21,12 @@ import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.CreateTableStatement;
 import org.dbsp.sqlCompiler.compiler.frontend.statements.DeclareViewStatement;
 import org.dbsp.sqlCompiler.compiler.sql.tools.BaseSQLTests;
+import org.dbsp.sqlCompiler.compiler.visitors.outer.TestSerialize;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.derived.DBSPTypeTuple;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
+import org.dbsp.util.HashString;
 import org.dbsp.util.NullPrintStream;
 import org.dbsp.util.Utilities;
 import org.junit.Assert;
@@ -29,7 +34,6 @@ import org.junit.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.PrintWriter;
@@ -41,8 +45,14 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /** Tests about table and view metadata */
@@ -65,6 +75,9 @@ public class MetadataTests extends BaseSQLTests {
         // Create a view named like a system view
         this.statementsFailingInCompilation("CREATE VIEW ERROR_VIEW AS SELECT 2;",
                 "'error_view' already defined");
+        // 'now' is a system table, so no view can carry that name either
+        this.statementsFailingInCompilation("CREATE VIEW now AS SELECT 2;",
+                "'now' already defined");
     }
 
     @Test
@@ -219,6 +232,22 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void testFloatingPointAggregateWarning() {
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation("""
+                CREATE TABLE T(g INT, d DOUBLE, n DECIMAL(10, 2));
+                CREATE VIEW V AS SELECT g, SUM(d), AVG(n) FROM T GROUP BY g;""");
+        compiler.getFinalCircuit(true);
+        TestUtil.assertMessagesContain(compiler, """
+                warning: Inefficient aggregate: SUM over DOUBLE values is inefficient because it uses floating-point arithmetic.  Consider using DECIMAL values if possible.
+                    1|CREATE TABLE T(g INT, d DOUBLE, n DECIMAL(10, 2));
+                    2|CREATE VIEW V AS SELECT g, SUM(d), AVG(n) FROM T GROUP BY g;
+                                                 ^^^^^^""");
+        // The DECIMAL aggregate is linear and produces no warning
+        Assert.assertEquals(1, compiler.messages.warningCount());
+    }
+
+    @Test
     public void testFormatWarnings() {
         String sql = "CREATE TABLE T(d DATE);\n" +
                 "CREATE VIEW V AS SELECT FORMAT_DATE(DATE '2020-10-10', '%Y-%m');";
@@ -234,7 +263,7 @@ public class MetadataTests extends BaseSQLTests {
         TestUtil.assertMessagesContain(compiler, """
                 Format argument does not look like a format string.
                     1|CREATE VIEW V AS SELECT PARSE_TIMESTAMP(10, '%s');
-                                                              ^^""");
+                                              ^^^^^^^^^^^^^^^^^^^^^^^^^""");
 
         compiler = this.chattyCompiler();
         compiler.submitStatementsForCompilation("CREATE VIEW V AS SELECT PARSE_TIMESTAMP('10', '%s');");
@@ -538,6 +567,117 @@ public class MetadataTests extends BaseSQLTests {
                 "Expected a boolean value for property 'skip_unused_columns'");
     }
 
+    /** For each table of a compiled circuit that an input map feeds, whether the map is lazy. */
+    static Map<String, Boolean> lazyInputMaps(DBSPCircuit circuit) {
+        Map<String, Boolean> result = new HashMap<>();
+        for (IInputOperator input : circuit.sourceOperators.values()) {
+            if (input.asOperator().is(IInputMapOperator.class))
+                result.put(input.getTableName().name(), input.asOperator().is(DBSPSourceLazyMapOperator.class));
+        }
+        return result;
+    }
+
+    @Test
+    public void lazyInputMapSurvivesMetadataRebuilds() {
+        DBSPCompiler compiler = this.testCompiler();
+        // The cast in each DEFAULT makes the compiler rebuild the input map with new metadata
+        compiler.submitStatementsForCompilation("""
+                SET FELDERA_LAZY_UPSERT = ON;
+                CREATE TABLE lazy_t(id INT NOT NULL PRIMARY KEY, d DATE DEFAULT '2024-01-01');
+                CREATE TABLE late_t(id INT NOT NULL PRIMARY KEY, d DATE DEFAULT '2024-01-01',
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);""");
+        DBSPCircuit circuit = getCircuit(compiler);
+        Map<String, Boolean> expected = Map.of("lazy_t", true, "late_t", false);
+        Assert.assertEquals(expected, lazyInputMaps(circuit));
+        DBSPCircuit decoded = new TestSerialize(compiler).apply(circuit);
+        Assert.assertEquals(expected, lazyInputMaps(decoded));
+    }
+
+    /** Inserts and deletes do the same to a table with a primary key whether the program
+     * turns lazy upserts on or off, although the table takes the lazy input map in one
+     * program and the eager map in the other: an insert replaces the row with the same
+     * key, and a delete removes it. */
+    @Test
+    public void lazyUpsertKeepsInsertsAndDeletes() {
+        for (String value : List.of("ON", "OFF")) {
+            var ccs = this.getCCS("SET FELDERA_LAZY_UPSERT = " + value + ";" + """
+                    CREATE TABLE t(id INT NOT NULL PRIMARY KEY, v INT);
+                    CREATE VIEW v AS SELECT id, v FROM t;""");
+            ccs.step("INSERT INTO t VALUES (1, 10), (2, 20);", """
+                     id | v  | weight
+                    ------------------
+                     1  | 10 | 1
+                     2  | 20 | 1""");
+            ccs.step("""
+                    INSERT INTO t VALUES (1, 11);
+                    REMOVE FROM t VALUES (2, 20);""", """
+                     id | v  | weight
+                    ------------------
+                     1  | 10 | -1
+                     1  | 11 | 1
+                     2  | 20 | -1""");
+        }
+    }
+
+    /** The persistent id of the input operator of each table of {@code sql}, by table name. */
+    Map<String, HashString> tablePersistentIds(String sql) {
+        DBSPCompiler compiler = this.testCompiler();
+        compiler.submitStatementsForCompilation(sql);
+        DBSPCircuit circuit = getCircuit(compiler);
+        Map<String, HashString> result = new HashMap<>();
+        for (IInputOperator input : circuit.sourceOperators.values())
+            result.put(input.getTableName().name(), OperatorHash.getHash(input.asOperator(), true));
+        return result;
+    }
+
+    /** Lazy upserts change the persistent id of the tables that take the lazy input map,
+     * and of no other table. */
+    @Test
+    public void lazyUpsertChangesTheIdOnlyWithTheMap() {
+        String tables = """
+                CREATE TABLE keyed_t(id INT NOT NULL PRIMARY KEY, s VARCHAR);
+                CREATE TABLE late_t(id INT NOT NULL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);
+                CREATE TABLE keyless_t(id INT, s VARCHAR);""";
+        Map<String, HashString> byDefault = this.tablePersistentIds(tables);
+        Map<String, HashString> off = this.tablePersistentIds("SET FELDERA_LAZY_UPSERT = OFF;" + tables);
+        Map<String, HashString> on = this.tablePersistentIds("SET FELDERA_LAZY_UPSERT = ON;" + tables);
+        Assert.assertEquals(byDefault, off);
+        Assert.assertEquals(Set.of("keyed_t", "late_t", "keyless_t"), on.keySet());
+        Assert.assertNotEquals(off.get("keyed_t"), on.get("keyed_t"));
+        for (String table : List.of("late_t", "keyless_t"))
+            Assert.assertEquals(table, off.get(table), on.get(table));
+    }
+
+    /** A program that turns lazy upserts on feeds every table with a primary key and no
+     * LATENESS through the lazy input map; off, the default, keeps every table on the
+     * eager map.  The SET statement applies wherever it appears, here after the tables,
+     * and is a known setting. */
+    @Test
+    public void lazyUpsertDecidesForEveryKeyedTable() {
+        String tables = """
+                CREATE TABLE t1(id INT NOT NULL PRIMARY KEY, s VARCHAR);
+                CREATE TABLE t2(id INT NOT NULL PRIMARY KEY, s VARCHAR);
+                CREATE TABLE late_t(id INT NOT NULL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 MINUTE);
+                CREATE TABLE keyless_t(id INT, s VARCHAR);
+                """;
+        Map<String, Boolean> lazy = Map.of("t1", true, "t2", true, "late_t", false);
+        Map<String, Boolean> eager = Map.of("t1", false, "t2", false, "late_t", false);
+        for (String value : List.of("ON", "true", "OFF", "false", "")) {
+            DBSPCompiler compiler = this.testCompiler();
+            // An empty value leaves the setting out.
+            compiler.submitStatementsForCompilation(
+                    value.isEmpty() ? tables : tables + "SET FELDERA_LAZY_UPSERT = " + value + ";");
+            DBSPCircuit circuit = getCircuit(compiler);
+            boolean on = value.equals("ON") || value.equals("true");
+            Assert.assertEquals(value, on ? lazy : eager, lazyInputMaps(circuit));
+            // Test compilers are quiet, which keeps warnings out of messages.toString().
+            for (var message : compiler.messages.messages)
+                Assert.assertFalse(message.toString(), message.toString().contains("Unknown setting"));
+        }
+    }
+
     @Test
     public void issue5436() {
         DBSPCompiler compiler = this.chattyCompiler();
@@ -640,6 +780,20 @@ public class MetadataTests extends BaseSQLTests {
                 Note that UNION never reorders fields.
                 First type: (x INTEGER, y INTEGER)
                 Mismatched type: (y INTEGER, x INTEGER)""");
+    }
+
+    /** Two views with the same definition always have the same contents. */
+    @Test
+    public void identicalViews() {
+        DBSPCompiler compiler = this.chattyCompiler();
+        compiler.submitStatementsForCompilation("""
+                CREATE TABLE T(x INT, y INT);
+                CREATE VIEW V1 AS SELECT x FROM T WHERE y > 0;
+                CREATE VIEW V2 AS SELECT x FROM T WHERE y > 0;""");
+        DBSPCircuit circuit = compiler.getFinalCircuit(false);
+        Assert.assertNotNull(circuit);
+        TestUtil.assertMessagesContain(compiler.messages,
+                "warning: Identical views: View 'v2' always has the same contents as view 'v1'");
     }
 
     @Test
@@ -904,6 +1058,12 @@ public class MetadataTests extends BaseSQLTests {
                         }
                     }
 
+                    impl dbsp::dynamic::OrdRepr<I256Wrapper> for ArchivedI256Wrapper {
+                        fn ord_cmp(&self, other: &I256Wrapper) -> std::cmp::Ordering {
+                            I256::from_be_bytes(self.bytes).cmp(&other.data)
+                        }
+                    }
+
                     pub type i128_sum_accumulator_type = I256Wrapper;
 
                     pub fn i128_sum_map(val: ByteArray) -> i128_sum_accumulator_type {
@@ -949,22 +1109,9 @@ public class MetadataTests extends BaseSQLTests {
                 }]');
                 CREATE MATERIALIZED VIEW V AS SELECT * FROM T;""";
 
-        // Save a copy of cargo.toml
-        Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
-        Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
+        // The UDF names adapterlib, which the 'adapterlib' feature of the test crate supplies
         File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         try {
-            Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
-            String cargoContents = Utilities.readFile(cargo);
-            cargoContents = cargoContents.replace("[dependencies]",
-                    """
-                            [dependencies]
-                            feldera-adapterlib = { path = "../../crates/adapterlib" }
-                            """);
-            PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
-            p.write(cargoContents);
-            p.close();
-
             PrintWriter udfWriter = new PrintWriter(udf, StandardCharsets.UTF_8);
             udfWriter.println("""
                     use feldera_adapterlib::format::{ParseError, Splitter};
@@ -1006,10 +1153,7 @@ public class MetadataTests extends BaseSQLTests {
                 throw new RuntimeException(messages.toString());
             BaseSQLTests.compileAndTestRust(false);
         } finally {
-            // Restore cargo.toml
             cleanupUdf();
-            Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
-            Utilities.deleteFile(cargoBackup.toFile(), true);
         }
     }
 
@@ -1026,22 +1170,9 @@ public class MetadataTests extends BaseSQLTests {
                    "config": {}
                 }]') AS SELECT * FROM T;""";
 
-        // Save a copy of cargo.toml
-        Path cargo = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml");
-        Path cargoBackup = Paths.get(RUST_DIRECTORY, "..", "Cargo.toml.bak");
-        File udf = Paths.get(RUST_DIRECTORY, "udf.rs").toFile();
+        // The UDF names adapterlib, which the 'adapterlib' feature of the test crate supplies
+        File udf = Paths.get(RUST_DIRECTORY, DBSPCompiler.UDF_FILE_NAME).toFile();
         try {
-            Files.copy(cargo, cargoBackup, StandardCopyOption.REPLACE_EXISTING);
-            String cargoContents = Utilities.readFile(cargo);
-            cargoContents = cargoContents.replace("[dependencies]",
-                    """
-                            [dependencies]
-                            feldera-adapterlib = { path = "../../crates/adapterlib" }
-                            """);
-            PrintWriter p = new PrintWriter(cargo.toFile(), StandardCharsets.UTF_8);
-            p.write(cargoContents);
-            p.close();
-
             PrintWriter udfWriter = new PrintWriter(udf, StandardCharsets.UTF_8);
             udfWriter.println("""
                     use feldera_adapterlib::format::{ParseError, Splitter};
@@ -1078,13 +1209,9 @@ public class MetadataTests extends BaseSQLTests {
             if (messages.errorCount() > 0)
                 throw new RuntimeException(messages.toString());
             BaseSQLTests.compileAndTestRust(false);
-            // Truncate udf file to 0 bytes
-            FileWriter writer = new FileWriter(udf);
-            writer.close();
         } finally {
-            // Restore cargo.toml
-            Files.copy(cargoBackup, cargo, StandardCopyOption.REPLACE_EXISTING);
-            Utilities.deleteFile(cargoBackup.toFile(), true);
+            // A udf.rs left behind here would break every later test that builds this crate
+            cleanupUdf();
         }
     }
 
@@ -1159,8 +1286,11 @@ public class MetadataTests extends BaseSQLTests {
     @Test
     public void testDefaultConnectorMetadata() throws IOException, InterruptedException, SQLException {
         String sql = """
-                CREATE TABLE T (KAFKA_TOPIC VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['kafka_topic'] AS VARCHAR));
-                CREATE VIEW V AS SELECT KAFKA_TOPIC FROM T;""";
+                CREATE TABLE T (
+                    KAFKA_TOPIC VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['kafka_topic'] AS VARCHAR),
+                    TOPIC_OR_EMPTY VARCHAR NOT NULL DEFAULT COALESCE(CAST(CONNECTOR_METADATA()['topic'] AS VARCHAR), '')
+                );
+                CREATE VIEW V AS SELECT KAFKA_TOPIC, TOPIC_OR_EMPTY FROM T;""";
         File file = createInputScript(sql);
         CompilerMessages messages = CompilerMain.execute("-q", "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
         messages.print();
@@ -1205,6 +1335,10 @@ public class MetadataTests extends BaseSQLTests {
                       Default: <empty string>
                     --format
                       Output the SQL program reformatted
+                      Default: false
+                    --gen2
+                      Compile for the Gen-2 engine: emit the circuit IR (as --jit does) and\s
+                      drop the primary-key columns from the value of an indexed source
                       Default: false
                     --handles
                       Use handles (true) or Catalog (false) in the emitted Rust code
@@ -2077,6 +2211,19 @@ public class MetadataTests extends BaseSQLTests {
         Assert.assertEquals(col, c.pos.getColumnNum());
     }
 
+    @Test
+    public void predefinedNameColumnTest() {
+        // A column can carry the name of a predefined function.  A reference to a
+        // function that SQL calls without parentheses (e.g. current_date) is parsed as
+        // a function call, so such a column has to be qualified or quoted.
+        // In contrast, 'now' always needs parentheses, so `now` is parsed as a column.
+        this.assertCompilesWithoutError("""
+                CREATE TABLE T(user INT, current_date INT, now INT);
+                CREATE VIEW V AS SELECT t.user AS a, "user" AS b,
+                    t.current_date AS c, "current_date" AS d, now AS e
+                FROM T AS t;""");
+    }
+
     /** Verify that {@code sql} is accepted by the SQL compiler without errors. */
     private void assertCompilesWithoutError(String sql) {
         DBSPCompiler compiler = this.testCompiler();
@@ -2364,6 +2511,17 @@ public class MetadataTests extends BaseSQLTests {
     }
 
     @Test
+    public void testSetAfterOtherStatements() {
+        // SET applies to the whole program: the warning emitted while validating
+        // the table is an error even though the SET statement follows the table.
+        this.statementsFailingInCompilation("""
+            CREATE TABLE T(x DECIMAL);
+            CREATE VIEW V AS SELECT x FROM T;
+            SET FELDERA_WARNINGS_ARE_ERRORS = ON;""",
+                "DECIMAL precision and scale unspecified");
+    }
+
+    @Test
     public void issue5896() throws IOException, SQLException {
         String sql = "CREATE VIEW v AS select cot(0)";
         File file = createInputScript(sql);
@@ -2374,5 +2532,118 @@ public class MetadataTests extends BaseSQLTests {
         ObjectMapper mapper = Utilities.deterministicObjectMapper();
         JsonNode parsed = mapper.readTree(json);
         Assert.assertNotNull(parsed);
+    }
+    
+    /** LATENESS on a view inside a recursive component is rejected, both on the declared
+     * recursive view and on a view of the component that needs no declaration. */
+    @Test
+    public void latenessOnRecursiveViewRejected() {
+        String program = """
+                CREATE TABLE t(x INT NOT NULL);
+                DECLARE RECURSIVE VIEW a(x INT NOT NULL);
+                CREATE LOCAL VIEW b AS SELECT x + 1 AS x FROM a WHERE x < 10;
+                CREATE VIEW a AS SELECT x FROM t UNION SELECT x FROM b;
+                """;
+        this.statementsFailingInCompilation(program + "LATENESS a.x 2;",
+                "LATENESS on views inside recursive components is not supported: view 'a'");
+        this.statementsFailingInCompilation(program + "LATENESS b.x 2;",
+                "LATENESS on views inside recursive components is not supported: view 'b'");
+    }
+
+    /** The Rust type of a VARIANT column, from the generated code. */
+    private String variantColumnType(String setStatement) throws IOException, SQLException {
+        File file = createInputScript(setStatement + """
+                CREATE TABLE T(V VARIANT);
+                CREATE VIEW P AS SELECT V FROM T;""");
+        CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        // Every generated file names the enum in deserialize_table_record!,
+        // which passes connector metadata; only the column type varies.
+        String rust = Utilities.readFile(Paths.get(BaseSQLTests.TEST_FILE_PATH));
+        return rust.contains("SqlVariant") ? "SqlVariant" : "Variant";
+    }
+
+
+
+    /** Maps each persistent id in the generated Rust to the operator declaration
+     * that follows it. */
+    private Map<String, String> persistentIds(String setStatement)
+            throws IOException, SQLException {
+        File file = createInputScript(setStatement + """
+                CREATE TABLE T(V VARIANT, K INT);
+                CREATE TABLE U(W VARIANT, K INT);
+                CREATE MATERIALIZED VIEW J AS
+                    SELECT T.V AS A, U.W AS B FROM T JOIN U ON T.K = U.K;
+                CREATE MATERIALIZED VIEW G AS
+                    SELECT V, COUNT(*) AS N FROM T GROUP BY V;
+                CREATE MATERIALIZED VIEW D AS SELECT DISTINCT V FROM T;""");
+        CompilerMain.execute("-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        String rust = Utilities.readFile(Paths.get(BaseSQLTests.TEST_FILE_PATH));
+        Map<String, String> result = new HashMap<>();
+        Matcher m = Pattern.compile(
+                "let hash = Some\\((?:concat!\\()?\"([0-9a-f]+)\"[^;]*;\\s*\\n(.*)")
+                .matcher(rust);
+        while (m.find())
+            result.put(m.group(1), m.group(2));
+        return result;
+    }
+
+    /** Every operator that holds VARIANT-typed state gets a different persistent
+     * id under the two representations.  Persistent ids are hashes of the
+     * generated Rust, and the representation appears in the type of any operator
+     * that stores VARIANT values, so a pipeline resumed after the switch does not
+     * find, and therefore cannot misread, state written in the other format. */
+    @Test
+    public void variantStateIsNotSharedAcrossRepresentations()
+            throws IOException, SQLException {
+        Map<String, String> flat = this.persistentIds("");
+        Map<String, String> legacy = this.persistentIds("SET FELDERA_FLAT_VARIANT = 'off';\n");
+        // Without VARIANT-typed operators the loop below would prove nothing.
+        long variantOperators = flat.values().stream()
+                .filter(declaration -> declaration.contains("SqlVariant")).count();
+        Assert.assertTrue("no VARIANT operators in the program", variantOperators > 0);
+
+        Set<String> shared = new HashSet<>(flat.keySet());
+        shared.retainAll(legacy.keySet());
+        for (String id : shared)
+            Assert.assertFalse(
+                    "operator holding VARIANT state kept its persistent id: " + flat.get(id),
+                    flat.get(id).contains("SqlVariant"));
+
+        // Some ids must move, or the check above proves nothing.
+        Assert.assertNotEquals(flat.keySet(), legacy.keySet());
+    }
+
+    @Test
+    public void flatVariantIsTheDefault() throws IOException, SQLException {
+        Assert.assertEquals("SqlVariant", this.variantColumnType(""));
+    }
+
+    /** FELDERA_FLAT_VARIANT = 'off' still selects the enum representation. */
+    @Test
+    public void flatVariantCanBeTurnedOff() throws IOException, SQLException {
+        Assert.assertEquals("Variant",
+                this.variantColumnType("SET FELDERA_FLAT_VARIANT = 'off';\n"));
+        // The setting must not leak into the next compilation.
+        Assert.assertEquals("SqlVariant", this.variantColumnType(""));
+    }
+
+    /** A VARIANT column defaulted from connector metadata uses the
+     * legacy representation. */
+    @Test
+    public void variantColumnFromConnectorMetadata()
+            throws IOException, InterruptedException, SQLException {
+        File file = createInputScript("""
+                CREATE TABLE T(
+                    V VARIANT DEFAULT CONNECTOR_METADATA()['headers'],
+                    S VARCHAR DEFAULT CAST(CONNECTOR_METADATA()['topic'] AS VARCHAR)
+                );
+                CREATE VIEW P AS SELECT * FROM T;""");
+        CompilerMessages messages = CompilerMain.execute(
+                "-o", BaseSQLTests.TEST_FILE_PATH, file.getPath());
+        if (messages.errorCount() > 0)
+            throw new RuntimeException(messages.toString());
+        String rust = Utilities.readFile(Paths.get(BaseSQLTests.TEST_FILE_PATH));
+        Assert.assertTrue(rust.contains("variant_to_fvN("));
+        BaseSQLTests.compileAndTestRust(false);
     }
 }

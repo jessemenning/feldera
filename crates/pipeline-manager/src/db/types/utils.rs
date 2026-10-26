@@ -13,10 +13,10 @@ use tracing::error;
 
 /// Pattern for non-empty string containing lowercase (a-z), uppercase (A-Z),
 /// number (0-9), underscore (_) or hyphen (-) characters.
-const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN: &str = r"^[a-zA-Z0-9_-]+$";
+pub(crate) const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN: &str = r"^[a-zA-Z0-9_-]+$";
 
 /// Description of the non-empty alphanumeric-underscore-hyphen pattern.
-const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION: &str = "be non-empty and only \
+pub(crate) const PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION: &str = "be non-empty and only \
 contain lowercase (a-z), uppercase (A-Z), number (0-9), underscore (_) or hyphen (-) characters";
 
 /// The pattern is almost the same as for Kubernetes label values but slightly stricter.
@@ -90,7 +90,7 @@ pub const MAXIMUM_DESCRIPTION_LENGTH: usize = 300;
 /// - It cannot be empty
 /// - It must be at most `length_limit` characters long
 /// - It must contain characters that follow the `pattern`
-fn validate_name(
+pub(crate) fn validate_name(
     name: &str,
     length_limit: usize,
     pattern: &str,
@@ -185,6 +185,8 @@ pub enum ValidationError {
     EnterpriseFeature(String),
     #[error("invalid pipeline environment: {0}")]
     InvalidPipelineEnv(String),
+    #[error("invalid dev_tweaks: {0}")]
+    InvalidDevTweaks(String),
 }
 
 /// Deserializes generic JSON value into [`RuntimeConfig`] and performs any additional validation.
@@ -201,14 +203,27 @@ pub(crate) fn validate_runtime_config(
             if runtime_config.fault_tolerance.is_enabled() {
                 let e = ValidationError::EnterpriseFeature("fault tolerance".to_string());
                 if log_if_invalid {
-                    error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
+                    error!(
+                        "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}"
+                    );
                 }
                 return Err(e);
             }
             if let Err(e) = validate_pipeline_env(&runtime_config.env) {
                 let e = ValidationError::InvalidPipelineEnv(e);
                 if log_if_invalid {
-                    error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
+                    error!(
+                        "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}"
+                    );
+                }
+                return Err(e);
+            }
+            if let Err(e) = runtime_config.dev_tweaks.validate() {
+                let e = ValidationError::InvalidDevTweaks(e);
+                if log_if_invalid {
+                    error!(
+                        "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}"
+                    );
                 }
                 return Err(e);
             }
@@ -216,7 +231,9 @@ pub(crate) fn validate_runtime_config(
         }
         Err(e) => {
             if log_if_invalid {
-                error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}");
+                error!(
+                    "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid runtime configuration due to: {e}"
+                );
             }
             Err(e)
         }
@@ -231,10 +248,12 @@ pub(crate) fn validate_program_config(
 ) -> Result<ProgramConfig, ValidationError> {
     let deserialize_result = serde_json::from_value(value.clone())
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
-    if let Err(e) = &deserialize_result {
-        if log_if_invalid {
-            error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid program configuration due to: {e}");
-        }
+    if let Err(e) = &deserialize_result
+        && log_if_invalid
+    {
+        error!(
+            "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid program configuration due to: {e}"
+        );
     }
     deserialize_result
 }
@@ -246,7 +265,9 @@ pub(crate) fn validate_program_info(
     let deserialize_result = serde_json::from_value(value.clone())
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
     if let Err(e) = &deserialize_result {
-        error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid program information due to: {e}");
+        error!(
+            "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid program information due to: {e}"
+        );
     }
     deserialize_result
 }
@@ -261,14 +282,18 @@ pub(crate) fn validate_deployment_config(
         Ok(deployment_config) => {
             if let Err(e) = validate_pipeline_env(&deployment_config.global.env) {
                 let e = ValidationError::InvalidPipelineEnv(e);
-                error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}");
+                error!(
+                    "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}"
+                );
                 Err(e)
             } else {
                 Ok(deployment_config)
             }
         }
         Err(e) => {
-            error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}");
+            error!(
+                "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid deployment configuration due to: {e}"
+            );
             Err(e)
         }
     }
@@ -281,7 +306,9 @@ pub(crate) fn validate_storage_status_details(
     let deserialize_result = serde_json::from_value(value.clone())
         .map_err(|e| ValidationError::DeserializationFailed(e.to_string()));
     if let Err(e) = &deserialize_result {
-        error!("Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid storage status details due to: {e}");
+        error!(
+            "Backward incompatibility detected: the following JSON:\n{value:#}\n\n... is no longer a valid storage status details due to: {e}"
+        );
     }
     deserialize_result
 }
@@ -289,14 +316,14 @@ pub(crate) fn validate_storage_status_details(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_api_key_name, validate_connector_name, validate_deployment_config,
-        validate_description, validate_pipeline_name, validate_program_config,
-        validate_program_info, validate_runtime_config, validate_tags, ValidationError,
         MAXIMUM_API_KEY_NAME_LENGTH, MAXIMUM_CONNECTOR_NAME_LENGTH, MAXIMUM_DESCRIPTION_LENGTH,
-        MAXIMUM_PIPELINE_NAME_LENGTH, MAXIMUM_TAGS_PER_PIPELINE, MAXIMUM_TAG_LENGTH,
+        MAXIMUM_PIPELINE_NAME_LENGTH, MAXIMUM_TAG_LENGTH, MAXIMUM_TAGS_PER_PIPELINE,
         PATTERN_KUBERNETES_LABEL_VALUE, PATTERN_KUBERNETES_LABEL_VALUE_DESCRIPTION,
         PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN,
-        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION,
+        PATTERN_NON_EMPTY_ALPHANUMERIC_UNDERSCORE_HYPHEN_DESCRIPTION, ValidationError,
+        validate_api_key_name, validate_connector_name, validate_deployment_config,
+        validate_description, validate_pipeline_name, validate_program_config,
+        validate_program_info, validate_runtime_config, validate_tags,
     };
     use crate::db::error::DBError;
     use crate::db::types::program::{CompilationProfile, ProgramConfig, ProgramInfo};
@@ -516,7 +543,7 @@ mod tests {
         // Too long.
         let too_long = "a".repeat(MAXIMUM_TAG_LENGTH + 1);
         assert!(matches!(
-            validate_tags(&[too_long.clone()]),
+            validate_tags(std::slice::from_ref(&too_long)),
             Err(DBError::InvalidTag { tag, .. }) if tag == too_long
         ));
         // Disallowed characters.
@@ -599,6 +626,26 @@ mod tests {
             validate_runtime_config(&json!({ "env": { "TOKIO_WORKER_THREADS": "1" } }), true),
             Err(ValidationError::InvalidPipelineEnv(_))
         ));
+
+        // A merge threshold above the bound is rejected; one at the bound is
+        // accepted.
+        assert!(matches!(
+            validate_runtime_config(
+                &json!({ "dev_tweaks": { "integral_merge_threshold_batches": 16 } }),
+                true
+            ),
+            Err(ValidationError::InvalidDevTweaks(s)) if s.contains("integral_merge_threshold_batches")
+        ));
+        assert_eq!(
+            validate_runtime_config(
+                &json!({ "dev_tweaks": { "accumulator_merge_threshold_batches": 15 } }),
+                true
+            )
+            .unwrap()
+            .dev_tweaks
+            .accumulator_merge_threshold_batches,
+            Some(15)
+        );
     }
 
     #[test]
@@ -636,6 +683,7 @@ mod tests {
             udf_stubs: "".to_string(),
             input_connectors: Default::default(),
             output_connectors: Default::default(),
+            circuit_ir: None,
             dataflow: None,
         };
         let value = serde_json::to_value(program_info.clone()).unwrap();

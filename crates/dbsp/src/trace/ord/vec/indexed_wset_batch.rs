@@ -245,9 +245,20 @@ where
     O: OrdOffset,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VecIndexedWSet")
-            .field("layer", &self.layer)
-            .finish()
+        writeln!(f, "VecIndexedWSet:")?;
+        let mut cursor = self.cursor();
+        while let Some(key) = cursor.get_key() {
+            writeln!(f, "    key {key:?}:")?;
+            while let Some(val) = cursor.get_val() {
+                writeln!(f, "        value {val:?}:")?;
+                cursor.map_times(&mut |time, diff| {
+                    let _ = writeln!(f, "            ({time:?}, {diff:?})");
+                });
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        Ok(())
     }
 }
 
@@ -349,7 +360,10 @@ where
         Self {
             layer: self.layer.neg_by_ref(),
             factories: self.factories.clone(),
-            negative_weight_count: self.negative_weight_count,
+            // Negation flips the sign of every weight, and a batch holds no zero
+            // weights, so exactly the records that were positive become negative.
+            negative_weight_count: (self.len_upper_bound() as u64)
+                .saturating_sub(self.negative_weight_count),
             touched_window_count: self.touched_window_count,
         }
     }
@@ -416,6 +430,11 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
+    fn is_empty(&self) -> bool {
+        // `len_upper_bound` is exact for this batch type, which stores only the
+        // (key, value) pairs that its cursor yields.
+        self.len_upper_bound() == 0
+    }
     type Key = K;
     type Val = V;
     type Time = ();
@@ -458,12 +477,12 @@ where
     }*/
 
     #[inline]
-    fn key_count(&self) -> usize {
+    fn key_count_upper_bound(&self) -> usize {
         self.layer.keys()
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    fn len_upper_bound(&self) -> usize {
         self.layer.tuples()
     }
 
@@ -564,6 +583,13 @@ where
     R: WeightTrait + ?Sized,
     O: OrdOffset,
 {
+    fn value_count_upper_bound(&self) -> usize {
+        // The layer stores a key's values contiguously, so the value cursor's
+        // bounds are the count.
+        let (start, end) = self.cursor.child.bounds();
+        end - start
+    }
+
     // fn key_factory(&self) -> &'static Factory<K> {
     //     self.cursor.storage.factories.key
     // }

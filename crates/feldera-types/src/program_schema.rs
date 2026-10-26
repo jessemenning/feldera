@@ -197,7 +197,11 @@ pub struct ProgramSchemaPropertiesOnly {
 #[cfg_attr(feature = "testing", derive(proptest_derive::Arbitrary))]
 pub struct PropertyValue {
     pub value: String,
+    #[serde(default)]
+    #[schema(required = true)]
     pub key_position: SourcePosition,
+    #[serde(default)]
+    #[schema(required = true)]
     pub value_position: SourcePosition,
 }
 
@@ -283,6 +287,9 @@ pub struct RelationPropertiesOnly {
     pub name: SqlIdentifier,
     #[serde(default)]
     pub properties: BTreeMap<String, PropertyValue>,
+    /// Whether the relation is declared `MATERIALIZED`.
+    #[serde(default)]
+    pub materialized: bool,
 }
 
 /// A SQL field.
@@ -297,7 +304,6 @@ pub struct Field {
     pub lateness: Option<String>,
     pub default: Option<String>,
     pub unused: bool,
-    pub watermark: Option<String>,
 }
 
 impl Field {
@@ -308,7 +314,6 @@ impl Field {
             lateness: None,
             default: None,
             unused: false,
-            watermark: None,
         }
     }
 
@@ -356,7 +361,6 @@ impl<'de> Deserialize<'de> for Field {
             #[serde(default)]
             unused: bool,
             lateness: Option<String>,
-            watermark: Option<String>,
         }
 
         fn helper_to_field(helper: FieldHelper) -> Field {
@@ -403,7 +407,6 @@ impl<'de> Deserialize<'de> for Field {
                 default: helper.default,
                 unused: helper.unused,
                 lateness: helper.lateness,
-                watermark: helper.watermark,
             }
         }
 
@@ -1335,10 +1338,7 @@ mod tests {
             ] {
                 let value1: SqlType = serde_json::from_str(&format!("\"{}\"", sql_str))
                     .unwrap_or_else(|e| {
-                        panic!(
-                            "\"{sql_str}\" should deserialize into its SQL type: {}",
-                            e.to_string()
-                        )
+                        panic!("\"{sql_str}\" should deserialize into its SQL type: {}", e)
                     });
                 assert_eq!(value1, expected_value);
                 let serialized_str =
@@ -1766,7 +1766,6 @@ mod tests {
                         lateness: None,
                         default: None,
                         unused: false,
-                        watermark: None,
                     }]),
                     key: None,
                     value: None,
@@ -1774,7 +1773,6 @@ mod tests {
                 lateness: None,
                 default: None,
                 unused: false,
-                watermark: None,
             }
         );
     }

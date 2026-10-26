@@ -16,6 +16,9 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.dbsp.sqlCompiler.ir.DBSPNode;
+import org.dbsp.sqlCompiler.compiler.errors.SourcePositionRange;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /** Deserialize data serialized by either {@link ToJsonOuterVisitor}
  * or {@link ToJsonInnerVisitor}. */
@@ -41,6 +44,10 @@ public class JsonDecoder {
     final Cache<IDBSPInnerNode> inner;
     final Cache<IDBSPOuterNode> outer;
     public final RelDataTypeFactory typeFactory;
+    /** True while decoding an incremental circuit, whose sources carry deltas */
+    boolean incremental = false;
+    /** True while decoding the operators inside a nested operator, which all carry deltas */
+    boolean nested = false;
 
     public JsonDecoder(RelDataTypeFactory typeFactory) {
         this.inner = new Cache<>();
@@ -105,14 +112,47 @@ public class JsonDecoder {
             if (!isStatic)
                 throw new RuntimeException(cls + ".fromJson is not static");
             IDBSPNode result = (IDBSPNode) method.invoke(null, node, this);
+            // The JSON carries at most one position per node: the inner IR JSON writer emits the single
+            // position of the node's CalciteObject.
+            // Operators keep a list of positions in their CalciteRelNode; but the outer IR JSON writer does
+            // not serialize them, so operators do not deserialize positions.
+            // A node that already has a position was built by an enclosing fromJson from one of
+            // its children and keeps it.  The fromJson methods that return process-wide singletons
+            // (DBSPTypeAny.INSTANCE, DBSPVariantNullLiteral.INSTANCE) are safe: those classes have
+            // no constructor taking a Calcite object, so their JSON never carries a position.
+            JsonNode position = object.get("position");
+            if (position != null && result instanceof DBSPNode dbspNode && dbspNode.getNode().isEmpty())
+                dbspNode.setSourcePosition(SourcePositionRange.fromJson(position));
             if (outer)
                 this.outer.cache(originalId, result);
             else
                 this.inner.cache(originalId, result);
             return result;
-        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-            throw new RuntimeException(e);
+        } catch (InvocationTargetException e) {
+            throw new RuntimeException("Error decoding " + cls.asText() + " with id " + originalId, e.getCause());
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            throw new RuntimeException("Class " + cls.asText() + " has no static fromJson(JsonNode, JsonDecoder) method", e);
         }
+    }
+
+    /** Called by DBSPCircuit.fromJson before it decodes the operators. */
+    public void setIncremental(boolean incremental) {
+        this.incremental = incremental;
+    }
+
+    /** Called by DBSPNestedOperator.fromJson around the decoding of its operators;
+     * returns the previous value, to restore afterwards. */
+    public boolean setNested(boolean nested) {
+        boolean previous = this.nested;
+        this.nested = nested;
+        return previous;
+    }
+
+    /** The kind of stream a source operator decoded at this point produces.  The kind is not
+     * serialized: it follows from the circuit mode and from the position of the operator, so
+     * the JSON hashed into persistent ids is unchanged. */
+    public StreamKind sourceKind() {
+        return (this.incremental || this.nested) ? StreamKind.DELTA : StreamKind.COLLECTION;
     }
 
     public <T extends IDBSPOuterNode> T decodeOuter(JsonNode node, Class<T> clazz) {

@@ -3,7 +3,7 @@ use crate::{
     algebra::{OrdIndexedZSet, OrdIndexedZSetFactories},
     circuit::{
         OwnershipPreference,
-        circuit_builder::register_replay_stream,
+        bootstrap::register_replay_stream,
         metadata::{BatchSizeStats, INPUT_BATCHES_STATS, OUTPUT_BATCHES_STATS, OperatorMeta},
         operator_traits::Operator,
         splitter_output_chunk_size, splitter_output_first_chunk_size,
@@ -182,13 +182,12 @@ where
                 &factories.output_factories,
                 Box::new(move |(k, v_rn), f| {
                     let (v, rn) = v_rn.split();
-                    let (row_number, num_rows) = unsafe { rn.downcast::<(RankType, RankType)>() };
-                    let mut row_number = *row_number;
+                    let (first_row_number, num_rows) =
+                        unsafe { rn.downcast::<(RankType, RankType)>() };
 
-                    for _ in 0..*num_rows {
+                    for row_number in *first_row_number..*first_row_number + *num_rows {
                         k.clone_to(&mut out_k);
                         output_func(row_number, v, &mut out_v);
-                        row_number += 1;
                         f(&mut out_k, &mut out_v);
                     }
                 }),
@@ -419,8 +418,8 @@ where
 {
     fn eval(
         self: std::rc::Rc<Self>,
-        delta: &Option<Spine<OrdIndexedZSet<K, V>>>,
-        delayed_trace: &Spine<RankedBatch<K, V>>,
+        delta: Cow<'_, Option<Spine<OrdIndexedZSet<K, V>>>>,
+        delayed_trace: Cow<'_, Spine<RankedBatch<K, V>>>,
     ) -> impl AsyncStream<Item = (RankedBatch<K, V>, bool, Option<Position>)> + 'static {
         let chunk_size = splitter_output_chunk_size();
 
@@ -428,7 +427,7 @@ where
         //     "{}: AggregateIncremental::eval({delta:?})",
         //     Runtime::worker_index()
         // );
-        let delta = delta.as_ref().map(|b| b.ro_snapshot());
+        let delta = (*delta).as_ref().map(|b| b.ro_snapshot());
 
         // We assume that delta.is_some() implies that the operator is being flushed,
         // since the integral is always flushed in the same step as delta.
@@ -445,7 +444,7 @@ where
                 return;
             };
 
-            self.input_batch_stats.borrow_mut().add_batch(delta.len());
+            self.input_batch_stats.borrow_mut().add_batch(delta.len_upper_bound());
 
             // println!("delta");
             // for (k, v, w) in delta.iter() {
@@ -585,7 +584,7 @@ where
                                 has_values = false;
                             }
                             let result = builder.done();
-                            self.output_batch_stats.borrow_mut().add_batch(result.len());
+                            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                             yield (result, false, joint_cursor.position());
                             builder = <RankedBatch::<K, V> as Batch>::Builder::with_capacity(&self.batch_factories, chunk_size + 1, chunk_size + 1);
                         }
@@ -611,7 +610,7 @@ where
                             builder.push_key(delta_cursor.key());
                             has_values = false;
                             let result = builder.done();
-                            self.output_batch_stats.borrow_mut().add_batch(result.len());
+                            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
                             yield (result, false, delta_cursor.position());
                             builder = <RankedBatch::<K, V> as Batch>::Builder::with_capacity(&self.batch_factories, chunk_size + 1, chunk_size + 1);
                         }
@@ -627,7 +626,7 @@ where
             }
 
             let result = builder.done();
-            self.output_batch_stats.borrow_mut().add_batch(result.len());
+            self.output_batch_stats.borrow_mut().add_batch(result.len_upper_bound());
             yield (result, true, None);
         }
     }

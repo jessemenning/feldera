@@ -26,13 +26,31 @@ export {
   advanceSearch,
   applySearchHighlight,
   compileSearchPattern,
+  countOccurrences,
   emptySearchState,
   findMatchOffsets,
   findOccurrence,
+  isFindShortcut,
   searchPatternsEqual,
+  positiveMod,
   type LineMatcher,
   type MatchRange,
+  type SearchDirection,
   type SearchPattern,
+  type SearchProgress,
   type SearchState
 } from './logSearch'
+export { default as SearchBar } from './SearchBar.svelte'
+export { useShortcut } from './useShortcut.svelte'
 export { sliceLinesForCopy, type CopySlice } from './logCopy'
+export { getThemeColor } from './themeColor'
+export { default as ClickFeedback } from './ClickFeedback.svelte'
+export { default as ClipboardCopyButton } from './ClipboardCopyButton.svelte'
+export { default as ConnectorMetricsTables } from './ConnectorMetricsTables.svelte'
+export {
+  statusChipClass,
+  statusCounterClass,
+  statusToneColors,
+  type StatusColors,
+  type StatusTone
+} from './statusTone'

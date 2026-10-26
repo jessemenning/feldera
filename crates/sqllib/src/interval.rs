@@ -10,7 +10,7 @@ use crate::{
     timestamp::{extract_epoch_Date, extract_quarter_Date},
 };
 use dbsp::{algebra::F64, num_entries_scalar};
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use feldera_types::serde_with_context::{
     DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
@@ -44,6 +44,7 @@ use crate::{Time, Timestamp};
     Serialize,
     Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -51,13 +52,6 @@ use crate::{Time, Timestamp};
 pub struct ShortInterval {
     microseconds: i64,
 }
-
-#[doc(hidden)]
-pub fn reinterpret_ShortInterval(value: ShortInterval) -> i64 {
-    value.milliseconds()
-}
-
-some_polymorphic_function1!(reinterpret, ShortInterval, ShortInterval, i64);
 
 #[doc(hidden)]
 impl<D> ::rkyv::Deserialize<ShortInterval, D> for ArchivedShortInterval
@@ -568,6 +562,7 @@ some_function2!(
     Serialize,
     Deserialize,
     IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Clone, Ord, Eq, PartialEq, PartialOrd))]
 #[archive(compare(PartialEq, PartialOrd))]
@@ -607,13 +602,6 @@ impl fmt::Display for LongInterval {
         write!(f, "{sign}{years}-{months:02}")
     }
 }
-
-#[doc(hidden)]
-pub fn reinterpret_LongInterval(value: LongInterval) -> i64 {
-    value.months() as i64
-}
-
-some_polymorphic_function1!(reinterpret, LongInterval, LongInterval, i64);
 
 #[doc(hidden)]
 pub fn abs_LongInterval(value: LongInterval) -> LongInterval {
@@ -1085,3 +1073,10 @@ some_polymorphic_function1!(extract_microsecond, ShortInterval, ShortInterval, i
 some_polymorphic_function1!(extract_second, ShortInterval, ShortInterval, i64);
 some_polymorphic_function1!(extract_minute, ShortInterval, ShortInterval, i64);
 some_polymorphic_function1!(extract_hour, ShortInterval, ShortInterval, i64);
+
+// Hashing the archived form the way the decoded one hashes; see
+// `crate::hash_repr`.
+crate::hash_repr::hash_repr_struct! {
+    ShortInterval => ArchivedShortInterval { microseconds: i64 },
+    LongInterval => ArchivedLongInterval { months: i32 },
+}

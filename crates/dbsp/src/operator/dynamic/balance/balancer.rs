@@ -586,21 +586,25 @@ impl BalancerInner {
         // Check that the new solution is significantly better than the current solution.
 
         // Is the current solution still valid?
-        if let Some(current_solution_cost) =
-            self.validate_solution(&current_effective_policy, &domains)
-        {
+        if Self::solution_is_valid(&current_effective_policy, &domains) {
             if !self.auto_rebalance_enabled {
                 return Ok(solution);
             }
 
-            let new_solution_cost = self.validate_solution(&solution, &domains).unwrap();
-            //println!("new_solution_cost: {:?}", new_solution_cost);
+            // Judge the change by the collections it actually changes.
+            let affected = Self::affected_streams(&current_effective_policy, &solution, &domains);
 
-            if new_solution_cost.0 as f64 * balancer_min_relative_improvement_threshold()
-                < current_solution_cost.0 as f64
-                && new_solution_cost + Cost(balancer_min_absolute_improvement_threshold())
-                    < current_solution_cost
-            {
+            let Some(current_solution_cost) =
+                Self::solution_cost(&current_effective_policy, &domains, &affected)
+            else {
+                return Ok(solution);
+            };
+            let Some(new_solution_cost) = Self::solution_cost(&solution, &domains, &affected)
+            else {
+                return Ok(current_effective_policy);
+            };
+
+            if Self::is_significant_improvement(current_solution_cost, new_solution_cost) {
                 return Ok(solution);
             } else {
                 return Ok(current_effective_policy);
@@ -634,7 +638,7 @@ impl BalancerInner {
             variable_indexes.insert(*stream, variable_index);
         }
 
-        for (_join, (left, right, is_left_join)) in self.clusters[cluster_index].joins.iter() {
+        for (left, right, is_left_join) in self.clusters[cluster_index].joins.values() {
             maxsat.add_constraint(JoinConstraint::new(
                 variable_indexes[left],
                 variable_indexes[right],
@@ -663,18 +667,52 @@ impl BalancerInner {
         Ok(solution)
     }
 
-    fn validate_solution(
-        &self,
+    /// Streams whose partitioning policy differs between two solutions.
+    ///
+    /// These are the collections a rebalancing would actually repartition, and
+    /// the only ones whose cost differs between the two solutions.
+    fn affected_streams(
+        current: &BTreeMap<NodeId, PartitioningPolicy>,
+        new: &BTreeMap<NodeId, PartitioningPolicy>,
+        domains: &BTreeMap<NodeId, BTreeMap<PartitioningPolicy, Cost>>,
+    ) -> BTreeSet<NodeId> {
+        domains
+            .keys()
+            .filter(|stream| current.get(stream) != new.get(stream))
+            .copied()
+            .collect()
+    }
+
+    /// Is the improvement worth the cost of repartitioning?
+    fn is_significant_improvement(current: Cost, new: Cost) -> bool {
+        new.0 as f64 * balancer_min_relative_improvement_threshold() < current.0 as f64
+            && new + Cost(balancer_min_absolute_improvement_threshold()) < current
+    }
+
+    /// Total cost of `solution` over `streams` only.
+    ///
+    /// `None` if any of those streams is missing from `solution` or carries a
+    /// policy outside its domain.
+    fn solution_cost(
         solution: &BTreeMap<NodeId, PartitioningPolicy>,
         domains: &BTreeMap<NodeId, BTreeMap<PartitioningPolicy, Cost>>,
+        streams: &BTreeSet<NodeId>,
     ) -> Option<Cost> {
         let mut total_cost = Cost(0);
-        for (variable, domain) in domains.iter() {
-            let policy = solution.get(variable)?;
-            let cost = domain.get(policy)?;
+        for stream in streams.iter() {
+            let policy = solution.get(stream)?;
+            let cost = domains.get(stream)?.get(policy)?;
             total_cost += *cost;
         }
         Some(total_cost)
+    }
+
+    /// Does `solution` give every stream in `domains` a policy from its domain?
+    fn solution_is_valid(
+        solution: &BTreeMap<NodeId, PartitioningPolicy>,
+        domains: &BTreeMap<NodeId, BTreeMap<PartitioningPolicy, Cost>>,
+    ) -> bool {
+        Self::solution_cost(solution, domains, &domains.keys().copied().collect()).is_some()
     }
 
     /// Solve all clusters and update the solution for each cluster.
@@ -1013,9 +1051,10 @@ impl BalancerInner {
         });
 
         // If at least one worker has flushed the current transaction, then the policy cannot change until the
-        // next transaction. Special case if this is the first step of a new transaction or we are between transactions
-        // (i.e., when set_hint is called) and workers have not had a chance to exchange metadata yet (an alternative
-        // is to introduce another round of metadata exchange after transaction commit).
+        // next transaction. Special case if we are between transactions (i.e., when set_hint is called): the
+        // metadata still describes the previous transaction, whose flush state does not constrain the next one.
+        // The first step of a transaction solves before `start_step` sets `transaction_in_progress`, but by then
+        // the metadata already reflects `start_transaction` (see `MetadataExchange`).
         let fixed_policy = if any_flushed && self.transaction_in_progress {
             // println!("{} metadata: {:?}", Runtime::worker_index(), metadata);
             // All workers must have the same policy.
@@ -1480,7 +1519,7 @@ impl Balancer {
             .collect();
 
         for (index, cluster) in clusters.iter().enumerate() {
-            for (stream, _layer) in cluster.streams.iter() {
+            for stream in cluster.streams.keys() {
                 inner.stream_to_cluster.insert(*stream, index);
             }
         }
@@ -1539,5 +1578,87 @@ impl Balancer {
 
     pub fn display(&self) -> String {
         self.inner.borrow().display()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BalancerInner, PartitioningPolicy};
+    use crate::circuit::NodeId;
+    use crate::operator::dynamic::balance::maxsat::Cost;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A rebalancing is judged by what it repartitions, not by its cluster.
+    ///
+    /// The costs are the ones measured on the ADP work-assignment pipeline's
+    /// cluster of 25 streams: the csv14 join's left input costs 406,764,652 under
+    /// `shard` and 21,650,427 under `balance`, while the rest of the cluster,
+    /// 2,076,650,693, cannot move because it is pinned by `broadcast` hints or has
+    /// already flushed for this transaction.
+    ///
+    /// This pins `affected_streams`, `solution_cost` and `is_significant_improvement`.
+    /// It does not pin the fact that `solve_cluster` calls them with `affected`
+    /// rather than every stream; that wiring needs a `BalancerInner` carrying
+    /// clusters and per-worker metadata.
+    #[test]
+    fn gate_measures_only_the_collections_it_changes() {
+        let skewed = NodeId::new(1);
+        let immovable = NodeId::new(2);
+
+        let domains = BTreeMap::from([
+            (
+                skewed,
+                BTreeMap::from([
+                    (PartitioningPolicy::Shard, Cost(406_764_652)),
+                    (PartitioningPolicy::Balance, Cost(21_650_427)),
+                ]),
+            ),
+            (
+                immovable,
+                BTreeMap::from([(PartitioningPolicy::Broadcast, Cost(2_076_650_693))]),
+            ),
+        ]);
+        let current = BTreeMap::from([
+            (skewed, PartitioningPolicy::Shard),
+            (immovable, PartitioningPolicy::Broadcast),
+        ]);
+        let new = BTreeMap::from([
+            (skewed, PartitioningPolicy::Balance),
+            (immovable, PartitioningPolicy::Broadcast),
+        ]);
+
+        let affected = BalancerInner::affected_streams(&current, &new, &domains);
+        assert_eq!(
+            affected,
+            BTreeSet::from([skewed]),
+            "the pinned stream keeps its policy, so it is not affected"
+        );
+
+        let current_cost = BalancerInner::solution_cost(&current, &domains, &affected).unwrap();
+        let new_cost = BalancerInner::solution_cost(&new, &domains, &affected).unwrap();
+        assert_eq!(current_cost, Cost(406_764_652));
+        assert_eq!(new_cost, Cost(21_650_427));
+        assert!(
+            BalancerInner::is_significant_improvement(current_cost, new_cost),
+            "an 18.8x reduction on the collection being repartitioned is significant"
+        );
+
+        // Summed over the whole cluster the very same change is only a 15.5% cut,
+        // which the default 1.2 relative threshold rejects.
+        let every_stream: BTreeSet<NodeId> = domains.keys().copied().collect();
+        let cluster_current =
+            BalancerInner::solution_cost(&current, &domains, &every_stream).unwrap();
+        let cluster_new = BalancerInner::solution_cost(&new, &domains, &every_stream).unwrap();
+        assert!(
+            !BalancerInner::is_significant_improvement(cluster_current, cluster_new),
+            "cluster-wide ratio is {:.4}, under the 1.2 threshold",
+            cluster_current.0 as f64 / cluster_new.0 as f64
+        );
+
+        // The saving itself is identical either way: only the yardstick changes.
+        assert_eq!(
+            cluster_current.0 - cluster_new.0,
+            current_cost.0 - new_cost.0
+        );
     }
 }

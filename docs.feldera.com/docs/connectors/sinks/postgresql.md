@@ -32,10 +32,11 @@ in the PostgreSQL table.
 | `ssl_client_key_location`        | string  |                | The path to the client certificate key file in PEM format. Takes lower precedence than `ssl_client_key`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `ssl_certificate_chain_location` | string  |                | The path to the certificate chain file. The file must contain a sequence of PEM-formatted certificates, the first being the leaf certificate, and the remainder forming the chain of certificates up to and including the trusted root certificate.                                                                                                                                                                                                                                                                                                                         |
 | `verify_hostname`                | boolean | `true`         | True to enable hostname verification when using TLS. True by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `max_records_in_buffer`          | integer |                | The maximum number of records in a single buffer. If not specified, there is no explicit limit on the number of records, but the buffer may still be constrained by `max_buffer_size_bytes`.                                                                                                                                                                                                                                                                                                                                                                                |
-| `max_buffer_size_bytes`          | integer | `1048576`      | The maximum buffer size (in bytes) for a single operation. Buffers for `INSERT`, `UPDATE`, and `DELETE` queries are maintained separately. Default is 1 MiB (`1048576` bytes).                                                                                                                                                                                                                                                                                                                                                                                              |
+| `max_records_in_buffer`          | integer |                | The maximum number of records in a single buffer. If not specified, there is no explicit limit on the number of records, but the buffer may still be constrained by `max_buffer_size`.                                                                                                                                                                                                                                                                                                                                                                                |
+| `max_buffer_size`                | string  | `"1Mi"`        | The maximum buffer size for a single operation, such as `"1Mi"`. `max_buffer_size_bytes`, a number of bytes, is a deprecated alias. Buffers for `INSERT`, `UPDATE`, and `DELETE` queries are maintained separately. Default is 1 MiB (`1048576` bytes).                                                                                                                                                                                                                                                                                                                                                                                              |
 | `on_conflict_do_nothing`         | bool    | `false`        | Specifies how the connector handles conflicts when executing an `INSERT` into a table with a primary key. By default, an existing row with the same key is overwritten. Setting this flag to `true` preserves the existing row and ignores the new insert. <p> This setting does not affect `UPDATE` statements, which always replace the value associated with the key.</p><p>**This setting has no effect when `mode = "cdc"`, since all operations are performed as append-only `INSERT`s into the target table. Any conflict in CDC mode will result in an error.**</p> |
 | `threads`                        | integer | `1`            | Number of parallel worker threads used to write to PostgreSQL. Each worker opens its own connection and handles a disjoint partition of the data. Increasing this value can improve throughput for large batches. Must be at least 1.                                                                                                                                                                                                                                                                                                                                       |
+| `extra_columns`                  | array of strings |        | The list of PostgreSQL columns that the Feldera view does not write. The connector writes the value last set by the `set_extra_columns` command into each of them; see [Extra columns](#extra-columns).                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
 [*]: Required fields
 
@@ -43,6 +44,32 @@ The schema of the PostgreSQL table should match the schema of the Feldera view, 
 
 - Narrower Feldera types such as `INT2` and `FLOAT4` can be stored in wider PostgreSQL column types like `INT8` and `FLOAT8` respectively.
 - Columns in the PostgreSQL table that are **nullable** or have **default** values may be omitted from the Feldera view.
+
+### Extra columns
+
+A PostgreSQL table may have more columns than the Feldera view that writes to
+it, e.g., a batch label. The value of `extra_columns` is the list of these
+columns. The `set_extra_columns` connector command sets the values written to
+them while the pipeline runs:
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:8080/v0/pipelines/{pipeline_name}/views/{view_name}/connectors/{connector_name}/command" \
+  -H "Content-Type: application/json" \
+  -d '{"set_extra_columns": {"batch_label": "2026-01-17-morning", "loaded_by": "nightly-job"}}'
+```
+
+The command names a subset of `extra_columns`; a name outside that list is
+rejected, and the error lists the permitted names. Every row the connector
+writes from then on carries the values in effect at the time, until a later
+command changes them. A `null` value writes SQL NULL. The response echoes the
+values of every extra column set so far.
+
+Values set this way are not part of the pipeline's checkpointed state, so a
+pipeline that restarts writes NULL into these columns until the command is
+issued again. Each extra column must therefore be nullable; a column default
+does not help, because the connector always names the column in its `INSERT`
+and so writes an explicit NULL rather than letting PostgreSQL apply the default.
 
 ### Write modes
 
@@ -87,7 +114,7 @@ If `ssl_ca_pem` is not specified, the connection will default to **plaintext**.
 Example:
 
 ```sql
-create materialized view v1 with (
+CREATE MATERIALIZED VIEW v1 WITH (
     'connectors' = '[{
         "index": "v1_idx",
         "transport": {
@@ -102,8 +129,8 @@ create materialized view v1 with (
             }
         }
     }]'
-) as select * from t0;
-create index v1_idx on v1(id);
+) AS SELECT * FROM t0;
+CREATE INDEX v1_idx ON v1(id);
 ```
 
 ## Data type mapping
@@ -157,7 +184,7 @@ connector.
 ```sql
 -- Feldera SQL
 -- Create a table and fill it with 5 randomly generated records.
-create table t0 (id int, s varchar) with (
+CREATE TABLE t0 (id INT, s VARCHAR) WITH (
   'connectors' = '[{
     "transport": {
       "name": "datagen",
@@ -173,7 +200,7 @@ create table t0 (id int, s varchar) with (
 
 -- Create a view that will contain a copy of all records in table `t0` and
 -- attach a Postgres output connector to it.
-create materialized view v1 with (
+CREATE MATERIALIZED VIEW v1 WITH (
     'connectors' = '[{
         "index": "v1_idx",
         "transport": {
@@ -184,11 +211,11 @@ create materialized view v1 with (
             }
         }
     }]'
-) as select * from t0;
+) AS SELECT * FROM t0;
 
 -- Index `v1` using `id` column as a key. The Postgres connector requires this
 -- index to group updates by key.
-create index v1_idx on v1(id);
+CREATE INDEX v1_idx ON v1(id);
 ```
 
 :::important
@@ -248,8 +275,8 @@ CREATE TABLE all_types_example (
   }]'
 );
 
-create materialized view v1
-with (
+CREATE MATERIALIZED VIEW v1
+WITH (
     'connectors' = '[{
         "index": "v1_idx",
         "transport": {
@@ -261,8 +288,8 @@ with (
         }
     }]'
 )
-as select * from all_types_example;
-create index v1_idx on v1(my_int2);
+AS SELECT * FROM all_types_example;
+CREATE INDEX v1_idx ON v1(my_int2);
 ```
 
 Now we create the equivalent table in PostgreSQL.
@@ -277,8 +304,8 @@ CREATE TABLE all_types_example (
     my_char_array        CHAR[],
     my_varchar           VARCHAR(50),
     my_varchar_array     VARCHAR(50)[],
-    my_name              NAME,
-    my_name_array        NAME[],
+    my_name              name,
+    my_name_array        name[],
     my_date              DATE,
     my_date_array        DATE[],
     my_time              TIME,
@@ -310,11 +337,11 @@ that Feldera has written to it:
 
 ```sql
 -- PostgreSQL
-SELECT count(*) FROM all_types_example;
- count
+SELECT COUNT(*) FROM all_types_example;
+ COUNT
 -------
      5
-(1 row)
+(1 ROW)
 ```
 
 ### Outputting multi-dimensional arrays

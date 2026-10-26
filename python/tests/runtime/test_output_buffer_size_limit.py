@@ -4,7 +4,7 @@ Test for the default value of ``max_output_buffer_size_records``.
 Output buffering decouples the rate at which the pipeline produces changes from
 the rate at which they are pushed to an output connector.  The buffer is flushed
 when either of two thresholds is crossed: it has held data for longer than
-``max_output_buffer_time_millis`` or it has accumulated more than
+``max_output_buffer_time`` or it has accumulated more than
 ``max_output_buffer_size_records`` records.
 
 ``max_output_buffer_size_records`` defaults to 10,000,000 records, which bounds
@@ -20,7 +20,7 @@ size cap.
 import json
 
 from feldera import Pipeline, PipelineBuilder
-from feldera.runtime_config import RuntimeConfig
+from feldera.runtime_config import Resources, RuntimeConfig
 from feldera.testutils import FELDERA_TEST_NUM_WORKERS
 from tests import TEST_CLIENT
 from tests.utils import DeltaTestLocation, wait_for_condition
@@ -51,7 +51,7 @@ def test_output_buffer_flushes_at_default_size_limit(pipeline_name):
         },
         # The Delta sink needs an index on the view to write with threads > 1.
         "index": "v_idx",
-        # Enable buffering but set neither ``max_output_buffer_time_millis``
+        # Enable buffering but set neither ``max_output_buffer_time``
         # nor ``max_output_buffer_size_records``, so the buffer relies on the
         # default 10M size cap to flush.
         "enable_output_buffer": True,
@@ -90,7 +90,13 @@ CREATE INDEX v_idx ON v(id);
         TEST_CLIENT,
         name=pipeline_name,
         sql=sql,
-        runtime_config=RuntimeConfig(workers=FELDERA_TEST_NUM_WORKERS),
+        runtime_config=RuntimeConfig(
+            workers=FELDERA_TEST_NUM_WORKERS,
+            # Buffering 10M+ records for the Delta sink peaks near 2 GiB;
+            # the default 1 GiB request under-reserves, and the kubelet
+            # evicts the pod when a packed node runs out of memory.
+            resources=Resources(memory_mb_min=4096),
+        ),
     ).create_or_replace()
 
     pipeline.start()

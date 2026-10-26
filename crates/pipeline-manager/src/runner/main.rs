@@ -1,5 +1,4 @@
 use crate::api::error::ApiError;
-use crate::api::util::parse_url_parameter;
 use crate::config::CommonConfig;
 use crate::db::listen_table::{Operation, PIPELINE_NOTIFY_CHANNEL_CAPACITY};
 use crate::db::probe::DbProbe;
@@ -10,10 +9,14 @@ use crate::error::ManagerError;
 use crate::runner::error::RunnerError;
 use crate::runner::pipeline_automata::PipelineAutomaton;
 use crate::runner::pipeline_executor::PipelineExecutor;
-use crate::runner::pipeline_logs::{LogMessage, LogsSender};
+use crate::runner::pipeline_logs::{
+    FollowMode, FollowRequest, FollowerMessage, LOGS_EPOCH_HEADER, LOGS_GAP_HEADER,
+    LOGS_SEQ_HEADER, LogMessage, LogsQuery, LogsSender,
+};
 use actix_web::HttpResponse;
+use actix_web::HttpResponseBuilder;
 use actix_web::Responder;
-use actix_web::{get, web, HttpRequest, HttpServer};
+use actix_web::{HttpServer, get, web};
 use async_stream::try_stream;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -22,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::spawn;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -46,7 +49,12 @@ const MAXIMUM_BUFFERED_LINES_PER_FOLLOWER: usize = 100_000;
 const PIPELINE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Type alias shorthand for the pipelines state the runner manager maintains and interacts with.
-type PipelinesState = BTreeMap<PipelineId, (JoinHandle<()>, Arc<Notify>, Sender<Sender<String>>)>;
+type PipelinesState = BTreeMap<PipelineId, (JoinHandle<()>, Arc<Notify>, Sender<FollowRequest>)>;
+
+/// How long the logs endpoint gives the logs thread to report a resuming follower's
+/// position. Set below `RunnerInteraction::RUNNER_HTTP_REQUEST_TIMEOUT` so the API server
+/// receives a response head rather than a timeout.
+const RESUME_POSITION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Returns whether the runner is healthy.
 /// The health check consults the continuous probe of database reachability.
@@ -56,8 +64,14 @@ async fn get_healthz(data: web::Data<Arc<Mutex<DbProbe>>>) -> Result<impl Respon
 }
 
 /// Produces a continuous stream of logs which are received from the pipeline runner.
+///
+/// `emit_end_notice` appends a closing `Logs have ended` line. It is suppressed for
+/// cursor-aware followers, whose body must contain one line per sequence number and
+/// nothing else for them to derive their next cursor by counting. Such a follower learns
+/// the same fact from the body ending without a transport error.
 async fn logs_stream(
-    mut receiver: Receiver<String>,
+    mut receiver: Receiver<FollowerMessage>,
+    emit_end_notice: bool,
 ) -> impl Stream<Item = Result<web::Bytes, actix_web::Error>> {
     try_stream! {
         loop {
@@ -67,12 +81,85 @@ async fn logs_stream(
                     // This can occur when the pipeline is deleted or the runner restarts.
                     break;
                 }
-                Some(line) => {
+                Some(FollowerMessage::Line(line)) => {
                     yield actix_web::web::Bytes::from(format!("{line}\n"));
+                }
+                Some(FollowerMessage::Resume { .. }) => {
+                    // Consumed by `get_logs` before the body starts, and sent at most once
+                    // per follower, so the stream never encounters one.
                 }
             }
         }
-        yield actix_web::web::Bytes::from("Logs have ended\n")
+        if emit_end_notice {
+            yield actix_web::web::Bytes::from("Logs have ended\n")
+        }
+    }
+}
+
+/// Outcome of waiting for a resuming follower's position.
+#[derive(Debug, PartialEq)]
+enum ResumePosition {
+    /// Where the follower's catch-up starts, as the epoch, sequence number and gap.
+    Reported(Uuid, u64, u64),
+    /// The logs thread dropped the follower, so no line follows either.
+    NoFollower,
+    /// The logs thread did not answer within the allotted time.
+    TimedOut,
+}
+
+/// Reads a resuming follower's position.
+///
+/// The wait is bounded so a wedged logs thread costs the caller a retry rather than the
+/// whole request.
+async fn resume_position(
+    receiver: &mut Receiver<FollowerMessage>,
+    within: Duration,
+) -> ResumePosition {
+    // Resolves as soon as the logs thread services the request, which is the same instant
+    // the first line would have been produced.
+    match timeout(within, receiver.recv()).await {
+        Ok(Some(FollowerMessage::Resume { epoch, seq, gap })) => {
+            ResumePosition::Reported(epoch, seq, gap)
+        }
+        // The logs thread dropped the follower, closing the channel.
+        Ok(None) => ResumePosition::NoFollower,
+        Ok(Some(FollowerMessage::Line(line))) => {
+            error!(
+                "Logs thread sent a line ahead of a resuming follower's position, and it is dropped: {line}"
+            );
+            ResumePosition::NoFollower
+        }
+        Err(_) => {
+            error!(
+                "Logs thread did not report a resuming follower's position within {within:?}: the request is answered with an error"
+            );
+            ResumePosition::TimedOut
+        }
+    }
+}
+
+/// Adds a resolved position to the response head.
+///
+/// The logs thread skips the lines the cursor names whether or not the position reaches the
+/// caller, so a body sent without the position headers reads as a full catch-up that is
+/// missing its beginning. A caller whose position did not arrive is sent back to retry.
+fn apply_resume_position(
+    builder: &mut HttpResponseBuilder,
+    position: ResumePosition,
+) -> Result<(), ManagerError> {
+    match position {
+        ResumePosition::Reported(epoch, seq, gap) => {
+            builder
+                .append_header((LOGS_EPOCH_HEADER, epoch.to_string()))
+                .append_header((LOGS_SEQ_HEADER, seq.to_string()))
+                .append_header((LOGS_GAP_HEADER, gap.to_string()));
+            Ok(())
+        }
+        // No position, and no lines either. The caller keeps its cursor and retries.
+        ResumePosition::NoFollower => Ok(()),
+        ResumePosition::TimedOut => Err(ManagerError::from(
+            RunnerError::RunnerInteractionLogPositionTimeout,
+        )),
     }
 }
 
@@ -80,10 +167,11 @@ async fn logs_stream(
 #[get("/logs/{pipeline_id}")]
 async fn get_logs(
     data: web::Data<Arc<Mutex<PipelinesState>>>,
-    req: HttpRequest,
+    query: web::Query<LogsQuery>,
+    path: web::Path<String>,
 ) -> Result<impl Responder, ManagerError> {
     // Parse pipeline identifier
-    let pipeline_id = parse_url_parameter(&req, "pipeline_id")?;
+    let pipeline_id = path.into_inner();
     let pipeline_id = PipelineId(Uuid::from_str(&pipeline_id).map_err(|e| {
         ManagerError::from(ApiError::InvalidUuidParam {
             value: pipeline_id.clone(),
@@ -91,40 +179,63 @@ async fn get_logs(
         })
     })?);
 
+    // Parse what the follower asks to receive. The API server validates the cursor too;
+    // the runner repeats it because it also serves callers that do not pass through the
+    // API server.
+    let mode = query.follow_mode().map_err(|e| {
+        ManagerError::from(ApiError::InvalidLogCursorParam {
+            value: query.cursor.clone().unwrap_or_default(),
+            error: e,
+        })
+    })?;
+    // A snapshot ends by design, so it gets no "Logs have ended" notice.
+    let emit_end_notice = matches!(mode, FollowMode::Full);
+    // A resuming follower is answered with its position, which the logs thread sends ahead
+    // of every line and which has to be in hand before the response head goes out.
+    let resolves_position = matches!(mode, FollowMode::Resume(_));
+
+    // Take a handle to the logs thread and release the pipelines lock before waiting on it.
+    // The reconciliation loop takes the same lock, so holding it across the wait below would
+    // stall pipeline discovery for as long as the logs thread takes to answer.
+    let follow_request_sender = match data.lock().await.get(&pipeline_id) {
+        None => return Ok(HttpResponse::NotFound().finish()),
+        Some((_, _, follow_request_sender)) => follow_request_sender.clone(),
+    };
+
     // Attempt to follow the logs and return them in a streaming response
-    match data.lock().await.get(&pipeline_id) {
-        None => Ok(HttpResponse::NotFound().finish()),
-        Some((_, _, follow_request_sender)) => {
-            let (sender, receiver) = channel::<String>(MAXIMUM_BUFFERED_LINES_PER_FOLLOWER);
-            match follow_request_sender.try_send(sender) {
-                Ok(()) => {
-                    // Streaming response with explicit content type of text/plain with UTF-8,
-                    // and requesting the browser to abide by it. The reason is to avoid
-                    // browsers (in particular, Chrome) not yet displaying the content because
-                    // they want more data to infer the content type (even though it was provided).
-                    Ok(HttpResponse::Ok()
-                        .content_type("text/plain; charset=utf-8")
-                        .append_header(("X-Content-Type-Options", "nosniff"))
-                        .streaming(logs_stream(receiver).await))
-                }
-                Err(e) => {
-                    match e {
-                        TrySendError::Full(_) => {
-                            error!("Unable to follow pipeline logs because the request channel is full");
-                            Err(ManagerError::from(
-                                RunnerError::RunnerInteractionLogFollowRequestChannelFull,
-                            ))
-                        }
-                        TrySendError::Closed(_) => {
-                            error!("Unable to follow pipeline logs because the request channel is closed");
-                            Err(ManagerError::from(
-                                RunnerError::RunnerInteractionLogFollowRequestChannelClosed,
-                            ))
-                        }
-                    }
-                }
+    let (sender, mut receiver) = channel::<FollowerMessage>(MAXIMUM_BUFFERED_LINES_PER_FOLLOWER);
+    match follow_request_sender.try_send(FollowRequest { sender, mode }) {
+        Ok(()) => {
+            // Streaming response with explicit content type of text/plain with UTF-8,
+            // and requesting the browser to abide by it. The reason is to avoid
+            // browsers (in particular, Chrome) not yet displaying the content because
+            // they want more data to infer the content type (even though it was provided).
+            let mut builder = HttpResponse::Ok();
+            builder
+                .content_type("text/plain; charset=utf-8")
+                .append_header(("X-Content-Type-Options", "nosniff"));
+            if resolves_position {
+                apply_resume_position(
+                    &mut builder,
+                    resume_position(&mut receiver, RESUME_POSITION_TIMEOUT).await,
+                )?;
             }
+            Ok(builder.streaming(logs_stream(receiver, emit_end_notice).await))
         }
+        Err(e) => match e {
+            TrySendError::Full(_) => {
+                error!("Unable to follow pipeline logs because the request channel is full");
+                Err(ManagerError::from(
+                    RunnerError::RunnerInteractionLogFollowRequestChannelFull,
+                ))
+            }
+            TrySendError::Closed(_) => {
+                error!("Unable to follow pipeline logs because the request channel is closed");
+                Err(ManagerError::from(
+                    RunnerError::RunnerInteractionLogFollowRequestChannelClosed,
+                ))
+            }
+        },
     }
 }
 
@@ -249,7 +360,9 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                     }
                 }
                 None => {
-                    error!("Runner main: listen notifier sending side has disconnected -- no longer able to send notifications");
+                    error!(
+                        "Runner main: listen notifier sending side has disconnected -- no longer able to send notifications"
+                    );
                     break;
                 }
             }
@@ -269,7 +382,9 @@ async fn reconcile<E: PipelineExecutor + 'static>(
         match db.lock().await.list_pipeline_ids_across_all_tenants().await {
             Ok(pipeline_ids) => {
                 if db_error_previously {
-                    info!("Runner main: again able to retrieve pipeline identifiers from the database. Any new pipelines will be retroactively detected.");
+                    info!(
+                        "Runner main: again able to retrieve pipeline identifiers from the database. Any new pipelines will be retroactively detected."
+                    );
                     db_error_previously = false;
                 }
                 for (tenant_id, pipeline_id) in pipeline_ids {
@@ -280,7 +395,7 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                         .or_insert_with(|| {
                             let notifier = Arc::new(Notify::new());
                             let (follow_request_sender, follow_request_receiver) =
-                                channel::<Sender<String>>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
+                                channel::<FollowRequest>(MAXIMUM_OUTSTANDING_LOG_FOLLOW_REQUESTS);
                             let (logs_sender, logs_receiver) =
                                 channel::<LogMessage>(MAXIMUM_BUFFERED_LINES_PER_FOLLOWER);
                             let logs_sender = LogsSender::new(logs_sender);
@@ -313,7 +428,9 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                 }
             }
             Err(e) => {
-                error!("Runner main: unable to retrieve pipeline identifiers from the database. Any new pipelines are not detected until again able to. Error: {e}");
+                error!(
+                    "Runner main: unable to retrieve pipeline identifiers from the database. Any new pipelines are not detected until again able to. Error: {e}"
+                );
                 db_error_previously = true;
             }
         }
@@ -344,5 +461,480 @@ async fn reconcile<E: PipelineExecutor + 'static>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{
+        FollowMode, FollowRequest, FollowerMessage, LOGS_EPOCH_HEADER, LOGS_GAP_HEADER,
+        LOGS_SEQ_HEADER, LogMessage, PipelineId, PipelinesState, RESUME_POSITION_TIMEOUT,
+        ResumePosition, apply_resume_position, get_logs, logs_stream, resume_position,
+    };
+    use crate::runner::pipeline_logs::start_thread_pipeline_logs;
+    use actix_web::http::StatusCode;
+    use actix_web::{App, test as actix_test, web};
+    use actix_web::{HttpResponse, HttpResponseBuilder, ResponseError};
+    use futures_util::StreamExt;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::spawn;
+    use tokio::sync::mpsc::{Receiver, Sender, channel};
+    use tokio::sync::{Mutex, Notify, oneshot};
+    use uuid::Uuid;
+
+    /// Drains a logs stream fed by `lines`, returning the body it produced.
+    async fn body_of(lines: &[&str], emit_end_notice: bool) -> String {
+        let (sender, receiver) = channel::<FollowerMessage>(10);
+        for line in lines {
+            sender
+                .send(FollowerMessage::Line(line.to_string()))
+                .await
+                .expect("send failed");
+        }
+        drop(sender);
+
+        let mut stream = Box::pin(logs_stream(receiver, emit_end_notice).await);
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            body.push_str(std::str::from_utf8(&chunk.expect("stream failed")).expect("not UTF-8"));
+        }
+        body
+    }
+
+    /// Followers that do not use a cursor keep the closing notice they have always seen.
+    #[tokio::test]
+    async fn end_notice_is_kept_without_a_cursor() {
+        assert_eq!(
+            body_of(&["one", "two"], true).await,
+            "one\ntwo\nLogs have ended\n"
+        );
+    }
+
+    /// A cursor-aware follower derives its next position by counting the lines it receives,
+    /// so the body must hold one line per sequence number and nothing else. It learns the
+    /// stream ended from the body ending without a transport error.
+    #[tokio::test]
+    async fn end_notice_is_suppressed_for_a_cursor() {
+        assert_eq!(body_of(&["one", "two"], false).await, "one\ntwo\n");
+    }
+
+    /// A logs thread wired into the state the endpoint reads, preloaded with lines.
+    struct LogsFixture {
+        pipeline_id: PipelineId,
+        pipelines: Arc<Mutex<PipelinesState>>,
+        epoch: Uuid,
+        terminate: oneshot::Sender<()>,
+        logs_sender: Sender<LogMessage>,
+        follow_sender: Sender<FollowRequest>,
+    }
+
+    impl LogsFixture {
+        /// Waits until the logs thread has serviced every follow request submitted so far.
+        /// Requests arrive over one channel in order, so a later one being serviced proves
+        /// the earlier ones were. Without this the terminate below can win the thread's
+        /// `select!` and the endpoint's follower is dropped before it is caught up.
+        async fn settle(&self) {
+            let (sender, mut probe) = channel::<FollowerMessage>(10);
+            self.follow_sender
+                .try_send(FollowRequest {
+                    sender,
+                    mode: FollowMode::Resume(None),
+                })
+                .unwrap_or_else(|_| panic!("unable to submit follow request"));
+            recv(&mut probe).await;
+        }
+
+        /// Ends the stream so a response body can be read to completion.
+        fn close(self) {
+            drop(self.logs_sender);
+            let _ = self.terminate.send(());
+        }
+    }
+
+    async fn recv(receiver: &mut Receiver<FollowerMessage>) -> FollowerMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("timed out waiting for a follower message")
+            .expect("follower channel was closed")
+    }
+
+    async fn logs_fixture(lines: &[&str]) -> LogsFixture {
+        let pipeline_id = PipelineId(Uuid::now_v7());
+        let (follow_sender, follow_receiver) = channel::<FollowRequest>(10);
+        let (logs_sender, logs_receiver) = channel::<LogMessage>(1000);
+        let (terminate, _join_handle) = start_thread_pipeline_logs(
+            pipeline_id.to_string(),
+            "test-pipeline",
+            follow_receiver,
+            logs_receiver,
+        );
+
+        // Attach a probe follower before sending anything: draining it is what proves the
+        // thread has appended the lines, and its position is where the epoch comes from.
+        let (probe_sender, mut probe) = channel::<FollowerMessage>(1000);
+        follow_sender
+            .try_send(FollowRequest {
+                sender: probe_sender,
+                mode: FollowMode::Resume(None),
+            })
+            .unwrap_or_else(|_| panic!("unable to submit follow request"));
+        let epoch = match recv(&mut probe).await {
+            FollowerMessage::Resume { epoch, .. } => epoch,
+            FollowerMessage::Line(line) => panic!("expected a position, received: {line}"),
+        };
+        recv(&mut probe).await; // The thread's own opening line, which holds sequence 1.
+
+        for line in lines {
+            logs_sender
+                .send(LogMessage::new_from_pipeline(line))
+                .await
+                .unwrap_or_else(|_| panic!("unable to send log line"));
+            recv(&mut probe).await;
+        }
+
+        let mut pipelines = BTreeMap::new();
+        pipelines.insert(
+            pipeline_id,
+            (
+                spawn(async {}),
+                Arc::new(Notify::new()),
+                follow_sender.clone(),
+            ),
+        );
+        LogsFixture {
+            pipeline_id,
+            pipelines: Arc::new(Mutex::new(pipelines)),
+            epoch,
+            terminate,
+            logs_sender,
+            follow_sender,
+        }
+    }
+
+    /// Reads the endpoint's response, ending the stream so the body can complete.
+    ///
+    /// The position it reports is all three headers or none. A caller that received only
+    /// some of them could not form a cursor, so a partial set is a failure rather than a
+    /// response to be interpreted.
+    async fn response_at(
+        fixture: LogsFixture,
+        uri: String,
+    ) -> (StatusCode, Option<(Uuid, u64, u64)>, String) {
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(fixture.pipelines.clone()))
+                .service(get_logs),
+        )
+        .await;
+        let response =
+            actix_test::call_service(&app, actix_test::TestRequest::get().uri(&uri).to_request())
+                .await;
+        let status = response.status();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|value| value.to_str().expect("header is not text").to_string())
+        };
+        let position = match (
+            header(LOGS_EPOCH_HEADER),
+            header(LOGS_SEQ_HEADER),
+            header(LOGS_GAP_HEADER),
+        ) {
+            (Some(epoch), Some(seq), Some(gap)) => Some((
+                Uuid::parse_str(&epoch).expect("epoch header is not a UUID"),
+                seq.parse().expect("sequence header is not a number"),
+                gap.parse().expect("gap header is not a number"),
+            )),
+            (None, None, None) => None,
+            partial => panic!("response carries only part of a position: {partial:?}"),
+        };
+        fixture.settle().await;
+        fixture.close();
+        let body = actix_test::read_body(response).await;
+        (
+            status,
+            position,
+            std::str::from_utf8(&body)
+                .expect("body is not UTF-8")
+                .to_string(),
+        )
+    }
+
+    /// The cursor survives the trip through the query string. The position is reported in
+    /// the headers and the body holds only the lines the caller is missing, with no line
+    /// the caller has to tell apart from a log line.
+    #[tokio::test]
+    async fn get_logs_resumes_from_a_cursor() {
+        let fixture = logs_fixture(&["one", "two", "three"]).await;
+        let epoch = fixture.epoch;
+        // Sequence 1 is the thread's opening line, so "one" holds 2 and a cursor at 2 is
+        // owed "two" and "three".
+        let uri = format!("/logs/{}?cursor={}:2", fixture.pipeline_id, epoch);
+        let (status, position, body) = response_at(fixture, uri).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(position, Some((epoch, 2, 0)));
+        assert_eq!(body, "two\nthree\n");
+    }
+
+    /// A caller already level with the stream is told where it stands and given an empty
+    /// body. The position rides in the headers, so it does not wait on a log line that may
+    /// never arrive.
+    #[tokio::test]
+    async fn get_logs_reports_the_position_with_nothing_to_send() {
+        let fixture = logs_fixture(&["one"]).await;
+        let epoch = fixture.epoch;
+        let uri = format!("/logs/{}?cursor={}:2", fixture.pipeline_id, epoch);
+        let (status, position, body) = response_at(fixture, uri).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(position, Some((epoch, 2, 0)));
+        assert_eq!(body, "");
+    }
+
+    /// The position reaches a caller over a real connection ahead of any log line.
+    ///
+    /// A caller level with the stream has no line coming, so the response head has to
+    /// travel on its own. `init_service` never touches a socket and so cannot show that:
+    /// were the head held back until the first body byte, this request would never return.
+    #[actix_web::test]
+    async fn position_headers_arrive_before_any_log_line() {
+        crate::ensure_default_crypto_provider(); // awc's connector wants one installed.
+        let fixture = logs_fixture(&["one"]).await;
+        let pipelines = fixture.pipelines.clone();
+        let server = ::actix_test::start(move || {
+            App::new()
+                .app_data(web::Data::new(pipelines.clone()))
+                .service(get_logs)
+        });
+
+        // Sequence 1 is the opening line and "one" holds 2, so this caller is level with
+        // the stream and no line follows the head.
+        let response = awc::Client::new()
+            .get(server.url(&format!(
+                "/logs/{}?cursor={}:2",
+                fixture.pipeline_id, fixture.epoch
+            )))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .expect("no response head arrived");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(LOGS_SEQ_HEADER)
+                .expect("no position"),
+            "2"
+        );
+        fixture.close();
+    }
+
+    /// Omitting the cursor leaves the stream exactly as callers have always seen it: no
+    /// position headers, the whole buffer, and the closing notice.
+    #[tokio::test]
+    async fn get_logs_without_a_cursor_is_unchanged() {
+        let fixture = logs_fixture(&["one", "two"]).await;
+        let uri = format!("/logs/{}", fixture.pipeline_id);
+        let (status, position, body) = response_at(fixture, uri).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(position, None);
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(
+            lines[0].contains("Fresh start of pipeline logs"),
+            "unexpected opening line: {}",
+            lines[0]
+        );
+        assert_eq!(&lines[1..], ["one", "two", "Logs have ended"]);
+    }
+
+    /// A malformed cursor can only come from a broken client, so it is rejected rather
+    /// than quietly reinterpreted as some other position.
+    #[tokio::test]
+    async fn get_logs_rejects_a_malformed_cursor() {
+        let fixture = logs_fixture(&[]).await;
+        let uri = format!("/logs/{}?cursor=nonsense", fixture.pipeline_id);
+        let (status, _, _) = response_at(fixture, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `follow=false` ends the body after the buffer, with no closing notice.
+    #[tokio::test]
+    async fn get_logs_without_follow_ends_after_the_buffer() {
+        let fixture = logs_fixture(&["one", "two"]).await;
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(fixture.pipelines.clone()))
+                .service(get_logs),
+        )
+        .await;
+        let uri = format!("/logs/{}?follow=false", fixture.pipeline_id);
+        let response =
+            actix_test::call_service(&app, actix_test::TestRequest::get().uri(&uri).to_request())
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The fixture stays open, so only the snapshot itself can end this body.
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            actix_test::read_body(response),
+        )
+        .await
+        .expect("the body did not end after the buffer");
+        let body = std::str::from_utf8(&body).expect("body is not UTF-8");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(
+            lines[0].contains("Fresh start of pipeline logs"),
+            "unexpected opening line: {}",
+            lines[0]
+        );
+        assert_eq!(&lines[1..], ["one", "two"]);
+        fixture.close();
+    }
+
+    /// A snapshot has no position, so `cursor` with `follow=false` is refused.
+    #[tokio::test]
+    async fn get_logs_rejects_a_cursor_without_follow() {
+        let fixture = logs_fixture(&[]).await;
+        let uri = format!("/logs/{}?cursor=&follow=false", fixture.pipeline_id);
+        let (status, _, _) = response_at(fixture, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A logs thread that never reports a position costs the caller a retry. An unbounded
+    /// wait would hold the request until the API server's proxy timeout reported the runner
+    /// as unreachable.
+    #[tokio::test]
+    async fn resume_position_gives_up_on_a_silent_thread() {
+        // The sender is held, so the channel stays open and nothing is ever sent on it.
+        let (_sender, mut receiver) = channel::<FollowerMessage>(1);
+        assert_eq!(
+            resume_position(&mut receiver, Duration::from_millis(10)).await,
+            ResumePosition::TimedOut
+        );
+    }
+
+    /// The names of the position headers, as they appear on a response.
+    fn position_headers(builder: &mut HttpResponseBuilder) -> Vec<String> {
+        builder
+            .finish()
+            .headers()
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .filter(|name| name.starts_with("feldera-logs-"))
+            .collect()
+    }
+
+    /// A caller whose position did not arrive is sent back to retry. Handing it the body
+    /// would hand it a catch-up missing its beginning, since the lines its cursor named
+    /// have already been skipped.
+    #[test]
+    fn a_position_that_timed_out_is_a_retryable_error() {
+        let error = apply_resume_position(&mut HttpResponse::Ok(), ResumePosition::TimedOut)
+            .expect_err("a timed-out position is answered with the body");
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A dropped follower receives no lines, so a response head without a position tells
+    /// the caller nothing it does not already learn from the empty body.
+    #[test]
+    fn a_dropped_follower_carries_no_position() {
+        let mut builder = HttpResponse::Ok();
+        apply_resume_position(&mut builder, ResumePosition::NoFollower)
+            .expect("a dropped follower is answered with an error");
+        assert_eq!(position_headers(&mut builder), Vec::<String>::new());
+    }
+
+    /// A reported position reaches the caller as the three headers it reads it from.
+    #[test]
+    fn a_reported_position_becomes_headers() {
+        let epoch = Uuid::now_v7();
+        let mut builder = HttpResponse::Ok();
+        apply_resume_position(&mut builder, ResumePosition::Reported(epoch, 7, 2))
+            .expect("a reported position is answered with an error");
+        let response = builder.finish();
+        let header = |name: &str| response.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header(LOGS_EPOCH_HEADER), epoch.to_string());
+        assert_eq!(header(LOGS_SEQ_HEADER), "7");
+        assert_eq!(header(LOGS_GAP_HEADER), "2");
+    }
+
+    /// The position is the first message a resuming follower receives.
+    #[tokio::test]
+    async fn resume_position_reads_the_position() {
+        let (sender, mut receiver) = channel::<FollowerMessage>(1);
+        let epoch = Uuid::now_v7();
+        sender
+            .send(FollowerMessage::Resume {
+                epoch,
+                seq: 7,
+                gap: 2,
+            })
+            .await
+            .expect("follower is gone");
+        assert_eq!(
+            resume_position(&mut receiver, RESUME_POSITION_TIMEOUT).await,
+            ResumePosition::Reported(epoch, 7, 2)
+        );
+    }
+
+    /// A line ahead of the position means the logs thread is broken, and it is not read as
+    /// a position.
+    #[tokio::test]
+    async fn resume_position_rejects_a_line_sent_ahead_of_it() {
+        let (sender, mut receiver) = channel::<FollowerMessage>(1);
+        sender
+            .send(FollowerMessage::Line("one".to_string()))
+            .await
+            .expect("follower is gone");
+        assert_eq!(
+            resume_position(&mut receiver, RESUME_POSITION_TIMEOUT).await,
+            ResumePosition::NoFollower
+        );
+    }
+
+    /// A follower the logs thread drops is answered without a position, and a caller that
+    /// receives none starts its log over.
+    #[tokio::test]
+    async fn get_logs_answers_without_a_position_when_the_follower_is_dropped() {
+        let pipeline_id = PipelineId(Uuid::now_v7());
+        let (follow_sender, mut follow_receiver) = channel::<FollowRequest>(10);
+        // Takes the request and drops it, which closes the follower's channel.
+        let drop_follower = spawn(async move {
+            follow_receiver.recv().await;
+        });
+        let mut pipelines = BTreeMap::new();
+        pipelines.insert(
+            pipeline_id,
+            (spawn(async {}), Arc::new(Notify::new()), follow_sender),
+        );
+        let pipelines = Arc::new(Mutex::new(pipelines));
+
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(pipelines))
+                .service(get_logs),
+        )
+        .await;
+        let response = actix_test::call_service(
+            &app,
+            actix_test::TestRequest::get()
+                .uri(&format!("/logs/{pipeline_id}?cursor="))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        for name in [LOGS_EPOCH_HEADER, LOGS_SEQ_HEADER, LOGS_GAP_HEADER] {
+            assert!(response.headers().get(name).is_none(), "{name} is reported");
+        }
+        let body = actix_test::read_body(response).await;
+        assert_eq!(std::str::from_utf8(&body).expect("body is not UTF-8"), "");
+        drop_follower.await.expect("follower was never taken");
     }
 }

@@ -321,6 +321,8 @@ These Spark functions exist in Feldera — translate directly:
 | `array_intersect(a, b)` | `ARRAY_INTERSECT(a, b)` | → [GBD-ARRAY-ORDER]: element order may differ from Spark — translate as-is and add NOTE comment per rule |
 | `array_except(a, b)` | `ARRAY_EXCEPT(a, b)` | → [GBD-ARRAY-ORDER]: element order may differ from Spark — translate as-is and add NOTE comment per rule |
 | `array_join(arr, sep)` | `ARRAY_JOIN(arr, sep)` | Alias for ARRAY_TO_STRING |
+| `flatten(nested_arr)` | `ARRAY_FLATTEN(nested_arr)` | Removes one level of nesting; NULL if any inner array is NULL, as in Spark |
+| `slice(arr, start, len)` | `ARRAY_SLICE(arr, start, len)` | Same 1-based indexing and negative-start rule as Spark |
 | `size(arr)` | `COALESCE(CARDINALITY(arr), -1)` | → [GBD-SIZE-NULL]. Do NOT mark unsupported. |
 | `array_size(arr)` | `COALESCE(CARDINALITY(arr), -1)` | Alias of `size()` — same rewrite. Add a warning. Do NOT mark unsupported. |
 | `get(arr, index)` | `arr[index + 1]` | Spark `get()` is **0-based**; Feldera array indexing is **1-based** — add 1 to the index. Add a warning. Do NOT mark unsupported. |
@@ -337,11 +339,12 @@ These Spark functions exist in Feldera — translate directly:
 |-------|---------|-------|
 | `transform(arr, x -> expr)` | `TRANSFORM(arr, x -> expr)` | |
 | `exists(arr, x -> expr)` | `ARRAY_EXISTS(arr, x -> expr)` | |
+| `filter(arr, x -> expr)` | `ARRAY_FILTER(arr, x -> expr)` | Elements whose predicate is NULL are dropped, as in Spark. The indexed form `filter(arr, (x, i) -> expr)` is not supported |
 
 #### 📝 Notes
 
-- `TRANSFORM(arr, x -> expr)` and `ARRAY_EXISTS(arr, x -> expr)` are **supported** — pass through (with name change for `exists`). Do NOT mark them unsupported.
-- `filter`, `zip_with`, `aggregate`, `forall`, `map_filter`, `transform_keys`, `transform_values` are unsupported — see Unsupported section.
+- `TRANSFORM(arr, x -> expr)`, `ARRAY_EXISTS(arr, x -> expr)` and `ARRAY_FILTER(arr, x -> expr)` are **supported**: pass through, renaming `exists` and `filter`. Do NOT mark them unsupported.
+- `zip_with`, `aggregate`, `forall`, `map_filter`, `transform_keys`, `transform_values` are unsupported; see Unsupported section.
 
 #### Map functions
 
@@ -377,6 +380,7 @@ Feldera uses a `VARIANT` type for JSON. Core functions:
 | Function | Purpose |
 |----------|---------|
 | `PARSE_JSON(string)` | JSON string → `VARIANT` |
+| `TRY_PARSE_JSON(string)` | JSON string → `VARIANT`, `NULL` for invalid JSON |
 | `TO_JSON(variant)` | `VARIANT` → JSON string |
 | `CAST(variant AS type)` | Extract typed value from VARIANT |
 
@@ -393,6 +397,7 @@ VARIANT access patterns:
 | Spark | Feldera | Notes |
 |-------|---------|-------|
 | `parse_json(s)` | `PARSE_JSON(s)` | Returns VARIANT |
+| `try_parse_json(s)` | `TRY_PARSE_JSON(s)` | Returns VARIANT; NULL for invalid JSON |
 | `to_json(v)` | `TO_JSON(v)` | |
 | `json_array_length(s)` | `CARDINALITY(CAST(PARSE_JSON(s) AS VARIANT ARRAY))` | |
 
@@ -1138,7 +1143,7 @@ Do NOT:
 
 | Function | Notes |
 |----------|-------|
-| `filter(arr, lambda)` | Compiler rejects — no equivalent |
+| `filter(arr, (x, i) -> lambda)` | Indexed form has no equivalent; only `filter(arr, x -> lambda)` maps to `ARRAY_FILTER` |
 | `aggregate(arr, init, lambda)` | No equivalent |
 | `forall(arr, lambda)` | No equivalent |
 | `zip_with(a, b, lambda)` | No equivalent |
@@ -1150,9 +1155,7 @@ Do NOT:
 
 | Function | Notes |
 |----------|-------|
-| `flatten(nested_arr)` | No equivalent |
 | `arrays_zip(a, b)` | No equivalent |
-| `slice(arr, start, len)` | No equivalent |
 
 #### Map
 

@@ -10,7 +10,6 @@ using the following grammar:
 ```
 aggregateCall:
       agg '(' [ ALL | DISTINCT ] value [, value ]* ')'
-      [ WITHIN DISTINCT '(' expression [, expression ]* ')' ]
       [ FILTER '(' WHERE condition ')' ]
   |   agg '(' '*' ')' [ FILTER (WHERE condition) ]
 ```
@@ -23,17 +22,16 @@ which condition evaluates to `TRUE`.
 If `DISTINCT` is present, duplicate argument values are eliminated
 before being passed to the aggregate function.
 
-If `WITHIN DISTINCT` is present, argument values are made distinct
-within each value of specified keys before being passed to the
-aggregate function.
-
 Most aggregation functions produce results of the same type as the
 input data, but compute using higher precision intermediate data
 types; aggregation of `UNSIGNED` values uses signed types for
 intermediate results.  If you expect the result to require a higher
-precision than the aggregated data type, we recommend converting the
-data to a wider data type, e.g.: instead of `SELECT SUM(col)`, you
-should write `SELECT SUM(CAST(col AS BIGINT))`.
+precision than the aggregated data type, or if you expect to aggregate
+many values, requiring a higher intermediate precision, we recommend
+converting the data to a wider data type, e.g.: instead of `SELECT
+SUM(col)`, you should write `SELECT SUM(CAST(col AS BIGINT))`.  This
+is particularly important for aggregates that return results quadratic
+in the size of input values, such as `VAR_*` or `REGR_*`.
 
 <table>
   <tr>
@@ -42,7 +40,9 @@ should write `SELECT SUM(CAST(col AS BIGINT))`.
   </tr>
   <tr>
      <td><a id="array_agg"></a><code>ARRAY_AGG([ ALL | DISTINCT ] value [ RESPECT NULLS | IGNORE NULLS ] [ORDER BY orderItem [, orderItem]*] )</code></td>
-     <td>Gathers all values in an array.  If <code>ORDER BY</code> is not present, the order of the values in the array is unspecified (but it is deterministic).</td>
+     <td>Gathers all values in an array.  If <code>ORDER BY</code> is not present, the order of the values in the array is unspecified (but it is deterministic).
+         The array keeps <code>NULL</code> values, unless <code>IGNORE NULLS</code> is specified.
+         Returns an empty array if there are no rows, or if <code>FILTER</code> or <code>IGNORE NULLS</code> removes all values.</td>
   </tr>
   <tr>
      <td><a id="avg"></a><code>AVG( [ ALL | DISTINCT ] numeric)</code></td>
@@ -83,6 +83,16 @@ should write `SELECT SUM(CAST(col AS BIGINT))`.
      <td>Returns the number of input rows for which the condition is true.</td>
   </tr>
   <tr>
+     <td><a id="covar_pop"></a><code>COVAR_POP(y, x)</code></td>
+     <td>Returns the population covariance of the (y, x) pairs; pairs where either value is <code>NULL</code> are ignored.
+         Returns <code>NULL</code> when no pairs remain.  The result has the type of the first argument.</td>
+  </tr>
+  <tr>
+     <td><a id="covar_samp"></a><code>COVAR_SAMP(y, x)</code></td>
+     <td>Returns the sample covariance of the (y, x) pairs; pairs where either value is <code>NULL</code> are ignored.
+         Returns <code>NULL</code> when fewer than two pairs remain.  The result has the type of the first argument.</td>
+  </tr>
+  <tr>
      <td><a id="every"></a><code>EVERY(condition)</code></td>
      <td>Returns <code>TRUE</code> if all of the values of condition are <code>TRUE</code></td>
   </tr>
@@ -101,6 +111,29 @@ should write `SELECT SUM(CAST(col AS BIGINT))`.
   <tr>
      <td><a id="min"></a><code>MIN( [ ALL | DISTINCT ] value)</code></td>
      <td>Returns the minimum value of value across all input values</td>
+  </tr>
+  <tr>
+     <td><a id="mode"></a><code>MODE(value)</code></td>
+     <td>Returns the most frequent value; <code>NULL</code> values are ignored.
+         Returns <code>NULL</code> if all values are <code>NULL</code>, or if there are no rows.
+         The rule for selecting the value is not specified if multiple values are tied for the highest frequency.
+         <code>DISTINCT</code> is not supported.</td>
+  </tr>
+  <tr>
+     <td><a id="regr_count"></a><code>REGR_COUNT(y, x)</code></td>
+     <td>Returns the number of pairs where both y and x are non-<code>NULL</code>.</td>
+  </tr>
+  <tr>
+     <td><a id="regr_sxx"></a><code>REGR_SXX(y, x)</code></td>
+     <td>Returns the sum of squares of deviations of x, the independent variable:
+         <code>REGR_COUNT(y, x) * VAR_POP(x)</code> over the pairs where both values are non-<code>NULL</code>.
+         Returns <code>NULL</code> when no pairs remain.</td>
+  </tr>
+  <tr>
+     <td><a id="regr_syy"></a><code>REGR_SYY(y, x)</code></td>
+     <td>Returns the sum of squares of deviations of y, the dependent variable:
+         <code>REGR_COUNT(y, x) * VAR_POP(y)</code> over the pairs where both values are non-<code>NULL</code>.
+         Returns <code>NULL</code> when no pairs remain.</td>
   </tr>
   <tr>
      <td><a id="some"></a><code>SOME(condition)</code></td>
@@ -146,8 +179,8 @@ other rows are discarded. For example:
 
 ```sql
 SELECT
-    count(*) AS unfiltered,
-    count(*) FILTER (WHERE i < 5) AS filtered
+    COUNT(*) AS unfiltered,
+    COUNT(*) FILTER (WHERE i < 5) AS filtered
 FROM my_table
 ```
 
@@ -170,6 +203,10 @@ The following window aggregate functions are supported:
   <tr>
     <th>Aggregate</th>
     <th>Description</th>
+  </tr>
+  <tr>
+    <td><a id="window-array_agg"></a><code>ARRAY_AGG(</code>value [ RESPECT NULLS | IGNORE NULLS ]<code>)</code></td>
+    <td>Returns an array with the values in window; with <code>IGNORE NULLS</code>, the array omits <code>NULL</code> values</td>
   </tr>
   <tr>
     <td><a id="window-avg"></a><code>AVG(</code>numeric<code>)</code></td>
@@ -270,40 +307,40 @@ PIVOT ( { aggregate_expression [ AS aggregate_expression_alias ] } [ , ... ]
 ### Example
 
 ```sql
-CREATE TABLE FURNITURE (
-   type VARCHAR,
-   year INTEGER,
-   count INTEGER
+CREATE TABLE furniture (
+   TYPE VARCHAR,
+   YEAR INTEGER,
+   COUNT INTEGER
 );
-INSERT INTO FURNITURE VALUES
+INSERT INTO furniture VALUES
   ('chair', 2020, 4),
   ('table', 2021, 3),
   ('chair', 2021, 4),
   ('desk', 2023, 1),
   ('table', 2023, 2);
 
-SELECT year, type, SUM(count) FROM FURNITURE GROUP BY year,type;
-year | type  | sum
+SELECT YEAR, TYPE, SUM(COUNT) FROM furniture GROUP BY YEAR,TYPE;
+YEAR | TYPE  | SUM
 -------------------
 2020 | chair | 4
-2021 | table | 3
+2021 | TABLE | 3
 2021 | chair | 4
 2023 | desk  | 1
-2023 | table | 2
-(5 rows)
+2023 | TABLE | 2
+(5 ROWS)
 
-SELECT * FROM FURNITURE
+SELECT * FROM furniture
 PIVOT (
-    SUM(count) AS ct
-    FOR type IN ('desk' AS desks, 'table' AS tables, 'chair' as chairs)
+    SUM(COUNT) AS ct
+    FOR TYPE IN ('desk' AS desks, 'table' AS tables, 'chair' AS chairs)
 );
 
-year | desks | tables | chairs
+YEAR | desks | tables | chairs
 ------------------------------
 2020 |       |        |    4
 2021 |       |     3  |    4
 2023 |     1 |     2  |
-(3 rows)
+(3 ROWS)
 ```
 
 Notice how the same information is presented in a tabular form where
@@ -313,30 +350,30 @@ that if we add an additional type, the `GROUP BY` query will produce a
 correct result, while the `PIVOT` query will produce the same result.
 
 ```sql
-INSERT INTO FURNITURE VALUES ('bed', 2020, 5);
-SELECT year, type, SUM(count) FROM FURNITURE GROUP BY year,type;
-year | type  | sum
+INSERT INTO furniture VALUES ('bed', 2020, 5);
+SELECT YEAR, TYPE, SUM(COUNT) FROM furniture GROUP BY YEAR,TYPE;
+YEAR | TYPE  | SUM
 -------------------
 2020 | chair | 4
 2020 | bed   | 5
-2021 | table | 3
+2021 | TABLE | 3
 2021 | chair | 4
 2023 | desk  | 1
-2023 | table | 2
-(6 rows)
+2023 | TABLE | 2
+(6 ROWS)
 
-SELECT * FROM FURNITURE
+SELECT * FROM furniture
 PIVOT (
-    SUM(count) AS ct
-    FOR type IN ('desk' AS desks, 'table' AS tables, 'chair' as chairs)
+    SUM(COUNT) AS ct
+    FOR TYPE IN ('desk' AS desks, 'table' AS tables, 'chair' AS chairs)
 );
 
-year | desks | tables | chairs
+YEAR | desks | tables | chairs
 ------------------------------
 2020 |       |        |    4
 2021 |       |     3  |    4
 2023 |     1 |     2  |
-(3 rows)
+(3 ROWS)
 ```
 
 ## On the efficiency of aggregates computations
@@ -383,7 +420,7 @@ reasonable cost in three circumstances:
 ```sql
 SELECT * FROM (
    SELECT empno,
-          row_number() OVER (ORDER BY empno) rn
+          ROW_NUMBER() OVER (ORDER BY empno) rn
    FROM empsalary) emp
 WHERE rn < 3
 ```

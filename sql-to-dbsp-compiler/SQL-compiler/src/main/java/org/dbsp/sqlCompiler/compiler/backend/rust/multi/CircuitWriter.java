@@ -109,7 +109,7 @@ public final class CircuitWriter extends BaseRustCodeGenerator {
             name = input.getName(false);
             this.builder().append("&")
                     .append(name)
-                    .append(".clone(), ");
+                    .append(", ");
         }
         if (node.is(DBSPControlledKeyFilterOperator.class)) {
             DBSPControlledKeyFilterOperator filter = node.to(DBSPControlledKeyFilterOperator.class);
@@ -226,7 +226,10 @@ public final class CircuitWriter extends BaseRustCodeGenerator {
     @Override
     public void write(DBSPCompiler compiler) {
         this.builder().append(COMMON_PREAMBLE);
+        this.builder().append(ALLOW_DEPRECATED_PREAMBLE);
         this.builder().append(STANDARD_PREAMBLE);
+        if (!compiler.options.ioOptions.emitHandles)
+            this.builder().append(CATALOG_PREAMBLE);
         this.builder().append(ALLOC_PREAMBLE);
         Set<String> deps = new HashSet<>(this.dependencies);
         List<String> sorted = Linq.list(deps);

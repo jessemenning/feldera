@@ -9,14 +9,13 @@ use crate::api::main::ServerState;
 use crate::api::support_data_collector::{
     CollectionSummary, SupportBundleData, SupportBundleParameters,
 };
-use crate::db::types::combined_status::{combine_since, CombinedDesiredStatus, CombinedStatus};
+use crate::db::types::combined_status::{CombinedDesiredStatus, CombinedStatus, combine_since};
 use crate::db::types::pipeline::ExtendedPipelineDescrMonitoring;
 use crate::db::{storage::Storage, types::tenant::TenantId};
 use crate::error::ManagerError;
 use actix_web::{
-    get,
+    HttpResponse, get,
     web::{self, Data as WebData, ReqData},
-    HttpResponse,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -97,6 +96,7 @@ impl SupportBundleZip {
         let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated);
+        let options_for = |method: CompressionMethod| options.compression_method(method);
 
         let combined_status = CombinedStatus::new(
             pipeline.deployment_resources_status,
@@ -124,13 +124,16 @@ impl SupportBundleZip {
         for data in bundles.iter() {
             let directory = unique_directory(&timestamp_dir(&data.time), &mut used_dirs);
             let dir_prefix = directory.clone();
-            let mut add_to_zip =
-                |filename: &str, content: &[u8]| -> Result<(), Box<dyn std::error::Error>> {
-                    let path = format!("{}/{}", dir_prefix, filename);
-                    zip.start_file(&path, options)?;
-                    zip.write_all(content)?;
-                    Ok(())
-                };
+            // Already-compressed items (gzip, zip) are stored verbatim
+            let mut add_to_zip = |filename: &str,
+                                  content: &[u8],
+                                  method: CompressionMethod|
+             -> Result<(), Box<dyn std::error::Error>> {
+                let path = format!("{}/{}", dir_prefix, filename);
+                zip.start_file(&path, options_for(method))?;
+                zip.write_all(content)?;
+                Ok(())
+            };
 
             let summary = data
                 .push_to_zip(&mut add_to_zip, params)
@@ -374,6 +377,7 @@ mod tests {
             program_status: ProgramStatus::Pending,
             program_status_since: Default::default(),
             deployment_error: None,
+            deployment_config: None,
             deployment_location: None,
             refresh_version: Version(1),
             storage_status: StorageStatus::Cleared,
@@ -412,7 +416,7 @@ mod tests {
         let mut archive = read_zip(&bundle.buffer);
 
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
 
         // `metadata.txt` and `metadata.json` sit at the root.
@@ -438,6 +442,16 @@ mod tests {
                     .any(|n| n == &format!("{dir}/circuit_profile.zip")),
                 "missing circuit_profile.zip in {dir}"
             );
+            // The JSON profile is stored gzip-compressed, exactly as collected.
+            let json_gz = archive
+                .by_name(&format!("{dir}/circuit_profile.json.gz"))
+                .expect("missing circuit_profile.json.gz");
+            assert_eq!(json_gz.compression(), CompressionMethod::Stored);
+            assert_eq!(
+                json_gz.size(),
+                3,
+                "stored bytes must be the collected bytes"
+            );
             assert!(
                 names
                     .iter()
@@ -459,11 +473,13 @@ mod tests {
         assert_eq!(collections.len(), 2);
         for c in collections {
             assert!(dirs.contains(c["directory"].as_str().unwrap()));
-            assert!(c["collected"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|f| f == "pipeline_events.json"));
+            assert!(
+                c["collected"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f == "pipeline_events.json")
+            );
         }
     }
 
@@ -476,7 +492,7 @@ mod tests {
             .unwrap();
         let mut archive = read_zip(&bundle.buffer);
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert_eq!(names.iter().filter(|n| n.contains('/')).count(), 0);
         assert!(names.iter().any(|n| n == "metadata.txt"));
@@ -498,7 +514,7 @@ mod tests {
             .unwrap();
         let mut archive = read_zip(&bundle.buffer);
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         let dirs: BTreeSet<&str> = names
             .iter()

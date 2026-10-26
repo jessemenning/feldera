@@ -1,3 +1,4 @@
+use crate::size::ConfigSize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -29,15 +30,158 @@ pub enum DeltaTableWriteMode {
     ErrorIfExists,
 }
 
+/// Encoding of `VARIANT` columns written to a Delta table.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+pub enum DeltaVariantEncoding {
+    /// The Delta `variant` type, holding the Parquet variant binary encoding.
+    ///
+    /// Values keep the types they have in Feldera: a date stays a date, a
+    /// decimal a decimal. Requires the `variantType` table feature, which the
+    /// connector enables on tables it creates.
+    #[default]
+    #[serde(rename = "variant")]
+    Variant,
+
+    /// A Delta `string` column holding JSON text.
+    ///
+    /// What Feldera wrote before it supported the Delta `variant` type. Use
+    /// this to append to a table whose `VARIANT` column is already a string,
+    /// or for readers that cannot read the `variant` type. Values that JSON
+    /// cannot express keep their type only approximately: a date becomes a
+    /// string.
+    #[serde(rename = "json_string")]
+    JsonString,
+}
+
+/// How the Delta table connector applies pipeline updates to the target table.
+///
+/// This is orthogonal to `mode`, which governs what happens to an existing table
+/// when the connector starts.
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+pub enum DeltaTableUpdateMode {
+    /// Append a change log.
+    ///
+    /// Every insert and delete becomes a row carrying `__feldera_op` and `__feldera_ts`
+    /// metadata columns. The table is an append-only record of changes, which a
+    /// downstream job folds into a state table.
+    #[default]
+    #[serde(rename = "cdc")]
+    Cdc,
+
+    /// Keep the table in sync with the current contents of the view.
+    ///
+    /// New row versions are appended and superseded rows are tombstoned with Delta
+    /// deletion vectors, so a flush never rewrites a data file. The table holds exactly the
+    /// view's columns, with no metadata columns.
+    ///
+    /// Requires the view to have a unique key (the connector's `index` property) and the
+    /// an existing target table to have `delta.enableDeletionVectors` set to `true`.
+    #[serde(rename = "merge")]
+    Merge,
+}
+
+impl Display for DeltaTableUpdateMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            DeltaTableUpdateMode::Cdc => write!(f, "cdc"),
+            DeltaTableUpdateMode::Merge => write!(f, "merge"),
+        }
+    }
+}
+
+/// Ceiling on `lookup_chunk_size`, in bytes.
+///
+/// The chunk addresses its buffer with 32-bit offsets, so a buffer that reached 4 GiB would
+/// wrap one and mix up where a key ends: the lookup would then compare the wrong bytes and
+/// supersede the wrong rows. Half the addressable range leaves room for the keys a chunk
+/// accumulates between two budget checks, and the chunk fails the flush if a large key
+/// exhausts that room.
+pub const MAX_LOOKUP_CHUNK_BYTES: usize = (u32::MAX / 2) as usize;
+
+/// Default ceiling on the encoded lookup keys held in memory at once.
+///
+/// At roughly 21 bytes per encoded 8-byte key this holds about 12M keys, more than a
+/// steady-state flush produces, so the common case is a single lookup pass.
+const fn default_lookup_chunk_size() -> ConfigSize {
+    ConfigSize::from_mib(256)
+}
+
+fn schema_default_lookup_chunk_size() -> String {
+    default_lookup_chunk_size().to_string()
+}
+
+/// Default number of data files read concurrently while locating rows to supersede.
+///
+/// The lookup reads each file in its own task, so this sets how much of the decoding runs in
+/// parallel as well as how many requests are in flight. Sixteen covers a typical core count
+/// and enough object-store round trips to keep those cores fed, for the projected key column
+/// of sixteen files -- tens of megabytes against the hundreds `lookup_chunk_size` allows.
+const fn default_max_concurrent_probes() -> usize {
+    16
+}
+
+fn is_default<T: Default + Eq>(t: &T) -> bool {
+    *t == T::default()
+}
+
+fn is_default_lookup_chunk_size(n: &ConfigSize) -> bool {
+    *n == default_lookup_chunk_size()
+}
+
+fn is_default_max_concurrent_probes(n: &usize) -> bool {
+    *n == default_max_concurrent_probes()
+}
+
 /// Delta table output connector configuration.
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub struct DeltaTableWriterConfig {
     /// Table URI.
     pub uri: String,
 
+    /// Encoding of `VARIANT` columns.
+    ///
+    /// Default: `variant`.
+    #[serde(default)]
+    pub variant_encoding: DeltaVariantEncoding,
+
     /// Determines how the Delta table connector handles an existing table at the target location.
     #[serde(default)]
     pub mode: DeltaTableWriteMode,
+
+    /// Determines how the connector applies updates to the target table.
+    ///
+    /// See [`DeltaTableUpdateMode`]. When omitted, defaults to
+    /// [`DeltaTableUpdateMode::Cdc`], the historical behavior. `merge` is experimental.
+    // Defaults stay out of the serialized form: a runtime pinned to an older release reads
+    // unknown keys into its string-valued `object_store_config`, where an integer fails.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub update_mode: DeltaTableUpdateMode,
+
+    /// Ceiling on the encoded keys the connector holds while locating the rows to
+    /// supersede, such as `"256Mi"`.
+    ///
+    /// Only used when `update_mode` is `merge`. A flush whose key set exceeds this budget
+    /// is split into successive lookup passes, which bounds memory at the cost of
+    /// re-scanning candidate files. Default: `"256Mi"`. Maximum: `"2147483647"`, one byte
+    /// less than 2 GiB.
+    #[serde(
+        default = "default_lookup_chunk_size",
+        skip_serializing_if = "is_default_lookup_chunk_size"
+    )]
+    #[schema(value_type = String, default = schema_default_lookup_chunk_size)]
+    pub lookup_chunk_size: ConfigSize,
+
+    /// Number of data files read concurrently while locating the rows to supersede.
+    ///
+    /// Only used when `update_mode` is `merge`. Each concurrent read holds one file's
+    /// projected key column, so this bounds memory as well as request concurrency.
+    /// Default: 16.
+    #[serde(
+        default = "default_max_concurrent_probes",
+        skip_serializing_if = "is_default_max_concurrent_probes"
+    )]
+    #[schema(minimum = 1)]
+    pub max_concurrent_probes: usize,
 
     /// Checkpoint interval (i.e., the number of commits after which a new checkpoint should be created) for newly created Delta tables.
     ///
@@ -95,13 +239,32 @@ pub struct DeltaTableWriterConfig {
 
     /// Number of parallel threads used by the connector.
     ///
-    /// Increasing this value can improve Delta Lake write throughput
-    /// by enabling concurrent writes.
+    /// Increasing this value can improve Delta Lake write throughput by enabling concurrent writes.
+    /// Values above 1 require the view to have a unique key, so that the connector can order inserts and deletes correctly.
+    /// With `update_mode: merge` the connector splits a batch only when each thread would get a
+    /// substantial share of it, so a small change still writes one file rather than one small file per thread.
+    /// Define the key with `CREATE INDEX` and set the connector's `index` property to that index;
+    /// see [views with unique keys](https://docs.feldera.com/connectors/sinks/delta/#views-with-unique-keys) and
+    /// [writing in parallel](https://docs.feldera.com/connectors/sinks/delta/#writing-in-parallel).
     ///
     /// Default: 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 1)]
     pub threads: Option<usize>,
+
+    /// Compact the target table from the connector, between flushes.
+    ///
+    /// Only used when `update_mode` is `merge`. Merge mode marks an old row version deleted
+    /// but leaves it in place, so without compaction the table keeps growing and reads slow
+    /// down, however few live rows it holds.
+    ///
+    /// Off by default, because maintenance is normally the table administrator's job. Set it
+    /// for tables where Feldera is the only writer and nothing else compacts the table. See
+    /// "Compaction is required" in the Delta output connector documentation.
+    ///
+    /// Default: `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_compact: bool,
 
     /// Storage options for configuring backend object store.
     ///
@@ -122,7 +285,34 @@ impl DeltaTableWriterConfig {
             validate_delta_interval(duration)
                 .map_err(|e| format!("invalid 'log_retention_duration' value '{duration}': {e}"))?;
         }
+        if self.max_concurrent_probes == 0 {
+            return Err("max_concurrent_probes must be greater than 0".to_string());
+        }
+        if self.lookup_chunk_size.is_zero() {
+            return Err("lookup_chunk_size must be greater than 0".to_string());
+        }
+        if self.auto_compact && self.update_mode != DeltaTableUpdateMode::Merge {
+            return Err("auto_compact only applies to 'update_mode: merge', which \
+                 is the only mode that supersedes rows and therefore the only one that \
+                 needs compacting"
+                .to_string());
+        }
+        if self.lookup_chunk_size > MAX_LOOKUP_CHUNK_BYTES as u64 {
+            return Err(format!(
+                "lookup_chunk_size is {} but must be at most {MAX_LOOKUP_CHUNK_BYTES} bytes \
+                 ({} MiB): the connector locates rows in chunks addressed by 32-bit offsets. \
+                 A larger budget does not speed the lookup up; lower the value.",
+                self.lookup_chunk_size,
+                MAX_LOOKUP_CHUNK_BYTES >> 20,
+            ));
+        }
         Ok(())
+    }
+
+    /// `true` if the connector keeps the target table in sync with the view rather than
+    /// appending a change log.
+    pub fn is_merge(&self) -> bool {
+        self.update_mode == DeltaTableUpdateMode::Merge
     }
 }
 
@@ -170,8 +360,6 @@ fn validate_delta_interval(value: &str) -> Result<(), String> {
 
 /// Delta table read mode.
 ///
-/// Three options are available:
-///
 /// * `snapshot` - read a snapshot of the table and stop.
 ///
 /// * `follow` - continuously ingest changes to the table, starting from a specified version
@@ -179,6 +367,7 @@ fn validate_delta_interval(value: &str) -> Result<(), String> {
 ///
 /// * `snapshot_and_follow` - read a snapshot of the table before switching to continuous ingestion
 ///   mode.
+///
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
 pub enum DeltaTableIngestMode {
     /// Read a snapshot of the table and stop.
@@ -203,6 +392,9 @@ pub enum DeltaTableIngestMode {
     /// In this mode, the connector does not read the initial snapshot of the table
     /// and follows the transaction log starting from the version of the table
     /// specified by the `version` or `datetime` property.
+    ///
+    /// Note: this mode reads a change log the *user* encoded as table rows.  To read
+    /// the change log Delta Lake itself maintains, see the `change_feed` property.
     #[serde(rename = "cdc")]
     Cdc,
 }
@@ -216,6 +408,80 @@ impl Display for DeltaTableIngestMode {
             DeltaTableIngestMode::Cdc => write!(f, "cdc"),
         }
     }
+}
+
+/// Whether the connector reads a Delta table's
+/// [Change Data Feed](https://docs.delta.io/latest/delta-change-data-feed.html).
+///
+/// A table with the `delta.enableChangeDataFeed` property records the rows an
+/// `UPDATE`, `DELETE`, or `MERGE` changed, in a `_change_data` directory. The connector
+/// can read this data in the `follow` and `snapshot_and_follow` mode, which allows
+/// it to ingest the changes to the table more efficiently than by reconstructing
+/// them the data files a commit added and removed. For a
+/// commit that rewrites whole files, the difference is between reading the changed
+/// rows and reading every file those rows lived in.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize, ToSchema, Default)]
+pub enum DeltaTableChangeFeed {
+    /// Read change data when a commit records it; otherwise read the commit's file
+    /// actions.
+    #[serde(rename = "auto")]
+    Auto,
+
+    /// Like `auto`, but fail at startup unless the table has
+    /// `delta.enableChangeDataFeed` set.
+    ///
+    /// Use this when the connector is provisioned for the cost of reading changed
+    /// rows rather than rewritten files: without the property the connector still
+    /// works, but reads as much as `off` does.
+    #[serde(rename = "require")]
+    Require,
+
+    /// Never read change data; reconstruct every change from the files a commit
+    /// added and removed.
+    ///
+    /// The default, until reading the change feed is supported end to end.
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+}
+
+impl Display for DeltaTableChangeFeed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            DeltaTableChangeFeed::Auto => write!(f, "auto"),
+            DeltaTableChangeFeed::Require => write!(f, "require"),
+            DeltaTableChangeFeed::Off => write!(f, "off"),
+        }
+    }
+}
+
+/// Environment override for the default [`DeltaTableChangeFeed`].
+///
+/// Undocumented and temporary; see [`DeltaTableReaderConfig::change_feed`].
+/// Named `DELTA_*` like the connector's other overrides, and deliberately not
+/// `FELDERA_*`, which pipelines may not set (see `ENV_VAR_PREFIX_BLOCKLIST`).
+const CHANGE_FEED_ENV: &str = "DELTA_CHANGE_FEED";
+
+/// The mode [`CHANGE_FEED_ENV`] names, or `off` if it names none.
+///
+/// Kept apart from the lookup so it can be tested without writing to the
+/// process environment, which races every other thread reading it.
+fn parse_change_feed(value: &str) -> DeltaTableChangeFeed {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => DeltaTableChangeFeed::Auto,
+        "require" => DeltaTableChangeFeed::Require,
+        "off" => DeltaTableChangeFeed::Off,
+        _ => {
+            log::warn!("ignoring {CHANGE_FEED_ENV}={value:?}: expected 'auto', 'require' or 'off'");
+            DeltaTableChangeFeed::Off
+        }
+    }
+}
+
+fn default_change_feed() -> DeltaTableChangeFeed {
+    std::env::var(CHANGE_FEED_ENV)
+        .map(|value| parse_change_feed(&value))
+        .unwrap_or_default()
 }
 
 fn default_num_parsers() -> u32 {
@@ -249,8 +515,9 @@ fn default_num_parsers() -> u32 {
 ///
 /// # How transaction log is ingested using transactions
 ///
-/// If the connector is configured in the `follow`, `snapshot_and_follow`, or `cdc` mode, and its
-/// `transaction_mode` is set to `catchup`, it ingests the transaction log in batches. When it starts a
+/// If the connector follows the transaction log (`follow`, `snapshot_and_follow`, or `cdc`
+/// mode), and its `transaction_mode` is set to `catchup`, it ingests the
+/// transaction log in batches. When it starts a
 /// Feldera transaction, it reads the latest available version of the Delta table (capped by `end_version` if set) and
 /// ingests all log entries up to and including that version in a single Feldera transaction before committing. It then
 /// repeats for subsequent versions as they appear in the log.
@@ -297,7 +564,8 @@ pub struct DeltaTableReaderConfig {
 
     /// Table column that serves as an event timestamp.
     ///
-    /// When this option is specified, and `mode` is one of `snapshot` or `snapshot_and_follow`,
+    /// When this option is specified, and `mode` takes an initial snapshot (`snapshot`
+    /// or `snapshot_and_follow`),
     /// table rows are ingested in the timestamp order, respecting the
     /// [`LATENESS`](https://docs.feldera.com/sql/streaming#lateness-expressions)
     /// property of the column: each ingested row has a timestamp no more than `LATENESS`
@@ -337,7 +605,8 @@ pub struct DeltaTableReaderConfig {
     /// tables.
     ///
     /// Note: The simplest way to exclude unused columns is to omit them from the Feldera SQL table
-    /// declaration. The connector never reads columns that aren't declared in the SQL schema.
+    /// declaration. The connector reads an undeclared column only when its own configuration names
+    /// it in `filter`, `snapshot_filter`, `cdc_order_by`, or `cdc_delete_filter`.
     /// Additionally, the SQL compiler emits warnings for declared but unused columns—use these as
     /// a guide to optimize your schema.
     #[serde(default)]
@@ -345,7 +614,8 @@ pub struct DeltaTableReaderConfig {
 
     /// Optional snapshot filter.
     ///
-    /// This option is only valid when `mode` is set to `snapshot` or `snapshot_and_follow`.
+    /// This option is only valid in a mode that takes an initial snapshot: `snapshot`
+    /// or `snapshot_and_follow`.
     ///
     /// When specified, only rows that satisfy the filter condition are included in the
     /// snapshot.  The condition must be a valid SQL Boolean expression that can be used in
@@ -365,9 +635,9 @@ pub struct DeltaTableReaderConfig {
     /// Optional table version.
     ///
     /// When this option is set, the connector finds and opens the specified version of the table.
-    /// In `snapshot` and `snapshot_and_follow` modes, it retrieves the snapshot of this version of
-    /// the table.  In `follow`, `snapshot_and_follow`, and `cdc` modes, it follows transaction log records
-    /// **after** this version.
+    /// In the snapshot-taking modes it retrieves the snapshot of this version of the table.
+    /// In the log-following modes (`follow`, `snapshot_and_follow`, `cdc`) it follows
+    /// transaction log records **after** this version.
     ///
     /// Note: at most one of `version` and `datetime` options can be specified.
     /// When neither of the two options is specified, the latest committed version of the table
@@ -380,9 +650,9 @@ pub struct DeltaTableReaderConfig {
     ///
     /// When this option is set, the connector finds and opens the version of the table as of the
     /// specified point in time (based on the server time recorded in the transaction log, not the
-    /// event time encoded in the data).  In `snapshot` and `snapshot_and_follow` modes, it
-    /// retrieves the snapshot of this version of the table.  In `follow`, `snapshot_and_follow`, and
-    /// `cdc` modes, it follows transaction log records **after** this version.
+    /// event time encoded in the data).  In the snapshot-taking modes it retrieves the snapshot
+    /// of this version of the table.  In the log-following modes (`follow`,
+    /// `snapshot_and_follow`, `cdc`) it follows transaction log records **after** this version.
     ///
     /// Note: at most one of `version` and `datetime` options can be specified.
     /// When neither of the two options is specified, the latest committed version of the table
@@ -392,11 +662,20 @@ pub struct DeltaTableReaderConfig {
 
     /// Optional final table version.
     ///
-    /// Valid only when the connector is configured in `follow`, `snapshot_and_follow`, or `cdc` mode.
+    /// Valid only when the connector follows the transaction log: `follow`,
+    /// `snapshot_and_follow`, or `cdc` mode.
     ///
     /// When set, the connector will stop scanning the table’s transaction log after reaching this version or any greater version.
     /// This bound is inclusive: if the specified version appears in the log, it will be processed before signaling end-of-input.
     pub end_version: Option<i64>,
+
+    /// How the connector reads changes: from the table's Change Data Feed, or from
+    /// the data files each commit added and removed.
+    ///
+    /// Valid only in the `follow` and `snapshot_and_follow` modes. See
+    /// [`DeltaTableChangeFeed`]. Defaults to `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_feed: Option<DeltaTableChangeFeed>,
 
     /// A predicate that determines whether the record represents a deletion.
     ///
@@ -434,13 +713,39 @@ pub struct DeltaTableReaderConfig {
     /// The default value is 6.
     pub max_concurrent_readers: Option<u32>,
 
+    /// Maximum number of rows the connector decodes into one Arrow batch.
+    ///
+    /// A batch is the unit the connector decodes a Parquet file into, and its
+    /// memory cost is this many rows of every column it reads. The connector
+    /// already lowers the batch size on its own when the Delta log says the
+    /// rows are wide; set this to pin a value, for instance when the log
+    /// carries no row counts and so cannot be measured.
+    ///
+    /// Lower values reduce the memory a read holds at the cost of throughput.
+    /// The default is 8192.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_size: Option<u64>,
+
+    /// Number of data files the connector decodes concurrently.
+    ///
+    /// Reading more files at a time is faster and holds more decoded data in
+    /// memory at once. Unlike `max_concurrent_readers`, which caps concurrent
+    /// object store reads across every Delta Lake connector in the pipeline,
+    /// this applies to one connector and governs the parallelism of a single
+    /// read.
+    ///
+    /// Defaults to the pipeline's `io_workers`, or its `workers` when
+    /// `io_workers` is not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_parallelism: Option<u64>,
+
     /// Enable verbose logging.
     ///
     /// When enabled, the connector will log detailed information at INFO level.
     ///
     /// Supported values:
     /// * 0 - no verbose logging
-    /// * 1 - log all Delta log entries in follow and cdc modes.
+    /// * 1 - log all Delta log entries in the log-following modes.
     /// * >1 - reserved for future use
     #[serde(default)]
     pub verbose: u32,
@@ -476,6 +781,66 @@ impl DeltaTableReaderConfig {
 }
 
 #[cfg(test)]
+mod change_feed_default_tests {
+    use super::*;
+
+    /// Built by deserializing, so the test exercises the same path a pipeline
+    /// config takes, including the field's `serde(default)`.
+    fn config(change_feed: Option<&str>) -> DeltaTableReaderConfig {
+        let feed = change_feed
+            .map(|v| format!(r#","change_feed":"{v}""#))
+            .unwrap_or_default();
+        serde_json::from_str(&format!(r#"{{"uri":"memory://","mode":"follow"{feed}}}"#)).unwrap()
+    }
+
+    /// Reading the change feed is off unless something asks for it.
+    ///
+    /// Serde and the accessor must agree, or a config that omits the field
+    /// would behave differently from one that spells out the default.
+    #[test]
+    fn default_is_off() {
+        assert_eq!(DeltaTableChangeFeed::default(), DeltaTableChangeFeed::Off);
+        assert_eq!(config(Some("off")).change_feed(), DeltaTableChangeFeed::Off);
+        assert!(!config(Some("off")).reads_change_feed());
+    }
+
+    /// What `DELTA_CHANGE_FEED` means, tested on the parser rather than through
+    /// the variable itself: writing to the process environment races every
+    /// other thread reading it, and the 120 other tests in this binary share
+    /// that environment.
+    #[test]
+    fn env_value_selects_the_mode() {
+        for (value, expected) in [
+            ("auto", DeltaTableChangeFeed::Auto),
+            ("require", DeltaTableChangeFeed::Require),
+            ("off", DeltaTableChangeFeed::Off),
+            ("  AUTO  ", DeltaTableChangeFeed::Auto),
+            // Not a user-facing knob, so a typo warns and falls back rather
+            // than failing the connector.
+            ("sometimes", DeltaTableChangeFeed::Off),
+            ("", DeltaTableChangeFeed::Off),
+        ] {
+            assert_eq!(parse_change_feed(value), expected, "for {value:?}");
+        }
+    }
+
+    /// A configured value is returned as it stands, so the override can only
+    /// set the default, never replace an explicit choice.
+    #[test]
+    fn configured_value_is_not_defaulted() {
+        for (configured, expected) in [
+            ("auto", DeltaTableChangeFeed::Auto),
+            ("require", DeltaTableChangeFeed::Require),
+            ("off", DeltaTableChangeFeed::Off),
+        ] {
+            let config = config(Some(configured));
+            assert_eq!(config.change_feed, Some(expected));
+            assert_eq!(config.change_feed(), expected);
+        }
+    }
+}
+
+#[cfg(test)]
 #[test]
 fn test_delta_reader_config_serde() {
     let config_str = r#"{
@@ -498,6 +863,58 @@ fn test_delta_reader_config_serde() {
         serde_json::from_str::<serde_json::Value>(&serialized_config).unwrap(),
         serde_json::from_str::<serde_json::Value>(expected).unwrap()
     );
+}
+
+/// Each `change_feed` setting round-trips through JSON and reports the right
+/// `reads_change_feed` and `requires_change_feed`.
+///
+/// An unset field serializes back absent, so a manager that does not know the
+/// field can round-trip a config through it.
+#[cfg(test)]
+#[test]
+fn test_delta_change_feed_serde() {
+    let config: DeltaTableReaderConfig =
+        serde_json::from_str(r#"{"uri":"s3://bucket/t","mode":"snapshot_and_follow"}"#).unwrap();
+    // Only what serde does with an absent field: the resolved default belongs
+    // to `change_feed_default_tests`, which controls the environment it reads.
+    assert_eq!(config.change_feed, None);
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("change_feed"),
+        "an unset change_feed must not be serialized"
+    );
+
+    for (json, expected, reads, requires) in [
+        ("auto", DeltaTableChangeFeed::Auto, true, false),
+        ("require", DeltaTableChangeFeed::Require, true, true),
+        ("off", DeltaTableChangeFeed::Off, false, false),
+    ] {
+        let config: DeltaTableReaderConfig = serde_json::from_str(&format!(
+            r#"{{"uri":"s3://bucket/t","mode":"follow","change_feed":"{json}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(config.change_feed(), expected);
+        assert_eq!(config.reads_change_feed(), reads);
+        assert_eq!(config.requires_change_feed(), requires);
+        assert_eq!(config.change_feed().to_string(), json);
+    }
+}
+
+/// `mode = cdc` follows the table without reading its change feed.
+///
+/// `cdc` reads a change log the user encoded as table rows, and Delta's own
+/// change data is a different answer to the same question, so the two modes do
+/// not combine.
+#[cfg(test)]
+#[test]
+fn test_delta_change_feed_excludes_cdc_mode() {
+    let config: DeltaTableReaderConfig = serde_json::from_str(
+        r#"{"uri":"s3://bucket/t","mode":"cdc","cdc_order_by":"ts","cdc_delete_filter":"op='d'","change_feed":"auto"}"#,
+    )
+    .unwrap();
+    assert!(config.follow());
+    assert!(!config.reads_change_feed());
 }
 
 #[cfg(test)]
@@ -523,6 +940,72 @@ fn test_delta_table_ingest_mode_display() {
 }
 
 #[cfg(test)]
+mod read_tuning_tests {
+    use super::*;
+
+    fn config(extra: &str) -> DeltaTableReaderConfig {
+        serde_json::from_str(&format!(r#"{{"uri":"memory://","mode":"follow"{extra}}}"#)).unwrap()
+    }
+
+    /// Both settings are optional, and absent means "let the connector decide":
+    /// it derives the batch size from the Delta log and the scan parallelism
+    /// from the pipeline's worker count.
+    #[test]
+    fn absent_by_default() {
+        let config = config("");
+        assert_eq!(config.batch_size, None);
+        assert_eq!(config.scan_parallelism, None);
+    }
+
+    #[test]
+    fn read_from_the_connector_config() {
+        let config = config(r#","batch_size":512,"scan_parallelism":4"#);
+        assert_eq!(config.batch_size, Some(512));
+        assert_eq!(config.scan_parallelism, Some(4));
+    }
+
+    /// Zero is rejected at config time rather than reaching DataFusion, which
+    /// would be asked for empty batches or no scan partitions.
+    #[test]
+    fn zero_is_rejected() {
+        assert_eq!(
+            config(r#","batch_size":0"#).validate(),
+            Err("'batch_size' must be greater than 0".to_string())
+        );
+        assert_eq!(
+            config(r#","scan_parallelism":0"#).validate(),
+            Err("'scan_parallelism' must be greater than 0".to_string())
+        );
+    }
+
+    /// A set value and an absent one both validate.
+    #[test]
+    fn positive_and_absent_settings_validate() {
+        assert_eq!(config("").validate(), Ok(()));
+        assert_eq!(
+            config(r#","batch_size":512,"scan_parallelism":4"#).validate(),
+            Ok(())
+        );
+    }
+
+    /// An unset setting stays out of the serialized form, so a config that
+    /// omits it round-trips unchanged through a manager that does not know it.
+    #[test]
+    fn absent_settings_are_not_serialized() {
+        let serialized = serde_json::to_string(&config("")).unwrap();
+        assert!(
+            !serialized.contains("batch_size") && !serialized.contains("scan_parallelism"),
+            "unset settings must not be serialized; got: {serialized}"
+        );
+        let serialized = serde_json::to_string(&config(r#","batch_size":512"#)).unwrap();
+        assert!(
+            serialized.contains(r#""batch_size":512"#),
+            "a set value must survive serialization; got: {serialized}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod log_retention_tests {
     use super::*;
 
@@ -530,11 +1013,16 @@ mod log_retention_tests {
         DeltaTableWriterConfig {
             uri: "memory://".to_string(),
             mode: DeltaTableWriteMode::default(),
+            variant_encoding: DeltaVariantEncoding::default(),
+            update_mode: DeltaTableUpdateMode::default(),
+            lookup_chunk_size: default_lookup_chunk_size(),
+            max_concurrent_probes: default_max_concurrent_probes(),
             checkpoint_interval: None,
             log_retention_duration: log_retention.map(str::to_string),
             enable_expired_log_cleanup: None,
             max_retries: None,
             threads: None,
+            auto_compact: false,
             object_store_config: HashMap::new(),
         }
     }
@@ -616,9 +1104,114 @@ mod log_retention_tests {
         let cfg = make_config(None);
         assert!(cfg.validate().is_ok());
     }
+
+    #[test]
+    fn update_mode_defaults_to_cdc() {
+        let config: DeltaTableWriterConfig =
+            serde_json::from_str(r#"{"uri":"memory://"}"#).unwrap();
+        assert_eq!(config.update_mode, DeltaTableUpdateMode::Cdc);
+        assert!(!config.is_merge());
+        assert_eq!(config.lookup_chunk_size, default_lookup_chunk_size());
+        assert_eq!(
+            config.max_concurrent_probes,
+            default_max_concurrent_probes()
+        );
+    }
+
+    #[test]
+    fn update_mode_merge_round_trips() {
+        let config: DeltaTableWriterConfig =
+            serde_json::from_str(r#"{"uri":"memory://","update_mode":"merge"}"#).unwrap();
+        assert!(config.is_merge());
+
+        // The flattened `object_store_config` makes it easy to typo a field into storage
+        // options instead of failing; confirm the mode survives a round trip.
+        let reparsed: DeltaTableWriterConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.update_mode, DeltaTableUpdateMode::Merge);
+        assert!(reparsed.object_store_config.is_empty());
+    }
+
+    /// Connector-driven compaction is opt-in and merge-only, so a misconfiguration fails at
+    /// startup rather than quietly never compacting: `cdc` mode never supersedes a row.
+    #[test]
+    fn validate_limits_auto_compact_to_merge_mode() {
+        let mut cfg = make_config(None);
+        cfg.update_mode = DeltaTableUpdateMode::Merge;
+        cfg.auto_compact = true;
+        assert!(cfg.validate().is_ok());
+
+        cfg.update_mode = DeltaTableUpdateMode::Cdc;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("only applies to 'update_mode: merge'")
+        );
+
+        // Off is the default, and valid in either mode.
+        cfg.auto_compact = false;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Merge mode accepts threads: a flush walks its key ranges separately but joins their
+    /// tombstones per file before it writes a deletion vector, so one file still gets one.
+    #[test]
+    fn validate_accepts_threads_in_merge_mode() {
+        let mut cfg = make_config(None);
+        cfg.update_mode = DeltaTableUpdateMode::Merge;
+        for threads in [1, 4] {
+            cfg.threads = Some(threads);
+            assert!(
+                cfg.validate().is_ok(),
+                "merge mode rejected threads {threads}"
+            );
+        }
+
+        cfg.update_mode = DeltaTableUpdateMode::Cdc;
+        cfg.threads = Some(4);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_budgets() {
+        let mut cfg = make_config(None);
+        cfg.max_concurrent_probes = 0;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_concurrent_probes")
+        );
+
+        let mut cfg = make_config(None);
+        cfg.lookup_chunk_size = ConfigSize::ZERO;
+        assert!(cfg.validate().unwrap_err().contains("lookup_chunk_size"));
+    }
+
+    /// A budget past the chunk's 32-bit addressing has to be rejected rather than wrap.
+    #[test]
+    fn an_oversized_lookup_chunk_is_rejected() {
+        let mut cfg = make_config(None);
+        cfg.lookup_chunk_size = ConfigSize::from_bytes(MAX_LOOKUP_CHUNK_BYTES as u64);
+        assert!(cfg.validate().is_ok());
+
+        cfg.lookup_chunk_size = ConfigSize::from_bytes(MAX_LOOKUP_CHUNK_BYTES as u64 + 1);
+        assert!(cfg.validate().unwrap_err().contains("lookup_chunk_size"));
+    }
 }
 
 impl DeltaTableReaderConfig {
+    /// Reject settings the connector cannot act on, so a misconfigured pipeline
+    /// fails at startup naming the setting rather than at the first read.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size.is_some_and(|n| n == 0) {
+            return Err("'batch_size' must be greater than 0".to_string());
+        }
+        if self.scan_parallelism.is_some_and(|n| n == 0) {
+            return Err("'scan_parallelism' must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
     /// `true` if the configuration requires taking an initial snapshot of the table.
     pub fn snapshot(&self) -> bool {
         matches!(
@@ -638,7 +1231,73 @@ impl DeltaTableReaderConfig {
         )
     }
 
+    /// `true` in the user-encoded change log mode (`cdc`), which is unrelated to
+    /// Delta Lake's own Change Data Feed ([`Self::change_feed`]).
     pub fn is_cdc(&self) -> bool {
         matches!(&self.mode, DeltaTableIngestMode::Cdc)
+    }
+
+    /// The configured [`DeltaTableChangeFeed`], or its default.
+    ///
+    /// With nothing configured the default is `off`, unless the environment
+    /// names another mode in `DELTA_CHANGE_FEED` (`auto`, `require` or `off`).
+    /// That override is a temporary way to reach the change feed until the
+    /// manager exposes `change_feed`, so it is deliberately absent from the
+    /// user documentation. An unparseable value is ignored with a warning
+    /// rather than failing the connector, since it is not a user-facing knob.
+    ///
+    /// A configured value always wins: the override sets the default, it does
+    /// not replace an explicit choice.
+    pub fn change_feed(&self) -> DeltaTableChangeFeed {
+        self.change_feed.unwrap_or_else(default_change_feed)
+    }
+
+    /// `true` if the connector reads a commit's change data when the commit records
+    /// any.
+    ///
+    /// The `cdc` mode is excluded: it reads a change log the user encoded as table
+    /// rows, taking each row's polarity from `cdc_delete_filter`.
+    pub fn reads_change_feed(&self) -> bool {
+        self.follow() && !self.is_cdc() && self.change_feed() != DeltaTableChangeFeed::Off
+    }
+
+    /// `true` if the table must record a change feed for the configuration to make
+    /// sense.
+    pub fn requires_change_feed(&self) -> bool {
+        self.change_feed() == DeltaTableChangeFeed::Require
+    }
+}
+
+#[cfg(test)]
+mod writer_config_tests {
+    use super::*;
+
+    /// A config that leaves the merge settings unset must serialize without them. The manager
+    /// re-serializes it for the runtime, and an older runtime would fail on the integers.
+    #[test]
+    fn unset_merge_settings_are_not_serialized() {
+        let parse = |json: &str| -> DeltaTableWriterConfig { serde_json::from_str(json).unwrap() };
+        let serialized = serde_json::to_string(&parse(r#"{"uri":"x"}"#)).unwrap();
+        for key in [
+            "update_mode",
+            "lookup_chunk_size",
+            "max_concurrent_probes",
+            "auto_compact",
+        ] {
+            assert!(
+                !serialized.contains(key),
+                "{key} was serialized: {serialized}"
+            );
+        }
+        let set = r#"{"uri":"x","update_mode":"merge","lookup_chunk_size":"7Ki","max_concurrent_probes":3,"auto_compact":true}"#;
+        let serialized = serde_json::to_string(&parse(set)).unwrap();
+        for value in [
+            r#""update_mode":"merge""#,
+            r#""lookup_chunk_size":"7Ki""#,
+            r#""max_concurrent_probes":3"#,
+            r#""auto_compact":true"#,
+        ] {
+            assert!(serialized.contains(value), "{value} was lost: {serialized}");
+        }
     }
 }

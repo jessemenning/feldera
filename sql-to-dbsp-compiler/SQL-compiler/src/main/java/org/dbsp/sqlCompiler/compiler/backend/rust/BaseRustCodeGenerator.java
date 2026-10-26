@@ -88,6 +88,20 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
             #![allow(non_upper_case_globals)]
             """;
 
+    /** Emitted only for crates that contain no user-written code.
+     *
+     * <p>Connector metadata is still using the deprecated {@code Variant}, and
+     * every table and view names it in its {@code deserialize_table_record!}
+     * invocation, so without this a pipeline build reports one deprecation
+     * warning per struct even when the program has no VARIANT column.
+     *
+     * <p>Remove this when connector metadata moves to {@code SqlVariant}:
+     * generated code stops naming the enum, so there is nothing left to
+     * silence, and keeping it would hide real deprecations. */
+    public static final String ALLOW_DEPRECATED_PREAMBLE = """
+            #![allow(deprecated)]
+            """;
+
     public static final String ALLOC_PREAMBLE = """
             #[cfg(not(target_env = "msvc"))]
             #[global_allocator]
@@ -95,6 +109,13 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
             #[allow(non_upper_case_globals)]
             #[export_name = "malloc_conf"]
             pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\\0";
+            """;
+
+    /** Emitted only for circuits that register their streams in a Catalog.
+     * Handles mode (--handles) needs no Catalog, and omitting the import lets the
+     * generated crates drop dbsp_adapters and its dependencies entirely. */
+    public static final String CATALOG_PREAMBLE = """
+            use dbsp_adapters::{Catalog, CircuitCatalog};
             """;
 
     public static final String STANDARD_PREAMBLE = """
@@ -139,11 +160,10 @@ public abstract class BaseRustCodeGenerator implements ICodeGenerator {
                 Error,
                 Runtime,
                 NumEntries,
-                MapHandle, SetHandle, ZSetHandle, OutputHandle,
+                MapHandle, LazyMapHandle, ZSetHandle, OutputHandle,
                 dynamic::{DynData,DynDataTyped},
                 typed_batch::SpineSnapshot,
             };
-            use dbsp_adapters::{Catalog, CircuitCatalog};
             use feldera_types::{
                 program_schema::SqlIdentifier,
                 deserialize_table_record, serialize_table_record,

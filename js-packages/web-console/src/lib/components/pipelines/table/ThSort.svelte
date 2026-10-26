@@ -32,51 +32,24 @@
   }
 </script>
 
-<th onclick={setSort} class={_class} class:active={sort.isActive}>
-  <div class="flex">
-    {@render children()}
-    <span class:asc={sort.direction === 'asc'} class:desc={sort.direction === 'desc'}> </span>
+<th
+  onclick={setSort}
+  class="{_class} group/sort cursor-pointer bg-inherit whitespace-nowrap select-none"
+>
+  <!-- A `justify-*` passed in through `_class` lands on the th, a table cell that
+    ignores it; `[justify-content:inherit]` hands that value to the flex row. -->
+  <div class="flex h-full items-center [justify-content:inherit]">
+    <div
+      class="-mx-3 -my-1 flex items-center gap-1 rounded-full px-3 py-1 {sort.isActive
+        ? 'bg-surface-50-950'
+        : 'group-hover/sort:bg-surface-50-950'}"
+    >
+      {@render children()}
+      <span
+        class="align-middle text-[14px] text-surface-500 {sort.isActive && sort.direction === 'desc'
+          ? 'fd fd-arrow-down'
+          : 'fd fd-arrow-up'} {sort.isActive ? '' : 'invisible group-hover/sort:visible'}"
+      ></span>
+    </div>
   </div>
 </th>
-
-<style>
-  th {
-    background: inherit;
-    white-space: nowrap;
-    user-select: none;
-    /* border-bottom: 1px solid var(--grey, #e0e0e0); */
-    cursor: pointer;
-  }
-  div.flex {
-    padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: flex-start;
-    height: 100%;
-  }
-  span {
-    padding-left: 8px;
-  }
-  span:before,
-  span:after {
-    border: 6px solid transparent;
-    content: '';
-    display: block;
-    height: 0;
-    width: 0;
-  }
-  span:before {
-    border-bottom-color: var(--grey, #e0e0e0);
-    margin-top: 4px;
-  }
-  span:after {
-    border-top-color: var(--grey, #e0e0e0);
-    margin-top: 4px;
-  }
-  th.active span.asc:before {
-    border-bottom-color: var(--font-grey, #9e9e9e);
-  }
-  th.active span.desc:after {
-    border-top-color: var(--font-grey, #9e9e9e);
-  }
-</style>

@@ -14,6 +14,8 @@ use feldera_types::serde_with_context::{
 use flate2::read::GzDecoder;
 use hex::ToHex;
 use md5::{Digest, Md5};
+use rkyv::ser::Serializer as RkyvSerializer;
+use rkyv::vec::ArchivedVec;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as _, Visitor},
@@ -46,7 +48,6 @@ type CompactVec = SmallVec<[u8; THRESHOLD]>;
     Serialize,
     Deserialize,
     rkyv::Archive,
-    rkyv::Serialize,
     rkyv::Deserialize,
     IsNone,
 )]
@@ -56,9 +57,64 @@ pub struct ByteArray {
     data: CompactVec,
 }
 
+/// Hand written rather than derived so that the payload is copied in one bulk
+/// write. The derived impl delegates to `SmallVec`'s, which resolves the bytes
+/// element by element, one `write` call per byte, and measured 47x slower on a
+/// 16 KiB value.
+impl<S: RkyvSerializer + ?Sized> rkyv::Serialize<S> for ByteArray {
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        // SAFETY: a byte is trivially copyable, has no padding, and archives as
+        // itself, so the copy is exactly the payload.
+        let data = unsafe { ArchivedVec::serialize_copy_from_slice(&self.data, serializer)? };
+        Ok(ByteArrayResolver { data })
+    }
+}
+
+/// A `ByteArray` derives its hash from the `SmallVec` holding the payload,
+/// and a `SmallVec` hashes as the slice it derefs to: the length, then the
+/// bytes in one write.
+impl crate::__HashRepr for ByteArray {
+    const FAITHFUL: bool = true;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        ::std::hash::Hash::hash(self, state)
+    }
+}
+
+/// The archived form holds the same bytes in an `ArchivedVec`, so hashing the
+/// slice reproduces the decoded answer exactly.
+impl crate::__HashRepr for ArchivedByteArray {
+    const FAITHFUL: bool = true;
+
+    #[inline]
+    fn hash_repr<H: ::std::hash::Hasher>(&self, state: &mut H) {
+        ::std::hash::Hash::hash(self.data.as_slice(), state)
+    }
+}
+
+/// Hand written rather than derived so that the bytes compare as one slice
+/// rather than one element at a time.
+impl dbsp::dynamic::OrdRepr<ByteArray> for ArchivedByteArray {
+    #[inline]
+    fn ord_cmp(&self, other: &ByteArray) -> std::cmp::Ordering {
+        self.data.as_slice().cmp(other.data.as_slice())
+    }
+}
+
 impl SizeOf for ByteArray {
     fn size_of_children(&self, context: &mut size_of::Context) {
-        self.data.size_of_children(context);
+        // `SmallVec` has no `SizeOf` impl, so delegating to `self.data` resolved
+        // to the one for `[u8]`, which walks the bytes and reports none of the
+        // buffer holding them: a spilled payload counted as zero, whatever its
+        // size. An inline payload needs nothing added, being part of
+        // `size_of::<ByteArray>()` already; a spilled one is one allocation,
+        // counted here the way `Vec` counts its own.
+        if self.data.spilled() {
+            context
+                .add_vectorlike(self.data.len(), self.data.capacity(), size_of::<u8>())
+                .add_distinct_allocation();
+        }
     }
 }
 
@@ -200,6 +256,76 @@ mod test_binary_deserializer {
             serde_json::from_slice::<serde_json::Value>(&reencoded).unwrap(),
             serde_json::Value::String(encoded.to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod test_binary_size_of {
+    use super::{ByteArray, THRESHOLD};
+    use size_of::SizeOf;
+    use std::mem::size_of;
+
+    /// A spilled payload is nearly the whole footprint of a large VARBINARY
+    /// value, and the batch spill accounting reads footprints through `SizeOf`,
+    /// so it has to be counted.
+    #[test]
+    fn size_of_counts_a_spilled_payload() {
+        let inline = ByteArray::new(&[7u8; THRESHOLD]);
+        assert!(!inline.data.spilled());
+        assert_eq!(inline.size_of().total_bytes(), size_of::<ByteArray>());
+        assert_eq!(inline.size_of().distinct_allocations(), 0);
+
+        // The payload is counted, and it scales with the payload rather than
+        // landing on some fixed overhead.
+        for length in [THRESHOLD + 1, 4096, 1 << 20] {
+            let spilled = ByteArray::new(&vec![7u8; length]);
+            assert!(spilled.data.spilled(), "length {length}");
+            assert_eq!(
+                spilled.size_of().total_bytes(),
+                size_of::<ByteArray>() + spilled.data.capacity(),
+                "length {length}"
+            );
+            assert!(
+                spilled.size_of().total_bytes() >= size_of::<ByteArray>() + length,
+                "length {length}"
+            );
+            assert_eq!(
+                spilled.size_of().distinct_allocations(),
+                1,
+                "length {length}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_binary_rkyv {
+    use super::{ByteArray, THRESHOLD};
+
+    /// The archived form holds the payload verbatim. `Serialize` copies it in
+    /// bulk through an unsafe rkyv entry point, so pin the bytes themselves
+    /// rather than only the value a round trip recovers: a copy that drops or
+    /// shifts bytes can still deserialize equal when the bytes it mangles
+    /// happen to match rkyv's alignment padding.
+    #[test]
+    fn rkyv_archives_the_payload_verbatim() {
+        // Inline, exactly at the spill point, and heap allocated.
+        for length in [0, 1, THRESHOLD, THRESHOLD + 1, 4096] {
+            let payload: Vec<u8> = (0..length).map(|i| (i * 7 + 1) as u8).collect();
+            let array = ByteArray::new(&payload);
+
+            let serialized = dbsp::storage::file::to_bytes(&array).unwrap();
+            // SAFETY: the bytes come from serializing `array` just above.
+            let archived = unsafe { rkyv::archived_root::<ByteArray>(&serialized) };
+            assert_eq!(
+                archived.data.as_slice(),
+                payload.as_slice(),
+                "length {length}"
+            );
+
+            let restored: ByteArray = dbsp::trace::aligned_deserialize(&serialized[..]);
+            assert_eq!(restored, array, "length {length}");
+        }
     }
 }
 

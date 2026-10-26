@@ -41,13 +41,15 @@ groups related actions into multi-action dropdowns when multiple options are ava
 <script lang="ts">
   import { Popover, Tooltip } from 'common-ui'
   import { slide } from 'svelte/transition'
-  import JSONbig from 'true-json-bigint'
   import { match, P } from 'ts-pattern'
   import { goto } from '$app/navigation'
   import IconLoader from '$assets/icons/generic/loader-alt.svg?component'
   import Popup from '$lib/components/common/Popup.svelte'
+  import SplitButton, {
+    type SplitButtonSize,
+    type SplitButtonVariant
+  } from '$lib/components/common/SplitButton.svelte'
   import DeleteDialog, { deleteDialogProps } from '$lib/components/dialogs/DeleteDialog.svelte'
-  import JSONDialog from '$lib/components/dialogs/JSONDialog.svelte'
   import PipelineConfigurationsPopup from '$lib/components/layout/pipelines/PipelineConfigurationsPopup.svelte'
   import { duplicatePipeline, duplicatePipelineTooltip } from '$lib/compositions/duplicatePipeline'
   import { useGlobalDialog } from '$lib/compositions/layout/useGlobalDialog.svelte'
@@ -57,18 +59,22 @@ groups related actions into multi-action dropdowns when multiple options are ava
     usePipelineList,
     useUpdatePipelineList
   } from '$lib/compositions/pipelines/usePipelineList.svelte'
+  import { useConceptualHq } from '$lib/compositions/useConceptualHq.svelte'
+  import { useIsEnterprise } from '$lib/compositions/useEdition.svelte'
+  import { usePermission } from '$lib/compositions/usePermission.svelte'
   import { getPipelineAction } from '$lib/compositions/usePipelineAction.svelte'
   import { usePipelineManager } from '$lib/compositions/usePipelineManager.svelte'
-  import { usePremiumFeatures } from '$lib/compositions/usePremiumFeatures.svelte'
   import { useToast } from '$lib/compositions/useToastNotification'
   import type { WritablePipeline } from '$lib/compositions/useWritablePipeline.svelte'
   import {
     deletePipelineDisabledReason,
+    editSettingsDisabledReason,
     getDeploymentStatusLabel,
     isPipelineShutdown
   } from '$lib/functions/pipelines/status'
   import { resolve } from '$lib/functions/svelte'
   import { captureEvent } from '$lib/services/analytics'
+  import { bookADemoUrl } from '$lib/services/calendly'
   import type { PipelineAction } from '$lib/services/pipelineManager'
   import type { Snippet } from '$lib/types/svelte'
 
@@ -116,6 +122,12 @@ groups related actions into multi-action dropdowns when multiple options are ava
   }
   const { toastError } = useToast()
 
+  const conceptualHq = useConceptualHq()
+  const calendlyPlacement = 'pipeline_actions_upgrade'
+  const calendlyUrl = $derived(
+    bookADemoUrl({ visitorId: conceptualHq.deviceId, placement: calendlyPlacement })
+  )
+
   // An already-deleted pipeline offers no Delete action; otherwise the backend
   // dictates when deletion is possible (fully stopped, storage cleared).
   const deleteDisabledReason = $derived(
@@ -142,149 +154,186 @@ groups related actions into multi-action dropdowns when multiple options are ava
     _spinner,
     _status_spinner,
     _configurations,
-    _configureProgram,
-    _configureResources,
     _saveFile,
     _unschedule,
     _storage_indicator
   }
 
-  const isPremium = usePremiumFeatures()
+  const isEnterprise = useIsEnterprise()
 
-  const stopButtons = isPremium.value
+  const canExec = usePermission('exec:pipeline')
+  const canWrite = usePermission('write:pipeline')
+  const canWriteCode = usePermission('write:pipeline_code')
+  // Gates the settings tooltip: a read-only caller sees a view-only hint instead
+  // of "stop the pipeline to edit", which they could never act on.
+  const canWriteConfig = usePermission('write:pipeline_config')
+
+  // Action-menu entries hidden without the matching permission. Lifecycle
+  // controls need `exec:pipeline`; the "More" menu holds only delete/duplicate,
+  // both `write:pipeline`; saving the file writes pipeline code, so it needs
+  // `write:pipeline_code`. Status, configuration and storage-state entries stay
+  // visible for read-only callers; the storage clear button inside
+  // `_storage_indicator` is gated on its own below.
+  const EXEC_ACTIONS = new Set<keyof typeof actions>([
+    '_start',
+    '_start_paused',
+    '_resume',
+    '_standby',
+    '_activate',
+    '_pause',
+    '_kill',
+    '_kill_short',
+    '_stop',
+    '_start_pending',
+    '_start_error',
+    '_unschedule'
+  ])
+  const WRITE_ACTIONS = new Set<keyof typeof actions>(['_more'])
+  const CODE_ACTIONS = new Set<keyof typeof actions>(['_saveFile'])
+  const filterByPermission = (list: (keyof typeof actions)[]) =>
+    list.filter(
+      (action) =>
+        (EXEC_ACTIONS.has(action) ? canExec.allowed : true) &&
+        (WRITE_ACTIONS.has(action) ? canWrite.allowed : true) &&
+        (CODE_ACTIONS.has(action) ? canWriteCode.allowed : true)
+    )
+
+  const stopButtons = isEnterprise.value
     ? (['_stop', '_kill'] as const)
     : (['_kill', '_stop'] as const)
 
   // Helper function to get raw actions for current pipeline status
   const getRawActions = (status: typeof pipeline.current.status) => {
-    return match(status)
-      .returnType<(keyof typeof actions)[]>()
-      .with('Stopped', () => [
-        '_start',
-        '_start_paused',
-        '_standby',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Preparing', 'Provisioning', 'Initializing', () => [
-        '_kill',
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Pausing', 'Resuming', () => [
-        ...stopButtons,
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Unavailable', () => [
-        ...stopButtons,
-        '_spacer_long',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Running', 'ConcurrentBootstrapping', () => [
-        ...stopButtons,
-        '_pause',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Paused', () => [
-        ...stopButtons,
-        '_resume',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Suspending', () => [
-        '_kill',
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Suspended', () => [
-        '_spinner',
-        '_kill',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Standby', () => [
-        '_kill',
-        '_activate',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Bootstrapping', () => [
-        '_kill',
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Replaying', 'Synchronizing', () => [
-        '_kill',
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('AwaitingApproval', () => [
-        '_kill',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with('Stopping', () => [
-        '_kill',
-        '_spinner',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .with(
-        { Queued: P.any },
-        { CompilingSql: P.any },
-        { SqlCompiled: P.any },
-        { CompilingRust: P.any },
-        (cause) => [
-          ...(Object.values(cause)[0].cause === 'upgrade' ? ['_unschedule' as const] : []),
-          '_start_pending',
+    return filterByPermission(
+      match(status)
+        .returnType<(keyof typeof actions)[]>()
+        .with('Stopped', () => [
+          '_start',
+          '_start_paused',
+          '_standby',
+          '_storage_indicator',
           '_saveFile',
           '_configurations',
-          '_storage_indicator',
           '_more'
-        ]
-      )
-      .with('SqlError', 'RustError', 'SystemError', () => [
-        '_start_error',
-        '_saveFile',
-        '_configurations',
-        '_storage_indicator',
-        '_more'
-      ])
-      .exhaustive()
+        ])
+        .with('Preparing', 'Provisioning', 'Initializing', () => [
+          '_kill',
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Pausing', 'Resuming', () => [
+          ...stopButtons,
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Unavailable', () => [
+          ...stopButtons,
+          '_spacer_long',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Running', 'ConcurrentBootstrapping', () => [
+          ...stopButtons,
+          '_pause',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Paused', () => [
+          ...stopButtons,
+          '_resume',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Suspending', () => [
+          '_kill',
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Suspended', () => [
+          '_spinner',
+          '_kill',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Standby', () => [
+          '_kill',
+          '_activate',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Bootstrapping', () => [
+          '_kill',
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Replaying', 'Synchronizing', () => [
+          '_kill',
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('AwaitingApproval', () => [
+          '_kill',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with('Stopping', () => [
+          '_kill',
+          '_spinner',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .with(
+          { Queued: P.any },
+          { CompilingSql: P.any },
+          { SqlCompiled: P.any },
+          { CompilingRust: P.any },
+          (cause) => [
+            ...(Object.values(cause)[0].cause === 'upgrade' ? ['_unschedule' as const] : []),
+            '_start_pending',
+            '_storage_indicator',
+            '_saveFile',
+            '_configurations',
+            '_more'
+          ]
+        )
+        .with('SqlError', 'RustError', 'SystemError', () => [
+          '_start_error',
+          '_storage_indicator',
+          '_saveFile',
+          '_configurations',
+          '_more'
+        ])
+        .exhaustive()
+    )
   }
 
   // Define groupable actions
@@ -353,11 +402,16 @@ groups related actions into multi-action dropdowns when multiple options are ava
   const isMobile = useIsMobile()
 
   const buttonClass = 'btn'
-  const iconClass = 'text-[20px]'
-  const shortClass = 'w-9'
-  const longClass = 'w-[104px] sm:w-[136px] justify-between pl-2! gap-2 text-sm sm:text-base'
+  const iconClass = 'text-[16px]'
+  const shortClass = 'btn-icon btn-icon-sm'
+  // Every button in the action bar is the 24px size. Labelled ones fit their content; only
+  // the spacer that stands in for a missing action keeps a fixed width.
+  const longClass = 'btn-sm'
+  const longSpacerClass = 'w-[104px] sm:w-[136px]'
   const shortColor = 'preset-tonal-surface'
-  const basicBtnColor = 'preset-filled-surface-100-900'
+  // The secondary actions (pause, stop, force stop, cancel start) are outlined; the start
+  // actions keep the filled primary style.
+  const basicBtnColor = 'preset-outlined-surface-200-800'
   const importantBtnColor = 'preset-filled-primary-500'
 
   const { postPipelineAction } = getPipelineAction()
@@ -389,13 +443,20 @@ groups related actions into multi-action dropdowns when multiple options are ava
   const multiActionConfigs = {
     start: {
       ariaLabel: 'See start options',
-      buttonClass: 'preset-filled-primary-500'
+      buttonClass: 'preset-filled-primary-500',
+      variant: 'filled',
+      size: 'sm'
     },
     stop: {
       ariaLabel: 'See stop options',
-      buttonClass: 'preset-filled-surface-100-900'
+      buttonClass: '',
+      variant: 'outlined',
+      size: 'sm'
     }
-  }
+  } satisfies Record<
+    string,
+    { ariaLabel: string; buttonClass: string; variant: SplitButtonVariant; size: SplitButtonSize }
+  >
 
   // Static button configurations for each action
   const buttonConfigs: Record<
@@ -446,7 +507,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
       label: 'Stop',
       description: 'Stop the pipeline after taking a checkpoint',
       onclick: () => (globalDialog.dialog = stopDialog),
-      disabled: () => !isPremium.value,
+      disabled: () => !isEnterprise.value,
       disabledText: 'Enterprise Only',
       standaloneButton: _stop
     },
@@ -567,7 +628,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
 {/snippet}
 
 {#if !deleted}
-  <div data-testid="box-action-buttons" class={'flex flex-nowrap gap-2 sm:gap-4 ' + _class}>
+  <div data-testid="box-action-buttons" class={'flex flex-nowrap items-center gap-2 ' + _class}>
     {#each active as name}
       {@render actions[name]()}
     {/each}
@@ -580,20 +641,17 @@ groups related actions into multi-action dropdowns when multiple options are ava
   {@const primeButtonName = buttonNames[0]}
   {@const primeButtonConfig = buttonConfigs[primeButtonName]}
 
-  <Popup>
+  <Popup wrapperClass="flex">
     {#snippet trigger(toggle)}
-      <div class="flex flex-nowrap p-0">
-        <div class="w-[58px] sm:w-[140px]">
-          {@render primeButtonConfig?.standaloneButton()}
-        </div>
-        <div class="z-10 -ml-6 h-9 border-l-[2px] border-surface-50-950"></div>
-        <button
-          onclick={toggle}
-          class="fd fd-chevron-down z-10 btn-icon h-5 w-5 !rounded-l-none text-[24px] {config.buttonClass}"
-          aria-label={config.ariaLabel}
-        >
-        </button>
-      </div>
+      <SplitButton
+        ontoggle={toggle}
+        toggleLabel={config.ariaLabel}
+        toggleClass={config.buttonClass}
+        variant={config.variant}
+        size={config.size}
+      >
+        {@render primeButtonConfig?.standaloneButton()}
+      </SplitButton>
     {/snippet}
     {#snippet content(close)}
       {@const buttons = buttonNames.map((buttonName) => {
@@ -609,7 +667,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
       })}
       <div
         transition:slide={{ duration: 100 }}
-        class="bg-white-dark absolute z-30 mt-2 scrollbar flex max-h-[400px] w-[calc(100vw-36px)] max-w-[300px] -translate-x-4 flex-col justify-stretch rounded shadow-md sm:max-w-[380px] sm:translate-x-0"
+        class="bg-white-dark absolute top-full right-0 z-30 mt-2 scrollbar flex max-h-[400px] w-[calc(100vw-36px)] max-w-[300px] flex-col justify-stretch rounded shadow-md sm:max-w-[380px]"
       >
         {#each buttons as button}
           <button
@@ -669,10 +727,10 @@ groups related actions into multi-action dropdowns when multiple options are ava
 {/snippet} -->
 
 {#snippet _more()}
-  <Popup>
+  <Popup wrapperClass="flex">
     {#snippet trigger(toggle)}
       <button
-        class="{buttonClass} {shortClass} {shortColor} fd fd-more_horiz preset-tonal-surface {iconClass}"
+        class="{buttonClass} {shortClass} {basicBtnColor} fd fd-more_horiz {iconClass}"
         onclick={toggle}
         aria-label="Pipeline options"
       >
@@ -681,7 +739,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
     {#snippet content(close)}
       <div
         transition:slide={{ duration: 100 }}
-        class="bg-white-dark absolute right-0 z-30 mt-2 flex w-44 flex-col justify-stretch rounded shadow-md"
+        class="bg-white-dark absolute top-full right-0 z-30 mt-2 flex w-44 flex-col justify-stretch rounded shadow-md"
       >
         <button
           class="flex items-center gap-2 px-4 py-3 text-left hover:bg-surface-50-950 disabled:opacity-50"
@@ -691,7 +749,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
             void duplicateCurrentPipeline()
           }}
         >
-          <span class="fd fd-copy-plus text-[20px]"></span>
+          <span class="fd fd-copy-plus text-[16px]"></span>
           Duplicate
         </button>
         <Tooltip placement="top">
@@ -709,7 +767,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
             globalDialog.dialog = deleteDialog
           }}
         >
-          <span class="fd fd-trash-2 text-[20px]"></span>
+          <span class="fd fd-trash-2 text-[16px]"></span>
           Delete
         </button>
         {#if deleteDisabledReason}
@@ -733,7 +791,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
       aria-label={text}
       class:disabled
       class={isMobile.current
-        ? `${buttonClass} ${shortClass} ${importantBtnColor} {iconClass}`
+        ? `${buttonClass} ${shortClass} ${importantBtnColor} ${iconClass}`
         : `${buttonClass} ${longClass} ${importantBtnColor}`}
       onclick={async () => {
         if (!action) {
@@ -747,7 +805,6 @@ groups related actions into multi-action dropdowns when multiple options are ava
       <span class="hidden sm:inline">
         {text}
       </span>
-      <span class="hidden sm:inline"></span>
     </button>
   </div>
 {/snippet}
@@ -815,7 +872,6 @@ groups related actions into multi-action dropdowns when multiple options are ava
   >
     <span class="fd fd-pause {iconClass}"></span>
     Pause
-    <span></span>
   </button>
   <button
     class="flex sm:hidden {buttonClass} {shortClass} {basicBtnColor} {iconClass}"
@@ -827,7 +883,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
 {#snippet _stop()}
   <div>
     <button
-      disabled={!isPremium.value}
+      disabled={!isEnterprise.value}
       class="hidden sm:flex {buttonClass} {longClass} {basicBtnColor}"
       onclick={() => {
         globalDialog.dialog = stopDialog
@@ -835,7 +891,6 @@ groups related actions into multi-action dropdowns when multiple options are ava
     >
       <span class="fd fd-square {iconClass}"></span>
       Stop
-      <span></span>
     </button>
     <button
       class="sm:hidden {buttonClass} {shortClass} {basicBtnColor} fd fd-square {iconClass}"
@@ -843,18 +898,17 @@ groups related actions into multi-action dropdowns when multiple options are ava
     >
     </button>
   </div>
-  {#if !isPremium.value}
+  {#if !isEnterprise.value}
     <Popover class="w-max max-w-[90vw]" placement="bottom">
       Stopping pipelines gracefully is only available in the Enterprise edition.<br />
       <a
         class="block pt-2 underline"
-        href="https://calendly.com/d/cqnj-p63-mbq/feldera-demo"
+        href={calendlyUrl}
         target="_blank"
         rel="noreferrer"
         onclick={() =>
-          captureEvent('calendly_opened', {
-            url: 'https://calendly.com/d/cqnj-p63-mbq/feldera-demo'
-          })}>Upgrade</a
+          captureEvent('calendly_opened', { url: calendlyUrl, placement: calendlyPlacement })}
+        >Upgrade</a
       >
     </Popover>
   {/if}
@@ -876,7 +930,6 @@ groups related actions into multi-action dropdowns when multiple options are ava
   >
     <span class="fd fd-square-power {iconClass}"></span>
     Force Stop
-    <span></span>
   </button>
   <button
     class="sm:hidden {buttonClass} {shortClass} {basicBtnColor} fd fd-square-power {iconClass}"
@@ -886,9 +939,9 @@ groups related actions into multi-action dropdowns when multiple options are ava
 {/snippet}
 {#snippet _saveFile()}
   <div class="-mr-2 block sm:hidden"></div>
-  <div class="hidden sm:block">
+  <div class="hidden sm:flex">
     <button
-      class="{buttonClass} {shortClass} {shortColor} fd fd-save {iconClass}"
+      class="{buttonClass} {shortClass} {basicBtnColor} fd fd-save {iconClass}"
       class:disabled={!unsavedChanges}
       onclick={saveFile}
     >
@@ -910,66 +963,20 @@ groups related actions into multi-action dropdowns when multiple options are ava
       globalDialog.dialog = killDialog
     }}
   >
-    <div></div>
-    <div></div>
     Cancel start
-    <div></div>
   </button>
   <Tooltip class="whitespace-nowrap" placement="top">
     The pipeline is scheduled to start automatically after compilation
   </Tooltip>
 {/snippet}
 
-{#snippet pipelineResourcesDialog(dialogTitle: string, field: keyof typeof pipeline.current)}
-  <JSONDialog
-    disabled={editConfigDisabled}
-    title={dialogTitle}
-    value={JSONbig.stringify(pipeline.current[field], undefined, '  ')}
-    filePath="file://feldera/pipelines/{pipeline.current.name}/{field}.json"
-    onApply={async (json) => {
-      await pipeline.patch({
-        [field]: JSONbig.parse(json)
-      })
-    }}
-  ></JSONDialog>
-{/snippet}
-{#snippet resourcesDialog()}
-  {@render pipelineResourcesDialog(
-    `Configure ${pipeline.current.name} runtime resources`,
-    'runtimeConfig'
-  )}
-{/snippet}
-{#snippet compilationDialog()}
-  {@render pipelineResourcesDialog(
-    `Configure ${pipeline.current.name} compilation profile`,
-    'programConfig'
-  )}
-{/snippet}
-{#snippet _configureResources()}
-  <button
-    onclick={() => (globalDialog.dialog = resourcesDialog)}
-    class="{buttonClass} {shortClass} {shortColor} fd fd-sliders-horizontal {basicBtnColor} {iconClass}"
-  >
-  </button>
-  {#if editConfigDisabled}
-    <Tooltip placement="top">Stop the pipeline to edit settings</Tooltip>
-  {/if}
-{/snippet}
-{#snippet _configureProgram()}
-  <button
-    onclick={() => (globalDialog.dialog = compilationDialog)}
-    class="{buttonClass} {shortClass} {shortColor} fd fd-settings {basicBtnColor} {iconClass}"
-  >
-  </button>
-  {#if editConfigDisabled}
-    <Tooltip placement="top">Stop the pipeline to edit settings</Tooltip>
-  {/if}
-{/snippet}
 {#snippet _configurations()}
   <PipelineConfigurationsPopup {pipeline} pipelineBusy={editConfigDisabled}
   ></PipelineConfigurationsPopup>
-  {#if editConfigDisabled}
-    <Tooltip placement="top">Stop the pipeline to edit settings</Tooltip>
+  {#if !canWriteConfig.allowed}
+    <Tooltip placement="top">You have read-only access to the configuration</Tooltip>
+  {:else if editConfigDisabled}
+    <Tooltip placement="top">{editSettingsDisabledReason(pipeline.current.status)}</Tooltip>
   {:else}
     <Tooltip placement="top">Compilation and runtime configuration</Tooltip>
   {/if}
@@ -978,7 +985,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
   <div class={shortClass}></div>
 {/snippet}
 {#snippet _spacer_long()}
-  <div class={longClass}></div>
+  <div class={longSpacerClass}></div>
 {/snippet}
 {#snippet _spinner()}
   <div class="flex sm:hidden">
@@ -990,69 +997,64 @@ groups related actions into multi-action dropdowns when multiple options are ava
 {/snippet}
 {#snippet _spinner_short()}
   <div class="pointer-events-none {buttonClass} {shortClass} {basicBtnColor}">
-    <IconLoader class="h-5 flex-none  animate-spin fill-surface-950-50"></IconLoader>
+    <IconLoader class="h-4 flex-none animate-spin fill-surface-950-50"></IconLoader>
   </div>
 {/snippet}
 {#snippet _status_spinner()}
   <button class="{buttonClass} {longClass} pointer-events-none {basicBtnColor}">
-    <IconLoader class="h-5 flex-none animate-spin fill-surface-950-50"></IconLoader>
+    <IconLoader class="h-4 flex-none animate-spin fill-surface-950-50"></IconLoader>
     <span>{getDeploymentStatusLabel(pipeline.current.status)}</span>
-    <span></span>
   </button>
 {/snippet}
 {#snippet _storage_indicator()}
+  <!-- The storage status, combined with a clear icon button when the user may clear the storage.
+       Clearing is only possible while the pipeline is stopped; while it runs the button is
+       disabled and its tooltip says why. -->
   {@const storageStatus = pipeline.current.storageStatus}
   {@const isShutdown = isPipelineShutdown(pipeline.current.status)}
   {#if storageStatus === 'Clearing'}
     <div
-      class="flex h-9 w-[120px] items-center gap-2 rounded preset-outlined-primary-500 pl-2 !ring-2"
+      class="flex h-6 items-center gap-1 rounded-sm px-2 text-[12px] leading-4 text-nowrap {basicBtnColor}"
     >
-      <div class="fd fd-database text-[20px]"></div>
-      <div class="w-10"></div>
-      <div class="rounded bg-primary-500 p-2">
-        <IconLoader class="h-5 flex-none animate-spin fill-surface-50-950"></IconLoader>
-      </div>
+      <IconLoader class="h-4 w-4 flex-none animate-spin fill-current"></IconLoader>
+      Clearing storage…
     </div>
     <Tooltip placement="top">Clearing pipeline storage, including any checkpoints.</Tooltip>
-  {:else}
+  {:else if storageStatus === 'InUse' && canExec.allowed}
     <div
-      class=" rounded-base border-2! {isShutdown && storageStatus === 'InUse'
-        ? 'preset-outlined-primary-500'
-        : 'preset-outlined-surface-200-800'} flex h-9 w-[120px] items-center gap-2 pl-1.5! text-nowrap"
+      class="flex h-6 items-center gap-1 rounded-sm pl-2 text-[12px] leading-4 text-nowrap text-surface-700-300 {basicBtnColor}"
     >
-      <div
-        class="fd {storageStatus === 'InUse' ? 'fd-database' : 'fd-database-off'}  text-[20px]"
-      ></div>
-      <div class="w-10">
-        {#if storageStatus === 'InUse'}
-          In use
-        {:else}
-          Cleared
-        {/if}
-      </div>
-      {#if storageStatus === 'InUse'}
+      <span class="fd fd-database text-[16px]"></span>
+      Storage in use
+      <div class="ml-1 flex h-full border-l border-surface-200-800">
         <button
-          class="fd fd-eraser btn-icon rounded p-2 text-[20px] {isShutdown &&
-          storageStatus === 'InUse'
-            ? ' preset-filled-primary-500'
-            : ' disabled preset-filled-surface-200-800'}"
+          aria-label="Clear storage"
+          class="{buttonClass} {shortClass} fd fd-eraser h-full! rounded-l-none! rounded-r-[2px]! {iconClass} hover:filter-none! hover:not-disabled:bg-surface-100-900"
+          disabled={!isShutdown}
           onclick={() => (globalDialog.dialog = clearDialog)}
-        >
-        </button>
-      {:else}
-        <div class="w-5"></div>
-      {/if}
+        ></button>
+      </div>
     </div>
-    <Tooltip
-      class="z-20 max-w-[calc(100vw-60px)] bg-white text-surface-950-50 dark:bg-black"
-      placement="top-start"
-    >
-      {#if storageStatus === 'Cleared'}
-        There are no checkpoints available.
-      {:else if isShutdown}
+    <Tooltip placement="top">
+      {#if isShutdown}
         Pipeline storage is in use. Click to clear it.
       {:else}
         The storage is used by the running pipeline. Stop the pipeline to clear it.
+      {/if}
+    </Tooltip>
+  {:else}
+    <div
+      class="flex h-6 items-center gap-1 px-2 text-[12px] leading-4 text-nowrap text-surface-700-300"
+    >
+      <span class="fd {storageStatus === 'InUse' ? 'fd-database' : 'fd-database-off'} text-[16px]"
+      ></span>
+      {storageStatus === 'InUse' ? 'Storage in use' : 'Storage cleared'}
+    </div>
+    <Tooltip placement="top">
+      {#if storageStatus === 'Cleared'}
+        There are no checkpoints available.
+      {:else}
+        Pipeline storage is in use.
       {/if}
     </Tooltip>
   {/if}
@@ -1062,7 +1064,7 @@ groups related actions into multi-action dropdowns when multiple options are ava
   {@const isShutdown = isPipelineShutdown(pipeline.current.status)}
   {#if storageStatus === 'Clearing'}
     <div class="pointer-events-none {buttonClass} {shortClass} {shortColor}">
-      <IconLoader class="h-5 flex-none  animate-spin fill-surface-950-50"></IconLoader>
+      <IconLoader class="h-4 flex-none animate-spin fill-surface-950-50"></IconLoader>
     </div>
     <Tooltip placement="top">
       The pipeline storage is being deleted, and provisioned resources deallocated.

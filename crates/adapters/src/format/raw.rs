@@ -3,7 +3,6 @@ use crate::{
     catalog::{DeCollectionStream, RecordFormat},
     format::{InputFormat, ParseError, Parser},
 };
-use actix_web::HttpRequest;
 use core::str;
 use dbsp::operator::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
@@ -40,22 +39,16 @@ impl InputFormat for RawInputFormat {
         Cow::Borrowed("raw")
     }
 
-    fn config_from_http_request(
+    fn config_from_http_query(
         &self,
         endpoint_name: &str,
-        request: &HttpRequest,
+        query: &str,
     ) -> Result<Box<dyn ErasedSerialize>, ControllerError> {
         Ok(Box::new(
             RawParserConfig::deserialize(UrlDeserializer::new(form_urlencoded::parse(
-                request.query_string().as_bytes(),
+                query.as_bytes(),
             )))
-            .map_err(|e| {
-                ControllerError::parser_config_parse_error(
-                    endpoint_name,
-                    &e,
-                    request.query_string(),
-                )
-            })?,
+            .map_err(|e| ControllerError::parser_config_parse_error(endpoint_name, &e, query))?,
         ))
     }
 
@@ -354,6 +347,7 @@ mod test {
         format::raw::{RawParserConfig, RawParserMode},
         program_schema::{ColumnType, Field, Relation, SqlIdentifier},
         serde_with_context::{DeserializeWithContext, SqlSerdeConfig},
+        variant::VariantValue,
     };
     use std::{borrow::Cow, collections::BTreeMap, fmt::Debug, hash::Hash};
 
@@ -637,8 +631,8 @@ mod test {
             ],
             varchar_with_metadata_schema(),
             Some(ConnectorMetadata::from(BTreeMap::from([(
-                Variant::String(SqlString::from("kafka_topic")),
-                Variant::String(SqlString::from("my_topic")),
+                "kafka_topic".to_string(),
+                VariantValue::String("my_topic".into()),
             )]))),
         );
 
@@ -737,8 +731,8 @@ mod test {
             )],
             opt_binary_with_metadata_schema(),
             Some(ConnectorMetadata::from(BTreeMap::from([(
-                Variant::String(SqlString::from("kafka_topic")),
-                Variant::String(SqlString::from("my_topic")),
+                "kafka_topic".to_string(),
+                VariantValue::String("my_topic".into()),
             )]))),
         );
 

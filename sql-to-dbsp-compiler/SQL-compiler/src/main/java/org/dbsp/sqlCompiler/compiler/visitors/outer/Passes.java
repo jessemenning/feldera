@@ -63,6 +63,9 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
         this.passes.add(pass);
     }
 
+    /** Called with the circuit that each pass produces. */
+    protected void afterPass(DBSPCircuit circuit) {}
+
     /** Insert a call to dump the current circuit as a png at this point */
     public void dump(int details) {
         String fileName = "start";
@@ -80,7 +83,7 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
             ToDot.dump(this.compiler, name, details, "png", circuit);
         }
         long begin = System.currentTimeMillis();
-        Logger.INSTANCE.belowLevel(this, 1)
+        Logger.INSTANCE.belowLevel(this, 2)
                 .append(this.toString())
                 .append(" starting ")
                 .append(this.passes.size())
@@ -88,13 +91,14 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
                 .increase();
         for (CircuitTransform pass: this.passes) {
             long start = System.currentTimeMillis();
-            long startId = DBSPNode.outerId;
+            long startId = DBSPNode.outerNodesAllocated();
             circuit = pass.apply(circuit);
             if (this.compiler.messages.exitCode != 0)
                 break;
-            long endId = DBSPNode.outerId;
+            this.afterPass(circuit);
+            long endId = DBSPNode.outerNodesAllocated();
             long end = System.currentTimeMillis();
-            Logger.INSTANCE.belowLevel(this, 1)
+            Logger.INSTANCE.belowLevel(this, 2)
                     .append(pass.toString())
                     .append(" took ")
                     .append(end - start)
@@ -109,7 +113,7 @@ public class Passes implements IWritesLogs, CircuitTransform, ICompilerComponent
             }
         }
         long finish = System.currentTimeMillis();
-        Logger.INSTANCE.belowLevel(this, 1)
+        Logger.INSTANCE.belowLevel(this, 2)
                 .decrease()
                 .append(this.toString())
                 .append(" took ")

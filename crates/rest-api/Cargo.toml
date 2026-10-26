@@ -22,8 +22,14 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 feldera-types = { workspace = true }
 progenitor-client = { workspace = true }
 rustversion.workspace = true
-sentry = { workspace = true }
-feldera-observability = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+rustls = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [build-dependencies]
 prettyplease = { workspace = true }
@@ -32,4 +38,5 @@ serde_json = { workspace = true }
 syn = { workspace = true }
 
 [package.metadata.cargo-machete]
-ignored = ["progenitor-client", "chrono", "prettytable-rs", "serde", "serde_json", "uuid"]
+# The build.rs-generated client code references these.
+ignored = ["progenitor-client", "chrono", "serde", "uuid", "reqwest", "feldera-types", "rustversion"]

@@ -103,13 +103,27 @@ jobs:
         run: cargo +stable check --locked -p dbsp_adapters
 
   build-image:
-    name: Build and Push Docker Image
+    name: Build and Push Docker Image (${{ matrix.arch }})
     # Only push on direct pushes — not PRs (PRs from forks don't have GITHUB_TOKEN write access)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    # Large runner recommended; Rust + Java compile takes ~25 min on a 2-core runner.
-    # If you have access to larger GitHub-hosted runners, change to ubuntu-latest-16-cores.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    # Each arch compiles natively on its own runner (no emulation), then the
+    # merge-manifest job assembles the two digests into one multi-arch tag.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64: solace-rs falls back to the official C_API_LINUX64 download,
+          # so no tarball URL is needed.
+          - arch: amd64
+            runner: ubuntu-latest
+            solclient_url: ""
+          # arm64: no official aarch64 download URL exists — supply the hosted
+          # solclient_Linux-aarch64 tarball. Native ARM runner (free on public repos).
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            solclient_url: ${{ vars.SOLCLIENT_AARCH64_TARBALL_URL }}
 
     steps:
       - name: Checkout repository
@@ -140,18 +154,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
-          key: maven-solace-${{ runner.os }}-${{ hashFiles('sql-to-dbsp-compiler/**/pom.xml') }}
-          restore-keys: maven-solace-${{ runner.os }}-
+          key: maven-solace-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('sql-to-dbsp-compiler/**/pom.xml') }}
+          restore-keys: maven-solace-${{ runner.os }}-${{ matrix.arch }}-
 
       - name: Build SQL compiler jar
         working-directory: ./sql-to-dbsp-compiler
         run: bash build.sh -pl SQL-compiler
 
       # ── Rust (pipeline-manager) ──────────────────────────────────────────────
-      - name: Install Rust 1.94.1
+      - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94.1"
+          toolchain: "1.99.0"
 
       - name: Install system dependencies
         run: |
@@ -167,8 +181,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-release-${{ runner.os }}-
+          key: cargo-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-${{ matrix.arch }}-
 
       # ── Web console (SvelteKit) ───────────────────────────────────────────────
       # Build the console so the cargo step below embeds it into the
@@ -199,6 +213,9 @@ jobs:
           # Embed the pre-built web console (previous step) into the binary.
           # build.rs serves whatever this dir contains; empty dir = no web UI.
           WEBCONSOLE_BUILD_DIR: ${{ github.workspace }}/js-packages/web-console/build
+          # arm64 needs the hosted aarch64 solclient tarball; empty on amd64
+          # (solace-rs uses the official C_API_LINUX64 download URL).
+          SOLCLIENT_TARBALL_URL: ${{ matrix.solclient_url }}
         run: cargo build --release --locked -p pipeline-manager
 
       # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────
@@ -220,18 +237,70 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: deploy/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/jessemenning/feldera:feat-solace-connector
-            ghcr.io/jessemenning/feldera:${{ github.sha }}
-          cache-from: type=gha,scope=feldera-docker
-          cache-to:   type=gha,mode=max,scope=feldera-docker
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            SOLCLIENT_TARBALL_URL=${{ matrix.solclient_url }}
+          # Push the single-arch image by digest only (no tag); the merge-manifest
+          # job stitches the per-arch digests into the real tags.
+          outputs: type=image,name=ghcr.io/jessemenning/feldera,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=feldera-docker-${{ matrix.arch }}
+          cache-to:   type=gha,mode=max,scope=feldera-docker-${{ matrix.arch }}
         env:
           # plain progress surfaces RUST_LOG heartbeat lines from --precompile
           # in the GHA log so we can tell "compiling" from "stuck"
           BUILDX_PROGRESS: plain
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Stitch the per-arch digests into one multi-arch manifest list ────────────
+  merge-manifest:
+    name: Merge multi-arch manifest
+    if: github.event_name != 'pull_request'
+    needs: [build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/jessemenning/feldera:feat-solace-connector \
+            -t ghcr.io/jessemenning/feldera:${{ github.sha }} \
+            $(for d in *; do echo "ghcr.io/jessemenning/feldera@sha256:$d"; done)
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect ghcr.io/jessemenning/feldera:feat-solace-connector

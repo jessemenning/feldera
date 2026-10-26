@@ -344,7 +344,6 @@ public class TableParser {
                 }
                 case ARRAY -> {
                     DBSPTypeArray array = fieldType.to(DBSPTypeArray.class);
-                    // TODO: this does not handle nested arrays
                     if (trimmed.equals("NULL")) {
                         yield new DBSPArrayExpression(array, true);
                     } else {
@@ -352,8 +351,7 @@ public class TableParser {
                             throw new UnimplementedException("Expected array constant to be bracketed: " + trimmed);
                         trimmed = trimmed.substring(1, trimmed.length() - 1);
                         if (!trimmed.isEmpty()) {
-                            // an empty string split still returns an empty string
-                            String[] parts = trimmed.split(",");
+                            String[] parts = splitTopLevel(trimmed);
                             DBSPExpression[] fields;
                             fields = Linq.map(
                                     parts, p -> parseValue(array.getElementType(), p, trimTrailingSpaces),
@@ -367,7 +365,8 @@ public class TableParser {
                 }
                 case BYTES -> {
                     if (!data.startsWith(" ")) {
-                        if (data.equals("NULL"))
+                        // Like a string, a NULL may be padded on the right to align the column
+                        if (data.startsWith("NULL"))
                             yield DBSPLiteral.none(fieldType);
                         else
                             throw new RuntimeException("Expected NULL or a space: " +
@@ -444,6 +443,30 @@ public class TableParser {
         return result;
     }
 
+    /** Split a comma-separated list of values at the commas that are not
+     * nested within braces; values may be brace-enclosed collections,
+     * e.g., nested arrays. */
+    static String[] splitTopLevel(String data) {
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < data.length(); i++) {
+            char c = data.charAt(i);
+            if (c == '{')
+                depth++;
+            else if (c == '}')
+                depth--;
+            if (c == ',' && depth == 0) {
+                parts.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        parts.add(current.toString());
+        return parts.toArray(new String[0]);
+    }
+
     public static DBSPTupleExpression parseRow(String line, DBSPTypeTupleBase rowType,
                                                String separatorRegex, boolean trimTrailingSpaces) {
         String[] columns;
@@ -468,12 +491,12 @@ public class TableParser {
 
     /** Parse a change table.  A change table is like a table, but has an extra
      * integer column that contains the weights. */
-    public static Change parseChangeTable(String table, DBSPType outputType) {
+    public static Change parseChangeTable(String table, DBSPType outputType, boolean trimTrailingSpaces) {
         List<DBSPType> extraFields =
                 Linq.list(outputType.to(DBSPTypeZSet.class).elementType.to(DBSPTypeTuple.class).tupFields);
         extraFields.add(new DBSPTypeInteger(CalciteObject.EMPTY, 64, true, false));
         DBSPType extraOutputType = new DBSPTypeTuple(extraFields);
-        Change change = parseTable(table, new DBSPTypeZSet(extraOutputType), -1, false);
+        Change change = parseTable(table, new DBSPTypeZSet(extraOutputType), -1, trimTrailingSpaces);
         TableData[] extracted = Linq.map(change.sets, SqlIoTest::extractWeight, TableData.class);
         return new Change(extracted);
     }
@@ -576,6 +599,6 @@ public class TableParser {
             builder.append("\t1");
         }
 
-        return parseChangeTable(builder.toString(), outputType);
+        return parseChangeTable(builder.toString(), outputType, false);
     }
 }

@@ -23,7 +23,11 @@ usage() {
 
 update_pom() {
     VERSION=$1
-    sed -i -E "s|<calcite.version>(.*)</calcite.version>|<calcite.version>${VERSION}</calcite.version>|" ./SQL-compiler/pom.xml
+    # `-i.bak` works with both GNU and BSD sed.  BSD (macOS) sed takes the `-E`
+    # in `-i -E` as the backup suffix, so the pattern runs as a basic regex,
+    # matches nothing, and the version is silently left unchanged.
+    sed -i.bak -E "s|<calcite.version>(.*)</calcite.version>|<calcite.version>${VERSION}</calcite.version>|" ./SQL-compiler/pom.xml
+    rm ./SQL-compiler/pom.xml.bak
 }
 
 if [ "${CALCITE_BUILD_NEXT}" = "y" ]; then
@@ -84,6 +88,16 @@ if [ "${CALCITE_BUILD_NEXT}" = "y" ]; then
     popd >/dev/null
 else
     update_pom "${CALCITE_CURRENT}"
+fi
+
+# Check if the list of reserved keywords is up-to-date
+# Fail if the SQL compiler reserves a keyword that Calcite does not reserve
+if [ ! -d "${CALCITE_BUILD_DIR}" ]; then
+    echo "keyword check: skipped, no Calcite source in ${CALCITE_BUILD_DIR}"
+elif ! command -v python3 >/dev/null; then
+    echo "keyword check: skipped, python3 is not installed"
+else
+    "${SCRIPT_DIR}/check-keyword-drift.py" "${CALCITE_BUILD_DIR}"
 fi
 
 mvn package -DskipTests --no-transfer-progress -DargLine="-ea" -q -B "$@"

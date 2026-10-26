@@ -10,10 +10,12 @@ import org.dbsp.sqlCompiler.ir.DBSPNode;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeIndexedZSet;
 import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeZSet;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 import org.dbsp.util.Utilities;
 import org.dbsp.util.graph.Port;
 
 import javax.annotation.Nullable;
+import org.dbsp.sqlCompiler.ir.type.CollectionShape;
 
 /** An output port of an operator. */
 public class OutputPort {
@@ -84,6 +86,16 @@ public class OutputPort {
 
     public DBSPType getOutputZSetElementType() {
         return this.getOutputZSetType().elementType;
+    }
+
+    /** The shape of the rows this port carries, or null if it carries no tuples */
+    @Nullable
+    public CollectionShape getShape() {
+        if (this.outputType().is(DBSPTypeZSet.class))
+            return this.getOutputZSetType().getShape();
+        if (this.outputType().is(DBSPTypeIndexedZSet.class))
+            return this.getOutputIndexedZSetType().getShape();
+        return null;
     }
 
     /** If the output is a ZSet it returns the element type.
@@ -161,7 +173,12 @@ public class OutputPort {
         return "{ \"node\": " + this.operator.id + ", \"output\": " + this.outputNumber + " }";
     }
 
-    public DBSPType streamType(boolean outerCircuit) {
-        return this.node().outputStreamType(this.outputNumber, outerCircuit);
+    /** The kind of stream flowing out of this port */
+    public StreamKind kind() {
+        return this.node().outputKind(this.outputNumber);
+    }
+
+    public DBSPType streamType(int nesting) {
+        return this.node().outputStreamType(this.outputNumber, nesting);
     }
 }

@@ -16,9 +16,11 @@ import org.dbsp.sqlCompiler.compiler.backend.rust.ToRustVisitor;
 import org.dbsp.sqlCompiler.compiler.frontend.calciteCompiler.ProgramIdentifier;
 import org.dbsp.sqlCompiler.compiler.visitors.outer.CircuitPostfix;
 import org.dbsp.sqlCompiler.ir.type.DBSPType;
-import org.dbsp.sqlCompiler.ir.type.user.DBSPTypeStream;
 import org.dbsp.util.HashString;
 import org.dbsp.util.Utilities;
+
+import java.util.HashSet;
+import java.util.Set;
 
 /** Writes the implementation of a {@link DBSPNestedOperator} as a function that instantiates
  * the operator in circuit. */
@@ -26,12 +28,15 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
     final DBSPNestedOperator operator;
     final DBSPCircuit circuit;
     final CircuitPostfix materializations;
+    /** Names of the region variables that the generated function declares */
+    final Set<String> regionsDeclared;
 
     public NestedOperatorWriter(DBSPNestedOperator operator, DBSPCircuit circuit,
                                 CircuitPostfix materializations) {
         this.circuit = circuit;
         this.operator = operator;
         this.materializations = materializations;
+        this.regionsDeclared = new HashSet<>();
     }
 
     private void processChild(DBSPOperator node) {
@@ -41,8 +46,8 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
         HashString merkle = OperatorHash.getHash(node, true);
         RegionAnnotation region = node.annotations.first(RegionAnnotation.class);
         if (region != null) {
-            boolean exists = this.materializations.recordRegion(region);
-            if (!exists) {
+            // The generated function is in a crate of its own, so it declares each region it uses
+            if (this.regionsDeclared.add(region.asVarName())) {
                 this.builder().append("let ")
                         .append(region.asVarName())
                         .append(": Option<RegionName> = Some(circuit.create_region_name(")
@@ -113,12 +118,55 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
         return "i" + inputNo;
     }
 
+    /** Emit the code that gives the stream named {@code name} the persistent id of
+     * {@code operator}. */
+    /** Name the stream that leaves the recursive circuit.
+     *
+     * <p>It must not be the operator's own id: that id already names the stream
+     * inside the scope, and the two are separate streams whose operators keep
+     * separate state.  Sharing it makes an inner trace and an outer one write
+     * the same file, and whichever restores second reads a batch that was
+     * written with the other's layout. */
+    private void setExportedPersistentId(DBSPOperator operator, String name) {
+        HashString hash = OperatorHash.getHash(operator, true);
+        if (hash == null) {
+            this.builder().append("let hash = None;").newline();
+        } else {
+            this.builder().append("let hash = Some(concat!(")
+                    .append(hash.toQuotedString())
+                    .append(", \".export\"));")
+                    .newline();
+        }
+        this.builder().append(name)
+                .append(".set_persistent_id(hash);")
+                .newline();
+    }
+
+    private void setPersistentId(DBSPOperator operator, String name) {
+        this.builder().append("let hash = ");
+        HashString hash = OperatorHash.getHash(operator, true);
+        if (hash == null) {
+            this.builder().append("None;").newline();
+        } else {
+            this.builder().append("Some(")
+                    .append(hash.toQuotedString())
+                    .append(");")
+                    .newline();
+        }
+        this.builder().append(name)
+                .append(".set_persistent_id(hash);")
+                .newline();
+    }
+
     @Override
     public void write(DBSPCompiler compiler) {
         boolean useHandles = compiler.options.ioOptions.emitHandles;
         this.builder()
                 .append(RustWriter.COMMON_PREAMBLE)
+                .append(RustWriter.ALLOW_DEPRECATED_PREAMBLE)
                 .append(RustWriter.STANDARD_PREAMBLE);
+        if (!useHandles)
+            this.builder().append(RustWriter.CATALOG_PREAMBLE);
         ToRustVisitor visitor = new ToRustVisitor(
                 compiler, this.builder(), this.circuit.metadata, new ProjectDeclarations(), this.materializations)
                 .withPreferHash(true);
@@ -143,7 +191,7 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
             input++;
             this.builder().append(n);
             this.builder().append(": &");
-            DBSPType streamType = port.streamType(true);
+            DBSPType streamType = port.streamType(0);
             streamType.accept(visitor.innerVisitor);
             this.builder().append(",").newline();
         }
@@ -152,7 +200,8 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
         this.builder().append("(");
         for (int i = 0; i < this.operator.outputCount(); i++) {
             if (this.operator.hasOutput(i)) {
-                DBSPType streamType = this.operator.outputStreamType(i, true);
+                // The outputs of the nested operator are streams of the root circuit
+                DBSPType streamType = this.operator.outputStreamType(i, 0);
                 streamType.accept(visitor.innerVisitor);
                 this.builder().append(",");
             }
@@ -177,8 +226,16 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
             if (decl != null) {
                 this.builder().append(decl.getNodeName(false)).append(", ");
             } else {
-                // view is not really recursive
-                this.builder().append("_").append(", ");
+                // view is not really recursive.
+                if (operator.internalOutputs.get(i) != null) {
+                    // It is not used in recursion,
+                    // but it must be an output of the recursive component, and we
+                    // want to assign it a persistent ID.
+                    this.builder().append("unused_").append(i).append(", ");
+                } else {
+                    // This output doesn't even exist
+                    this.builder().append("_, ");
+                }
             }
         }
         this.builder().append("): (");
@@ -186,12 +243,42 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
             if (operator.internalOutputs.get(i) == null) {
                 this.builder().append("()").append(", ");
             } else {
-                DBSPType streamType = new DBSPTypeStream(operator.outputType(i), false);
+                // The streams produced inside the nested circuit
+                DBSPType streamType = operator.internalOutputs.get(i).streamType(1);
                 streamType.accept(visitor.innerVisitor);
                 this.builder().append(", ");
             }
         }
         this.builder().append(")| {").increase();
+
+        // Name the recursive streams before the operators of the scope are created.
+        // An operator that maintains state over a stream copies that stream's
+        // persistent id when it is constructed, so a name assigned later would leave
+        // the integrals over the recursive streams without an id, and checkpointing
+        // the circuit would fail.
+        for (int i = 0; i < operator.outputCount(); i++) {
+            ProgramIdentifier view = operator.outputViews.get(i);
+            DBSPViewDeclarationOperator decl = operator.declarationByName.get(view);
+            OutputPort port = operator.internalOutputs.get(i);
+            if (decl != null) {
+                this.setPersistentId(decl, decl.getNodeName(false));
+            } else if (port != null) {
+                HashString hash0 = OperatorHash.getHash(port.operator, true);
+                if (hash0 == null) {
+                    this.builder().append("let hash = None;");
+                } else {
+                    this.builder().append("let hash = Some(concat!(")
+                            .append(hash0.toQuotedString())
+                            .append(", \".delay\"));");
+                }
+                this.builder()
+                        .newline()
+                        .append("unused_")
+                        .append(i)
+                        .append(".set_persistent_id(hash);")
+                        .newline();
+            }
+        }
 
         for (DBSPOperator node : this.operator.getAllOperators())
             if (!node.is(DBSPViewDeclarationOperator.class))
@@ -211,21 +298,8 @@ public final class NestedOperatorWriter extends BaseRustCodeGenerator {
 
         for (int i = 0; i < operator.outputCount(); i++) {
             OutputPort port = operator.internalOutputs.get(i);
-            if (port != null) {
-                this.builder().append("let hash = ");
-                HashString hash1 = OperatorHash.getHash(port.operator, true);
-                if (hash1 == null) {
-                    this.builder().append("None;").newline();
-                } else {
-                    this.builder().append("Some(")
-                            .append(Utilities.doubleQuote(hash1.toString(), false))
-                            .append(");")
-                            .newline();
-                }
-                this.builder().append(port.getName(false))
-                        .append(".set_persistent_id(hash);")
-                        .newline();
-            }
+            if (port != null)
+                this.setExportedPersistentId(port.operator, port.getName(false));
         }
 
         this.builder().append("if let Some(region) = region { circuit.close_region(region.clone()) };").newline();

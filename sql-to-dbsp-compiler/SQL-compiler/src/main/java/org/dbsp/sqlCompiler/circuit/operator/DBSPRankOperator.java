@@ -27,7 +27,7 @@ import java.util.Objects;
  * Corresponds to one of the DBSP operators rank_custom_order or
  * dense_rank_custom_order.  Similar to {@link DBSPIndexedTopKOperator}. */
 public class DBSPRankOperator extends DBSPUnaryOperator
-    implements IContainsIntegrator, IIncremental {
+    implements IHasPostIntegrator, IIncremental {
     public final DBSPIndexedTopKOperator.Numbering numbering;
     /** Closure which produces the output tuple.  The signature is
      * (i64, sorted_tuple) -> output_tuple.  i64 is the rank of the current row. */
@@ -134,7 +134,6 @@ public class DBSPRankOperator extends DBSPUnaryOperator
     @SuppressWarnings("unused")
     public static DBSPRankOperator fromJson(JsonNode node, JsonDecoder decoder) {
         CommonInfo info = commonInfoFromJson(node, decoder);
-        DBSPExpression limit = fromJsonInner(node, "limit", decoder, DBSPExpression.class);
         DBSPIndexedTopKOperator.Numbering numbering = DBSPIndexedTopKOperator.Numbering.valueOf(Utilities.getStringProperty(node, "numbering"));
         DBSPClosureExpression projectionFunc = fromJsonInner(node, "projectionFunc", decoder, DBSPClosureExpression.class);
         DBSPClosureExpression outputProducer = fromJsonInner(node, "outputProducer", decoder, DBSPClosureExpression.class);

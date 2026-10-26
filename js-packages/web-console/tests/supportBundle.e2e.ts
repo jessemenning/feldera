@@ -1,9 +1,10 @@
-import { type BrowserContext, expect, type Page, test } from '@playwright/test'
+import { type BrowserContext, expect, type Page, type Request, test } from '@playwright/test'
 import { putPipeline } from '$lib/services/pipelineManager'
 import {
   cleanupPipeline,
   configureTestClient,
   startPipelineAndWaitForRunning,
+  TEST_COMPILATION_PROFILE,
   waitForCompilation
 } from '$lib/services/testPipelineHelpers'
 
@@ -17,9 +18,10 @@ const PIPELINE_NAME = `test-support-bundle-${Date.now()}`
  * `beforeAll` does the expensive shared setup once: create + compile + start the
  * pipeline, then download its support bundle to disk so the upload-path test can
  * reuse it. Each test then opens the profile viewer through a different entry
- * point — a fresh remote download, or the saved bundle re-uploaded into a new
- * tab via the BroadcastChannel + postMessage handoff — and asserts the loaded
- * viewer renders its core panels (logs, per-node metrics).
+ * point (a fresh remote download, or the saved bundle re-opened from disk into a
+ * new tab) and asserts the loaded viewer renders its core panels (logs, per-node
+ * metrics). The upload path additionally reloads the viewer tab, which is the promise
+ * the bundle history exists to keep.
  *
  * Serial: the tests share the pipeline created in `beforeAll`, and there's no
  * value in running the upload path once the remote path has already proven the
@@ -38,7 +40,7 @@ test.describe('Profile viewer', () => {
       name: PIPELINE_NAME,
       description: 'E2E test pipeline for the profile viewer',
       program_code: 'create view v as (select 1)',
-      program_config: { profile: 'unoptimized' }
+      program_config: { profile: TEST_COMPILATION_PROFILE }
     })
     await waitForCompilation(PIPELINE_NAME, 240_000)
     await startPipelineAndWaitForRunning(PIPELINE_NAME, 60_000)
@@ -75,6 +77,15 @@ test.describe('Profile viewer', () => {
   })
 
   test('re-uploaded bundle opens a working viewer', async ({ page, context }) => {
+    // Playwright cannot drive the operating system's file picker, so hide the File
+    // System Access API from the page. The controls then take the file-input fallback,
+    // which is the path Firefox and Safari take and the only one an automated test can
+    // drive. That path also writes to the bundle history, so this test covers the
+    // viewer reading a bundle back out of IndexedDB. The browser tests cover the
+    // handle path.
+    await page.addInitScript(() => {
+      Object.defineProperty(window, 'showOpenFilePicker', { value: undefined })
+    })
     await openSupportBundleControls(page)
     await page.getByTestId('input-upload-support-bundle').setInputFiles(bundlePath)
 
@@ -82,7 +93,39 @@ test.describe('Profile viewer', () => {
     const confirmViewProfile = page.getByTestId('btn-confirm-view-profile')
     await expect(confirmViewProfile).toBeVisible({ timeout: 10_000 })
 
-    await withProfileViewer(context, () => confirmViewProfile.click())
+    await withProfileViewer(
+      context,
+      () => confirmViewProfile.click(),
+      async (viewer) => {
+        // The link names the history entry the file input wrote, which is the whole
+        // point of the change: were the archive still handed over as bytes, the URL
+        // would carry a `channel` instead and the reload below would time out waiting
+        // for a tab that has nothing left to send.
+        await expect(viewer).toHaveURL(/[?&]bundle=\d+/)
+        await viewer.reload()
+        await assertLogsPanelPopulates(viewer)
+      }
+    )
+  })
+
+  test('opens an uploaded bundle with the manager unreachable', async ({ browser }) => {
+    // Issue #6819: the console is served, the pipeline manager is gone. Every manager request
+    // is refused, the way a dead instance refuses them; the viewer must still open the bundle
+    // and raise no error.
+    const context = await browser.newContext()
+    await context.route(/\/v0\//, (route) => route.abort('connectionrefused'))
+    const viewer = await context.newPage()
+    try {
+      // The bare route is the viewer with nothing to load, offering the upload.
+      await viewer.goto('/profile-viewer')
+      await expect(viewer.getByText('Open a support bundle')).toBeVisible({ timeout: 30_000 })
+      await viewer.locator('input[type="file"]').setInputFiles(bundlePath)
+      await assertLogsPanelPopulates(viewer)
+      // Error toasts carry role=status.
+      await expect(viewer.getByRole('status')).toHaveCount(0)
+    } finally {
+      await context.close()
+    }
   })
 })
 
@@ -104,25 +147,60 @@ async function openSupportBundleControls(page: Page) {
  * Run `trigger` (which opens /profile-viewer in a new tab), then verify the
  * loaded viewer's core functionality before closing the tab. The caller's
  * `page` still refers to the originating pipeline page afterwards.
+ *
+ * @param alsoCheck further assertions on the viewer tab, run once the core ones have
+ *   passed. Used by the upload path, whose promise is that its tab survives a reload.
  */
-async function withProfileViewer(context: BrowserContext, trigger: () => Promise<void>) {
+async function withProfileViewer(
+  context: BrowserContext,
+  trigger: () => Promise<void>,
+  alsoCheck?: (viewer: Page) => Promise<void>
+) {
   const viewerPromise = context.waitForEvent('page')
   await trigger()
   const viewer = await viewerPromise
+  const requests = recordManagerRequests(viewer)
   try {
     await viewer.waitForLoadState('domcontentloaded')
     await expect(viewer.getByTestId('box-profile-viewer-page')).toBeVisible({ timeout: 30_000 })
 
     await assertLogsPanelPopulates(viewer)
     await assertNodeMetricsShowPersistentId(viewer)
+    // The viewer reads a bundle, so nothing on its route may poll the manager.
+    expect(requests.paths.filter((path) => !viewerMayRequest(path))).toEqual([])
+
+    await alsoCheck?.(viewer)
   } finally {
+    requests.stop()
     await viewer.close()
   }
 }
 
 /**
- * Switch to the Logs tab and confirm at least one log line rendered — the signal
- * that `logText` was extracted from the bundle (remote fetch or cross-tab handoff).
+ * The manager endpoints the viewer's route legitimately reaches: the configuration the root
+ * layout boots from, and the bundle download itself. Anything else, such as the pipeline list
+ * or cluster health the app shell polls, is a poller that leaked onto the route.
+ */
+const viewerMayRequest = (pathname: string) =>
+  /\/v0\/config(\/session)?$/.test(pathname) ||
+  /\/v0\/pipelines\/[^/]+\/support_bundle$/.test(pathname)
+
+/** Collect the path of every manager request `page` makes until `stop` is called. */
+function recordManagerRequests(page: Page): { paths: string[]; stop: () => void } {
+  const paths: string[] = []
+  const record = (request: Request) => {
+    const { pathname } = new URL(request.url())
+    if (pathname.includes('/v0/')) {
+      paths.push(pathname)
+    }
+  }
+  page.on('request', record)
+  return { paths, stop: () => page.off('request', record) }
+}
+
+/**
+ * Switch to the Logs tab and confirm at least one log line rendered, which shows that
+ * `logText` was extracted from the bundle, however it arrived.
  */
 async function assertLogsPanelPopulates(viewer: Page) {
   // The Logs tab label appears once the bundle finishes loading and the

@@ -90,6 +90,11 @@ public class CalciteOptimizer implements IWritesLogs {
         String getName();
         /** Optimize the program for the specified optimization level */
         RelNode optimize(RelNode rel, int level);
+        /** True if an exception thrown by this step aborts the compilation; otherwise the
+         * optimizer skips the step with a warning */
+        default boolean abortOnError() {
+            return false;
+        }
     }
 
     /** Base class for optimizations that use a HEP optimizer */
@@ -110,11 +115,23 @@ public class CalciteOptimizer implements IWritesLogs {
         final int level;
         final String name;
         final HepProgramBuilder builder;
+        boolean abortOnError = false;
 
         public BaseOptimizerStep(String name, int level) {
             this.level = level;
             this.name = name;
             this.builder = new HepProgramBuilder();
+        }
+
+        /** Make an exception thrown by this step abort the compilation */
+        BaseOptimizerStep setAbortOnError() {
+            this.abortOnError = true;
+            return this;
+        }
+
+        @Override
+        public boolean abortOnError() {
+            return this.abortOnError;
         }
 
         @Override
@@ -189,6 +206,8 @@ public class CalciteOptimizer implements IWritesLogs {
                     rel = optimized;
                 }
             } catch (Throwable ex) {
+                if (step.abortOnError())
+                    throw ex;
                 this.reporter.reportWarning(
                         SourcePositionRange.INVALID, "Calcite optimizer exception caught",
                         "Calcite optimizer failed during '" + step.getName() +
@@ -227,6 +246,41 @@ public class CalciteOptimizer implements IWritesLogs {
                 CoreRules.AGGREGATE_MERGE,
                 CoreRules.INTERSECT_MERGE);
 
+        // Must be the first step: with expand=false the converter leaves
+        // RexSubQuery nodes, and every later step expects Correlate/Join nodes.
+        this.addStep(new SimpleOptimizerStep("Remove sub-queries", 0,
+                CoreRules.FILTER_SUB_QUERY_TO_CORRELATE,
+                CoreRules.PROJECT_SUB_QUERY_TO_CORRELATE,
+                CoreRules.JOIN_SUB_QUERY_TO_CORRELATE,
+                CoreRules.AGGREGATE_REMOVE_LITERAL_AGG).setAbortOnError());
+        // Must run right after "Remove sub-queries": later steps rewrite the constructs
+        // that RejectUnsupportedPlans checks, such as ROWS frames and DISTINCT aggregates.
+        this.addStep(new CalciteOptimizerStep() {
+            @Override
+            public String getName() {
+                return "Reject unsupported plans";
+            }
+
+            @Override
+            public RelNode optimize(RelNode rel, int level) {
+                rel.accept(new RejectUnsupportedPlans(CalciteOptimizer.this.reporter));
+                return rel;
+            }
+
+            @Override
+            public boolean abortOnError() {
+                return true;
+            }
+
+            @Override
+            public String toString() {
+                return this.getName();
+            }
+        });
+        // Must run before "Expand windows", which converts the RexOver
+        // projections this rewrite creates.
+        this.addStep(new SimpleOptimizerStep("Rewrite SESSION", 0,
+                new SessionRewriteRule()));
         this.addStep(new SimpleOptimizerStep("Constant fold", 2,
                 CoreRules.COERCE_INPUTS,
                 SingleValuesOptimizationRules.JOIN_LEFT_INSTANCE,
@@ -238,7 +292,6 @@ public class CalciteOptimizer implements IWritesLogs {
                 ReduceExpressionsRule.JOIN_REDUCE_EXPRESSIONS,
                 ReduceExpressionsRule.WINDOW_REDUCE_EXPRESSIONS,
                 ReduceExpressionsRule.CALC_REDUCE_EXPRESSIONS,
-                CoreRules.CALC_REDUCE_DECIMALS,
                 ValuesReduceRule.FILTER_VALUES_MERGE,
                 ValuesReduceRule.PROJECT_FILTER_VALUES_MERGE,
                 ValuesReduceRule.PROJECT_VALUES_MERGE,
@@ -262,7 +315,9 @@ public class CalciteOptimizer implements IWritesLogs {
                 new MaxCaseToCountRule(),
                 // Prepares inputs for next rule
                 CoreRules.AGGREGATE_CASE_TO_FILTER,
-                new AggregateNowFilterRule()
+                new AggregateNowFilterRule(),
+                // After AGGREGATE_CASE_TO_FILTER, which may give MODE calls a filter
+                new ModeToArgMaxRule()
         ));
         this.addStep(new SimpleOptimizerStep("Simplify set operations", 0,
                 CoreRules.UNION_MERGE,
@@ -282,6 +337,8 @@ public class CalciteOptimizer implements IWritesLogs {
                 CoreRules.PROJECT_CORRELATE_TRANSPOSE,
                 CoreRules.FILTER_CORRELATE));
         this.addStep(merge);
+        this.addStep(new SimpleOptimizerStep("Right joins to left joins", 0,
+                CoreRules.JOIN_COMMUTE_RIGHT_TO_LEFT));
 
         var joinOrder = new BaseOptimizerStep("Join order", 2) {
             @Override
@@ -438,6 +495,7 @@ public class CalciteOptimizer implements IWritesLogs {
         this.addStep(merge);
         this.addStep(new SimpleOptimizerStep("Remove dead code", 0,
                 CoreRules.AGGREGATE_REMOVE,
+                new AntiJoinDistinctRemoveRule(),
                 CoreRules.UNION_REMOVE,
                 CoreRules.PROJECT_REMOVE,
                 CoreRules.PROJECT_JOIN_JOIN_REMOVE,

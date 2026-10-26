@@ -117,6 +117,10 @@ fn type_replacement() -> Vec<(&'static str, &'static str)> {
             "feldera_types::transport::nexmark::NexmarkInputOptions",
         ),
         (
+            "DeltaTableChangeFeed",
+            "feldera_types::transport::delta_table::DeltaTableChangeFeed",
+        ),
+        (
             "DeltaTableIngestMode",
             "feldera_types::transport::delta_table::DeltaTableIngestMode",
         ),
@@ -213,6 +217,19 @@ fn type_replacement() -> Vec<(&'static str, &'static str)> {
             "NatsInputConfig",
             "feldera_types::transport::nats::NatsInputConfig",
         ),
+        ("NatsHeader", "feldera_types::transport::nats::NatsHeader"),
+        (
+            "NatsMessageId",
+            "feldera_types::transport::nats::NatsMessageId",
+        ),
+        (
+            "NatsOutputConfig",
+            "feldera_types::transport::nats::NatsOutputConfig",
+        ),
+        (
+            "StartFromCheckpoint",
+            "feldera_types::config::StartFromCheckpoint",
+        ),
         (
             "ClockAdvanceRequest",
             "feldera_types::transport::clock::ClockAdvanceRequest",
@@ -230,6 +247,7 @@ fn main() {
     let spec = serde_json::from_reader(&openapi[..]).unwrap();
     let mut settings = GenerationSettings::new();
     settings.with_interface(InterfaceStyle::Builder);
+    settings.with_inner_type("crate::RetryPolicy".parse().unwrap());
     for (from, to) in type_replacement() {
         let impls = vec![];
         settings.with_replacement(from, to, impls.into_iter());
@@ -239,16 +257,7 @@ fn main() {
 
     let tokens = generator.generate_tokens(&spec).unwrap();
     let ast = syn::parse2(tokens).unwrap();
-    let mut content = prettyplease::unparse(&ast);
-    for verb in ["get", "post", "put", "patch", "delete"] {
-        let pattern = format!(".{verb}(url)");
-        let replacement = format!(".{verb}(url)\n                .with_sentry_tracing()");
-        content = content.replace(&pattern, &replacement);
-    }
-    content = content.replace(
-        "pub mod builder {",
-        "pub mod builder {\n    use feldera_observability::ReqwestTracingExt;",
-    );
+    let content = prettyplease::unparse(&ast);
     let content = content.replace(
         "impl Client",
         "#[rustversion::attr(since(1.89), allow(mismatched_lifetime_syntaxes))]\nimpl Client",

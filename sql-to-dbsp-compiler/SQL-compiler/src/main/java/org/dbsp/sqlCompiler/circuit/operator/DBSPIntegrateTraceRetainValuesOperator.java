@@ -22,6 +22,7 @@ import org.dbsp.util.Utilities;
 import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Objects;
+import org.dbsp.sqlCompiler.ir.type.user.StreamKind;
 
 /** Currently always inserted after the input of a join operator */
 public final class DBSPIntegrateTraceRetainValuesOperator
@@ -37,6 +38,11 @@ public final class DBSPIntegrateTraceRetainValuesOperator
     @Override
     public DBSPSimpleOperator asOperator() {
         return this;
+    }
+
+    @Override
+    public OutputPort data() {
+        return this.left();
     }
 
     public static DBSPIntegrateTraceRetainValuesOperator create(
@@ -55,7 +61,7 @@ public final class DBSPIntegrateTraceRetainValuesOperator
         DBSPParameter param = new DBSPParameter(dataArg.variable, dataArg.getType());
         DBSPExpression project = dataProjection
                 .to(PartiallyMonotoneTuple.class)
-                .getField(1)
+                .getFieldType(1)
                 .projectExpression(dataArg.deref());
         DBSPExpression compare0 = controlArg.deepCopy().deref().field(0).not();
         DBSPExpression compare = DBSPControlledKeyFilterOperator.generateTupleCompare(
@@ -96,5 +102,13 @@ public final class DBSPIntegrateTraceRetainValuesOperator
         return new DBSPIntegrateTraceRetainValuesOperator(CalciteEmptyRel.INSTANCE,
                 info.getFunction(), info.getInput(0), info.getInput(1))
                 .addAnnotations(info.annotations(), DBSPIntegrateTraceRetainValuesOperator.class);
+    }
+
+    /** The data passes through unchanged; the control input carries the bound. */
+    @Override
+    protected StreamKind computeOutputKind() {
+        this.requireInputAmong(0, StreamKind.DELTA, StreamKind.COLLECTION);
+        this.requireInputAmong(1, StreamKind.WATERLINE);
+        return this.inputs.get(0).kind();
     }
 }

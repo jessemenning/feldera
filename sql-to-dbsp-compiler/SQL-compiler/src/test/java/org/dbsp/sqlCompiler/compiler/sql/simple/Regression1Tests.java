@@ -309,7 +309,7 @@ public class Regression1Tests extends SqlIoTest {
                 -- Credit card transactions.
                 CREATE TABLE transaction (
                     -- Lateness annotation: transactions cannot arrive more than 1 day out of order.
-                    ts TIMESTAMP LATENESS INTERVAL 1 DAYS,
+                    ts TIMESTAMP NOT NULL LATENESS INTERVAL 1 DAYS,
                     amt DOUBLE,
                     customer_id BIGINT NOT NULL,
                     state VARCHAR
@@ -532,11 +532,12 @@ public class Regression1Tests extends SqlIoTest {
     public void castBinaryToString() {
         var ccs = this.getCCS("""
                 CREATE TABLE T(x BINARY(2));
-                CREATE VIEW V AS SELECT CAST(x AS VARCHAR), CAST(x'AB01' AS VARCHAR) FROM T;""");
+                CREATE VIEW V AS SELECT CAST(x AS VARCHAR), CAST(x'AB01' AS VARCHAR) FROM T;""")
+                .withStringTrim();
         ccs.stepWeightOne("INSERT INTO T VALUES(x'AB01')", """
-                    x| y
-                ----------
-                 ab01| ab01""");
+                 x    | y
+                -------------
+                 ab01 | ab01""");
     }
 
     @Test
@@ -546,9 +547,9 @@ public class Regression1Tests extends SqlIoTest {
                 CREATE VIEW V AS SELECT CAST(x AS TIMESTAMP), CAST(10.20 AS TIMESTAMP),
                 CAST(10 AS TIMESTAMP), cast(y AS TIMESTAMP) FROM T;""");
         ccs.stepWeightOne("INSERT INTO T VALUES(10.20, 10)", """
-                 x                   | decimal             | int                 | y
-                -------------------------------------------------------------------
-                 1970-01-01 00:00:00 | 1970-01-01 00:00:00 | 1970-01-01 00:00:00 | 1970-01-01 00:00:00""");
+                 x                        | decimal                  | int                     | y
+                -------------------------------------------------------------------------------------------------
+                 1970-01-01 00:00:00.0102 | 1970-01-01 00:00:00.0102 | 1970-01-01 00:00:00.010 | 1970-01-01 00:00:00.010""");
     }
 
     @Test
@@ -1203,21 +1204,23 @@ public class Regression1Tests extends SqlIoTest {
                 SELECT cast(contacts as MAP<varchar, variant>) contacts
                     FROM user_props
                 ) SELECT key, to_json(contact)
-                FROM ref_profile profile_0, UNNEST(profile_0.contacts) AS t(key, contact)""");
+                FROM ref_profile profile_0, UNNEST(profile_0.contacts) AS t(key, contact)""")
+                .withStringTrim();
         ccs.stepWeightOne("""
                 INSERT INTO j VALUES('{ "a": "1", "b": 2, "c": [1, 2, 3], "d": null, "e": { "f": 1 } }');""", """
                  key | contact
                 ---------------
-                 a| "1"
-                 b| 2
-                 c| [1,2,3]
-                 d| null
-                 e| {"f":1}""");
+                 a   | "1"
+                 b   | 2
+                 c   | [1,2,3]
+                 d   | null
+                 e   | {"f":1}""");
     }
 
     @Test
     public void issue4890() {
-        this.getCC("""
+        // IN expands into an equality test, which is not supported for ROW values
+        this.statementsFailingInCompilation("""
                 CREATE TABLE tbl(
                 roww ROW(i1 INT, v1 VARCHAR NULL));
 
@@ -1227,12 +1230,12 @@ public class Regression1Tests extends SqlIoTest {
 
                 CREATE MATERIALIZED VIEW v2 AS SELECT
                 roww IN (ROW(4,'cat')) AS roww
-                FROM tbl;""");
+                FROM tbl;""", "ROW values cannot be compared using '='");
     }
 
     @Test
     public void issue4891() {
-        this.getCC("""
+        this.statementsFailingInCompilation("""
                 CREATE TABLE tbl(
                 roww ROW(i1 INT, v1 VARCHAR NULL));
 
@@ -1242,7 +1245,7 @@ public class Regression1Tests extends SqlIoTest {
 
                 CREATE MATERIALIZED VIEW v2 AS SELECT
                 roww NOT IN (roww) AS roww
-                FROM tbl;""");
+                FROM tbl;""", "ROW values cannot be compared using '='");
     }
 
     @Test
@@ -1529,13 +1532,13 @@ public class Regression1Tests extends SqlIoTest {
                 CREATE VIEW V AS
                 WITH FT as (select 'a' as e union all select 'bc')
                 SELECT x, x in (SELECT e from FT)
-                FROM T;""");
+                FROM T;""").withStringTrim();
         ccs.stepWeightOne("INSERT INTO T VALUES('a'), ('b'), ('ab');", """
-                 x | in
-                -------
-                 a| true
-                 b|false
-                 ab|false""");
+                 x  | in
+                -----------
+                 a  | true
+                 b  | false
+                 ab | false""");
     }
 
     @Test
@@ -1609,12 +1612,12 @@ public class Regression1Tests extends SqlIoTest {
                         VALUES
                             ('a', 1, ARRAY['by'], true),
                             ('b', 1, ARRAY(), false)
-                    ) AS t (f1, f2, f3, f4);""");
+                    ) AS t (f1, f2, f3, f4);""").withStringTrim();
         ccs.stepWeightOne("", """
-                 f1 | f2 | f3 | f4
-                --------------------
-                 a| 1 | { by} | true
-                 b| 1 | {}    | false""");
+                 f1 | f2 | f3    | f4
+                ------------------------
+                 a  | 1 | { by} | true
+                 b  | 1 | {}    | false""");
     }
 
     @Test

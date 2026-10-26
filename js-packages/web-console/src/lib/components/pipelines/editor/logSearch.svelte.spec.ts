@@ -9,9 +9,12 @@ import {
   advanceSearch,
   applySearchHighlight,
   compileSearchPattern,
+  countOccurrences,
   emptySearchState,
   findMatchOffsets,
   findOccurrence,
+  isFindShortcut,
+  positiveMod,
   type SearchPattern,
   searchPatternsEqual
 } from 'common-ui'
@@ -45,6 +48,29 @@ describe('searchPatternsEqual', () => {
   })
 })
 
+describe('positiveMod', () => {
+  it('leaves an in-range cursor alone', () => {
+    expect(positiveMod(0, 3)).toBe(0)
+    expect(positiveMod(2, 3)).toBe(2)
+  })
+
+  it('wraps forward past the last match', () => {
+    expect(positiveMod(3, 3)).toBe(0)
+    expect(positiveMod(7, 3)).toBe(1)
+  })
+
+  it('wraps backward before the first match (plain % would give a negative index)', () => {
+    expect(-1 % 3).toBe(-1) // the reason the Euclidean form is needed
+    expect(positiveMod(-1, 3)).toBe(2)
+    expect(positiveMod(-4, 3)).toBe(2)
+  })
+
+  it('collapses onto the only match for a single-match search', () => {
+    expect(positiveMod(-5, 1)).toBe(0)
+    expect(positiveMod(5, 1)).toBe(0)
+  })
+})
+
 describe('advanceSearch', () => {
   it('clears on an empty (null) pattern', () => {
     const state = { pattern: substr('a'), occurrenceIndex: 3 }
@@ -59,6 +85,63 @@ describe('advanceSearch', () => {
   it('resets the cursor to the first match on a new pattern', () => {
     const state = { pattern: substr('a'), occurrenceIndex: 5 }
     expect(advanceSearch(state, substr('b'))).toEqual({ pattern: substr('b'), occurrenceIndex: 0 })
+  })
+
+  it('steps the cursor backward on the same pattern with direction "prev"', () => {
+    const state = { pattern: substr('a'), occurrenceIndex: 3 }
+    expect(advanceSearch(state, substr('a'), 'prev')).toEqual({
+      pattern: substr('a'),
+      occurrenceIndex: 2
+    })
+  })
+
+  it('ignores direction on a new pattern (always the first match)', () => {
+    const state = { pattern: substr('a'), occurrenceIndex: 5 }
+    expect(advanceSearch(state, substr('b'), 'prev')).toEqual({
+      pattern: substr('b'),
+      occurrenceIndex: 0
+    })
+  })
+
+  it('defaults to stepping forward when no direction is given', () => {
+    const state = { pattern: substr('a'), occurrenceIndex: 1 }
+    expect(advanceSearch(state, substr('a')).occurrenceIndex).toBe(2)
+  })
+})
+
+describe('countOccurrences', () => {
+  const lines = ['alpha', 'beta', 'gamma', 'alpha again']
+
+  it('counts matching lines (one match per line, matching findOccurrence)', () => {
+    expect(countOccurrences(lines, substr('alpha'))).toBe(2)
+    expect(countOccurrences(lines, substr('a'))).toBe(4) // every line contains "a"
+  })
+
+  it('returns 0 for a null, empty, or non-matching pattern', () => {
+    expect(countOccurrences(lines, null)).toBe(0)
+    expect(countOccurrences(lines, substr(''))).toBe(0)
+    expect(countOccurrences(lines, substr('zzz'))).toBe(0)
+  })
+
+  it('respects case sensitivity', () => {
+    expect(countOccurrences(['ABC', 'abc'], substr('abc', true))).toBe(1)
+    expect(countOccurrences(['ABC', 'abc'], substr('abc', false))).toBe(2)
+  })
+})
+
+describe('isFindShortcut', () => {
+  const ev = (init: KeyboardEventInit) => new KeyboardEvent('keydown', init)
+
+  it('matches Ctrl-F and Cmd-F (case-insensitive key)', () => {
+    expect(isFindShortcut(ev({ key: 'f', ctrlKey: true }))).toBe(true)
+    expect(isFindShortcut(ev({ key: 'F', metaKey: true }))).toBe(true)
+  })
+
+  it('rejects plain "f", other keys, and extra modifiers', () => {
+    expect(isFindShortcut(ev({ key: 'f' }))).toBe(false)
+    expect(isFindShortcut(ev({ key: 'g', ctrlKey: true }))).toBe(false)
+    expect(isFindShortcut(ev({ key: 'f', ctrlKey: true, shiftKey: true }))).toBe(false)
+    expect(isFindShortcut(ev({ key: 'f', ctrlKey: true, altKey: true }))).toBe(false)
   })
 })
 

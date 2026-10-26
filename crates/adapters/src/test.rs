@@ -43,6 +43,7 @@ mod mock_input_consumer;
 mod mock_output_consumer;
 
 mod datagen;
+mod soft_delete;
 
 #[cfg(all(
     feature = "with-iceberg",
@@ -50,7 +51,8 @@ mod datagen;
         feature = "iceberg-tests-fs",
         feature = "iceberg-tests-glue",
         feature = "iceberg-tests-rest",
-        feature = "iceberg-tests-s3tables"
+        feature = "iceberg-tests-s3tables",
+        feature = "iceberg-tests-follow"
     )
 ))]
 mod iceberg;
@@ -59,12 +61,14 @@ use crate::catalog::InputCollectionHandle;
 use crate::format::get_input_format;
 use crate::transport::input_transport_config_to_endpoint;
 pub use data::{
-    DatabricksPeople, DeltaTestStruct, EmbeddedStruct, IcebergSubsetTestStruct, IcebergTestStruct,
-    KeyStruct, S3TablesTestStruct, TestStruct, TestStruct2, generate_test_batch,
-    generate_test_batches, generate_test_batches_with_weights,
+    CountRow, DatabricksPeople, DeltaTestStruct, EmbeddedStruct, IcebergSubsetTestStruct,
+    IcebergTestStruct, KeyStruct, S3TablesTestStruct, TestStruct, TestStruct2,
+    TestStructSoftDelete, generate_test_batch, generate_test_batches,
+    generate_test_batches_with_weights,
 };
 use dbsp::circuit::{CircuitConfig, NodeId};
 use dbsp::utils::Tup2;
+use feldera_adapterlib::soft_delete::SoftDeleteHandle;
 use feldera_types::format::json::{JsonFlavor, JsonLines, JsonParserConfig, JsonUpdateFormat};
 use feldera_types::program_schema::{
     Field, PropertyValue, Relation, SourcePosition, SqlIdentifier,
@@ -73,7 +77,7 @@ pub use mock_dezset::{
     MockDeZSet, MockUpdate, wait_for_output_count, wait_for_output_ordered,
     wait_for_output_unordered,
 };
-pub use mock_input_consumer::{MockInputConsumer, MockInputParser};
+pub use mock_input_consumer::{ErrorCallback, MockInputConsumer, MockInputParser};
 pub use mock_output_consumer::MockOutputConsumer;
 
 pub static DEFAULT_TIMEOUT_MS: u128 = 600_000;
@@ -156,6 +160,47 @@ where
     Ok((consumer, parser, input_handle))
 }
 
+/// Like [`mock_parser_pipeline`], but with soft deletes enabled, the way the
+/// controller configures an endpoint whose `soft_delete` property is set:
+///
+/// ```text
+/// ┌─────────────────┐   ┌──────┐   ┌────────────────┐   ┌──────────┐
+/// │MockInputConsumer├──►│parser├──►│SoftDeleteStream├──►│MockDeZSet│
+/// └─────────────────┘   └──────┘   └────────────────┘   └──────────┘
+/// ```
+pub fn mock_soft_delete_parser_pipeline<T, U>(
+    schema: &Relation,
+    config: &FormatConfig,
+) -> AnyResult<(MockInputConsumer, MockInputParser, MockDeZSet<T, U>)>
+where
+    T: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Hash
+        + Send
+        + Sync
+        + Debug
+        + Clone
+        + 'static,
+    U: for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Hash
+        + Send
+        + Sync
+        + Debug
+        + Clone
+        + 'static,
+{
+    let input_handle = <MockDeZSet<T, U>>::new();
+    let consumer = MockInputConsumer::new();
+    let parser = MockInputParser::from_handle(
+        &InputCollectionHandle::new(
+            schema.clone(),
+            SoftDeleteHandle::new(Box::new(input_handle.clone())),
+            NodeId::new(0),
+        ),
+        config,
+    );
+    Ok((consumer, parser, input_handle))
+}
+
 /// Build an input pipeline that allows testing a transport endpoint and parser
 /// standalone, without a DBSP circuit or controller.
 ///
@@ -217,6 +262,7 @@ where
         &config.connector_config.transport,
         "",
         default_secrets_directory(),
+        None,
     )?
     .unwrap();
 
@@ -262,6 +308,70 @@ where
         + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
         + Sync,
 {
+    test_circuit_inner::<T>(
+        config,
+        schema,
+        input_properties,
+        persistent_output_ids,
+        true,
+        true,
+    )
+}
+
+/// Like [`test_circuit`] with one stream, but neither the input nor the
+/// output is materialized, like a SQL table and view declared without
+/// `MATERIALIZED`.  The output's accumulator is then enabled only while an
+/// output endpoint reads it.
+pub fn test_circuit_not_materialized<T>(
+    config: CircuitConfig,
+    schema: &[Field],
+) -> (DBSPHandle, Box<dyn CircuitCatalog>)
+where
+    T: DBData
+        + SerializeWithContext<SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Sync,
+{
+    test_circuit_inner::<T>(config, schema, &[], &[None], true, false)
+}
+
+/// Creates a one-stream test circuit that cannot be checkpointed.
+///
+/// Shaped like [`test_circuit`], but assigns no persistent operator ids, so a
+/// checkpoint fails in every worker with `StorageError::NoPersistentId`.  Use
+/// it to exercise the controller's handling of a worker-side checkpoint
+/// failure.
+pub fn test_circuit_without_persistent_ids<T>(
+    config: CircuitConfig,
+    schema: &[Field],
+) -> (DBSPHandle, Box<dyn CircuitCatalog>)
+where
+    T: DBData
+        + SerializeWithContext<SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Sync,
+{
+    test_circuit_inner::<T>(config, schema, &[], &[None], false, true)
+}
+
+/// The body of [`test_circuit_with_properties`] and
+/// [`test_circuit_without_persistent_ids`].  `persistent_ids` says whether the
+/// input operators get persistent ids, which is what a checkpoint needs.
+/// `materialized` says whether the inputs and outputs are materialized.
+fn test_circuit_inner<T>(
+    config: CircuitConfig,
+    schema: &[Field],
+    input_properties: &[(&str, &str)],
+    persistent_output_ids: &[Option<&str>],
+    persistent_ids: bool,
+    materialized: bool,
+) -> (DBSPHandle, Box<dyn CircuitCatalog>)
+where
+    T: DBData
+        + SerializeWithContext<SqlSerdeConfig>
+        + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>
+        + Sync,
+{
     let zero_position = SourcePosition {
         start_line_number: 0,
         start_column: 0,
@@ -294,10 +404,12 @@ where
 
         for (persistent_output_id, i) in persistent_output_ids.iter().zip(1..) {
             let (input, hinput) = circuit.add_input_zset::<T>();
-            if n > 1 {
-                input.set_persistent_mir_id(&format!("input{i}"));
-            } else {
-                input.set_persistent_mir_id("input");
+            if persistent_ids {
+                if n > 1 {
+                    input.set_persistent_mir_id(&format!("input{i}"));
+                } else {
+                    input.set_persistent_mir_id("input");
+                }
             }
 
             let input_schema = serde_json::to_string(&Relation::new(
@@ -316,14 +428,108 @@ where
             ))
             .unwrap();
 
-            catalog.register_materialized_input_zset(input.clone(), hinput, &input_schema);
+            if materialized {
+                catalog.register_materialized_input_zset(input.clone(), hinput, &input_schema);
+            } else {
+                catalog.register_input_zset(input.clone(), hinput, &input_schema);
+            }
 
-            catalog.register_materialized_output_zset_persistent(
-                persistent_output_id.as_ref().map(|s| s.as_str()),
-                input,
-                &output_schema,
-            );
+            let persistent_output_id = persistent_output_id.as_ref().map(|s| s.as_str());
+            if materialized {
+                catalog.register_materialized_output_zset_persistent(
+                    persistent_output_id,
+                    input,
+                    &output_schema,
+                );
+            } else {
+                catalog.register_output_zset_persistent(
+                    persistent_output_id,
+                    input,
+                    &output_schema,
+                );
+            }
         }
+        Ok(catalog)
+    })
+    .unwrap();
+    (circuit, Box::new(catalog))
+}
+
+/// Maps a record id onto one of `n_keys` groups with roughly the JSONBench
+/// event distribution: 45% of records in the first group, 36% in the second,
+/// then a long tail down to single-digit groups.  The skew is the point: it
+/// puts most of the aggregate's input through one or two workers.
+fn skewed_key(id: i64, n_keys: i64) -> i64 {
+    // Above the number of event types there is no distribution to imitate, so
+    // spread the keys out instead: a high-cardinality aggregate builds a large
+    // trace and makes the circuit merge and spill during the transaction.
+    if n_keys > 64 {
+        return id.rem_euclid(n_keys);
+    }
+
+    // Cumulative percentages of the 15 bluesky event types, scaled to 10,000.
+    const CUMULATIVE: [i64; 15] = [
+        4489, 8093, 9001, 9587, 9727, 9845, 9926, 9979, 9988, 9992, 9996, 9998, 9999, 10000, 10000,
+    ];
+    let bucket = (id * 7919).rem_euclid(10_000);
+    let key = CUMULATIVE.iter().position(|c| bucket < *c).unwrap_or(14) as i64;
+    key % n_keys
+}
+
+/// A circuit shaped like the JSONBench pipeline that fails in cloud#1934: one
+/// input feeding two materialized views, one of them behind a `group by`.
+///
+/// ```text
+/// test_input1 ──┬─────────────────────────► passthrough
+///               └─► group by id % n_keys ──► counts
+/// ```
+///
+/// All three relations are materialized, so an ad-hoc query can read each of
+/// them out of the same snapshot.  `sum(n)` over `counts` must equal the row
+/// count of `passthrough` and of `test_input1`, whatever the step and
+/// transaction boundaries turn out to be.
+pub fn test_circuit_with_aggregate(
+    config: CircuitConfig,
+    n_keys: i64,
+) -> (DBSPHandle, Box<dyn CircuitCatalog>) {
+    let (circuit, catalog) = Runtime::init_circuit(config, move |circuit| {
+        let mut catalog = Catalog::new();
+
+        let (input, hinput) = circuit.add_input_zset::<TestStruct>();
+        input.set_persistent_mir_id("input");
+
+        let relation = |name: &str, fields: Vec<Field>| {
+            serde_json::to_string(&Relation::new(name.into(), fields, false, BTreeMap::new()))
+                .unwrap()
+        };
+
+        catalog.register_materialized_input_zset::<OrdZSet<TestStruct>, TestStruct>(
+            input.clone(),
+            hinput,
+            &relation("test_input1", TestStruct::schema()),
+        );
+
+        // Stands in for the JSONBench `bluesky` view: a map over the table,
+        // materialized, with the aggregate reading it rather than the table.
+        let view = input.map(|record| record.clone());
+
+        catalog.register_materialized_output_zset_persistent::<OrdZSet<TestStruct>, TestStruct>(
+            Some("passthrough"),
+            view.clone(),
+            &relation("passthrough", TestStruct::schema()),
+        );
+
+        let counts = view
+            .map_index(move |record| (skewed_key(record.id as i64, n_keys), ()))
+            .weighted_count()
+            .map(|(key, n)| CountRow { key: *key, n: *n });
+
+        catalog.register_materialized_output_zset_persistent::<OrdZSet<CountRow>, CountRow>(
+            Some("counts"),
+            counts,
+            &relation("counts", CountRow::schema()),
+        );
+
         Ok(catalog)
     })
     .unwrap();
@@ -434,6 +640,78 @@ where
     (circuit, Box::new(catalog))
 }
 
+/// Creates a circuit with a materialized view and its only index, which
+/// share one output handle.
+///
+/// This is how the SQL compiler registers the first index of a materialized
+/// view: the view and the index are the same indexed stream, so connectors on
+/// either one read their updates from the same handle.
+///
+/// # Arguments
+///
+/// * `config` - Circuit configuration.
+/// * `view_name` - Name of the view.
+/// * `index_name` - Name of the view's index, keyed on `id`.
+///
+/// # Returns
+///
+/// The circuit and its catalog.  The view contains the records of table
+/// `test_input1`, whose primary key is `id`.
+pub fn test_circuit_with_aliased_index(
+    config: CircuitConfig,
+    view_name: &str,
+    index_name: &str,
+) -> (DBSPHandle, Box<dyn CircuitCatalog>) {
+    let view_name = view_name.to_string();
+    let index_name = index_name.to_string();
+
+    let (circuit, catalog) = Runtime::init_circuit(config, move |circuit| {
+        let mut catalog = Catalog::new();
+
+        let (input, hinput) = circuit
+            .add_input_map_persistent::<KeyStruct, TestStruct, TestStruct, _>(
+                Some("input"),
+                |val, upd| *val = upd.clone(),
+            );
+        input.set_persistent_mir_id("input");
+
+        let relation =
+            |name: &str| Relation::new(name.into(), TestStruct::schema(), false, BTreeMap::new());
+        let input_schema = serde_json::to_string(
+            &relation("test_input1").with_primary_key(&[SqlIdentifier::from("id")]),
+        )
+        .unwrap();
+        let view_schema = serde_json::to_string(&relation(&view_name)).unwrap();
+
+        let key_func = |record: &TestStruct| KeyStruct::for_id(record.id);
+        catalog.register_materialized_input_map::<
+            KeyStruct,
+            KeyStruct,
+            TestStruct,
+            TestStruct,
+            TestStruct,
+            TestStruct,
+            _,
+            _,
+        >(input.clone(), hinput, key_func, key_func, &input_schema);
+        catalog.register_materialized_output_map_persistent::<
+            KeyStruct,
+            KeyStruct,
+            TestStruct,
+            TestStruct,
+        >(
+            Some("output"),
+            input,
+            Some(SqlIdentifier::from(&index_name)),
+            &view_schema,
+            &["id".to_string()],
+        );
+        Ok(catalog)
+    })
+    .unwrap();
+    (circuit, Box::new(catalog))
+}
+
 pub fn list_files_recursive(dir: &Path, extension: &OsStr) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut result = Vec::new();
 
@@ -457,6 +735,16 @@ pub fn file_to_zset<T>(file: &mut File) -> OrdZSet<T>
 where
     T: DBData + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>,
 {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+    bytes_to_zset(&bytes)
+}
+
+/// Parse `insert_delete` JSON records into a Z-set.
+pub fn bytes_to_zset<T>(bytes: &[u8]) -> OrdZSet<T>
+where
+    T: DBData + for<'de> DeserializeWithContext<'de, SqlSerdeConfig, Variant>,
+{
     let format = get_input_format("json").unwrap();
     let buffer = MockDeZSet::<T, T>::new();
 
@@ -471,9 +759,7 @@ where
         )
         .unwrap();
 
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).unwrap();
-    let (mut parsed_buffers, errors) = parser.parse(&bytes, None);
+    let (mut parsed_buffers, errors) = parser.parse(bytes, None);
     parsed_buffers.flush();
 
     // Use assert_eq, so errors are printed in case of a failure.

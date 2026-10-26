@@ -114,16 +114,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # amd64: solace-rs falls back to the official C_API_LINUX64 download,
-          # so no tarball URL is needed.
+          # Both arches download solclient from Solace's official URLs, wired in
+          # solace-rs (C_API_LINUX64 for amd64, C_API_ARM for aarch64) — no
+          # self-hosted tarball or override needed.
           - arch: amd64
             runner: ubuntu-latest
-            solclient_url: ""
-          # arm64: no official aarch64 download URL exists — supply the hosted
-          # solclient_Linux-aarch64 tarball. Native ARM runner (free on public repos).
           - arch: arm64
-            runner: ubuntu-24.04-arm
-            solclient_url: ${{ vars.SOLCLIENT_AARCH64_TARBALL_URL }}
+            runner: ubuntu-24.04-arm   # native ARM runner (free on public repos)
 
     steps:
       - name: Checkout repository
@@ -213,9 +210,6 @@ jobs:
           # Embed the pre-built web console (previous step) into the binary.
           # build.rs serves whatever this dir contains; empty dir = no web UI.
           WEBCONSOLE_BUILD_DIR: ${{ github.workspace }}/js-packages/web-console/build
-          # arm64 needs the hosted aarch64 solclient tarball; empty on amd64
-          # (solace-rs uses the official C_API_LINUX64 download URL).
-          SOLCLIENT_TARBALL_URL: ${{ matrix.solclient_url }}
         run: cargo build --release --locked -p pipeline-manager
 
       # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────
@@ -244,8 +238,6 @@ jobs:
           context: .
           file: deploy/Dockerfile
           platforms: linux/${{ matrix.arch }}
-          build-args: |
-            SOLCLIENT_TARBALL_URL=${{ matrix.solclient_url }}
           # Push the single-arch image by digest only (no tag); the merge-manifest
           # job stitches the per-arch digests into the real tags.
           outputs: type=image,name=ghcr.io/jessemenning/feldera,push-by-digest=true,name-canonical=true,push=true

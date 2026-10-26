@@ -2019,7 +2019,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -2037,7 +2037,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2786,7 +2786,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5005,7 +5005,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7629,7 +7629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -8165,7 +8165,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10251,7 +10251,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11365,7 +11365,7 @@ dependencies = [
  "security-framework 3.6.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12230,7 +12230,7 @@ dependencies = [
 [[package]]
 name = "solace-rs"
 version = "0.9.1"
-source = "git+https://github.com/jessemenning/solace-rs?rev=9787d31#9787d31c71c206c2d9e09b51935b52d66df260a5"
+source = "git+https://github.com/jessemenning/solace-rs?rev=727668a#727668a32f5f23eaf4390256b7f89d58df607bd2"
 dependencies = [
  "enum_primitive",
  "futures-core",
@@ -12244,7 +12244,7 @@ dependencies = [
 [[package]]
 name = "solace-rs-sys"
 version = "1.1.0"
-source = "git+https://github.com/jessemenning/solace-rs?rev=9787d31#9787d31c71c206c2d9e09b51935b52d66df260a5"
+source = "git+https://github.com/jessemenning/solace-rs?rev=727668a#727668a32f5f23eaf4390256b7f89d58df607bd2"
 dependencies = [
  "bindgen 0.66.1",
  "cfg-if",
@@ -14450,7 +14450,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

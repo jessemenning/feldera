@@ -20,14 +20,6 @@ RUN CARGO_LOCK=/tmp/Cargo.lock PREFIX=/usr/local bash /tmp/install-librdkafka.sh
 FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Source URL for the Solace C SDK tarball (solace-rs-sys). Empty on amd64, where
-# solace-rs falls back to the official C_API_LINUX64 download. Required on arm64,
-# which has no official download URL — the arm64 build passes the hosted
-# solclient_Linux-aarch64 tarball here so --precompile (and runtime pipeline
-# compiles) can link solclient. Inherited by the `release` stage.
-ARG SOLCLIENT_TARBALL_URL=""
-ENV SOLCLIENT_TARBALL_URL=${SOLCLIENT_TARBALL_URL}
-
 RUN apt update --fix-missing && apt -y dist-upgrade && apt install \
   # pkg-config is how rdkafka-sys locates the librdkafka copied in below
   pkg-config \

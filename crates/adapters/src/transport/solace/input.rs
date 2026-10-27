@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,12 +6,13 @@ use anyhow::Result as AnyResult;
 use chrono::Utc;
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::ConnectorMetadata;
+use feldera_types::variant::VariantValue;
 use feldera_adapterlib::format::Parser;
 use feldera_adapterlib::transport::{
     InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand, Resume,
     TransportInputEndpoint,
 };
-use feldera_sqllib::{SqlString, Timestamp, Variant};
+use feldera_sqllib::{Timestamp, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
@@ -962,11 +963,11 @@ fn process_message(
 struct MetadataSpec {
     include_topic: bool,
     include_broker_timestamp: bool,
-    topic_key: Variant,
-    broker_ts_key: Variant,
+    topic_key: String,
+    broker_ts_key: String,
     /// One entry per `topic_pattern` slash level: `Some(key)` for a `{name}`
     /// capture segment, `None` for a static segment.
-    pattern_keys: Option<Vec<Option<Variant>>>,
+    pattern_keys: Option<Vec<Option<String>>>,
 }
 
 impl MetadataSpec {
@@ -978,12 +979,12 @@ impl MetadataSpec {
         let pattern_keys = config.topic_pattern.as_ref().map(|pattern| {
             pattern
                 .split('/')
-                .map(|seg| -> Option<Variant> {
+                .map(|seg| -> Option<String> {
                     let name = seg.strip_prefix('{')?.strip_suffix('}')?;
                     if name.is_empty() {
                         None
                     } else {
-                        Some(Variant::String(SqlString::from(name)))
+                        Some(name.to_string())
                     }
                 })
                 .collect()
@@ -991,8 +992,8 @@ impl MetadataSpec {
         Some(Self {
             include_topic: config.include_topic,
             include_broker_timestamp: config.include_broker_timestamp,
-            topic_key: Variant::String(SqlString::from("solace_topic")),
-            broker_ts_key: Variant::String(SqlString::from("broker_ts")),
+            topic_key: "solace_topic".to_string(),
+            broker_ts_key: "broker_ts".to_string(),
             pattern_keys,
         })
     }
@@ -1050,35 +1051,36 @@ fn metadata_from_fields(
     topic: Option<&str>,
     broker_ts_ms: Option<i64>,
 ) -> Option<ConnectorMetadata> {
-    let mut meta = BTreeMap::new();
+    let mut meta = ConnectorMetadata::new();
 
     if let Some(topic) = topic {
         if spec.include_topic {
-            meta.insert(
-                spec.topic_key.clone(),
-                Variant::String(SqlString::from(topic)),
-            );
+            meta.insert(&spec.topic_key, VariantValue::String(topic.to_string()));
         }
         if let Some(keys) = &spec.pattern_keys {
             for (key, seg) in keys.iter().zip(topic.split('/')) {
                 if let Some(key) = key {
-                    meta.insert(key.clone(), Variant::String(SqlString::from(seg)));
+                    meta.insert(key, VariantValue::String(seg.to_string()));
                 }
             }
         }
     }
 
     if let Some(ms) = broker_ts_ms {
+        // Match the canonical Variant -> VariantValue mapping (a SQL TIMESTAMP
+        // becomes VariantValue::TimestampNtzMicros) so the deserializer reads
+        // the attribute back unchanged.
         meta.insert(
-            spec.broker_ts_key.clone(),
-            Variant::Timestamp(Timestamp::from_milliseconds(ms)),
+            &spec.broker_ts_key,
+            VariantValue::try_from(&Variant::Timestamp(Timestamp::from_milliseconds(ms)))
+                .expect("timestamp converts to VariantValue"),
         );
     }
 
     if meta.is_empty() {
         None
     } else {
-        Some(ConnectorMetadata::from(meta))
+        Some(meta)
     }
 }
 
@@ -1163,12 +1165,12 @@ mod tests {
     use solace_rs::flow::FlowEvent;
     use solace_rs::session::SessionEvent;
 
-    use feldera_sqllib::{SqlString, Timestamp, Variant};
+    use feldera_sqllib::{Timestamp, Variant};
 
     use super::{
         ConnectorError, InputEndpoint, MetadataSpec, PendingAcks, RgmidCache, SolaceInputEndpoint,
-        State, acks_ready, classify_connect_failure, is_fatal_error_text, is_flow_failure,
-        is_session_failure, metadata_from_fields, split_acks_on_close,
+        State, VariantValue, acks_ready, classify_connect_failure, is_fatal_error_text,
+        is_flow_failure, is_session_failure, metadata_from_fields, split_acks_on_close,
     };
 
     fn make_config() -> SolaceInputConfig {
@@ -1397,8 +1399,8 @@ mod tests {
         MetadataSpec::from_config(&cfg)
     }
 
-    fn string_variant(s: &str) -> Variant {
-        Variant::String(SqlString::from(s))
+    fn string_value(s: &str) -> VariantValue {
+        VariantValue::String(s.to_string())
     }
 
     #[test]
@@ -1415,12 +1417,12 @@ mod tests {
         let meta = metadata_from_fields(&spec, Some("demo/events/us-east/order"), None).unwrap();
         assert_eq!(
             meta.get_by_name("solace_topic"),
-            Some(&string_variant("demo/events/us-east/order"))
+            Some(&string_value("demo/events/us-east/order"))
         );
-        assert_eq!(meta.get_by_name("region"), Some(&string_variant("us-east")));
+        assert_eq!(meta.get_by_name("region"), Some(&string_value("us-east")));
         assert_eq!(
             meta.get_by_name("event_type"),
-            Some(&string_variant("order"))
+            Some(&string_value("order"))
         );
     }
 
@@ -1429,7 +1431,7 @@ mod tests {
         let spec = spec(false, false, Some("app/v1/{tenant}/events")).unwrap();
         let meta = metadata_from_fields(&spec, Some("app/v1/acme/events"), None).unwrap();
         assert_eq!(meta.get_by_name("solace_topic"), None);
-        assert_eq!(meta.get_by_name("tenant"), Some(&string_variant("acme")));
+        assert_eq!(meta.get_by_name("tenant"), Some(&string_value("acme")));
     }
 
     #[test]
@@ -1437,13 +1439,13 @@ mod tests {
         // Pattern longer than topic: unmatched captures are absent.
         let spec_long = spec(false, false, Some("a/{b}/{c}")).unwrap();
         let meta = metadata_from_fields(&spec_long, Some("a/x"), None).unwrap();
-        assert_eq!(meta.get_by_name("b"), Some(&string_variant("x")));
+        assert_eq!(meta.get_by_name("b"), Some(&string_value("x")));
         assert_eq!(meta.get_by_name("c"), None);
 
         // Topic longer than pattern: extra levels produce no captures.
         let spec_short = spec(false, false, Some("a/{b}")).unwrap();
         let meta = metadata_from_fields(&spec_short, Some("a/x/y/z"), None).unwrap();
-        assert_eq!(meta.get_by_name("b"), Some(&string_variant("x")));
+        assert_eq!(meta.get_by_name("b"), Some(&string_value("x")));
     }
 
     #[test]
@@ -1456,7 +1458,7 @@ mod tests {
             None,
             "static segment captures nothing"
         );
-        assert_eq!(meta.get_by_name("tail"), Some(&string_variant("end")));
+        assert_eq!(meta.get_by_name("tail"), Some(&string_value("end")));
     }
 
     #[test]
@@ -1465,9 +1467,12 @@ mod tests {
         let meta = metadata_from_fields(&spec, None, Some(1_700_000_000_000)).unwrap();
         assert_eq!(
             meta.get_by_name("broker_ts"),
-            Some(&Variant::Timestamp(Timestamp::from_milliseconds(
-                1_700_000_000_000
-            )))
+            Some(
+                &VariantValue::try_from(&Variant::Timestamp(Timestamp::from_milliseconds(
+                    1_700_000_000_000
+                )))
+                .unwrap()
+            )
         );
     }
 

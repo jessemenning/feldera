@@ -51,6 +51,9 @@ impl MemoryUseReporter {
     }
 
     /// The most recent measured memory use in bytes.
+    // Only called from the server and Kafka outputs, which are compiled out in a
+    // `--no-default-features --features with-solace` build.
+    #[allow(dead_code)]
     pub(crate) fn current(&self) -> usize {
         self.current as usize
     }

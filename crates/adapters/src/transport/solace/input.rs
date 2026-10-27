@@ -6,7 +6,6 @@ use anyhow::Result as AnyResult;
 use chrono::Utc;
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::ConnectorMetadata;
-use feldera_types::variant::VariantValue;
 use feldera_adapterlib::format::Parser;
 use feldera_adapterlib::transport::{
     InputConsumer, InputEndpoint, InputQueue, InputReader, InputReaderCommand, Resume,
@@ -16,6 +15,7 @@ use feldera_sqllib::{Timestamp, Variant};
 use feldera_types::config::FtModel;
 use feldera_types::coordination::Completion;
 use feldera_types::program_schema::Relation;
+use feldera_types::variant::VariantValue;
 use serde_json::{Value as JsonValue, json};
 use solace_rs::Context;
 use solace_rs::async_support::{AsyncSession, AsyncSessionBuilder, OwnedAsyncFlow};
@@ -1077,11 +1077,7 @@ fn metadata_from_fields(
         );
     }
 
-    if meta.is_empty() {
-        None
-    } else {
-        Some(meta)
-    }
+    if meta.is_empty() { None } else { Some(meta) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,10 +1416,7 @@ mod tests {
             Some(&string_value("demo/events/us-east/order"))
         );
         assert_eq!(meta.get_by_name("region"), Some(&string_value("us-east")));
-        assert_eq!(
-            meta.get_by_name("event_type"),
-            Some(&string_value("order"))
-        );
+        assert_eq!(meta.get_by_name("event_type"), Some(&string_value("order")));
     }
 
     #[test]

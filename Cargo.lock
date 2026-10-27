@@ -2019,7 +2019,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
@@ -2037,7 +2037,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -7629,7 +7629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -12230,7 +12230,7 @@ dependencies = [
 [[package]]
 name = "solace-rs"
 version = "0.9.1"
-source = "git+https://github.com/jessemenning/solace-rs?rev=727668a#727668a32f5f23eaf4390256b7f89d58df607bd2"
+source = "git+https://github.com/jessemenning/solace-rs?rev=8714748#8714748e836dec53eaddac07d9c7f87ee096c0cf"
 dependencies = [
  "enum_primitive",
  "futures-core",
@@ -12244,7 +12244,7 @@ dependencies = [
 [[package]]
 name = "solace-rs-sys"
 version = "1.1.0"
-source = "git+https://github.com/jessemenning/solace-rs?rev=727668a#727668a32f5f23eaf4390256b7f89d58df607bd2"
+source = "git+https://github.com/jessemenning/solace-rs?rev=8714748#8714748e836dec53eaddac07d9c7f87ee096c0cf"
 dependencies = [
  "bindgen 0.66.1",
  "cfg-if",

@@ -548,6 +548,7 @@ fn watched_input_pipeline(
         &config.connector_config.transport,
         "",
         default_secrets_directory(),
+        None, // shard: non-distributed test endpoint (param added upstream)
     )
     .unwrap()
     .unwrap();

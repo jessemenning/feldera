@@ -104,7 +104,7 @@ awc = { workspace = true, features = [
     "rustls-0_23-webpki-roots",
 ] }
 async-nats = { workspace = true }
-solace-rs = { git = "https://github.com/jessemenning/solace-rs", rev = "8714748", features = ["async"], optional = true }
+solace-rs = { git = "https://github.com/jessemenning/solace-rs", rev = "b1f9bee", features = ["async"], optional = true }
 async-stream = { workspace = true }
 data-encoding = { workspace = true }
 anyhow = { workspace = true, features = ["backtrace"] }

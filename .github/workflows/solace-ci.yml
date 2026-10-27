@@ -211,6 +211,10 @@ jobs:
           # Embed the pre-built web console (previous step) into the binary.
           # build.rs serves whatever this dir contains; empty dir = no web UI.
           WEBCONSOLE_BUILD_DIR: ${{ github.workspace }}/js-packages/web-console/build
+          # postgresql_embedded resolves Postgres binaries via the GitHub
+          # releases API; unauthenticated it's 60 req/h/IP and the arm64 leg hit
+          # a 403 rate-limit. Authenticating raises it to 5000/h.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: cargo build --release --locked -p pipeline-manager
 
       # ── Stage build/ artifacts for deploy/Dockerfile ────────────────────────

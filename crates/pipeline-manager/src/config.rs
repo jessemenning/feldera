@@ -15,6 +15,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::server::WebPkiClientVerifier;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
@@ -386,6 +387,24 @@ pub struct CommonConfig {
     #[arg(long, env = "FELDERA_CA_CERT_PATH")]
     pub private_ca_cert_path: Option<String>,
 
+    /// Require clients to present a certificate (mutual TLS) on the HTTP servers.
+    ///
+    /// When true, the server accepts only connections whose client certificate
+    /// chains to a CA in `--https-tls-cert-path` (and `--private-ca-cert-path` if
+    /// set); connections without a valid client certificate are rejected at the
+    /// TLS handshake. Requires `--enable-https`.
+    ///
+    /// This is the FIPS-posture identity model: clients authenticate by mTLS on a
+    /// validated module rather than a bearer/JWT, which keeps the non-FIPS
+    /// `jsonwebtoken`/`ring` verification path out of the boundary (turn JWT/OIDC
+    /// off by leaving `FELDERA_AUTH_*` unset). See FIPS-IDENTITY-HANDOFF.md.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "FELDERA_REQUIRE_CLIENT_CERTIFICATES"
+    )]
+    pub https_require_client_certificate: bool,
+
     /// Number of monitor events that are retained for each pipeline.
     #[arg(long, default_value_t = default_pipeline_monitor_events_retention(), env = "FELDERA_PIPELINE_MONITOR_EVENTS_RETENTION")]
     pub pipeline_monitor_events_retention: u32,
@@ -509,13 +528,41 @@ impl CommonConfig {
             let key_der = PrivateKeyDer::from_pem_file(https_tls_key_path)
                 .expect("HTTPS TLS key should be read");
 
-            // Server configuration
-            let server_config = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, key_der)
-                .expect(
-                    "server configuration should be built using the certificate and private key",
+            // Server configuration. When mutual TLS is required, verify client
+            // certificates against the configured CA(s); otherwise accept any
+            // client (server-authenticated TLS only).
+            let builder = rustls::ServerConfig::builder();
+            let server_config = if self.https_require_client_certificate {
+                let mut client_roots = RootCertStore::empty();
+                for path in self.ca_cert_paths() {
+                    for cert in CertificateDer::pem_file_iter(path)
+                        .expect("client-CA certificate should be read")
+                        .flatten()
+                    {
+                        client_roots
+                            .add(cert)
+                            .expect("client-CA certificate should be a valid trust anchor");
+                    }
+                }
+                assert!(
+                    !client_roots.is_empty(),
+                    "FELDERA_REQUIRE_CLIENT_CERTIFICATES needs a CA: set --https-tls-cert-path \
+                     (and/or --private-ca-cert-path) to the CA that signs client certificates"
                 );
+                let verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+                    .build()
+                    .expect("client certificate verifier should build");
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(cert_chain, key_der)
+                    .expect(
+                        "server configuration should be built using the certificate and private key",
+                    )
+            } else {
+                builder.with_no_client_auth().with_single_cert(cert_chain, key_der).expect(
+                    "server configuration should be built using the certificate and private key",
+                )
+            };
             feldera_observability::fips::log_rustls_fips_status(
                 "HTTPS server config",
                 server_config.fips(),
@@ -680,6 +727,7 @@ impl CommonConfig {
             https_tls_cert_path: None,
             https_tls_key_path: None,
             private_ca_cert_path: None,
+            https_require_client_certificate: false,
             pipeline_monitor_events_retention: 720,
             disable_cluster_monitor_resources: false,
         }

@@ -2060,6 +2060,7 @@ mod test {
             https_tls_cert_path: None,
             https_tls_key_path: None,
             private_ca_cert_path: None,
+            https_require_client_certificate: false,
             pipeline_monitor_events_retention: 720,
             disable_cluster_monitor_resources: false,
         };
